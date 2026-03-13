@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "dev"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up conda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: saxshell-dev
+          environment-file: environment.yml
+          python-version: ${{ matrix.python-version }}
+          auto-activate-base: false
+
+      - name: Show environment
+        shell: bash -l {0}
+        run: |
+          conda info
+          conda list
+
+      - name: Ruff check
+        shell: bash -l {0}
+        run: ruff check .
+
+      - name: Ruff format check
+        shell: bash -l {0}
+        run: ruff format --check .
+
+      - name: MyPy
+        shell: bash -l {0}
+        run: mypy src
+
+      - name: Pytest
+        shell: bash -l {0}
+        run: pytest -q

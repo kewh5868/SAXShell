@@ -1,0 +1,23 @@
+name: saxshell-dev
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - scipy
+  - matplotlib
+  - pandas
+  - xarray
+  - pyyaml
+  - networkx
+  - lmfit
+  - pytest
+  - pytest-cov
+  - ruff
+  - mypy
+  - pre-commit
+  - pip:
+      - -e .

@@ -1,0 +1,10 @@
+include LICENSE
+include README.md
+
+graft tests
+
+global-exclude *.py[cod]
+global-exclude .DS_Store
+global-exclude __pycache__
+global-exclude .git*
+global-exclude .idea*
