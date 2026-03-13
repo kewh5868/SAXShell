@@ -1,0 +1,20 @@
+{
+  "author_names": "Keith White",
+  "author_emails": "keith.white@colorado.edu",
+  "maintainer_names": "Keith White",
+  "maintainer_emails": "keith.white@colorado.edu",
+  "maintainer_github_usernames": "kewh5868",
+  "contributors": "Keith White",
+  "license_holders": "The University of Colorado Boulder in the City of Boulder",
+  "project_name": "saxshell",
+  "github_username_or_orgname": "kewh5868",
+  "github_repo_name": "saxshell",
+  "conda_pypi_package_dist_name": "saxshell",
+  "package_dir_name": "saxshell",
+  "project_short_description": "Python package for analysis of small-angle scattering data from molecular dynamics derived liquid structures.",
+  "project_keywords": "scattering, SAXS, X-ray, diffraction, solvation",
+  "minimum_supported_python_version": "3.11",
+  "maximum_supported_python_version": "3.14",
+  "project_needs_c_code_compiled": "No",
+  "project_has_gui_tests": "Yes"
+}
