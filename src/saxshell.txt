@@ -1,0 +1,995 @@
+SAXShell Complete Code and Workflow Outline
+===========================================
+src/saxshell/
+    __init__.py
+    version.py
+
+    mdtrajectory.py
+    saxshell.py
+    pdfsetup.py
+
+    mdtrajectory/
+        __init__.py
+
+        frame/
+            __init__.py
+            loader.py
+            selector.py
+            extractor.py
+
+        structure/
+            __init__.py
+            molecule_reference.py
+            molecule_identifier.py
+            xyz_to_pdb.py
+            pdb_utils.py
+
+        cluster/
+            __init__.py
+            extractor.py
+            sorting.py
+            family.py
+            ensemble.py
+
+        bondanalysis/
+            __init__.py
+            lengths.py
+            angles.py
+            distributions.py
+
+        coord/
+            __init__.py
+            coordination.py
+            neighbor_lists.py
+            summaries.py
+
+    plotting/
+        __init__.py
+        histograms.py
+        cluster_plots.py
+        saxs_plots.py
+        pdf_plots.py
+        fit_plots.py
+        styles.py
+
+    saxs/
+        __init__.py
+
+        debye/
+            __init__.py
+            calculator.py
+            qgrid.py
+            scattering_objects.py
+
+        model/
+            __init__.py
+            components.py
+            averaging.py
+            weights.py
+            model_data.py
+            model.py
+
+        prefit/
+            __init__.py
+            lmfit_setup.py
+            lmfit_runner.py
+            result.py
+
+        dream/
+            __init__.py
+            priors.py
+            setup.py
+            runner.py
+            result.py
+            loaders.py
+
+    pdf/
+        __init__.py
+
+        debyer/
+            __init__.py
+            runner.py
+            partials.py
+            io.py
+
+        fullrmc/
+            __init__.py
+            setup_generator.py
+            constraints.py
+            io.py
+
+App 1: MD Trajectory -> Frames -> Cluster Extraction
+- Load MD File, convert to XYZ frames, would also like to be able 
+to start from extracted XYZ state (frames)
+- Plot Energy Profile/Select Frame Range
+- Extract XYZ files
+- Load Molecule references 
+- Convert to PDB files using molecule reference
+- Cluster Extraction 
+    - User selects stoichiometric binning (which atoms to bin by)
+    - User defined network connectivity (atom pair distance cutoff)
+
+/mdtrajectory/
+    /frame/: Trajectory parsing tools and XYZ frame extraction.
+    /structure/: XYZ -> PDB conversion tools, atom/molecule classification tools.
+    /cluster/: Cluster extraction and sorting tools
+    /bondanalysis/: Bond distance and angle analysis tools
+    /coord/: Coordination number analysis tools
+/plotting/: Store plotting tools across all applications here. 
+/saxs/
+    /debye/: Compute debye scattering for a cluster
+    /model/: Cluster averaging scheme and weighting to construct prior weights 
+    for prefit model.
+    /prefit/: LMFit-based SAXS model setup, and pre-fit execution.
+    /dream/: Load prefit model, set prior weight parameter space and DREAM fit 
+    specifications, generate model run file.
+/pdf/
+    /debyer/: Run debyer to compute PDF, partial PDFs from MD trajectories.
+    /fullrmc/: Run to generate setup files for fullrmc from SAXS fit distributions.
+/apps/
+    mdtrajectory.py: Main application for /mdtrajectory/ code.
+    saxshell.py: Runs the main debye modelling code, prefit code, and DREAM modelling 
+    - multi-panel UI with save features.
+    pdfsetup.py: Runs code in /pdf/ to help setup fullRMC pdf runs and pre-calculated Debyer PDFs.
+------------------------------------------------------------------------------------------
+Project Purpose
+---------------
+SAXShell is a software framework for extracting chemically meaningful
+solute-centered cluster ensembles from molecular dynamics trajectories
+and using those extracted cluster families as interpretable building
+blocks for small-angle X-ray scattering (SAXS) model construction,
+initial deterministic fitting, and Bayesian refinement.
+
+Core Idea
+---------
+Rather than modeling SAXS directly from an entire molecular dynamics box
+as one opaque object, SAXShell reduces the trajectory into a set of
+interpretable local structural motifs.
+
+These motifs are:
+- solute-centered atom networks
+- coordinated solvent shells
+- grouped cluster families sorted by stoichiometry
+- optionally later classified by topology, coordination motif, or other
+  descriptors
+
+These cluster families then become the structural basis for building
+multicomponent SAXS models.
+
+High-Level Workflow
+-------------------
+1. Load a molecular dynamics trajectory
+2. Select a frame range and stride
+3. Extract individual frames
+4. For each frame:
+   a. export or access the frame as XYZ
+   b. identify molecules using a user-defined molecule reference file
+   c. assign atoms into distinct molecules
+   d. convert the frame into a structured PDB-like representation
+5. For each frame PDB:
+   a. identify solute-centered atom networks
+   b. identify coordinating solvent molecules
+   c. extract solute-plus-solvation-shell clusters
+6. Collect clusters across all frames
+7. Sort clusters into cluster families by stoichiometry
+8. Build structural distributions and summary statistics
+9. Compute SAXS components for cluster families
+10. Build an initial multicomponent SAXS model
+11. Perform an initial deterministic fit using lmfit
+12. Use the lmfit result to initialize a secondary Bayesian fit using
+    pyDREAM
+13. Save and analyze final fit results
+
+Conceptual Layering
+-------------------
+SAXShell should be separated into four major layers:
+
+1. Structural Extraction Layer
+   - trajectory loading
+   - frame handling
+   - molecule identification
+   - cluster extraction
+
+2. Cluster Dataset Layer
+   - cluster family grouping
+   - stoichiometric sorting
+   - representative cluster selection
+   - structural statistics and distributions
+
+3. SAXS Modeling Layer
+   - scattering component generation
+   - model data preparation
+   - multicomponent SAXS model construction
+
+4. Fitting and Inference Layer
+   - deterministic model prefit with lmfit
+   - Bayesian sampling and refinement with pyDREAM
+   - diagnostics and posterior analysis
+
+Core Data Flow
+--------------
+Trajectory
+  -> Frame collection
+  -> Molecule assignments
+  -> ClusterEnsemble
+  -> ComponentLibrary
+  -> SAXSModelData
+  -> SAXSModel
+  -> LMFitResult
+  -> DREAMFitResult
+
+Detailed Workflow Description
+-----------------------------
+
+Stage 1. Trajectory Loading
+---------------------------
+Input:
+- MD trajectory file
+- topology or metadata if needed
+- user frame selection settings
+
+Purpose:
+- read the trajectory into an internal representation
+- identify available frame indices
+- expose frame subsetting tools
+
+Output:
+- trajectory object
+- frame index list
+- metadata for downstream extraction
+
+Stage 2. Frame Selection and Extraction
+---------------------------------------
+Input:
+- trajectory object
+- frame range
+- stride
+
+Purpose:
+- select a subset of frames for analysis
+- extract individual frame snapshots
+
+Output:
+- Frame objects or temporary XYZ snapshots
+
+Stage 3. Molecule Identification
+--------------------------------
+Input:
+- XYZ frame
+- molecule reference file
+
+Purpose:
+- define molecules distinctly within each frame
+- assign atoms to molecular identities
+- distinguish solvent molecules, solute molecules, ions, ligands, etc.
+
+Output:
+- MoleculeAssignment for each frame
+
+Stage 4. Frame Conversion
+-------------------------
+Input:
+- frame data
+- molecule assignments
+
+Purpose:
+- convert each frame into a PDB-like structured form
+- preserve residue, molecule, and atom identity needed for extraction
+
+Output:
+- frame PDB representation
+
+Stage 5. Cluster Extraction
+---------------------------
+Input:
+- frame PDB
+- user extraction settings
+
+Purpose:
+- identify solute-centered atom networks
+- identify coordinating solvent molecules around those networks
+- extract solute-plus-solvation-shell clusters
+
+Output:
+- Cluster objects for each frame
+
+Stage 6. Cluster Family Grouping
+--------------------------------
+Input:
+- all Cluster objects across all frames
+
+Purpose:
+- group extracted clusters into family types
+- primary grouping by stoichiometry
+- later extensible to topology, coordination motif, symmetry, etc.
+
+Output:
+- ClusterFamily objects
+- ClusterEnsemble object
+
+Stage 7. Structural Analysis
+----------------------------
+Input:
+- ClusterEnsemble
+
+Purpose:
+- analyze structural distributions across cluster families and members
+
+Examples:
+- stoichiometry histograms
+- bond length distributions
+- bond angle distributions
+- coordination number distributions
+- species-resolved statistics
+- representative cluster structures
+
+Output:
+- plots
+- summary tables
+- structural metrics
+
+Stage 8. SAXS Component Generation
+----------------------------------
+Input:
+- ClusterEnsemble
+- scattering settings
+- q-range
+
+Purpose:
+- compute SAXS contributions for cluster families
+- create a component library that maps cluster family identity to
+  scattering curve
+
+Output:
+- ScatteringComponent objects
+- ComponentLibrary
+
+Stage 9. SAXS Model Construction
+--------------------------------
+Input:
+- ComponentLibrary
+- experimental SAXS data
+- model constraints and settings
+
+Purpose:
+- define a multicomponent SAXS model
+- assign component weights, scales, bounds, and backgrounds
+- prepare a reusable SAXS model data object
+
+Output:
+- SAXSModelData
+- SAXSModel
+
+Stage 10. Initial Deterministic Fit with lmfit
+----------------------------------------------
+Input:
+- SAXSModelData
+- SAXSModel
+
+Purpose:
+- generate a sensible initial fit
+- estimate model weights and nuisance parameters
+- identify parameter degeneracy and obvious model issues
+- create an initialized model state for Bayesian refinement
+
+Output:
+- LMFitResult
+- initialized SAXSModel
+
+Stage 11. Secondary Bayesian Fit with pyDREAM
+---------------------------------------------
+Input:
+- initialized model
+- LMFitResult
+- priors and DREAM sampling settings
+
+Purpose:
+- perform posterior exploration
+- quantify uncertainty
+- identify parameter correlations
+- generate posterior predictive model behavior
+
+Output:
+- DREAMFitResult
+
+Recommended Package Structure
+-----------------------------
+src/saxshell/
+  io/
+    trajectory_loader.py
+    xyz.py
+    pdb.py
+
+  trajectory/
+    trajectory.py
+    selectors.py
+
+  molecules/
+    reference.py
+    identifier.py
+    assignment.py
+    topology.py
+
+  frames/
+    frame.py
+    frame_extractor.py
+    frame_converter.py
+
+  clusters/
+    cluster.py
+    extractor.py
+    stoichiometry.py
+    family.py
+    ensemble.py
+
+  analysis/
+    histograms.py
+    bond_lengths.py
+    bond_angles.py
+    coordination.py
+    summaries.py
+
+  scattering/
+    debye.py
+    component.py
+    component_library.py
+    qgrid.py
+    saxs_data.py
+
+  modeling/
+    model_data.py
+    parameters.py
+    constraints.py
+    saxs_model.py
+
+  fitting/
+    lmfit_runner.py
+    lmfit_result.py
+    dream_setup.py
+    dream_runner.py
+    dream_result.py
+
+  apps/
+    extract_clusters.py
+    analyze_clusters.py
+    build_components.py
+    build_model.py
+    prefit_model.py
+    dream_fit_model.py
+
+  utils/
+    paths.py
+    logging.py
+    serialization.py
+    validation.py
+
+Recommended Core Objects
+------------------------
+
+1. TrajectoryDataset
+--------------------
+Purpose:
+- represent the loaded molecular dynamics trajectory
+
+Suggested fields:
+- trajectory_path
+- topology_path
+- n_frames
+- atom_labels
+- metadata
+- frame_index_map
+
+Suggested methods:
+- get_frame(index)
+- iter_frames()
+- select_frames(start, stop, stride)
+
+2. Frame
+--------
+Purpose:
+- represent one MD frame as a single atomic snapshot
+
+Suggested fields:
+- frame_index
+- coordinates
+- atom_labels
+- atom_ids
+- box_vectors
+- metadata
+
+Suggested methods:
+- to_xyz()
+- subset_atoms(indices)
+
+3. MoleculeReference
+--------------------
+Purpose:
+- define how molecules are recognized in a frame
+
+Suggested fields:
+- molecule_names
+- atom_patterns
+- bonding_rules
+- residue_templates
+- naming_rules
+
+Suggested methods:
+- validate()
+- identify_molecule_type(atom_subset)
+
+4. MoleculeAssignment
+---------------------
+Purpose:
+- store atom-to-molecule assignments for one frame
+
+Suggested fields:
+- frame_index
+- molecule_ids
+- molecule_types
+- atom_membership
+- molecule_lookup
+
+Suggested methods:
+- atoms_for_molecule(molecule_id)
+- molecules_of_type(name)
+
+5. Cluster
+----------
+Purpose:
+- represent one extracted solute-centered cluster with coordinating
+  solvent molecules
+
+Suggested fields:
+- cluster_id
+- frame_index
+- central_solute_atoms
+- coordinating_molecule_ids
+- all_atom_indices
+- molecule_ids
+- stoichiometry
+- coordinates
+- metadata
+
+Suggested methods:
+- to_pdb()
+- summary()
+- get_species_counts()
+
+6. ClusterFamily
+----------------
+Purpose:
+- represent a family of equivalent clusters grouped by stoichiometry
+
+Suggested fields:
+- family_id
+- stoichiometry
+- member_cluster_ids
+- cluster_count
+- probability
+- representative_cluster_id
+- summary_statistics
+
+Suggested methods:
+- add_cluster(cluster)
+- compute_probability(total_clusters)
+- representative_cluster()
+
+7. ClusterEnsemble
+------------------
+Purpose:
+- represent the full extracted cluster dataset across all frames
+
+Suggested fields:
+- extraction_settings
+- frame_indices
+- clusters
+- cluster_families
+- family_probabilities
+- representative_structures
+- distributions
+- metadata
+
+Suggested methods:
+- build_families()
+- family_by_id(family_id)
+- export_summary()
+- save()
+- load()
+
+Notes:
+- this should be the stable output of structural extraction
+- it should be reloadable without rerunning trajectory parsing
+
+8. ScatteringComponent
+----------------------
+Purpose:
+- represent one SAXS component associated with a cluster family
+
+Suggested fields:
+- family_id
+- q_values
+- intensity
+- normalization
+- metadata
+
+Suggested methods:
+- interpolate(q)
+- normalize()
+
+9. ComponentLibrary
+-------------------
+Purpose:
+- store all scattering components derived from cluster families
+
+Suggested fields:
+- components_by_family
+- q_grid
+- generation_settings
+- metadata
+
+Suggested methods:
+- add_component(component)
+- get_component(family_id)
+- list_families()
+- save()
+- load()
+
+10. SAXSModelData
+-----------------
+Purpose:
+- represent the prepared input data needed to build and fit a SAXS model
+
+Suggested fields:
+- experimental_q
+- experimental_iq
+- experimental_sigma
+- component_library
+- initial_weights
+- bounds
+- constraints
+- scale_metadata
+- background_metadata
+- metadata
+
+Suggested methods:
+- validate()
+- export_config()
+- save()
+- load()
+
+Notes:
+- this is the bridge object between extraction and fitting
+- this should be serializable and reusable independently of extraction
+
+11. SAXSModel
+-------------
+Purpose:
+- define the mathematical multicomponent SAXS model
+
+Suggested fields:
+- parameters
+- component_weights
+- scale_terms
+- background_terms
+- constraints
+- priors
+- metadata
+
+Suggested methods:
+- evaluate(q)
+- simulate()
+- residual()
+- update_parameters()
+- summary()
+
+12. LMFitResult
+---------------
+Purpose:
+- store the result of the initial deterministic fit
+
+Suggested fields:
+- best_fit_parameters
+- residual_statistics
+- covariance_estimates
+- predicted_curve
+- background_estimates
+- scale_estimates
+- parameter_bounds
+- metadata
+
+Suggested methods:
+- summary()
+- save()
+- load()
+
+13. DREAMModelSetup
+-------------------
+Purpose:
+- store the Bayesian model specification used for pyDREAM
+
+Suggested fields:
+- priors
+- likelihood_definition
+- parameter_transforms
+- initial_chain_positions
+- bounds
+- constraints
+- lmfit_reference
+- metadata
+
+Suggested methods:
+- validate()
+- build_sampler_inputs()
+
+14. DREAMFitResult
+------------------
+Purpose:
+- store the posterior sampling result from pyDREAM
+
+Suggested fields:
+- posterior_samples
+- map_estimate
+- posterior_mean
+- credible_intervals
+- parameter_correlations
+- posterior_predictive_curves
+- convergence_metrics
+- metadata
+
+Suggested methods:
+- summary()
+- save()
+- load()
+- export_corner_data()
+
+15. FitResult
+-------------
+Purpose:
+- optional higher-level wrapper around LMFitResult and DREAMFitResult
+  if a unified interface is desired
+
+Suggested fields:
+- lmfit_result
+- dream_result
+- metadata
+
+Recommended Apps
+----------------
+
+1. extract_clusters
+-------------------
+Purpose:
+- load a trajectory
+- select frames
+- identify molecules
+- convert frames to structured representation
+- extract solute-centered, solvent-coordinated clusters
+- group clusters into families
+- save ClusterEnsemble
+
+Inputs:
+- trajectory file
+- molecule reference file
+- frame selection settings
+- extraction settings
+
+Outputs:
+- ClusterEnsemble
+- representative cluster files
+- extraction summaries
+
+2. analyze_clusters
+-------------------
+Purpose:
+- analyze an existing ClusterEnsemble
+- generate structural statistics and plots
+
+Inputs:
+- ClusterEnsemble
+
+Outputs:
+- stoichiometry histograms
+- bond length distributions
+- bond angle distributions
+- coordination number summaries
+- tables and plots
+
+3. build_components
+-------------------
+Purpose:
+- compute SAXS curves for cluster families
+- generate a ComponentLibrary
+
+Inputs:
+- ClusterEnsemble
+- q-range
+- scattering settings
+
+Outputs:
+- ScatteringComponent objects
+- ComponentLibrary
+- component SAXS plots
+
+4. build_model
+--------------
+Purpose:
+- combine ComponentLibrary with experimental SAXS data
+- define a multicomponent SAXS model
+- prepare SAXSModelData
+
+Inputs:
+- experimental SAXS data
+- ComponentLibrary
+- model settings
+- bounds and constraints
+
+Outputs:
+- SAXSModelData
+- SAXSModel
+- initial model predictions
+
+5. prefit_model
+---------------
+Purpose:
+- perform an initial deterministic fit using lmfit
+- provide a stable initialized model state
+
+Inputs:
+- SAXSModelData
+- SAXSModel
+
+Outputs:
+- LMFitResult
+- updated initialized model
+- diagnostic plots
+
+6. dream_fit_model
+------------------
+Purpose:
+- perform secondary Bayesian refinement using pyDREAM
+
+Inputs:
+- initialized model
+- LMFitResult
+- priors
+- pyDREAM settings
+
+Outputs:
+- DREAMFitResult
+- posterior summaries
+- convergence diagnostics
+- posterior predictive fits
+
+Recommended Responsibilities by App
+-----------------------------------
+
+extract_clusters
+- owns trajectory parsing and structural extraction
+- should not perform fitting
+
+analyze_clusters
+- owns structural characterization of extracted ensembles
+- should not construct mathematical models
+
+build_components
+- owns conversion of cluster families into scattering components
+- should not perform fitting
+
+build_model
+- owns model configuration and assembly
+- should not perform long inference
+
+prefit_model
+- owns deterministic initialization
+- should not perform posterior sampling
+
+dream_fit_model
+- owns Bayesian refinement and uncertainty quantification
+
+Recommended File Outputs by Stage
+---------------------------------
+
+Trajectory Stage
+- raw trajectory files
+- frame selection metadata
+
+Extraction Stage
+- ClusterEnsemble
+- representative cluster structures
+- extraction logs
+
+Analysis Stage
+- histogram data
+- bond distribution data
+- coordination summaries
+- plots and tables
+
+Scattering Stage
+- ComponentLibrary
+- per-family I(q)
+- q-grid metadata
+
+Model Stage
+- SAXSModelData
+- model configuration
+- initial parameters and constraints
+
+lmfit Stage
+- LMFitResult
+- predicted best-fit curve
+- deterministic diagnostics
+
+pyDREAM Stage
+- DREAMFitResult
+- posterior samples
+- convergence diagnostics
+- posterior predictive curves
+
+Recommended Serialization Targets
+---------------------------------
+ClusterEnsemble
+- save independently of later SAXS fitting work
+
+ComponentLibrary
+- save independently of extraction
+
+SAXSModelData
+- save independently of fitting
+
+LMFitResult
+- save independently of DREAM
+
+DREAMFitResult
+- save independently for post-analysis
+
+Recommended Design Principles
+-----------------------------
+1. Keep structural extraction separate from SAXS model construction
+2. Keep SAXS model construction separate from fitting
+3. Keep deterministic initialization separate from Bayesian inference
+4. Use explicit data objects between stages
+5. Avoid a single monolithic "god object"
+6. Make each stage reloadable from disk
+7. Make cluster family identity central to the software design
+8. Treat ClusterEnsemble and SAXSModelData as stable bridge objects
+
+What Not To Do
+--------------
+Do not build one giant object that stores:
+- raw frames
+- molecule assignments
+- extracted clusters
+- cluster distributions
+- scattering components
+- model parameters
+- fit results
+- posterior samples
+
+That would become difficult to maintain, hard to serialize cleanly, and
+hard to reason about.
+
+Recommended Stable Bridge Objects
+---------------------------------
+1. ClusterEnsemble
+   - stable output of structural extraction
+
+2. ComponentLibrary
+   - stable output of scattering generation
+
+3. SAXSModelData
+   - stable output of model preparation
+
+4. LMFitResult
+   - stable output of deterministic initialization
+
+5. DREAMFitResult
+   - stable output of Bayesian refinement
+
+One-Sentence Summary
+--------------------
+SAXShell should convert molecular dynamics trajectories into chemically
+meaningful solute-centered cluster ensembles, organize those ensembles
+into interpretable cluster families, use those families to construct a
+multicomponent SAXS model, initialize the model with an lmfit prefit,
+and then refine parameter uncertainty and posterior behavior with
+pyDREAM.
