@@ -1,9 +1,11 @@
 """Frame extraction and cutoff-selection tools for SAXShell."""
 
 from .base import FrameRecord
-from .manager import CP2KFrameExtractionWorkflow
-from .manager import FrameSelectionPreview
-from .manager import TrajectoryManager
+from .manager import (
+    CP2KFrameExtractionWorkflow,
+    FrameSelectionPreview,
+    TrajectoryManager,
+)
 
 __all__ = [
     "CP2KFrameExtractionWorkflow",
@@ -20,8 +22,7 @@ else:
     __all__.append("CP2KEnergyData")
 
 try:
-    from .cutoff_analysis import CP2KEnergyAnalyzer
-    from .cutoff_analysis import SteadyStateResult
+    from .cutoff_analysis import CP2KEnergyAnalyzer, SteadyStateResult
 except ModuleNotFoundError:
     CP2KEnergyAnalyzer = None
     SteadyStateResult = None

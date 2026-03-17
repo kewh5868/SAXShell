@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import pytest
 
 from saxshell.mdtrajectory.frame.manager import TrajectoryManager

@@ -1,8 +1,6 @@
 import os
 from pathlib import Path
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
 import numpy as np
 import pytest
 from PySide6.QtWidgets import QApplication
@@ -16,6 +14,7 @@ from saxshell.mdtrajectory.ui.main_window import MDTrajectoryMainWindow
 
 @pytest.fixture(scope="module")
 def qapp():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     app = QApplication.instance()
     if app is None:
         app = QApplication([])
@@ -95,7 +94,9 @@ def test_main_window_reuses_loaded_trajectory_for_new_energy_file(
     def fake_start_inspection_worker(**kwargs):
         captured.update(kwargs)
 
-    monkeypatch.setattr(window, "_start_inspection_worker", fake_start_inspection_worker)
+    monkeypatch.setattr(
+        window, "_start_inspection_worker", fake_start_inspection_worker
+    )
 
     window.inspect_trajectory()
 

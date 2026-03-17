@@ -4,20 +4,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from re import sub
 
-from PySide6.QtCore import QObject
-from PySide6.QtCore import QThread
-from PySide6.QtCore import Qt
-from PySide6.QtCore import Signal
-from PySide6.QtCore import Slot
-from PySide6.QtWidgets import QApplication
-from PySide6.QtWidgets import QFrame
-from PySide6.QtWidgets import QHBoxLayout
-from PySide6.QtWidgets import QMainWindow
-from PySide6.QtWidgets import QMessageBox
-from PySide6.QtWidgets import QScrollArea
-from PySide6.QtWidgets import QSplitter
-from PySide6.QtWidgets import QVBoxLayout
-from PySide6.QtWidgets import QWidget
+from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QMainWindow,
+    QMessageBox,
+    QScrollArea,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
 
 from saxshell.mdtrajectory.frame.cp2k_ener import CP2KEnergyData
 from saxshell.mdtrajectory.frame.manager import TrajectoryManager
@@ -158,9 +156,7 @@ class MDTrajectoryMainWindow(QMainWindow):
         self.cutoff_panel.suggestion_updated.connect(
             self._store_suggested_cutoff
         )
-        self.cutoff_panel.cutoff_selected.connect(
-            self._store_selected_cutoff
-        )
+        self.cutoff_panel.cutoff_selected.connect(self._store_selected_cutoff)
         self.export_panel.set_selection_summary(
             "Inspect a trajectory to preview the export selection."
         )
@@ -433,9 +429,7 @@ class MDTrajectoryMainWindow(QMainWindow):
         self._inspect_worker.metadata_ready.connect(
             self._handle_inspection_metadata
         )
-        self._inspect_worker.finished.connect(
-            self._handle_energy_data_loaded
-        )
+        self._inspect_worker.finished.connect(self._handle_energy_data_loaded)
         self._inspect_worker.failed.connect(self._handle_inspection_error)
         self._inspect_worker.finished.connect(self._inspect_thread.quit)
         self._inspect_worker.failed.connect(self._inspect_thread.quit)
@@ -469,7 +463,8 @@ class MDTrajectoryMainWindow(QMainWindow):
         n_frames = result.summary.get("n_frames", "unknown")
         file_type = result.summary.get("file_type", "unknown")
         self.export_panel.append_log(
-            f"Trajectory metadata loaded: {n_frames} estimated {file_type} frames."
+            "Trajectory metadata loaded: "
+            f"{n_frames} estimated {file_type} frames."
         )
         self._refresh_selection_preview()
         if self.state.energy_file is None:
@@ -548,12 +543,12 @@ class MDTrajectoryMainWindow(QMainWindow):
             lines.append("Output target: None")
         lines.extend(
             [
-            f"Trajectory frames: {preview.total_frames}",
-            f"Frames selected: {preview.selected_frames}",
-            f"Start: {preview.start}",
-            f"Stop: {preview.stop}",
-            f"Stride: {preview.stride}",
-            f"Time-tagged frames: {preview.time_metadata_frames}",
+                f"Trajectory frames: {preview.total_frames}",
+                f"Frames selected: {preview.selected_frames}",
+                f"Start: {preview.start}",
+                f"Stop: {preview.stop}",
+                f"Stride: {preview.stride}",
+                f"Time-tagged frames: {preview.time_metadata_frames}",
             ]
         )
         if preview.min_time_fs is not None:

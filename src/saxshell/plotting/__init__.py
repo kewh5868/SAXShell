@@ -12,7 +12,8 @@
 # See LICENSE.rst for license information.
 #
 ##############################################################################
-"""Python package for analysis of small-angle scattering data from molecular dynamics derived liquid structures."""
+"""Python package for analysis of small-angle scattering data from
+molecular dynamics derived liquid structures."""
 
 # package version
 from saxshell.version import __version__  # noqa

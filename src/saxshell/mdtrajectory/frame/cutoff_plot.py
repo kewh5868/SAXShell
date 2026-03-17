@@ -3,8 +3,10 @@ from __future__ import annotations
 import tkinter as tk
 from collections.abc import Callable
 
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+from matplotlib.backends.backend_tkagg import (
+    FigureCanvasTkAgg,
+    NavigationToolbar2Tk,
+)
 from matplotlib.figure import Figure
 
 from .cp2k_ener import CP2KEnergyData
@@ -12,8 +14,8 @@ from .cutoff_analysis import SteadyStateResult
 
 
 class CP2KEnergyCutoffSelector:
-    """
-    Tkinter window for interactive cutoff selection on CP2K .ener data.
+    """Tkinter window for interactive cutoff selection on CP2K .ener
+    data.
 
     This is a temporary UI implementation. The data and analysis logic
     live outside this class so the plotting layer can later be replaced
@@ -81,9 +83,7 @@ class CP2KEnergyCutoffSelector:
                 ),
             )
 
-        mid_fs = (
-            float(time_fs[len(time_fs) // 2]) if len(time_fs) > 0 else 0.0
-        )
+        mid_fs = float(time_fs[len(time_fs) // 2]) if len(time_fs) > 0 else 0.0
         self.cutoff_x_fs = mid_fs
         self._cutoff_lines = [
             ax.axvline(
