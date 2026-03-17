@@ -106,6 +106,102 @@ Getting Started
 
 You may consult our `online documentation <https://kewh5868.github.io/saxshell>`_ for tutorials and API references.
 
+Applications
+------------
+
+``saxshell`` includes application-oriented workflows for common
+simulation analysis tasks. The first complete application in the
+package is ``mdtrajectory``.
+
+``mdtrajectory``
+~~~~~~~~~~~~~~~~
+
+The ``mdtrajectory`` application is designed for inspecting molecular
+dynamics trajectories, selecting an equilibration cutoff, previewing
+the resulting frame selection, and exporting a new set of output
+frames.
+
+The current workflow supports CP2K-style ``.xyz`` and ``.pdb``
+trajectory files, with optional CP2K ``.ener`` files for temperature-
+based steady-state cutoff suggestions.
+
+The same ``mdtrajectory`` workflow can be used in three ways:
+
+1. As a Qt desktop application for interactive use.
+2. As a terminal command for scripted or batch workflows.
+3. As a Python class in notebooks and other Python scripts.
+
+To launch the Qt application, use one of the following commands ::
+
+        mdtrajectory
+        mdtrajectory ui
+        saxshell mdtrajectory
+        python -m saxshell.mdtrajectory
+
+Terminal Use Cases
+------------------
+
+The ``mdtrajectory`` command-line interface is useful when you want to
+inspect a run quickly, automate frame exports, or include trajectory
+preprocessing inside a larger shell workflow.
+
+Inspect a trajectory and optional energy file ::
+
+        mdtrajectory inspect traj.xyz --energy-file traj.ener
+
+Suggest a steady-state cutoff from a CP2K energy profile ::
+
+        mdtrajectory suggest-cutoff traj.xyz \
+            --energy-file traj.ener \
+            --temp-target-k 300 \
+            --temp-tol-k 1.0 \
+            --window 3
+
+Preview the selected export range without writing files ::
+
+        mdtrajectory preview traj.xyz \
+            --use-cutoff \
+            --cutoff-fs 50 \
+            --start 0 \
+            --stride 2
+
+Export frames directly from the terminal ::
+
+        mdtrajectory export traj.xyz \
+            --energy-file traj.ener \
+            --use-suggested-cutoff \
+            --temp-target-k 300 \
+            --window 3
+
+The ``saxshell`` command also forwards to the same workflow ::
+
+        saxshell mdtrajectory inspect traj.xyz
+
+Python and Notebook Use
+-----------------------
+
+For notebook use, the ``MDTrajectoryWorkflow`` class exposes the same
+inspection, cutoff-selection, preview, and export functionality used
+by the UI and terminal interfaces.
+
+::
+
+        from saxshell.mdtrajectory import MDTrajectoryWorkflow
+
+        workflow = MDTrajectoryWorkflow(
+            "traj.xyz",
+            energy_file="traj.ener",
+        )
+        summary = workflow.inspect()
+        suggested = workflow.suggest_cutoff(
+            temp_target_k=300.0,
+            temp_tol_k=1.0,
+            window=3,
+        )
+        workflow.set_selected_cutoff(suggested.cutoff_time_fs)
+        preview = workflow.preview_selection(use_cutoff=True)
+        result = workflow.export_frames(use_cutoff=True)
+
 Support and Contribute
 ----------------------
 

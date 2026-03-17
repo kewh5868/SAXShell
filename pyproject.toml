@@ -38,7 +38,7 @@ Homepage = "https://github.com/kewh5868/SAXShell/"
 Issues = "https://github.com/kewh5868/SAXShell/issues/"
 
 [project.scripts]
-mdtrajectory = "saxshell.mdtrajectory:main"
+mdtrajectory = "saxshell.mdtrajectory.cli:main"
 saxshell = "saxshell.saxshell:main"
 pdfsetup = "saxshell.pdfsetup:main"
 
