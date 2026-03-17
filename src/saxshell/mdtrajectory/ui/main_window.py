@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from re import sub
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
@@ -23,6 +22,7 @@ from saxshell.mdtrajectory.ui.cutoff_panel import CutoffPanel
 from saxshell.mdtrajectory.ui.export_panel import ExportPanel
 from saxshell.mdtrajectory.ui.state import MDTrajectoryAppState
 from saxshell.mdtrajectory.ui.trajectory_panel import TrajectoryPanel
+from saxshell.mdtrajectory.workflow import suggest_output_dir
 
 
 @dataclass(slots=True)
@@ -595,15 +595,6 @@ class MDTrajectoryMainWindow(QMainWindow):
         if source_path is None:
             return None
 
-        parent_dir = source_path.parent
-        suffix = source_path.suffix.lower()
-        if suffix == ".xyz":
-            base_name = "splitxyz"
-        elif suffix == ".pdb":
-            base_name = "splitpdb"
-        else:
-            base_name = "splitframes"
-
         min_time_fs = None
         if (
             self.export_panel.use_cutoff()
@@ -611,33 +602,7 @@ class MDTrajectoryMainWindow(QMainWindow):
         ):
             min_time_fs = self.cutoff_panel.get_selected_cutoff()
 
-        if min_time_fs is not None:
-            cutoff_text = self._format_cutoff_for_dir(min_time_fs)
-            folder_name = f"{base_name}_t{cutoff_text}fs"
-        else:
-            folder_name = base_name
-
-        return self._next_available_output_dir(parent_dir, folder_name)
-
-    def _next_available_output_dir(
-        self,
-        parent_dir: Path,
-        folder_name: str,
-    ) -> Path:
-        candidate = parent_dir / folder_name
-        if not candidate.exists():
-            return candidate
-
-        index = 1
-        while True:
-            candidate = parent_dir / f"{folder_name}{index:04d}"
-            if not candidate.exists():
-                return candidate
-            index += 1
-
-    def _format_cutoff_for_dir(self, cutoff_fs: float) -> str:
-        rounded = f"{cutoff_fs:.3f}".rstrip("0").rstrip(".")
-        return sub(r"[^0-9A-Za-z]+", "_", rounded)
+        return suggest_output_dir(source_path, cutoff_fs=min_time_fs)
 
     def _show_error(self, message: str) -> None:
         QMessageBox.critical(self, "Error", message)
