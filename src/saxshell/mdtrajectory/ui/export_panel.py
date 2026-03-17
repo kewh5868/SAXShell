@@ -3,17 +3,19 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QCheckBox
-from PySide6.QtWidgets import QFileDialog
-from PySide6.QtWidgets import QFormLayout
-from PySide6.QtWidgets import QGroupBox
-from PySide6.QtWidgets import QHBoxLayout
-from PySide6.QtWidgets import QLabel
-from PySide6.QtWidgets import QLineEdit
-from PySide6.QtWidgets import QPushButton
-from PySide6.QtWidgets import QTextEdit
-from PySide6.QtWidgets import QVBoxLayout
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
 
 class ExportPanel(QGroupBox):
@@ -80,9 +82,7 @@ class ExportPanel(QGroupBox):
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setMinimumHeight(120)
-        self.log_box.setToolTip(
-            "Summary of the last frame export operation."
-        )
+        self.log_box.setToolTip("Summary of the last frame export operation.")
         layout.addWidget(self.log_box)
 
         self.setLayout(layout)

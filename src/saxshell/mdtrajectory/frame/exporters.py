@@ -29,9 +29,7 @@ def export_xyz_frames(
                 label = "".join(c for c in parts[0] if not c.isdigit())
                 label = label.capitalize()
                 x, y, z = parts[1], parts[2], parts[3]
-                handle.write(
-                    f"{label:>4} {x:>10} {y:>10} {z:>10}\n"
-                )
+                handle.write(f"{label:>4} {x:>10} {y:>10} {z:>10}\n")
         written_files.append(file_path)
 
     return written_files

@@ -1,5 +1,1 @@
-sphinx
-sphinx_rtd_theme
-sphinx-copybutton
-doctr
-m2r2
+# No docs-only packages are currently installed in saxshell-py312.

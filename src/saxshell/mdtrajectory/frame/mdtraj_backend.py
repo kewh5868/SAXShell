@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import mdtraj as md
 
-from .base import FrameRecord
-from .base import TrajectoryBackend
+from .base import FrameRecord, TrajectoryBackend
 
 
 class MDTrajBackend(TrajectoryBackend):
@@ -37,7 +34,11 @@ class MDTrajBackend(TrajectoryBackend):
                     file_type="xyz",
                     atom_count=frame.n_atoms,
                     lines=lines,
-                    time_fs=float(frame.time[0]) if frame.time is not None else None,
+                    time_fs=(
+                        float(frame.time[0])
+                        if frame.time is not None
+                        else None
+                    ),
                 )
             )
 

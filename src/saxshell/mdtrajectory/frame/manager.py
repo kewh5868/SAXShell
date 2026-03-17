@@ -6,8 +6,7 @@ from typing import TYPE_CHECKING
 
 from .base import FrameRecord
 from .cp2k_backend import CP2KTrajectoryBackend
-from .exporters import export_pdb_frames
-from .exporters import export_xyz_frames
+from .exporters import export_pdb_frames, export_xyz_frames
 from .selectors import select_frames
 
 if TYPE_CHECKING:
@@ -184,10 +183,8 @@ class TrajectoryManager:
 
 
 class CP2KFrameExtractionWorkflow:
-    """
-    Helper workflow that combines CP2K trajectory handling with
-    optional .ener-based cutoff selection.
-    """
+    """Helper workflow that combines CP2K trajectory handling with
+    optional .ener-based cutoff selection."""
 
     def __init__(
         self,

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
 import re
+from pathlib import Path
 
-from .base import FrameRecord
-from .base import TrajectoryBackend
+from .base import FrameRecord, TrajectoryBackend
 
 TIME_PATTERNS = (
     re.compile(
@@ -13,16 +12,14 @@ TIME_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"time_fs\s*=\s*"
-        r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)",
+        r"time_fs\s*=\s*" r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)",
         re.IGNORECASE,
     ),
 )
 
 
 class CP2KTrajectoryBackend(TrajectoryBackend):
-    """
-    Backend for CP2K-style XYZ and PDB trajectory files.
+    """Backend for CP2K-style XYZ and PDB trajectory files.
 
     Supports:
     - standard XYZ frames

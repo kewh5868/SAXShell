@@ -10,8 +10,8 @@ def select_frames(
     stride: int = 1,
     min_time_fs: float | None = None,
 ) -> list[FrameRecord]:
-    """
-    Apply index-based and optional time-based filtering to frame records.
+    """Apply index-based and optional time-based filtering to frame
+    records.
 
     Parameters
     ----------

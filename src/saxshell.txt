@@ -99,13 +99,13 @@ src/saxshell/
             io.py
 
 App 1: MD Trajectory -> Frames -> Cluster Extraction
-- Load MD File, convert to XYZ frames, would also like to be able 
+- Load MD File, convert to XYZ frames, would also like to be able
 to start from extracted XYZ state (frames)
 - Plot Energy Profile/Select Frame Range
 - Extract XYZ files
-- Load Molecule references 
+- Load Molecule references
 - Convert to PDB files using molecule reference
-- Cluster Extraction 
+- Cluster Extraction
     - User selects stoichiometric binning (which atoms to bin by)
     - User defined network connectivity (atom pair distance cutoff)
 
@@ -115,20 +115,20 @@ to start from extracted XYZ state (frames)
     /cluster/: Cluster extraction and sorting tools
     /bondanalysis/: Bond distance and angle analysis tools
     /coord/: Coordination number analysis tools
-/plotting/: Store plotting tools across all applications here. 
+/plotting/: Store plotting tools across all applications here.
 /saxs/
     /debye/: Compute debye scattering for a cluster
-    /model/: Cluster averaging scheme and weighting to construct prior weights 
+    /model/: Cluster averaging scheme and weighting to construct prior weights
     for prefit model.
     /prefit/: LMFit-based SAXS model setup, and pre-fit execution.
-    /dream/: Load prefit model, set prior weight parameter space and DREAM fit 
+    /dream/: Load prefit model, set prior weight parameter space and DREAM fit
     specifications, generate model run file.
 /pdf/
     /debyer/: Run debyer to compute PDF, partial PDFs from MD trajectories.
     /fullrmc/: Run to generate setup files for fullrmc from SAXS fit distributions.
 /apps/
     mdtrajectory.py: Main application for /mdtrajectory/ code.
-    saxshell.py: Runs the main debye modelling code, prefit code, and DREAM modelling 
+    saxshell.py: Runs the main debye modelling code, prefit code, and DREAM modelling
     - multi-panel UI with save features.
     pdfsetup.py: Runs code in /pdf/ to help setup fullRMC pdf runs and pre-calculated Debyer PDFs.
 ------------------------------------------------------------------------------------------

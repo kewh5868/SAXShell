@@ -31,11 +31,9 @@ class CP2KEnergyAnalyzer:
         kinetic_rel_std_max: float = 1.0e-3,
         potential_rel_std_max: float = 1.0e-3,
     ) -> SteadyStateResult:
-        """
-        Find the first time where temperature stays near the target
+        """Find the first time where temperature stays near the target
         and kinetic/potential fluctuations remain small across a
-        consecutive window.
-        """
+        consecutive window."""
         time_fs = self.energy_data.time_fs
         kinetic = self.energy_data.kinetic
         temperature = self.energy_data.temperature

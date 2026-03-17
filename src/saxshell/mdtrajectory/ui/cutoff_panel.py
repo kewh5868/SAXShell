@@ -3,15 +3,17 @@ from __future__ import annotations
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QDoubleSpinBox
-from PySide6.QtWidgets import QFormLayout
-from PySide6.QtWidgets import QGroupBox
-from PySide6.QtWidgets import QHBoxLayout
-from PySide6.QtWidgets import QLabel
-from PySide6.QtWidgets import QPushButton
-from PySide6.QtWidgets import QSpinBox
-from PySide6.QtWidgets import QTextEdit
-from PySide6.QtWidgets import QVBoxLayout
+from PySide6.QtWidgets import (
+    QDoubleSpinBox,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSpinBox,
+    QTextEdit,
+    QVBoxLayout,
+)
 
 from saxshell.mdtrajectory.frame.cp2k_ener import CP2KEnergyData
 from saxshell.mdtrajectory.frame.cutoff_analysis import CP2KEnergyAnalyzer
