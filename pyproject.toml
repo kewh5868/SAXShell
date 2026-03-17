@@ -4,38 +4,43 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "saxshell"
-dynamic=['version', 'dependencies']
+dynamic = ["version", "dependencies"]
 authors = [
-  {name='Keith White', email='keith.white@colorado.edu'},
+  { name = "Keith White", email = "keith.white@colorado.edu" },
 ]
 maintainers = [
-  {name='Keith White', email='keith.white@colorado.edu'},
+  { name = "Keith White", email = "keith.white@colorado.edu" },
 ]
 description = "Python package for analysis of small-angle scattering data from molecular dynamics derived liquid structures."
-keywords = ['scattering', 'SAXS', 'X-ray', 'diffraction', 'solvation']
+keywords = ["scattering", "SAXS", "X-ray", "diffraction", "solvation"]
 readme = "README.rst"
 requires-python = ">=3.11, <3.15"
 classifiers = [
-        'Development Status :: 5 - Production/Stable',
-        'Environment :: Console',
-        'Intended Audience :: Developers',
-        'Intended Audience :: Science/Research',
-        'License :: OSI Approved :: BSD License',
-        'Operating System :: MacOS :: MacOS X',
-        'Operating System :: Microsoft :: Windows',
-        'Operating System :: POSIX',
-        'Operating System :: Unix',
-        'Programming Language :: Python :: 3.11',
-        'Programming Language :: Python :: 3.12',
-        'Programming Language :: Python :: 3.13',
-        'Programming Language :: Python :: 3.14',
-        'Topic :: Scientific/Engineering :: Physics',
-        'Topic :: Scientific/Engineering :: Chemistry',
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: BSD License",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX",
+  "Operating System :: Unix",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Physics",
+  "Topic :: Scientific/Engineering :: Chemistry",
 ]
 
 [project.urls]
-Homepage = "https://github.com/kewh5868/saxshell/"
-Issues = "https://github.com/kewh5868/saxshell/issues/"
+Homepage = "https://github.com/kewh5868/SAXShell/"
+Issues = "https://github.com/kewh5868/SAXShell/issues/"
+
+[project.scripts]
+mdtrajectory = "saxshell.mdtrajectory:main"
+saxshell = "saxshell.saxshell:main"
+pdfsetup = "saxshell.pdfsetup:main"
 
 [tool.setuptools-git-versioning]
 enabled = true
@@ -44,16 +49,13 @@ dev_template = "{tag}"
 dirty_template = "{tag}"
 
 [tool.setuptools.packages.find]
-where = ["src"]  # list of folders that contain the packages (["."] by default)
-include = ["*"]  # package names should match these glob patterns (["*"] by default)
-exclude = []  # exclude packages matching these glob patterns (empty by default)
-namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
-
-[project.scripts]
-saxshell = "saxshell.app:main"
+where = ["src"]
+include = ["*"]
+exclude = []
+namespaces = false
 
 [tool.setuptools.dynamic]
-dependencies = {file = ["requirements/pip.txt"]}
+dependencies = { file = ["requirements/pip.txt"] }
 
 [tool.codespell]
 exclude-file = ".codespell/ignore_lines.txt"
@@ -81,8 +83,6 @@ exclude = '''
   | buck-out
   | build
   | dist
-
-  # The following are specific to Black, you probably don't want those.
   | blib2to3
   | tests/data
 )/

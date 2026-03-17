@@ -36,9 +36,17 @@
 .. |Tracking| image:: https://img.shields.io/badge/issue_tracking-github-blue
         :target: https://github.com/kewh5868/saxshell/issues
 
-Python package for analysis of small-angle scattering data from molecular dynamics derived liquid structures.
+Python toolkit for analyzing small-angle X-ray scattering from
+molecular dynamics-derived liquid structures.
 
-* LONGER DESCRIPTION HERE
+``saxshell`` is intended for researchers who want reproducible,
+scriptable workflows that connect atomistic simulation output to
+scattering observables and structural interpretation.
+
+The project is being developed as a Python library with command-line
+entry points and documentation for simulation-driven scattering
+analysis, especially for liquid-state structure and solvation-focused
+studies.
 
 For more information about the saxshell library, please consult our `online documentation <https://kewh5868.github.io/saxshell>`_.
 
