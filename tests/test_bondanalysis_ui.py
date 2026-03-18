@@ -60,12 +60,10 @@ def test_bondanalysis_main_window_prefills_cluster_types_and_output_dir(
     assert window.cluster_type_list.count() == 2
     assert not window.use_checked_cluster_types_box.isChecked()
     assert (
-        window.cluster_type_list.item(0).checkState()
-        == Qt.CheckState.Checked
+        window.cluster_type_list.item(0).checkState() == Qt.CheckState.Checked
     )
     assert (
-        window.cluster_type_list.item(1).checkState()
-        == Qt.CheckState.Checked
+        window.cluster_type_list.item(1).checkState() == Qt.CheckState.Checked
     )
     assert window.output_dir_edit.text().endswith(
         "bondanalysis_clusters_splitxyz0001"

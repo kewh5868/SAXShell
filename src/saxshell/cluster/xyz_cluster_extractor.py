@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import csv
 import os
 import re
-from collections import Counter, deque
 from dataclasses import dataclass, field
-from string import ascii_uppercase
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Literal, Optional, Set, Tuple
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -476,7 +473,6 @@ class XYZClusterExtractor:
         donor_coords = coords[donor_indices_arr]
         tree = KDTree(donor_coords)
 
-        max_cut = self.config.max_coordination_cutoff
         per_center: Dict[int, int] = {}
 
         for center_idx in cluster.node_indices:

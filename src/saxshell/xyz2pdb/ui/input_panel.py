@@ -58,7 +58,9 @@ class XYZToPDBInputPanel(QGroupBox):
         self.config_edit.textChanged.connect(
             lambda _text: self.settings_changed.emit()
         )
-        form.addRow("Config JSON", self._make_file_row(self.config_edit, "json"))
+        form.addRow(
+            "Config JSON", self._make_file_row(self.config_edit, "json")
+        )
 
         self.library_dir_edit = QLineEdit()
         self.library_dir_edit.setToolTip(
@@ -203,4 +205,3 @@ class XYZToPDBInputPanel(QGroupBox):
 
     def set_summary_text(self, text: str) -> None:
         self.summary_box.setPlainText(text)
-

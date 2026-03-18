@@ -131,8 +131,8 @@ class AngleTripletDefinition:
 
 
 class BondAnalyzer:
-    """Measure bond-pair and angle-triplet distributions from flat cluster
-    folders.
+    """Measure bond-pair and angle-triplet distributions from flat
+    cluster folders.
 
     The analyzer expects one cluster-type directory to contain single-frame
     ``.pdb`` or ``.xyz`` files directly inside the directory. The higher-level
@@ -151,7 +151,8 @@ class BondAnalyzer:
         self.angle_triplets = tuple(dict.fromkeys(angle_triplets or ()))
 
     def structure_files(self, cluster_dir: str | Path) -> list[Path]:
-        """Return all structure files directly inside one cluster folder."""
+        """Return all structure files directly inside one cluster
+        folder."""
         path = Path(cluster_dir)
         return sorted(
             file_path
@@ -185,9 +186,7 @@ class BondAnalyzer:
         dict[AngleTripletDefinition, list[float]],
     ]:
         bond_values = {definition: [] for definition in self.bond_pairs}
-        angle_values = {
-            definition: [] for definition in self.angle_triplets
-        }
+        angle_values = {definition: [] for definition in self.angle_triplets}
         if not atoms:
             return bond_values, angle_values
 
@@ -328,7 +327,9 @@ class BondAnalyzer:
         return float(np.linalg.norm(coords[index1] - coords[index2]))
 
     @staticmethod
-    def _angle_between(vector1: np.ndarray, vector2: np.ndarray) -> float | None:
+    def _angle_between(
+        vector1: np.ndarray, vector2: np.ndarray
+    ) -> float | None:
         norm1 = float(np.linalg.norm(vector1))
         norm2 = float(np.linalg.norm(vector2))
         if norm1 == 0.0 or norm2 == 0.0:

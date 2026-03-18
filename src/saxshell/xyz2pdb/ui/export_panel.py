@@ -144,4 +144,3 @@ class XYZToPDBExportPanel(QGroupBox):
         self.progress_label.setText(
             f"Progress: {processed} processed, {max(total - processed, 0)} remaining"
         )
-

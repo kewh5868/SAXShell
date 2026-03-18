@@ -69,22 +69,13 @@ def test_bondanalysis_workflow_supports_notebook_style_usage(tmp_path):
     assert result.total_structure_files == 2
     assert result.manifest_path.exists()
     assert (
-        result.output_dir
-        / "cluster_types"
-        / "PbI2"
-        / "Pb_I_distribution.csv"
+        result.output_dir / "cluster_types" / "PbI2" / "Pb_I_distribution.csv"
     ).exists()
     assert (
-        result.output_dir
-        / "cluster_types"
-        / "PbI2"
-        / "Pb_I_distribution.npy"
+        result.output_dir / "cluster_types" / "PbI2" / "Pb_I_distribution.npy"
     ).exists()
     assert (
-        result.output_dir
-        / "cluster_types"
-        / "PbI2"
-        / "Pb_I_histogram.png"
+        result.output_dir / "cluster_types" / "PbI2" / "Pb_I_histogram.png"
     ).exists()
     assert (
         result.output_dir / "all_clusters" / "Pb_I_distribution.csv"
@@ -93,19 +84,13 @@ def test_bondanalysis_workflow_supports_notebook_style_usage(tmp_path):
         result.output_dir / "all_clusters" / "Pb_I_distribution.npy"
     ).exists()
     assert (
-        result.output_dir
-        / "comparisons"
-        / "Pb_I_cluster_type_overlay.png"
+        result.output_dir / "comparisons" / "Pb_I_cluster_type_overlay.png"
     ).exists()
     assert (
-        result.output_dir
-        / "comparisons"
-        / "Pb_I_cluster_type_overlay.csv"
+        result.output_dir / "comparisons" / "Pb_I_cluster_type_overlay.csv"
     ).exists()
     assert (
-        result.output_dir
-        / "comparisons"
-        / "Pb_I_cluster_type_overlay.npy"
+        result.output_dir / "comparisons" / "Pb_I_cluster_type_overlay.npy"
     ).exists()
 
 

@@ -6,8 +6,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
-    QApplication,
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -36,9 +36,9 @@ from PySide6.QtWidgets import (
 from saxshell.bondanalysis import (
     AngleTripletDefinition,
     BondAnalysisBatchResult,
+    BondAnalysisPreset,
     BondAnalysisWorkflow,
     BondPairDefinition,
-    BondAnalysisPreset,
     load_presets,
     ordered_preset_names,
     save_custom_preset,
@@ -309,9 +309,7 @@ class BondAnalysisMainWindow(QMainWindow):
         add_button = QPushButton("Add Angle Triplet")
         add_button.clicked.connect(self._add_angle_triplet_row)
         remove_button = QPushButton("Remove Selected")
-        remove_button.clicked.connect(
-            self._remove_selected_angle_triplet_rows
-        )
+        remove_button.clicked.connect(self._remove_selected_angle_triplet_rows)
         controls.addWidget(add_button)
         controls.addWidget(remove_button)
         controls.addStretch(1)
@@ -435,9 +433,9 @@ class BondAnalysisMainWindow(QMainWindow):
 
     def _cluster_type_check_states(self) -> dict[str, Qt.CheckState]:
         return {
-            self.cluster_type_list.item(index).text(): self.cluster_type_list.item(
-                index
-            ).checkState()
+            self.cluster_type_list.item(index)
+            .text(): self.cluster_type_list.item(index)
+            .checkState()
             for index in range(self.cluster_type_list.count())
         }
 
@@ -751,9 +749,7 @@ class BondAnalysisMainWindow(QMainWindow):
         ]
         lines.append(f"Cluster types detected: {len(cluster_types)}")
         checked_cluster_types = self._checked_cluster_types()
-        lines.append(
-            f"Checked cluster types: {len(checked_cluster_types)}"
-        )
+        lines.append(f"Checked cluster types: {len(checked_cluster_types)}")
         if self.use_checked_cluster_types_box.isChecked():
             if selected_cluster_types:
                 lines.append(
@@ -779,9 +775,7 @@ class BondAnalysisMainWindow(QMainWindow):
 
         try:
             angle_triplets = self._read_angle_triplets()
-            lines.append(
-                f"Angle triplets configured: {len(angle_triplets)}"
-            )
+            lines.append(f"Angle triplets configured: {len(angle_triplets)}")
         except Exception as exc:
             lines.append(f"Angle triplets configured: invalid ({exc})")
 

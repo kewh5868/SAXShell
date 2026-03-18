@@ -144,9 +144,7 @@ def ordered_preset_names(
     """Return preset names with built-ins first and customs after."""
     defaults = default_presets()
     ordered_names = [name for name in defaults if name in presets]
-    custom_names = sorted(
-        name for name in presets if name not in defaults
-    )
+    custom_names = sorted(name for name in presets if name not in defaults)
     override_names = sorted(
         name
         for name, preset in presets.items()

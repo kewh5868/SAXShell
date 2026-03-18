@@ -87,7 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
         "references",
         help="List bundled reference molecules or add a new one.",
     )
-    references_subparsers = references_parser.add_subparsers(dest="reference_command")
+    references_subparsers = references_parser.add_subparsers(
+        dest="reference_command"
+    )
 
     list_parser = references_subparsers.add_parser(
         "list",
@@ -132,8 +134,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"xyz2pdb {__version__}")
         return 0
 
-    if args.command == "references" and getattr(args, "reference_command", None) is None:
-        parser.exit(2, "Error: choose 'references list' or 'references add'.\n")
+    if (
+        args.command == "references"
+        and getattr(args, "reference_command", None) is None
+    ):
+        parser.exit(
+            2, "Error: choose 'references list' or 'references add'.\n"
+        )
 
     if args.command is None:
         return _handle_ui(args)
@@ -295,9 +302,7 @@ def _handle_export(args: argparse.Namespace) -> int:
         "First-frame molecules: "
         + ", ".join(
             f"{name} x{count}"
-            for name, count in sorted(
-                result.preview.molecule_counts.items()
-            )
+            for name, count in sorted(result.preview.molecule_counts.items())
         )
     )
     return 0

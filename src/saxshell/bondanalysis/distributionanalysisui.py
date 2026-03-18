@@ -10,11 +10,16 @@ legacy displacement workflow is treated as deprecated until it is refreshed.
 
 from pathlib import Path
 
-from .ui.main_window import BondAnalysisMainWindow, launch_bondanalysis_ui, main
+from .ui.main_window import (
+    BondAnalysisMainWindow,
+    launch_bondanalysis_ui,
+    main,
+)
 
 
 class DistributionAnalysisWindow(BondAnalysisMainWindow):
-    """Backwards-compatible name for the new bondanalysis main window."""
+    """Backwards-compatible name for the new bondanalysis main
+    window."""
 
     def __init__(
         self,

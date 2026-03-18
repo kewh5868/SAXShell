@@ -59,7 +59,9 @@ class XYZToPDBExportWorker(QObject):
                 reference_library_dir=self.config.library_dir,
                 output_dir=self.config.output_dir,
             )
-            preview = workflow.preview_conversion(output_dir=self.config.output_dir)
+            preview = workflow.preview_conversion(
+                output_dir=self.config.output_dir
+            )
             self.progress.emit(
                 f"Preview complete. First output will be written under {preview.output_dir}."
             )
@@ -231,7 +233,9 @@ class XYZToPDBMainWindow(QMainWindow):
             if input_path is None:
                 raise ValueError("Select an XYZ file or XYZ folder first.")
             if config_file is None:
-                raise ValueError("Select a residue-assignment JSON file first.")
+                raise ValueError(
+                    "Select a residue-assignment JSON file first."
+                )
             job_config = XYZToPDBJobConfig(
                 input_path=input_path,
                 config_file=config_file,
@@ -317,7 +321,9 @@ class XYZToPDBMainWindow(QMainWindow):
         if input_path is None:
             return
         try:
-            self.export_panel.suggest_output_dir(suggest_output_dir(input_path))
+            self.export_panel.suggest_output_dir(
+                suggest_output_dir(input_path)
+            )
         except Exception:
             return
 

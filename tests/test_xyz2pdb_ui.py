@@ -88,7 +88,9 @@ def test_reference_library_dropdown_populates_from_selected_folder(
 
     assert window.reference_panel.reference_combo.count() == 1
     assert window.reference_panel.reference_combo.currentText() == "pbi"
-    assert "Residue name: PBI" in window.reference_panel.details_box.toPlainText()
+    assert (
+        "Residue name: PBI" in window.reference_panel.details_box.toPlainText()
+    )
 
 
 def test_main_window_creates_reference_and_suggests_output_dir(
@@ -121,6 +123,4 @@ def test_main_window_creates_reference_and_suggests_output_dir(
     window.input_panel.config_edit.setText(str(config_file))
     window._suggest_output_dir_from_input(input_xyz)
 
-    assert window.export_panel.get_output_dir() == (
-        tmp_path / "xyz2pdb_input"
-    )
+    assert window.export_panel.get_output_dir() == (tmp_path / "xyz2pdb_input")

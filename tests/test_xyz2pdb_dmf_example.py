@@ -92,7 +92,9 @@ def _write_xyz_cell(
     atom_records: list[tuple[int, str, np.ndarray]] = []
     for molecule_index, molecule_atoms in enumerate(molecules):
         for atom_name, element, coordinates in molecule_atoms:
-            atom_records.append((molecule_index, atom_name, element, coordinates))
+            atom_records.append(
+                (molecule_index, atom_name, element, coordinates)
+            )
 
     permutation = np.random.default_rng(20260318).permutation(
         len(atom_records)

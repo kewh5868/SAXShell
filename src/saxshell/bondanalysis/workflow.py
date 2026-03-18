@@ -105,13 +105,15 @@ def _base_output_dir_name(clusters_dir: Path) -> str:
     return f"bondanalysis_{folder_label}"
 
 
-def discover_cluster_types(clusters_dir: str | Path) -> list[ClusterTypeSummary]:
+def discover_cluster_types(
+    clusters_dir: str | Path,
+) -> list[ClusterTypeSummary]:
     """Discover stoichiometry-level cluster folders.
 
-    The expected layout is a root directory containing one folder per cluster
-    type, with structure files directly inside each of those folders. If the
-    selected directory itself contains structure files directly, it is treated
-    as one single cluster type.
+    The expected layout is a root directory containing one folder per
+    cluster type, with structure files directly inside each of those
+    folders. If the selected directory itself contains structure files
+    directly, it is treated as one single cluster type.
     """
 
     source_path = Path(clusters_dir)
@@ -147,7 +149,8 @@ def discover_cluster_types(clusters_dir: str | Path) -> list[ClusterTypeSummary]
 
 
 class BondAnalysisWorkflow:
-    """Shared workflow used by the UI, CLI, and notebook entry points."""
+    """Shared workflow used by the UI, CLI, and notebook entry
+    points."""
 
     def __init__(
         self,
@@ -161,9 +164,7 @@ class BondAnalysisWorkflow:
         self.clusters_dir = Path(clusters_dir)
         self.bond_pairs = tuple(dict.fromkeys(bond_pairs or ()))
         self.angle_triplets = tuple(dict.fromkeys(angle_triplets or ()))
-        self.output_dir = (
-            Path(output_dir) if output_dir is not None else None
-        )
+        self.output_dir = Path(output_dir) if output_dir is not None else None
         self.selected_cluster_types = (
             tuple(selected_cluster_types)
             if selected_cluster_types is not None
@@ -230,9 +231,7 @@ class BondAnalysisWorkflow:
         aggregate_angle_rows = {
             definition: [] for definition in self.angle_triplets
         }
-        comparison_bonds = {
-            definition: {} for definition in self.bond_pairs
-        }
+        comparison_bonds = {definition: {} for definition in self.bond_pairs}
         comparison_angles = {
             definition: {} for definition in self.angle_triplets
         }
@@ -383,11 +382,11 @@ class BondAnalysisWorkflow:
 
         selected_names = set(self.selected_cluster_types)
         selected = [
-            summary
-            for summary in summaries
-            if summary.name in selected_names
+            summary for summary in summaries if summary.name in selected_names
         ]
-        missing = selected_names.difference(summary.name for summary in selected)
+        missing = selected_names.difference(
+            summary.name for summary in selected
+        )
         if missing:
             missing_text = ", ".join(sorted(missing))
             raise ValueError(
@@ -407,8 +406,12 @@ class BondAnalysisWorkflow:
     ) -> dict[str, int]:
         counts: dict[str, int] = {}
         for definition, rows in rows_by_definition.items():
-            csv_path = output_dir / f"{definition.filename_stem}_distribution.csv"
-            npy_path = output_dir / f"{definition.filename_stem}_distribution.npy"
+            csv_path = (
+                output_dir / f"{definition.filename_stem}_distribution.csv"
+            )
+            npy_path = (
+                output_dir / f"{definition.filename_stem}_distribution.npy"
+            )
             self._write_distribution_csv(
                 csv_path,
                 rows,
@@ -418,7 +421,9 @@ class BondAnalysisWorkflow:
             values = [row[2] for row in rows]
             counts[definition.display_label] = len(values)
             if values:
-                png_path = output_dir / f"{definition.filename_stem}_histogram.png"
+                png_path = (
+                    output_dir / f"{definition.filename_stem}_histogram.png"
+                )
                 self._save_histogram(
                     values,
                     title=(
@@ -453,7 +458,9 @@ class BondAnalysisWorkflow:
             values = [row[2] for row in rows]
             counts[definition.display_label] = len(values)
             if values:
-                png_path = output_dir / f"{definition.filename_stem}_histogram.png"
+                png_path = (
+                    output_dir / f"{definition.filename_stem}_histogram.png"
+                )
                 self._save_histogram(
                     values,
                     title=(
@@ -547,9 +554,7 @@ class BondAnalysisWorkflow:
             writer = csv.writer(stream)
             writer.writerow(header)
             for cluster_type, structure_file, value in rows:
-                writer.writerow(
-                    [cluster_type, structure_file, f"{value:.6f}"]
-                )
+                writer.writerow([cluster_type, structure_file, f"{value:.6f}"])
 
     @staticmethod
     def _write_distribution_npy(

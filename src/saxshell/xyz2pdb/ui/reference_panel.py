@@ -4,6 +4,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -11,7 +12,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
-    QComboBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -165,4 +165,3 @@ class ReferenceLibraryPanel(QGroupBox):
     def get_residue_name(self) -> str | None:
         text = self.residue_edit.text().strip()
         return text or None
-

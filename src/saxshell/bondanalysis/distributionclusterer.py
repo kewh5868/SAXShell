@@ -1,27 +1,30 @@
-import os, re
+import os
+import re
 import shutil
 import warnings
-import numpy as np
-import matplotlib.pyplot as plt
 from datetime import datetime
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
+from typing import Dict, List, Optional, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
 from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
-from typing import List, Dict, Tuple, Optional
+from sklearn.preprocessing import StandardScaler
 
 # Optional: k-medoids
 try:
     from sklearn_extra.cluster import KMedoids
+
     HAVE_KMEDOIDS = True
 except ImportError:
     HAVE_KMEDOIDS = False
 
 from motif.structuredescriptor import StructureDescriptor
 
+
 def remove_report(root_folder: str) -> None:
-    """
-    Delete all report_<datetime>/ subdirectories (and their contents)
+    """Delete all report_<datetime>/ subdirectories (and their contents)
     from each direct subfolder of `root_folder`.
 
     A report directory is identified by the pattern: report_YYYYMMDD_HHMMSS
@@ -33,7 +36,7 @@ def remove_report(root_folder: str) -> None:
         directories to delete.
     """
     # Regex for report_<YYYYMMDD>_<HHMMSS>
-    report_pattern = re.compile(r'^report_\d{8}_\d{6}$')
+    report_pattern = re.compile(r"^report_\d{8}_\d{6}$")
 
     # Iterate over each item in the root folder
     for entry in os.listdir(root_folder):
@@ -51,9 +54,10 @@ def remove_report(root_folder: str) -> None:
                 except Exception as e:
                     print(f"Failed to delete {report_path}: {e}")
 
+
 class DistributionClusterer:
-    """
-    Cluster a set of structures (PDB/XYZ) based on structural descriptors.
+    """Cluster a set of structures (PDB/XYZ) based on structural
+    descriptors.
 
     Available comparators:
       • 'rmsd'         – RMSD to the reference structure
@@ -61,11 +65,12 @@ class DistributionClusterer:
       • 'centroids'    – Distances from each element’s centre to anchor-atom centre
       • 'coordination' – Coordination numbers for specified absorber–partner pairs
     """
+
     comparator_descriptions = {
-        'rmsd':         "Root-mean-square deviation to reference (StructureDescriptor)",
-        'inertia':      "Three principal moments of inertia (StructureDescriptor)",
-        'centroids':    "Distances from each element’s centre to anchor-atom centre",
-        'coordination': "Coordination numbers for absorber–partner pairs (StructureDescriptor)"
+        "rmsd": "Root-mean-square deviation to reference (StructureDescriptor)",
+        "inertia": "Three principal moments of inertia (StructureDescriptor)",
+        "centroids": "Distances from each element’s centre to anchor-atom centre",
+        "coordination": "Coordination numbers for absorber–partner pairs (StructureDescriptor)",
     }
 
     def __init__(
@@ -73,13 +78,13 @@ class DistributionClusterer:
         structure_folder: str,
         comparators: List[str] = None,
         n_clusters: int = None,
-        cluster_method: str = 'kmeans',
+        cluster_method: str = "kmeans",
         pca_components: Optional[int] = None,
         silhouette_range: Tuple[int, int] = (2, 10),
         random_state: int = 42,
-        anchor_atom: str = 'Pb',
+        anchor_atom: str = "Pb",
         comparator_weights: Dict[str, float] = None,
-        coord_cutoffs: Dict[Tuple[str, str], float] = None
+        coord_cutoffs: Dict[Tuple[str, str], float] = None,
     ):
         self.structure_folder = structure_folder
         self.n_clusters = n_clusters
@@ -127,32 +132,37 @@ class DistributionClusterer:
 
     def _load_structural_descriptors(self):
         """Compute descriptors using StructureDescriptor."""
-        files = sorted(f for f in os.listdir(self.structure_folder)
-                       if f.endswith(('.xyz', '.pdb')))
+        files = sorted(
+            f
+            for f in os.listdir(self.structure_folder)
+            if f.endswith((".xyz", ".pdb"))
+        )
         if not files:
-            raise ValueError(f"No structure files found in {self.structure_folder}")
+            raise ValueError(
+                f"No structure files found in {self.structure_folder}"
+            )
         self.filenames = files
 
         sd = StructureDescriptor(
             self.structure_folder,
             anchor_atom=self.anchor_atom,
-            coord_cutoffs=self.coord_cutoffs
+            coord_cutoffs=self.coord_cutoffs,
         )
-        methods = [m for m in ('rmsd', 'inertia') if m in self.comparators]
+        methods = [m for m in ("rmsd", "inertia") if m in self.comparators]
         sd.run(methods=methods, verbose=False)
 
-        if 'rmsd' in self.comparators:
+        if "rmsd" in self.comparators:
             self.struct_rmsd = sd.rmsd
-        if 'inertia' in self.comparators:
+        if "inertia" in self.comparators:
             self.struct_inertia = sd.inertia
-        if 'centroids' in self.comparators:
+        if "centroids" in self.comparators:
             ecs = sd.compute_element_centers()
             types = sorted(e for e in ecs[0].keys() if e != self.anchor_atom)
             self.centroid_types = types
-            self.struct_centroids = np.vstack([
-                [np.linalg.norm(c[e]) for e in types] for c in ecs
-            ])
-        if 'coordination' in self.comparators:
+            self.struct_centroids = np.vstack(
+                [[np.linalg.norm(c[e]) for e in types] for c in ecs]
+            )
+        if "coordination" in self.comparators:
             cns_list = sd.compute_coordination_numbers()
             self.struct_coordination = cns_list
             self.coordination_pairs = list(cns_list[0].keys())
@@ -164,16 +174,18 @@ class DistributionClusterer:
             blocks = []
             for comp in self.comparators:
                 w = self.comparator_weights[comp]
-                if comp == 'rmsd':
+                if comp == "rmsd":
                     blocks.append(np.array([self.struct_rmsd[i] * w]))
-                elif comp == 'inertia':
+                elif comp == "inertia":
                     blocks.append(self.struct_inertia[i] * w)
-                elif comp == 'centroids':
+                elif comp == "centroids":
                     blocks.append(self.struct_centroids[i] * w)
-                elif comp == 'coordination':
+                elif comp == "coordination":
                     vals = []
                     for pair in self.coordination_pairs:
-                        arr = np.array(self.struct_coordination[i][pair], dtype=int)
+                        arr = np.array(
+                            self.struct_coordination[i][pair], dtype=int
+                        )
                         vals.extend(np.sort(arr))
                     blocks.append(np.array(vals) * w)
             rows.append(np.hstack(blocks))
@@ -182,16 +194,22 @@ class DistributionClusterer:
     def preprocess(self):
         """Standardize & optionally PCA reduce."""
         if self.features is None:
-            raise ValueError("Features have not been assembled. Call _assemble_features() first.")
+            raise ValueError(
+                "Features have not been assembled. Call _assemble_features() first."
+            )
         scaler = StandardScaler()
         X = scaler.fit_transform(self.features)
         if self.pca_components:
             max_dim = min(X.shape)
             n_comp = min(self.pca_components, max_dim)
             if self.pca_components > max_dim:
-                warnings.warn(f"PCA comps ({self.pca_components}) > dims ({max_dim}); using {max_dim}")
+                warnings.warn(
+                    f"PCA comps ({self.pca_components}) > dims ({max_dim}); using {max_dim}"
+                )
             if n_comp > 0:
-                X = PCA(n_components=n_comp, random_state=self.random_state).fit_transform(X)
+                X = PCA(
+                    n_components=n_comp, random_state=self.random_state
+                ).fit_transform(X)
         self.features = X
 
     def determine_k(self):
@@ -203,7 +221,7 @@ class DistributionClusterer:
         self.tested_ks, self.inertias = [], []
         kmin, kmax = self.silhouette_range
         for k in range(kmin, kmax + 1):
-            if self.cluster_method == 'kmedoids' and HAVE_KMEDOIDS:
+            if self.cluster_method == "kmedoids" and HAVE_KMEDOIDS:
                 m = KMedoids(n_clusters=k, random_state=self.random_state)
             else:
                 m = KMeans(n_clusters=k, random_state=self.random_state)
@@ -222,7 +240,7 @@ class DistributionClusterer:
         if self.n_clusters is None:
             raise ValueError("n_clusters not set. Call determine_k() first.")
         k = self.determine_k()
-        if self.cluster_method == 'kmedoids':
+        if self.cluster_method == "kmedoids":
             if not HAVE_KMEDOIDS:
                 raise ImportError("sklearn_extra required for kmedoids")
             med = KMedoids(n_clusters=k, random_state=self.random_state)
@@ -250,15 +268,23 @@ class DistributionClusterer:
 
     def write_report(self):
         """Write summary report."""
-        report_path = os.path.join(self.report_dir, 'cluster_report.txt')
-        sil = silhouette_score(self.features, self.labels) if self.n_clusters > 1 else None
-        weights = [int(np.sum(self.labels == i)) for i in range(self.n_clusters)]
-        with open(report_path, 'w') as f:
+        report_path = os.path.join(self.report_dir, "cluster_report.txt")
+        sil = (
+            silhouette_score(self.features, self.labels)
+            if self.n_clusters > 1
+            else None
+        )
+        weights = [
+            int(np.sum(self.labels == i)) for i in range(self.n_clusters)
+        ]
+        with open(report_path, "w") as f:
             f.write(f"Run Report\nDate/Time: {datetime.now().isoformat()}\n\n")
             f.write("Comparators used:\n")
             for key in self.comparators:
-                f.write(f"  - {key:12s}: {self.comparator_descriptions[key]}\n")
-        
+                f.write(
+                    f"  - {key:12s}: {self.comparator_descriptions[key]}\n"
+                )
+
             # Comparator weights
             f.write("\nComparator weights:\n")
             for key, w in self.comparator_weights.items():
@@ -286,8 +312,8 @@ class DistributionClusterer:
 
     def write_cluster_membership(self):
         """Write membership details."""
-        membership = os.path.join(self.report_dir, 'cluster_membership.txt')
-        with open(membership, 'w') as f:
+        membership = os.path.join(self.report_dir, "cluster_membership.txt")
+        with open(membership, "w") as f:
             for i in range(self.n_clusters):
                 f.write(f"Cluster {i}\n")
                 # f.write(f"Representative: {self.filenames[self.rep_indices[i]]}\n")
@@ -314,11 +340,11 @@ class DistributionClusterer:
     def plot_elbow(self):
         """Plot elbow curve."""
         plt.figure()
-        plt.plot(self.tested_ks, self.inertias, 'o-', lw=2)
-        plt.axvline(self.n_clusters, ls='--', color='k')
-        plt.xlabel('k')
-        plt.ylabel('Inertia (WSS)')
-        plt.title('Elbow Method')
+        plt.plot(self.tested_ks, self.inertias, "o-", lw=2)
+        plt.axvline(self.n_clusters, ls="--", color="k")
+        plt.xlabel("k")
+        plt.ylabel("Inertia (WSS)")
+        plt.title("Elbow Method")
         plt.show()
 
     def plot_silhouette(self):
@@ -326,35 +352,43 @@ class DistributionClusterer:
         if not self.tested_ks or not self.silhouette_scores:
             raise ValueError("No silhouette data. Run determine_k() first.")
         plt.figure()
-        plt.plot(self.tested_ks, self.silhouette_scores, 'o-', lw=2)
-        plt.axvline(self.n_clusters, ls='--', color='k')
-        plt.xlabel('k')
-        plt.ylabel('Silhouette Score')
-        plt.title('Silhouette Analysis')
+        plt.plot(self.tested_ks, self.silhouette_scores, "o-", lw=2)
+        plt.axvline(self.n_clusters, ls="--", color="k")
+        plt.xlabel("k")
+        plt.ylabel("Silhouette Score")
+        plt.title("Silhouette Analysis")
         plt.show()
 
     def run(self, verbose: bool = False):
         """Full clustering pipeline."""
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.report_dir = os.path.join(self.structure_folder, f'report_{ts}')
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.report_dir = os.path.join(self.structure_folder, f"report_{ts}")
         os.makedirs(self.report_dir, exist_ok=True)
-        if verbose: print(f"Report dir: {self.report_dir}")
+        if verbose:
+            print(f"Report dir: {self.report_dir}")
 
-        if verbose: print("Loading structural descriptors...")
+        if verbose:
+            print("Loading structural descriptors...")
         self._load_structural_descriptors()
-        if verbose: print("Assembling features...")
+        if verbose:
+            print("Assembling features...")
         self._assemble_features()
         self.describe_comparators()
-        if verbose: print("Preprocessing...")
+        if verbose:
+            print("Preprocessing...")
         self.preprocess()
-        if verbose: print("Determining k...")
+        if verbose:
+            print("Determining k...")
         self.determine_k()
-        if verbose: print(f"Using k = {self.n_clusters}")
-        if verbose: print("Clustering...")
+        if verbose:
+            print(f"Using k = {self.n_clusters}")
+        if verbose:
+            print("Clustering...")
         self.cluster()
         # if verbose: print("Selecting representatives...")
         # self.select_representatives()
-        if verbose: print("Writing reports...")
+        if verbose:
+            print("Writing reports...")
         report_path = self.write_report()
         membership_path = self.write_cluster_membership()
         # if verbose: print("Copying representatives...")
@@ -365,9 +399,11 @@ class DistributionClusterer:
             print(f" - Membership: {membership_path}")
             # if copied:
             #     print(f"Representative structures copied: {len(copied)} files")
-        if verbose: print("Plotting elbow...")
+        if verbose:
+            print("Plotting elbow...")
         # try:
         #     self.plot_elbow()
         # except Exception as e:
         #     warnings.warn(f"Elbow plot failed: {e}")
-        if verbose: print("Done.")
+        if verbose:
+            print("Done.")

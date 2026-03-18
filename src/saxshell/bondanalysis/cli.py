@@ -72,8 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help=(
-            "Angle triplet definition as "
-            "VERTEX:ARM1:ARM2:CUTOFF1:CUTOFF2."
+            "Angle triplet definition as " "VERTEX:ARM1:ARM2:CUTOFF1:CUTOFF2."
         ),
     )
     run_parser.set_defaults(handler=_handle_run)
@@ -138,8 +137,7 @@ def _handle_run(args: argparse.Namespace) -> int:
     lines = [
         f"Clusters directory: {result.clusters_dir}",
         f"Output directory: {result.output_dir}",
-        "Selected cluster types: "
-        + ", ".join(result.selected_cluster_types),
+        "Selected cluster types: " + ", ".join(result.selected_cluster_types),
         f"Structure files processed: {result.total_structure_files}",
         f"Manifest file: {result.manifest_path}",
     ]

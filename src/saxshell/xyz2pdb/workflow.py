@@ -62,16 +62,19 @@ def rotation_matrix_from_to(
         ],
         dtype=float,
     )
-    return np.eye(3) + np.sin(angle) * skew + (
-        1.0 - np.cos(angle)
-    ) * (skew @ skew)
+    return (
+        np.eye(3)
+        + np.sin(angle) * skew
+        + (1.0 - np.cos(angle)) * (skew @ skew)
+    )
 
 
 def rigid_alignment_from_points(
     source_points: np.ndarray,
     target_points: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return the rigid-body transform that best aligns two point sets."""
+    """Return the rigid-body transform that best aligns two point
+    sets."""
     if source_points.shape != target_points.shape:
         raise ValueError("Point sets must have matching shapes for alignment.")
     if source_points.ndim != 2 or source_points.shape[1] != 3:
@@ -84,9 +87,7 @@ def rigid_alignment_from_points(
     source_centered = source_points - source_centroid
     target_centered = target_points - target_centroid
     covariance = source_centered.T @ target_centered
-    left_vectors, _singular_values, right_vectors_t = np.linalg.svd(
-        covariance
-    )
+    left_vectors, _singular_values, right_vectors_t = np.linalg.svd(covariance)
     rotation = left_vectors @ right_vectors_t
     if float(np.linalg.det(rotation)) < 0.0:
         left_vectors[:, -1] *= -1.0
@@ -311,7 +312,9 @@ class XYZToPDBInspectionResult:
                 None if self.config_file is None else str(self.config_file)
             ),
             "reference_library_dir": str(self.reference_library_dir),
-            "available_references": [entry.name for entry in self.available_references],
+            "available_references": [
+                entry.name for entry in self.available_references
+            ],
             "configured_molecules": list(self.configured_molecules),
             "configured_reference_names": list(
                 self.configured_reference_names
@@ -383,7 +386,9 @@ def list_reference_library(
         return []
 
     entries: list[ReferenceLibraryEntry] = []
-    for path in sorted(resolved_dir.glob("*.pdb"), key=lambda item: item.name.lower()):
+    for path in sorted(
+        resolved_dir.glob("*.pdb"), key=lambda item: item.name.lower()
+    ):
         structure = PDBStructure.from_file(path)
         residue_name = (
             structure.atoms[0].residue_name if structure.atoms else "UNK"
@@ -522,7 +527,8 @@ def create_reference_molecule(
 
 
 class XYZToPDBWorkflow:
-    """Headless xyz-to-pdb conversion workflow with reference matching."""
+    """Headless xyz-to-pdb conversion workflow with reference
+    matching."""
 
     def __init__(
         self,
@@ -580,7 +586,8 @@ class XYZToPDBWorkflow:
         return XYZFrame(filepath=path, comment=lines[1], atoms=atoms)
 
     def inspect(self) -> XYZToPDBInspectionResult:
-        """Inspect the selected input path and optional configuration."""
+        """Inspect the selected input path and optional
+        configuration."""
         input_mode, xyz_files = self._resolve_xyz_inputs()
         available_references = tuple(
             list_reference_library(self.reference_library_dir)
@@ -614,7 +621,9 @@ class XYZToPDBWorkflow:
         if self._configuration is not None:
             return self._configuration
         if self.config_file is None:
-            raise ValueError("A residue-assignment JSON config file is required.")
+            raise ValueError(
+                "A residue-assignment JSON config file is required."
+            )
 
         payload = json.loads(self.config_file.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
@@ -640,7 +649,8 @@ class XYZToPDBWorkflow:
         *,
         output_dir: str | Path | None = None,
     ) -> XYZToPDBPreviewResult:
-        """Preview the first-frame residue assignments and output path."""
+        """Preview the first-frame residue assignments and output
+        path."""
         inspection = self.inspect()
         if not inspection.xyz_files:
             raise ValueError("No XYZ files were found for conversion.")
@@ -651,9 +661,11 @@ class XYZToPDBWorkflow:
         resolved_output_dir = (
             Path(output_dir)
             if output_dir is not None
-            else self.output_dir
-            if self.output_dir is not None
-            else suggest_output_dir(self.input_path)
+            else (
+                self.output_dir
+                if self.output_dir is not None
+                else suggest_output_dir(self.input_path)
+            )
         )
         molecule_counts: Counter[str] = Counter()
         residue_counts: Counter[str] = Counter()
@@ -694,8 +706,12 @@ class XYZToPDBWorkflow:
                 residues = template_residues
             else:
                 frame = self.read_xyz_frame(xyz_file)
-                residues = tuple(self._apply_template(frame, template_residues))
-            atoms = [atom.copy() for residue in residues for atom in residue.atoms]
+                residues = tuple(
+                    self._apply_template(frame, template_residues)
+                )
+            atoms = [
+                atom.copy() for residue in residues for atom in residue.atoms
+            ]
             structure = PDBStructure(atoms=atoms, source_name=xyz_file.stem)
             written_path = structure.write_pdb_file(
                 output_path / f"{xyz_file.stem}.pdb",
@@ -733,9 +749,7 @@ class XYZToPDBWorkflow:
             key=lambda path: path.name.lower(),
         )
         if not xyz_files:
-            raise ValueError(
-                f"No .xyz files were found in {self.input_path}"
-            )
+            raise ValueError(f"No .xyz files were found in {self.input_path}")
         return "xyz_folder", xyz_files
 
     def _parse_pbc_params(
@@ -745,7 +759,9 @@ class XYZToPDBWorkflow:
         if value is None:
             return {}
         if not isinstance(value, dict):
-            raise ValueError("The optional 'pbc' config section must be an object.")
+            raise ValueError(
+                "The optional 'pbc' config section must be an object."
+            )
 
         parsed: dict[str, float | str] = {}
         for key in ("a", "b", "c", "alpha", "beta", "gamma"):
@@ -769,7 +785,9 @@ class XYZToPDBWorkflow:
         molecules: list[MoleculeDefinition] = []
         for item in value:
             if not isinstance(item, dict):
-                raise ValueError("Each molecule config entry must be an object.")
+                raise ValueError(
+                    "Each molecule config entry must be an object."
+                )
             reference_value = item.get("reference")
             if reference_value is None:
                 raise ValueError(
@@ -783,10 +801,7 @@ class XYZToPDBWorkflow:
             reference_atoms = tuple(
                 atom.copy()
                 for atom in reference_structure.atoms
-                if not (
-                    exclude_hydrogen
-                    and atom.element.upper() == "H"
-                )
+                if not (exclude_hydrogen and atom.element.upper() == "H")
             )
             if not reference_atoms:
                 raise ValueError(
@@ -812,7 +827,10 @@ class XYZToPDBWorkflow:
                         f"Molecule {molecule_name!r} has an invalid anchor entry."
                     )
                 pair_value = anchor_item.get("pair")
-                if not isinstance(pair_value, list | tuple) or len(pair_value) != 2:
+                if (
+                    not isinstance(pair_value, list | tuple)
+                    or len(pair_value) != 2
+                ):
                     raise ValueError(
                         f"Molecule {molecule_name!r} anchor pairs must contain two atom names."
                     )
@@ -895,7 +913,9 @@ class XYZToPDBWorkflow:
         for item in items:
             if not isinstance(item, dict):
                 raise ValueError("Each free-atom entry must be an object.")
-            element = _normalized_element_symbol(str(item.get("element") or ""))
+            element = _normalized_element_symbol(
+                str(item.get("element") or "")
+            )
             residue_name = _normalized_residue_name(
                 item.get("residue_name"),
                 fallback=element,
@@ -1054,7 +1074,11 @@ class XYZToPDBWorkflow:
         )
         anchor_reference_indices = tuple(sorted(anchor_constraints))
 
-        for anchor_index1, anchor_index2, tolerance in molecule.resolved_anchor_indices:
+        for (
+            anchor_index1,
+            anchor_index2,
+            tolerance,
+        ) in molecule.resolved_anchor_indices:
             anchor_atom1 = reference_atoms[anchor_index1]
             anchor_atom2 = reference_atoms[anchor_index2]
             reference_vector = (
@@ -1095,28 +1119,35 @@ class XYZToPDBWorkflow:
                         continue
 
                     transformed = (
-                        (reference_coordinates - reference_coordinates[anchor_index1])
+                        (
+                            reference_coordinates
+                            - reference_coordinates[anchor_index1]
+                        )
                         @ rotation.T
                     ) + position1
                     initial_anchor_assignment = {
                         anchor_index1: source_index1,
                         anchor_index2: source_index2,
                     }
-                    expanded_anchor_assignments = self._expand_anchor_assignments(
-                        frame,
-                        used,
-                        reference_atoms=reference_atoms,
-                        anchor_reference_indices=anchor_reference_indices,
-                        anchor_constraints=anchor_constraints,
-                        initial_assignment=initial_anchor_assignment,
+                    expanded_anchor_assignments = (
+                        self._expand_anchor_assignments(
+                            frame,
+                            used,
+                            reference_atoms=reference_atoms,
+                            anchor_reference_indices=anchor_reference_indices,
+                            anchor_constraints=anchor_constraints,
+                            initial_assignment=initial_anchor_assignment,
+                        )
                     )
                     for anchor_assignment in expanded_anchor_assignments:
                         target_coordinates = transformed
                         if len(anchor_assignment) >= 3:
-                            target_coordinates = self._transform_reference_with_anchors(
-                                reference_coordinates,
-                                frame,
-                                anchor_assignment,
+                            target_coordinates = (
+                                self._transform_reference_with_anchors(
+                                    reference_coordinates,
+                                    frame,
+                                    anchor_assignment,
+                                )
                             )
                         assignment, score = self._assign_reference_atoms(
                             frame,
@@ -1138,7 +1169,9 @@ class XYZToPDBWorkflow:
         reference_coordinates: np.ndarray,
         resolved_anchor_indices: Sequence[tuple[int, int, float]],
     ) -> dict[int, list[tuple[int, float, float]]]:
-        constraints: dict[int, list[tuple[int, float, float]]] = defaultdict(list)
+        constraints: dict[int, list[tuple[int, float, float]]] = defaultdict(
+            list
+        )
         for anchor_index1, anchor_index2, tolerance in resolved_anchor_indices:
             reference_distance = float(
                 np.linalg.norm(
@@ -1228,9 +1261,11 @@ class XYZToPDBWorkflow:
 
             satisfied = False
             valid = True
-            for other_reference_index, reference_distance, tolerance in (
-                anchor_constraints.get(reference_index, [])
-            ):
+            for (
+                other_reference_index,
+                reference_distance,
+                tolerance,
+            ) in anchor_constraints.get(reference_index, []):
                 if other_reference_index not in current_assignment:
                     continue
                 satisfied = True
@@ -1274,11 +1309,15 @@ class XYZToPDBWorkflow:
             ],
             dtype=float,
         )
-        rotation, source_centroid, target_centroid = rigid_alignment_from_points(
-            source_points,
-            target_points,
+        rotation, source_centroid, target_centroid = (
+            rigid_alignment_from_points(
+                source_points,
+                target_points,
+            )
         )
-        return ((reference_coordinates - source_centroid) @ rotation) + target_centroid
+        return (
+            (reference_coordinates - source_centroid) @ rotation
+        ) + target_centroid
 
     def _assign_reference_atoms(
         self,
