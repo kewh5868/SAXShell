@@ -32,6 +32,42 @@ def main(argv: list[str] | None = None) -> int:
         nargs=argparse.REMAINDER,
         help="Arguments passed through to the mdtrajectory command.",
     )
+    cluster_parser = subparsers.add_parser(
+        "cluster",
+        help=(
+            "Inspect or analyze extracted frame folders, or launch the "
+            "cluster UI."
+        ),
+    )
+    cluster_parser.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="Arguments passed through to the cluster UI command.",
+    )
+    bondanalysis_parser = subparsers.add_parser(
+        "bondanalysis",
+        help=(
+            "Run bond-pair and angle-distribution analysis, or launch the "
+            "bondanalysis UI."
+        ),
+    )
+    bondanalysis_parser.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="Arguments passed through to the bondanalysis command.",
+    )
+    xyz2pdb_parser = subparsers.add_parser(
+        "xyz2pdb",
+        help=(
+            "Convert XYZ files to PDB using reference molecules and "
+            "residue-assignment rules."
+        ),
+    )
+    xyz2pdb_parser.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="Arguments passed through to the xyz2pdb command.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -42,6 +78,30 @@ def main(argv: list[str] | None = None) -> int:
         if forwarded_args[:1] == ["--"]:
             forwarded_args = forwarded_args[1:]
         return mdtrajectory_main(forwarded_args)
+
+    if args.command == "cluster":
+        from saxshell.cluster.cli import main as cluster_main
+
+        forwarded_args = list(args.args)
+        if forwarded_args[:1] == ["--"]:
+            forwarded_args = forwarded_args[1:]
+        return cluster_main(forwarded_args)
+
+    if args.command == "bondanalysis":
+        from saxshell.bondanalysis.cli import main as bondanalysis_main
+
+        forwarded_args = list(args.args)
+        if forwarded_args[:1] == ["--"]:
+            forwarded_args = forwarded_args[1:]
+        return bondanalysis_main(forwarded_args)
+
+    if args.command == "xyz2pdb":
+        from saxshell.xyz2pdb.cli import main as xyz2pdb_main
+
+        forwarded_args = list(args.args)
+        if forwarded_args[:1] == ["--"]:
+            forwarded_args = forwarded_args[1:]
+        return xyz2pdb_main(forwarded_args)
 
     parser.print_help()
     return 0

@@ -38,9 +38,12 @@ Homepage = "https://github.com/kewh5868/SAXShell/"
 Issues = "https://github.com/kewh5868/SAXShell/issues/"
 
 [project.scripts]
+bondanalysis = "saxshell.bondanalysis.cli:main"
+clusters = "saxshell.cluster.cli:main"
 mdtrajectory = "saxshell.mdtrajectory.cli:main"
 saxshell = "saxshell.saxshell:main"
 pdfsetup = "saxshell.pdfsetup:main"
+xyz2pdb = "saxshell.xyz2pdb.cli:main"
 
 [tool.setuptools-git-versioning]
 enabled = true
@@ -56,6 +59,9 @@ namespaces = false
 
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements/pip.txt"] }
+
+[tool.setuptools.package-data]
+"saxshell.xyz2pdb" = ["reference_library/*.pdb", "reference_library/*.txt"]
 
 [tool.codespell]
 exclude-file = ".codespell/ignore_lines.txt"

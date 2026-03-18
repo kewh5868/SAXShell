@@ -29,6 +29,7 @@ bin/
 temp/
 tags/
 errors.err
+src/saxshell/_deprecated/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
