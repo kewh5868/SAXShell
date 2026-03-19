@@ -338,3 +338,6 @@ dependencies:
   - zlib-ng=2.3.3
   - zstandard=0.25.0
   - zstd=1.5.7
+  - pip:
+      - pydream
+      - xraydb>=4.5.8

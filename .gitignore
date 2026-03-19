@@ -30,6 +30,8 @@ temp/
 tags/
 errors.err
 src/saxshell/_deprecated/
+src/saxshell/saxs/_deprecated/
+examples/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
