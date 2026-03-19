@@ -1,0 +1,493 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import re
+import shutil
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+from saxshell.saxs.dream.distributions import (
+    DreamParameterEntry,
+    build_default_parameter_map,
+    load_parameter_map,
+    save_parameter_map,
+)
+from saxshell.saxs.dream.settings import (
+    DreamRunSettings,
+    load_dream_settings,
+    save_dream_settings,
+)
+from saxshell.saxs.prefit import SAXSPrefitWorkflow
+from saxshell.saxs.project_manager import (
+    SAXSProjectManager,
+    build_project_paths,
+)
+
+
+@dataclass(slots=True)
+class DreamRunBundle:
+    run_dir: Path
+    runtime_script_path: Path
+    metadata_path: Path
+    settings_path: Path
+    parameter_map_path: Path
+
+
+class SAXSDreamWorkflow:
+    """Create and manage SAXS DREAM runtime bundles."""
+
+    def __init__(self, project_dir: str | Path) -> None:
+        self.project_manager = SAXSProjectManager()
+        self.settings = self.project_manager.load_project(project_dir)
+        self.paths = build_project_paths(self.settings.project_dir)
+        self.prefit_workflow = SAXSPrefitWorkflow(self.paths.project_dir)
+        self.dream_settings_path = self.paths.dream_dir / "pd_settings.json"
+        self.parameter_map_path = self.paths.dream_dir / "pd_param_map.json"
+        self.settings_presets_dir = self.paths.dream_dir / "settings_presets"
+        self.settings_presets_dir.mkdir(parents=True, exist_ok=True)
+
+    def load_settings(self) -> DreamRunSettings:
+        settings = load_dream_settings(self.dream_settings_path)
+        if settings.model_name is None:
+            settings.model_name = self.prefit_workflow.template_spec.name
+        return settings
+
+    def save_settings(self, settings: DreamRunSettings) -> Path:
+        if settings.model_name is None:
+            settings.model_name = self.prefit_workflow.template_spec.name
+        return save_dream_settings(self.dream_settings_path, settings)
+
+    def list_settings_presets(self) -> list[str]:
+        return sorted(
+            [
+                path.stem
+                for path in self.settings_presets_dir.glob("*.json")
+                if path.is_file()
+            ]
+        )
+
+    def load_settings_preset(
+        self, preset_name: str | None
+    ) -> DreamRunSettings:
+        if preset_name is None:
+            return self.load_settings()
+        preset_path = self.settings_presets_dir / (
+            f"{self._sanitize_preset_name(preset_name)}.json"
+        )
+        settings = load_dream_settings(preset_path)
+        if settings.model_name is None:
+            settings.model_name = self.prefit_workflow.template_spec.name
+        return settings
+
+    def save_settings_preset(
+        self,
+        settings: DreamRunSettings,
+        preset_name: str | None,
+    ) -> Path:
+        active_path = self.save_settings(settings)
+        if preset_name is None:
+            return active_path
+        preset_path = self.settings_presets_dir / (
+            f"{self._sanitize_preset_name(preset_name)}.json"
+        )
+        return save_dream_settings(preset_path, settings)
+
+    def load_parameter_map(
+        self,
+        *,
+        persist_if_missing: bool = True,
+    ) -> list[DreamParameterEntry]:
+        if not self.parameter_map_path.is_file():
+            return self.create_default_parameter_map(
+                persist=persist_if_missing
+            )
+        payload = json.loads(
+            self.parameter_map_path.read_text(encoding="utf-8")
+        )
+        entries = load_parameter_map(self.parameter_map_path)
+        normalized_payload = {
+            "entries": [entry.to_dict() for entry in entries]
+        }
+        if payload != normalized_payload:
+            save_parameter_map(self.parameter_map_path, entries)
+        return entries
+
+    def save_parameter_map(
+        self,
+        entries: list[DreamParameterEntry],
+    ) -> Path:
+        return save_parameter_map(self.parameter_map_path, entries)
+
+    def create_default_parameter_map(
+        self,
+        *,
+        persist: bool = True,
+    ) -> list[DreamParameterEntry]:
+        prefit_path = self.paths.prefit_dir / "pd_prefit_params.json"
+        if not prefit_path.is_file():
+            raise FileNotFoundError(
+                "No prefit parameters were saved. Complete and save a SAXS "
+                "prefit before setting up DREAM."
+            )
+        payload = json.loads(prefit_path.read_text(encoding="utf-8"))
+        entries = build_default_parameter_map(payload)
+        if persist:
+            self.save_parameter_map(entries)
+        return entries
+
+    def create_runtime_bundle(
+        self,
+        *,
+        settings: DreamRunSettings | None = None,
+        entries: list[DreamParameterEntry] | None = None,
+    ) -> DreamRunBundle:
+        parameter_entries = entries or self.load_parameter_map()
+        active_settings = self._prepare_runtime_settings(
+            settings or self.load_settings(),
+            parameter_entries,
+        )
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = (
+            f"dream_{self._sanitize_runtime_name(self.paths.project_dir.name)}"
+            f"_{timestamp}"
+        )
+        run_dir = self.paths.dream_runtime_dir / run_name
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        runtime_script_path = run_dir / f"{run_name}.py"
+        metadata_path = run_dir / "dream_runtime_metadata.json"
+        settings_path = run_dir / "pd_settings.json"
+        parameter_map_path = run_dir / "pd_param_map.json"
+
+        save_dream_settings(settings_path, active_settings)
+        save_parameter_map(parameter_map_path, parameter_entries)
+        self._copy_prefit_snapshot(run_dir)
+
+        metadata = self._build_runtime_metadata(
+            active_settings,
+            parameter_entries,
+        )
+        metadata_path.write_text(
+            json.dumps(metadata, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        runtime_script_path.write_text(
+            self._build_runtime_script(metadata),
+            encoding="utf-8",
+        )
+        return DreamRunBundle(
+            run_dir=run_dir,
+            runtime_script_path=runtime_script_path,
+            metadata_path=metadata_path,
+            settings_path=settings_path,
+            parameter_map_path=parameter_map_path,
+        )
+
+    def run_bundle(self, bundle: DreamRunBundle) -> dict[str, object]:
+        module_name, module, added_sys_path = self._load_runtime_module(bundle)
+        try:
+            if not hasattr(module, "run_sampler"):
+                raise AttributeError(
+                    "Generated DREAM runtime script does not define run_sampler()."
+                )
+            return module.run_sampler()
+        finally:
+            self._unload_runtime_module(
+                module_name,
+                added_sys_path=added_sys_path,
+            )
+
+    def _load_runtime_module(
+        self,
+        bundle: DreamRunBundle,
+    ) -> tuple[str, object, bool]:
+        module_name = bundle.runtime_script_path.stem
+        run_dir = str(bundle.run_dir)
+        added_sys_path = False
+        if run_dir not in sys.path:
+            sys.path.insert(0, run_dir)
+            added_sys_path = True
+        import_spec = importlib.util.spec_from_file_location(
+            module_name,
+            bundle.runtime_script_path,
+        )
+        if import_spec is None or import_spec.loader is None:
+            raise ImportError(
+                f"Unable to import generated runtime script from "
+                f"{bundle.runtime_script_path}"
+            )
+        module = importlib.util.module_from_spec(import_spec)
+        sys.modules[module_name] = module
+        try:
+            import_spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            if added_sys_path:
+                try:
+                    sys.path.remove(run_dir)
+                except ValueError:
+                    pass
+            raise
+        return module_name, module, added_sys_path
+
+    @staticmethod
+    def _unload_runtime_module(
+        module_name: str,
+        *,
+        added_sys_path: bool,
+    ) -> None:
+        module = sys.modules.pop(module_name, None)
+        if added_sys_path and module is not None:
+            module_path = getattr(module, "__file__", None)
+            if module_path:
+                run_dir = str(Path(module_path).resolve().parent)
+                try:
+                    sys.path.remove(run_dir)
+                except ValueError:
+                    pass
+
+    def _copy_prefit_snapshot(self, run_dir: Path) -> None:
+        prefit_json = self.paths.prefit_dir / "pd_prefit_params.json"
+        prefit_state = self.paths.prefit_dir / "prefit_state.json"
+        if prefit_json.is_file():
+            shutil.copy2(prefit_json, run_dir / prefit_json.name)
+        if prefit_state.is_file():
+            shutil.copy2(prefit_state, run_dir / prefit_state.name)
+
+    def _prepare_runtime_settings(
+        self,
+        settings: DreamRunSettings,
+        entries: list[DreamParameterEntry],
+    ) -> DreamRunSettings:
+        active_settings = DreamRunSettings.from_dict(settings.to_dict())
+        if not active_settings.model_name:
+            active_settings.model_name = (
+                self.prefit_workflow.template_spec.name
+            )
+        active_count = sum(1 for entry in entries if entry.vary)
+        if active_count <= 0:
+            raise ValueError(
+                "No DREAM parameters are currently set to vary. Edit the "
+                "priors and enable vary for at least one refinable parameter "
+                "before writing or running a DREAM bundle."
+            )
+        if active_settings.nchains < active_count:
+            active_settings.nchains = active_count
+        if active_settings.nseedchains <= 0:
+            active_settings.nseedchains = max(10 * active_settings.nchains, 1)
+        active_settings.nseedchains = max(
+            int(active_settings.nseedchains),
+            int(active_settings.nchains) * 2,
+        )
+        if active_settings.history_file is not None:
+            history_file = str(active_settings.history_file).strip()
+            active_settings.history_file = history_file or None
+        return active_settings
+
+    @staticmethod
+    def _sanitize_preset_name(preset_name: str) -> str:
+        cleaned = re.sub(r'[<>:"/\\\\|?*]+', "_", preset_name.strip())
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip(" ._") or "dream_settings"
+
+    @staticmethod
+    def _sanitize_runtime_name(name: str) -> str:
+        cleaned = re.sub(r"\W+", "_", name.strip())
+        cleaned = cleaned.strip("_")
+        if not cleaned:
+            return "project"
+        if cleaned[0].isdigit():
+            return f"project_{cleaned}"
+        return cleaned
+
+    def _build_runtime_metadata(
+        self,
+        settings: DreamRunSettings,
+        entries: list[DreamParameterEntry],
+    ) -> dict[str, object]:
+        prefit_entries = self.prefit_workflow.parameter_entries
+        full_parameter_names = [entry.name for entry in prefit_entries]
+        fixed_parameter_values = [entry.value for entry in prefit_entries]
+        active_indices: list[int] = []
+        active_entries: list[dict[str, object]] = []
+        for dream_entry in entries:
+            if not dream_entry.vary:
+                continue
+            active_indices.append(
+                full_parameter_names.index(dream_entry.param)
+            )
+            active_entries.append(dream_entry.to_dict())
+
+        evaluation = self.prefit_workflow.evaluate()
+        metadata = {
+            "project_dir": str(self.paths.project_dir),
+            "template_name": self.prefit_workflow.template_spec.name,
+            "settings": settings.to_dict(),
+            "parameter_map": [entry.to_dict() for entry in entries],
+            "active_parameter_entries": active_entries,
+            "active_parameter_indices": active_indices,
+            "full_parameter_names": full_parameter_names,
+            "fixed_parameter_values": fixed_parameter_values,
+            "q_values": evaluation.q_values.tolist(),
+            "experimental_intensities": (
+                evaluation.experimental_intensities.tolist()
+            ),
+            "theoretical_intensities": [
+                component.intensities.tolist()
+                for component in self.prefit_workflow.components
+            ],
+            "solvent_intensities": (
+                self.prefit_workflow.solvent_data.tolist()
+                if self.prefit_workflow.solvent_data is not None
+                else [0.0] * len(evaluation.q_values)
+            ),
+        }
+        return metadata
+
+    def _build_runtime_script(self, metadata: dict[str, object]) -> str:
+        template_path = self.prefit_workflow.template_spec.module_path
+        template_source = template_path.read_text(encoding="utf-8")
+        lmfit_model_name = self.prefit_workflow.template_spec.lmfit_model_name
+        dream_model_name = self.prefit_workflow.template_spec.dream_model_name
+        return f"""from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+from scipy import stats
+
+try:
+    from pydream.core import run_dream
+    from pydream.parameters import SampledParam
+except ImportError:
+    run_dream = None
+    SampledParam = None
+
+
+RUN_DIR = Path(__file__).resolve().parent
+RUNTIME_METADATA = json.loads(
+    (RUN_DIR / "dream_runtime_metadata.json").read_text(encoding="utf-8")
+)
+SETTINGS = RUNTIME_METADATA["settings"]
+FULL_PARAMETER_NAMES = list(RUNTIME_METADATA["full_parameter_names"])
+ACTIVE_PARAMETER_INDICES = list(RUNTIME_METADATA["active_parameter_indices"])
+FIXED_PARAMETER_VALUES = np.asarray(
+    RUNTIME_METADATA["fixed_parameter_values"],
+    dtype=float,
+)
+ACTIVE_PARAMETER_ENTRIES = list(RUNTIME_METADATA["active_parameter_entries"])
+q_values = np.asarray(RUNTIME_METADATA["q_values"], dtype=float)
+experimental_intensities = np.asarray(
+    RUNTIME_METADATA["experimental_intensities"],
+    dtype=float,
+)
+theoretical_intensities = [
+    np.asarray(values, dtype=float)
+    for values in RUNTIME_METADATA["theoretical_intensities"]
+]
+solvent_intensities = np.asarray(
+    RUNTIME_METADATA["solvent_intensities"],
+    dtype=float,
+)
+
+
+{template_source}
+
+
+def expand_active_params(active_params):
+    full = FIXED_PARAMETER_VALUES.astype(float).copy()
+    full[np.asarray(ACTIVE_PARAMETER_INDICES, dtype=int)] = np.asarray(
+        active_params,
+        dtype=float,
+    )
+    return full
+
+
+def full_params_to_kwargs(full_params):
+    return {{
+        name: float(full_params[index])
+        for index, name in enumerate(FULL_PARAMETER_NAMES)
+    }}
+
+
+def model_from_active_params(active_params):
+    full_params = expand_active_params(active_params)
+    params = full_params_to_kwargs(full_params)
+    return {lmfit_model_name}(
+        q_values,
+        solvent_intensities,
+        theoretical_intensities,
+        **params,
+    )
+
+
+def active_log_likelihood(active_params):
+    full_params = expand_active_params(active_params)
+    return {dream_model_name}(full_params)
+
+
+def build_sampled_parameters():
+    if SampledParam is None:
+        raise RuntimeError(
+            "pydream is not installed. Install pydream to execute the "
+            "generated DREAM runtime script."
+        )
+    sampled_parameters = []
+    for entry in ACTIVE_PARAMETER_ENTRIES:
+        distribution = getattr(stats, entry["distribution"])
+        sampled_parameters.append(
+            SampledParam(distribution, **entry["dist_params"])
+        )
+    return sampled_parameters
+
+
+def run_sampler():
+    if run_dream is None:
+        raise RuntimeError(
+            "pydream is not installed. Install pydream to run this bundle."
+        )
+    sampled_parameters = build_sampled_parameters()
+    sampled_params, log_ps = run_dream(
+        parameters=sampled_parameters,
+        likelihood=active_log_likelihood,
+        nchains=int(SETTINGS["nchains"]),
+        niterations=int(SETTINGS["niterations"]),
+        restart=bool(SETTINGS["restart"]),
+        verbose=bool(SETTINGS["verbose"]),
+        parallel=bool(SETTINGS["parallel"]),
+        nseedchains=int(SETTINGS["nseedchains"]),
+        adapt_crossover=bool(SETTINGS["adapt_crossover"]),
+        crossover_burnin=int(SETTINGS["crossover_burnin"]),
+        lamb=float(SETTINGS["lamb"]),
+        zeta=float(SETTINGS["zeta"]),
+        history_thin=int(SETTINGS["history_thin"]),
+        snooker=float(SETTINGS["snooker"]),
+        p_gamma_unity=float(SETTINGS["p_gamma_unity"]),
+        model_name=SETTINGS.get("model_name") or False,
+        history_file=SETTINGS.get("history_file") or False,
+    )
+    sampled_params = np.asarray(sampled_params, dtype=float)
+    log_ps = np.asarray(log_ps, dtype=float)
+    if log_ps.ndim == 3 and log_ps.shape[-1] == 1:
+        log_ps = log_ps[..., 0]
+    np.save(RUN_DIR / "dream_sampled_params.npy", sampled_params)
+    np.save(RUN_DIR / "dream_log_ps.npy", log_ps)
+    return {{
+        "sampled_params_path": str(RUN_DIR / "dream_sampled_params.npy"),
+        "log_ps_path": str(RUN_DIR / "dream_log_ps.npy"),
+    }}
+
+
+if __name__ == "__main__":
+    run_sampler()
+"""
+
+
+__all__ = [
+    "DreamRunBundle",
+    "SAXSDreamWorkflow",
+]

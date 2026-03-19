@@ -68,6 +68,18 @@ def main(argv: list[str] | None = None) -> int:
         nargs=argparse.REMAINDER,
         help="Arguments passed through to the xyz2pdb command.",
     )
+    saxs_parser = subparsers.add_parser(
+        "saxs",
+        help=(
+            "Build SAXS fitting projects, refine prefit models, and "
+            "launch the SAXS fitting UI."
+        ),
+    )
+    saxs_parser.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="Arguments passed through to the SAXS command.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -102,6 +114,14 @@ def main(argv: list[str] | None = None) -> int:
         if forwarded_args[:1] == ["--"]:
             forwarded_args = forwarded_args[1:]
         return xyz2pdb_main(forwarded_args)
+
+    if args.command == "saxs":
+        from saxshell.saxs.cli import main as saxs_main
+
+        forwarded_args = list(args.args)
+        if forwarded_args[:1] == ["--"]:
+            forwarded_args = forwarded_args[1:]
+        return saxs_main(forwarded_args)
 
     parser.print_help()
     return 0
