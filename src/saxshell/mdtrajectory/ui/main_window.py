@@ -296,6 +296,9 @@ class MDTrajectoryMainWindow(QMainWindow):
                 stop=self.state.stop,
                 stride=self.state.stride,
                 min_time_fs=min_time_fs,
+                post_cutoff_stride=self._resolved_post_cutoff_stride(
+                    min_time_fs=min_time_fs
+                ),
             )
             if preview.selected_frames == 0:
                 raise ValueError(
@@ -308,6 +311,9 @@ class MDTrajectoryMainWindow(QMainWindow):
                 stop=self.state.stop,
                 stride=self.state.stride,
                 min_time_fs=min_time_fs,
+                post_cutoff_stride=self._resolved_post_cutoff_stride(
+                    min_time_fs=min_time_fs
+                ),
             )
 
             lines = [
@@ -320,6 +326,10 @@ class MDTrajectoryMainWindow(QMainWindow):
             ]
             if min_time_fs is not None:
                 lines.append(f"Applied cutoff: {min_time_fs:.3f} fs")
+                lines.append(
+                    "Post-cutoff frame interval: "
+                    f"{self._resolved_post_cutoff_stride(min_time_fs=min_time_fs)}"
+                )
             else:
                 lines.append("Applied cutoff: None")
             if preview.first_frame_index is not None:
@@ -353,6 +363,12 @@ class MDTrajectoryMainWindow(QMainWindow):
         self.state.stop = self.trajectory_panel.get_stop()
         self.state.stride = self.trajectory_panel.get_stride()
         self.state.use_cutoff_for_export = self.export_panel.use_cutoff()
+        self.state.use_post_cutoff_stride = (
+            self.export_panel.use_post_cutoff_stride()
+        )
+        self.state.post_cutoff_stride = (
+            self.export_panel.get_post_cutoff_stride()
+        )
         self.state.selected_cutoff_fs = self.cutoff_panel.get_selected_cutoff()
         self.state.suggested_cutoff_fs = (
             self.cutoff_panel.get_suggested_cutoff()
@@ -366,6 +382,15 @@ class MDTrajectoryMainWindow(QMainWindow):
                 "Cutoff export is enabled, but no cutoff time is selected."
             )
         return self.state.selected_cutoff_fs
+
+    def _resolved_post_cutoff_stride(
+        self,
+        *,
+        min_time_fs: float | None,
+    ) -> int:
+        if min_time_fs is None or not self.state.use_post_cutoff_stride:
+            return 1
+        return max(1, int(self.state.post_cutoff_stride))
 
     def _refresh_selection_preview(self) -> None:
         self._sync_state_from_controls()
@@ -387,6 +412,9 @@ class MDTrajectoryMainWindow(QMainWindow):
                 stop=self.state.stop,
                 stride=self.state.stride,
                 min_time_fs=min_time_fs,
+                post_cutoff_stride=self._resolved_post_cutoff_stride(
+                    min_time_fs=min_time_fs
+                ),
             )
             self.export_panel.set_selection_summary(
                 self._format_selection_summary(preview)
@@ -553,6 +581,9 @@ class MDTrajectoryMainWindow(QMainWindow):
         )
         if preview.min_time_fs is not None:
             lines.append(f"Applied cutoff: {preview.min_time_fs:.3f} fs")
+            lines.append(
+                "Post-cutoff frame interval: " f"{preview.post_cutoff_stride}"
+            )
         else:
             lines.append("Applied cutoff: None")
         if preview.first_frame_index is not None:

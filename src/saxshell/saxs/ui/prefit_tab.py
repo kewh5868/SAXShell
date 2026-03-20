@@ -18,7 +18,9 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QPushButton,
+    QScrollArea,
     QSpinBox,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -74,20 +76,52 @@ class PrefitTab(QWidget):
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(12)
+        root.setSpacing(0)
 
-        top_row = QHBoxLayout()
-        top_row.setSpacing(12)
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
+        self._scroll_area = QScrollArea()
+        self._scroll_area.setWidgetResizable(True)
+        self._scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self._scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(12)
+
+        self._main_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._main_splitter.setChildrenCollapsible(False)
+        self._main_splitter.setHandleWidth(10)
+
+        self._pane_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._pane_splitter.setChildrenCollapsible(False)
+        self._pane_splitter.setHandleWidth(10)
+
+        self._left_panel = QWidget()
+        left_layout = QVBoxLayout(self._left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(12)
         left_layout.addWidget(self._build_controls_group())
         left_layout.addWidget(self._build_parameter_group(), stretch=1)
-        top_row.addWidget(left_panel, stretch=5)
-        top_row.addWidget(self._build_plot_group(), stretch=7)
-        root.addLayout(top_row, stretch=1)
-        root.addWidget(self._build_output_group())
+        self._plot_group = self._build_plot_group()
+        self._pane_splitter.addWidget(self._left_panel)
+        self._pane_splitter.addWidget(self._plot_group)
+        self._pane_splitter.setStretchFactor(0, 5)
+        self._pane_splitter.setStretchFactor(1, 7)
+        self._pane_splitter.setSizes([520, 760])
+        self._output_group = self._build_output_group()
+        self._main_splitter.addWidget(self._pane_splitter)
+        self._main_splitter.addWidget(self._output_group)
+        self._main_splitter.setStretchFactor(0, 4)
+        self._main_splitter.setStretchFactor(1, 2)
+        self._main_splitter.setSizes([760, 260])
+        content_layout.addWidget(self._main_splitter, stretch=1)
+
+        self._scroll_area.setWidget(content)
+        root.addWidget(self._scroll_area)
 
     def _build_controls_group(self) -> QGroupBox:
         group = QGroupBox("Prefit Controls")

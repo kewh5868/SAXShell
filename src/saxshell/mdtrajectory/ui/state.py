@@ -26,3 +26,5 @@ class MDTrajectoryAppState:
 
     output_dir: Path | None = None
     use_cutoff_for_export: bool = False
+    use_post_cutoff_stride: bool = False
+    post_cutoff_stride: int = 1

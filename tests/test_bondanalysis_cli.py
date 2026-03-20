@@ -67,7 +67,7 @@ def test_bondanalysis_workflow_supports_notebook_style_usage(tmp_path):
     assert summary["total_structure_files"] == 2
     assert result.output_dir == tmp_path / "bondanalysis_clusters_splitxyz0001"
     assert result.total_structure_files == 2
-    assert result.manifest_path.exists()
+    assert result.results_index_path.exists()
     assert (
         result.output_dir / "cluster_types" / "PbI2" / "Pb_I_distribution.csv"
     ).exists()
@@ -117,6 +117,7 @@ def test_bondanalysis_cli_run_writes_expected_outputs(tmp_path, capsys):
     assert f"Output directory: {output_dir}" in captured.out
     assert "Selected cluster types: PbI2" in captured.out
     assert "Structure files processed: 1" in captured.out
+    assert "Results index file:" in captured.out
     assert (
         output_dir / "cluster_types" / "PbI2" / "Pb_I_distribution.csv"
     ).exists()

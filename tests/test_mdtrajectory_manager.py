@@ -63,6 +63,41 @@ def test_export_frames_returns_written_files(tmp_path):
     assert written_files[0].read_text().startswith("2\n")
 
 
+def test_preview_selection_can_keep_every_nth_frame_after_cutoff(tmp_path):
+    trajectory_file = tmp_path / "traj.xyz"
+    trajectory_file.write_text(
+        "2\n"
+        "i = 0, time = 0.0, E = -1.0\n"
+        "H 0.0 0.0 0.0\n"
+        "O 1.0 0.0 0.0\n"
+        "2\n"
+        "i = 1, time = 50.0, E = -1.0\n"
+        "H 0.0 0.1 0.0\n"
+        "O 1.0 0.1 0.0\n"
+        "2\n"
+        "i = 2, time = 100.0, E = -1.0\n"
+        "H 0.0 0.2 0.0\n"
+        "O 1.0 0.2 0.0\n"
+        "2\n"
+        "i = 3, time = 150.0, E = -1.0\n"
+        "H 0.0 0.3 0.0\n"
+        "O 1.0 0.3 0.0\n"
+    )
+
+    manager = TrajectoryManager(input_file=trajectory_file)
+    preview = manager.preview_selection(
+        min_time_fs=50.0,
+        post_cutoff_stride=2,
+    )
+
+    assert preview.selected_frames == 2
+    assert preview.post_cutoff_stride == 2
+    assert preview.first_frame_index == 1
+    assert preview.last_frame_index == 3
+    assert preview.first_time_fs == pytest.approx(50.0)
+    assert preview.last_time_fs == pytest.approx(150.0)
+
+
 def test_time_cutoff_requires_time_metadata(tmp_path):
     trajectory_file = tmp_path / "traj.xyz"
     trajectory_file.write_text(

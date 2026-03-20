@@ -39,6 +39,26 @@ def test_export_panel_suggest_output_dir_keeps_manual_override(
     assert panel.get_output_dir() == manual_dir
 
 
+def test_export_panel_post_cutoff_stride_controls_follow_cutoff_toggle(qapp):
+    del qapp
+    panel = ExportPanel()
+
+    assert not panel.use_cutoff()
+    assert not panel.post_cutoff_stride_box.isEnabled()
+    assert not panel.post_cutoff_stride_spin.isEnabled()
+
+    panel.use_cutoff_box.setChecked(True)
+
+    assert panel.post_cutoff_stride_box.isEnabled()
+    assert not panel.post_cutoff_stride_spin.isEnabled()
+
+    panel.post_cutoff_stride_box.setChecked(True)
+    panel.post_cutoff_stride_spin.setValue(3)
+
+    assert panel.use_post_cutoff_stride()
+    assert panel.get_post_cutoff_stride() == 3
+
+
 def test_cutoff_panel_load_energy_draws_target_temperature_line(
     qapp,
     tmp_path,
@@ -117,6 +137,7 @@ def test_selection_preview_includes_output_folder_details(qapp, tmp_path):
         stop=None,
         stride=2,
         min_time_fs=50.0,
+        post_cutoff_stride=3,
         first_frame_index=2,
         last_frame_index=8,
         first_time_fs=50.0,
@@ -128,6 +149,7 @@ def test_selection_preview_includes_output_folder_details(qapp, tmp_path):
 
     assert "Output folder: selected_frames" in text
     assert f"Output path: {output_dir}" in text
+    assert "Post-cutoff frame interval: 3" in text
 
 
 def test_main_window_suggests_new_output_subfolder_in_source_dir(

@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -29,6 +30,8 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -44,6 +47,14 @@ from saxshell.bondanalysis import (
     save_custom_preset,
     suggest_bondanalysis_output_dir,
 )
+from saxshell.bondanalysis.results import (
+    BondAnalysisPlotRequest,
+    BondAnalysisResultIndex,
+    BondAnalysisResultLeaf,
+    build_plot_request,
+    load_result_index,
+)
+from saxshell.bondanalysis.ui.plot_window import BondAnalysisPlotWindow
 
 _OPEN_WINDOWS: list["BondAnalysisMainWindow"] = []
 
@@ -94,6 +105,8 @@ class BondAnalysisMainWindow(QMainWindow):
         self._run_thread: QThread | None = None
         self._run_worker: BondAnalysisWorker | None = None
         self._presets: dict[str, BondAnalysisPreset] = {}
+        self._results_index: BondAnalysisResultIndex | None = None
+        self._plot_windows: list[BondAnalysisPlotWindow] = []
         self._build_ui()
         if initial_clusters_dir is not None:
             self.set_clusters_dir(initial_clusters_dir)
@@ -143,7 +156,7 @@ class BondAnalysisMainWindow(QMainWindow):
         preview_layout = QVBoxLayout(preview_group)
         self.selection_box = QTextEdit()
         self.selection_box.setReadOnly(True)
-        self.selection_box.setMinimumHeight(220)
+        self.selection_box.setMinimumHeight(150)
         preview_layout.addWidget(self.selection_box)
         layout.addWidget(preview_group)
 
@@ -172,16 +185,86 @@ class BondAnalysisMainWindow(QMainWindow):
         run_layout.addWidget(self.legacy_label)
         layout.addWidget(run_group)
 
+        browser_log_panel = QWidget()
+        browser_log_layout = QVBoxLayout(browser_log_panel)
+        browser_log_layout.setContentsMargins(0, 0, 0, 0)
+        browser_log_layout.setSpacing(12)
+        browser_log_layout.addWidget(self._build_results_browser_group())
+
         log_group = QGroupBox("Run Log")
         log_layout = QVBoxLayout(log_group)
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
-        self.log_box.setMinimumHeight(260)
+        self.log_box.setMinimumHeight(180)
         log_layout.addWidget(self.log_box)
-        layout.addWidget(log_group)
+        browser_log_layout.addWidget(log_group)
+
+        layout.addWidget(browser_log_panel, stretch=1)
 
         layout.addStretch(1)
-        return right
+        return self._wrap_scroll_area(right)
+
+    def _build_results_browser_group(self) -> QGroupBox:
+        group = QGroupBox("Computed Distributions")
+        layout = QVBoxLayout(group)
+
+        controls = QHBoxLayout()
+        self.refresh_results_button = QPushButton("Refresh Results")
+        self.refresh_results_button.clicked.connect(self._refresh_results_tree)
+        controls.addWidget(self.refresh_results_button)
+
+        self.open_selected_window_button = QPushButton(
+            "Open Selected in Window"
+        )
+        self.open_selected_window_button.clicked.connect(
+            self._open_selected_plot_window
+        )
+        controls.addWidget(self.open_selected_window_button)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        self.results_tree = QTreeWidget()
+        self.results_tree.setColumnCount(3)
+        self.results_tree.setHeaderLabels(["Distribution", "Scope", "Values"])
+        self.results_tree.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.results_tree.itemSelectionChanged.connect(
+            self._on_results_tree_selection_changed
+        )
+        self.results_tree.header().setStretchLastSection(False)
+        self.results_tree.header().setSectionResizeMode(
+            0,
+            QHeaderView.ResizeMode.Stretch,
+        )
+        self.results_tree.header().setSectionResizeMode(
+            1,
+            QHeaderView.ResizeMode.ResizeToContents,
+        )
+        self.results_tree.header().setSectionResizeMode(
+            2,
+            QHeaderView.ResizeMode.ResizeToContents,
+        )
+        layout.addWidget(self.results_tree, stretch=1)
+
+        self.results_hint_label = QLabel(
+            "Select one computed bond pair or angle distribution and use "
+            "'Open Selected in Window' to view it. Select multiple leaves "
+            "of the same type across different cluster types to overlay "
+            "them together in a separate window. The 'all' entry opens that "
+            "bond pair or angle across all cluster types."
+        )
+        self.results_hint_label.setWordWrap(True)
+        layout.addWidget(self.results_hint_label)
+
+        self.results_status_label = QLabel(
+            "Run bondanalysis or refresh an existing output directory to "
+            "browse computed distributions."
+        )
+        self.results_status_label.setWordWrap(True)
+        self.results_status_label.setFrameShape(QFrame.Shape.StyledPanel)
+        layout.addWidget(self.results_status_label)
+        return group
 
     def _build_paths_group(self) -> QGroupBox:
         group = QGroupBox("Directories")
@@ -214,6 +297,10 @@ class BondAnalysisMainWindow(QMainWindow):
         refresh_button = QPushButton("Refresh Cluster Types")
         refresh_button.clicked.connect(self._refresh_cluster_types)
         layout.addRow("", refresh_button)
+
+        load_existing_button = QPushButton("Load Existing Bondanalysis Folder")
+        load_existing_button.clicked.connect(self._choose_existing_results_dir)
+        layout.addRow("", load_existing_button)
         return group
 
     def _build_presets_group(self) -> QGroupBox:
@@ -364,8 +451,75 @@ class BondAnalysisMainWindow(QMainWindow):
         if path:
             line_edit.setText(path)
 
+    def _choose_existing_results_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "Select existing bondanalysis output directory",
+        )
+        if not path:
+            return
+        try:
+            self.load_existing_results_dir(path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Bond Analysis", str(exc))
+
     def set_clusters_dir(self, clusters_dir: str | Path) -> None:
         self.clusters_dir_edit.setText(str(clusters_dir))
+
+    def load_existing_results_dir(self, output_dir: str | Path) -> None:
+        result_index = load_result_index(output_dir)
+        self._results_index = result_index
+        self.output_dir_edit.blockSignals(True)
+        self.output_dir_edit.setText(str(result_index.output_dir))
+        self.output_dir_edit.blockSignals(False)
+        self.clusters_dir_edit.blockSignals(True)
+        self.clusters_dir_edit.setText(str(result_index.clusters_dir))
+        self.clusters_dir_edit.blockSignals(False)
+        self._set_bond_pair_rows(result_index.bond_pairs)
+        self._set_angle_triplet_rows(result_index.angle_triplets)
+        self._restore_cluster_type_list(result_index)
+        self._refresh_results_tree()
+        self._append_log(
+            "Loaded existing bondanalysis folder: "
+            f"{result_index.output_dir}"
+        )
+        self._append_log(
+            f"Results index file: {result_index.results_index_path}"
+        )
+        self.statusBar().showMessage(
+            f"Loaded existing bondanalysis results: {result_index.output_dir}"
+        )
+        self._update_selection_summary()
+
+    def _restore_cluster_type_list(
+        self,
+        result_index: BondAnalysisResultIndex,
+    ) -> None:
+        cluster_type_names = list(result_index.cluster_type_names)
+        selected_names = set(result_index.selected_cluster_types)
+        use_checked_filter = bool(selected_names) and (
+            len(selected_names) != len(cluster_type_names)
+        )
+
+        self.cluster_type_list.blockSignals(True)
+        self.cluster_type_list.clear()
+        for cluster_type in cluster_type_names:
+            item = QListWidgetItem(cluster_type)
+            item.setFlags(
+                (item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                & ~Qt.ItemFlag.ItemIsSelectable
+            )
+            check_state = (
+                Qt.CheckState.Checked
+                if not selected_names or cluster_type in selected_names
+                else Qt.CheckState.Unchecked
+            )
+            item.setCheckState(check_state)
+            self.cluster_type_list.addItem(item)
+        self.cluster_type_list.blockSignals(False)
+        self.use_checked_cluster_types_box.blockSignals(True)
+        self.use_checked_cluster_types_box.setChecked(use_checked_filter)
+        self.use_checked_cluster_types_box.blockSignals(False)
 
     def _on_clusters_dir_changed(self, _text: str) -> None:
         self._refresh_cluster_types()
@@ -784,6 +938,202 @@ class BondAnalysisMainWindow(QMainWindow):
         )
         self.selection_box.setPlainText("\n".join(lines))
 
+    def _refresh_results_tree(self) -> None:
+        output_dir = self._output_dir_path()
+        if output_dir is None:
+            self._clear_results_tree(
+                "Choose a bondanalysis output directory first."
+            )
+            return
+
+        try:
+            self._results_index = load_result_index(output_dir)
+        except Exception as exc:
+            self._results_index = None
+            self._clear_results_tree(str(exc))
+            return
+
+        self.results_tree.clear()
+        self._populate_results_category(
+            "Bond Pairs",
+            self._results_index.bond_groups,
+        )
+        self._populate_results_category(
+            "Bond Angles",
+            self._results_index.angle_groups,
+        )
+        self.results_tree.expandAll()
+        self.results_status_label.setText(
+            "Browse computed bond-pair and angle distributions from the "
+            f"current output directory: {self._results_index.output_dir}"
+        )
+
+    def _populate_results_category(
+        self,
+        title: str,
+        groups: tuple[object, ...],
+    ) -> None:
+        if not groups:
+            return
+        category_item = QTreeWidgetItem([title, "", ""])
+        category_item.setFlags(
+            category_item.flags() & ~Qt.ItemFlag.ItemIsSelectable
+        )
+        self.results_tree.addTopLevelItem(category_item)
+        for group in groups:
+            group_item = QTreeWidgetItem([group.display_label, "", ""])
+            group_item.setFlags(
+                group_item.flags() & ~Qt.ItemFlag.ItemIsSelectable
+            )
+            category_item.addChild(group_item)
+            group_item.addChild(self._make_results_leaf_item(group.all_leaf))
+            for leaf in group.cluster_leaves:
+                group_item.addChild(self._make_results_leaf_item(leaf))
+
+    def _make_results_leaf_item(
+        self,
+        leaf: BondAnalysisResultLeaf,
+    ) -> QTreeWidgetItem:
+        scope_label = "all clusters" if leaf.is_all else "cluster type"
+        item = QTreeWidgetItem(
+            [leaf.scope_name, scope_label, str(leaf.point_count)]
+        )
+        item.setData(0, Qt.ItemDataRole.UserRole, leaf)
+        item.setToolTip(
+            0,
+            f"{leaf.display_label} • {leaf.scope_name} "
+            f"({leaf.point_count} values)",
+        )
+        return item
+
+    def _selected_result_leaves(self) -> list[BondAnalysisResultLeaf]:
+        leaves: list[BondAnalysisResultLeaf] = []
+        for item in self.results_tree.selectedItems():
+            payload = item.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(payload, BondAnalysisResultLeaf):
+                leaves.append(payload)
+        return leaves
+
+    def _on_results_tree_selection_changed(self) -> None:
+        leaves = self._selected_result_leaves()
+        if not leaves:
+            self.results_status_label.setText(
+                "Select one computed distribution and use 'Open Selected in "
+                "Window' to view it, or select multiple leaves of the same "
+                "type and open them together as an overlay."
+            )
+            return
+
+        if len(leaves) == 1:
+            leaf = leaves[0]
+            self.results_status_label.setText(
+                f"Ready to open {leaf.display_label} for {leaf.scope_name} "
+                "in a separate plot window."
+            )
+            return
+
+        try:
+            self._validate_multi_leaf_selection(leaves)
+        except ValueError as exc:
+            self.results_status_label.setText(str(exc))
+            return
+
+        cluster_names = ", ".join(leaf.scope_name for leaf in leaves)
+        self.results_status_label.setText(
+            "Ready to overlay "
+            f"{leaves[0].display_label} across: {cluster_names}"
+        )
+
+    def _validate_multi_leaf_selection(
+        self,
+        leaves: list[BondAnalysisResultLeaf],
+    ) -> None:
+        first_leaf = leaves[0]
+        if any(leaf.is_all for leaf in leaves):
+            raise ValueError(
+                "Select either the 'all' entry or multiple individual "
+                "cluster leaves, not both together."
+            )
+        if any(
+            leaf.category != first_leaf.category
+            or leaf.display_label != first_leaf.display_label
+            for leaf in leaves[1:]
+        ):
+            raise ValueError(
+                "To overlay distributions, select bond pairs or angles of "
+                "the same type across different cluster types."
+            )
+
+    def _open_selected_plot_window(self) -> None:
+        leaves = self._selected_result_leaves()
+        if not leaves:
+            QMessageBox.information(
+                self,
+                "Computed Distributions",
+                "Select one or more computed bond pair or angle "
+                "distributions first.",
+            )
+            return
+        self._open_plot_window_for_leaves(leaves)
+
+    def _open_plot_window_for_leaves(
+        self,
+        leaves: list[BondAnalysisResultLeaf],
+    ) -> None:
+        if self._results_index is None:
+            QMessageBox.warning(
+                self,
+                "Computed Distributions",
+                "Run bondanalysis or refresh an existing output directory "
+                "before opening standalone plot windows.",
+            )
+            return
+        try:
+            if len(leaves) > 1:
+                self._validate_multi_leaf_selection(leaves)
+            plot_request = build_plot_request(self._results_index, leaves)
+        except Exception as exc:
+            QMessageBox.warning(self, "Computed Distributions", str(exc))
+            return
+        self._open_plot_window_for_request(plot_request)
+
+    def _open_plot_window_for_request(
+        self,
+        plot_request: BondAnalysisPlotRequest,
+    ) -> None:
+        default_output_dir = (
+            self._results_index.output_dir
+            if self._results_index is not None
+            else (self._output_dir_path() or Path.cwd())
+        )
+        if self._plot_windows:
+            window = self._plot_windows[0]
+            window.add_plot_request(plot_request)
+        else:
+            window = BondAnalysisPlotWindow(
+                plot_request,
+                default_output_dir=default_output_dir,
+                parent=self,
+            )
+            window.destroyed.connect(
+                lambda _obj=None, win=window: self._remove_plot_window(win)
+            )
+            self._plot_windows.append(window)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _remove_plot_window(self, window: BondAnalysisPlotWindow) -> None:
+        self._plot_windows = [
+            existing
+            for existing in self._plot_windows
+            if existing is not window
+        ]
+
+    def _clear_results_tree(self, message: str) -> None:
+        self.results_tree.clear()
+        self.results_status_label.setText(message)
+
     def _append_log(self, text: str) -> None:
         current = self.log_box.toPlainText().strip()
         if current:
@@ -862,13 +1212,15 @@ class BondAnalysisMainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Bond analysis complete: {result.output_dir}"
         )
+        self.output_dir_edit.setText(str(result.output_dir))
         self._append_log(f"Output directory: {result.output_dir}")
-        self._append_log(f"Manifest file: {result.manifest_path}")
+        self._append_log(f"Results index file: {result.results_index_path}")
         for cluster_result in result.cluster_results:
             self._append_log(
                 f"{cluster_result.cluster_type}: "
                 f"{cluster_result.structure_count} file(s)"
             )
+        self._refresh_results_tree()
         self._update_selection_summary()
 
     def _fail_run(self, message: str) -> None:

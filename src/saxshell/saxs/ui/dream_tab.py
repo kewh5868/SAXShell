@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import numpy as np
+from matplotlib import colormaps
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg,
     NavigationToolbar2QT,
 )
+from matplotlib.colors import to_hex
 from matplotlib.figure import Figure
-from PySide6.QtCore import QTimer, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -25,6 +28,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -39,6 +43,77 @@ from saxshell.saxs.dream import (
     DreamViolinPlotData,
 )
 
+DREAM_SEARCH_FILTER_PRESETS: dict[str, dict[str, object]] = {
+    "less_aggressive": {
+        "nchains": 4,
+        "niterations": 5000,
+        "burnin_percent": 15,
+        "nseedchains": 24,
+        "crossover_burnin": 500,
+        "posterior_filter_mode": "all_post_burnin",
+        "posterior_top_percent": 20.0,
+        "posterior_top_n": 1000,
+        "violin_sample_source": "filtered_posterior",
+    },
+    "medium": {
+        "nchains": 4,
+        "niterations": 10000,
+        "burnin_percent": 20,
+        "nseedchains": 40,
+        "crossover_burnin": 1000,
+        "posterior_filter_mode": "all_post_burnin",
+        "posterior_top_percent": 10.0,
+        "posterior_top_n": 500,
+        "violin_sample_source": "filtered_posterior",
+    },
+    "more_aggressive": {
+        "nchains": 8,
+        "niterations": 20000,
+        "burnin_percent": 25,
+        "nseedchains": 80,
+        "crossover_burnin": 2000,
+        "posterior_filter_mode": "top_percent_logp",
+        "posterior_top_percent": 5.0,
+        "posterior_top_n": 250,
+        "violin_sample_source": "filtered_posterior",
+    },
+}
+
+
+class ScientificDoubleSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox that displays and accepts scientific notation."""
+
+    def textFromValue(self, value: float) -> str:
+        if abs(float(value)) < 1e-300:
+            return "0.0e+00"
+        return f"{float(value):.3e}"
+
+    def valueFromText(self, text: str) -> float:
+        cleaned = text.strip()
+        if not cleaned:
+            return 0.0
+        return float(cleaned)
+
+    def validate(
+        self,
+        text: str,
+        position: int,
+    ) -> tuple[QValidator.State, str, int]:
+        cleaned = text.strip()
+        if not cleaned:
+            return (QValidator.State.Intermediate, text, position)
+        if cleaned in {"-", "+", ".", "-.", "+.", "e", "E"}:
+            return (QValidator.State.Intermediate, text, position)
+        if cleaned.lower().endswith(("e", "e+", "e-")):
+            return (QValidator.State.Intermediate, text, position)
+        try:
+            value = float(cleaned)
+        except ValueError:
+            return (QValidator.State.Invalid, text, position)
+        if self.minimum() <= value <= self.maximum():
+            return (QValidator.State.Acceptable, text, position)
+        return (QValidator.State.Invalid, text, position)
+
 
 class DreamTab(QWidget):
     ACTIVE_SETTINGS_LABEL = "Active project settings"
@@ -50,6 +125,8 @@ class DreamTab(QWidget):
     run_dream_requested = Signal()
     load_results_requested = Signal()
     save_report_requested = Signal()
+    save_model_fit_requested = Signal()
+    save_violin_data_requested = Signal()
     settings_preset_changed = Signal(str)
     visualization_settings_changed = Signal()
 
@@ -58,24 +135,61 @@ class DreamTab(QWidget):
         self._summary_text = ""
         self._base_log_text = ""
         self._history_messages: list[str] = []
+        self._live_output_history_index: int | None = None
+        self._applying_search_filter_preset = False
         self._blink_timer = QTimer(self)
         self._blink_timer.setInterval(180)
         self._blink_timer.timeout.connect(self._advance_button_blink)
         self._blink_remaining = 0
         self._blink_target_button: QPushButton | None = None
         self._build_ui()
+        self.set_settings(DreamRunSettings(), preset_name=None)
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(12)
+        root.setSpacing(0)
 
-        top_row = QHBoxLayout()
-        top_row.setSpacing(12)
-        top_row.addWidget(self._build_settings_scroll_area(), stretch=4)
-        top_row.addWidget(self._build_plot_panel(), stretch=7)
-        root.addLayout(top_row, stretch=1)
-        root.addWidget(self._build_output_group())
+        self._outer_scroll_area = QScrollArea()
+        self._outer_scroll_area.setWidgetResizable(True)
+        self._outer_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self._outer_scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(12)
+
+        self._output_group = self._build_output_group()
+        self._top_splitter = QSplitter()
+        self._top_splitter.setOrientation(Qt.Orientation.Horizontal)
+        self._top_splitter.setChildrenCollapsible(False)
+        self._top_splitter.setHandleWidth(10)
+        self._main_splitter = self._top_splitter
+        self._settings_scroll_area = self._build_settings_scroll_area()
+        self._plot_scroll_area = QScrollArea()
+        self._plot_scroll_area.setWidgetResizable(True)
+        self._plot_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self._plot_scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self._plot_panel = self._build_plot_panel()
+        self._plot_scroll_area.setWidget(self._plot_panel)
+        self._top_splitter.addWidget(self._settings_scroll_area)
+        self._top_splitter.addWidget(self._plot_scroll_area)
+        self._top_splitter.setStretchFactor(0, 4)
+        self._top_splitter.setStretchFactor(1, 7)
+        self._top_splitter.setSizes([420, 760])
+        content_layout.addWidget(self._top_splitter)
+
+        self._outer_scroll_area.setWidget(content)
+        root.addWidget(self._outer_scroll_area)
 
     def _build_settings_scroll_area(self) -> QScrollArea:
         scroll = QScrollArea()
@@ -86,6 +200,7 @@ class DreamTab(QWidget):
         content_layout.setSpacing(12)
         content_layout.addWidget(self._build_settings_group())
         content_layout.addWidget(self._build_parameter_map_group())
+        content_layout.addWidget(self._output_group)
         content_layout.addStretch(1)
         scroll.setWidget(content)
         return scroll
@@ -115,6 +230,37 @@ class DreamTab(QWidget):
         layout.addWidget(self.settings_preset_combo, row, 1, 1, 3)
 
         row += 1
+        self.search_filter_preset_combo = QComboBox()
+        self.search_filter_preset_combo.addItem("Custom", "custom")
+        self.search_filter_preset_combo.addItem(
+            "Less Aggressive",
+            "less_aggressive",
+        )
+        self.search_filter_preset_combo.addItem("Medium", "medium")
+        self.search_filter_preset_combo.addItem(
+            "More Aggressive",
+            "more_aggressive",
+        )
+        self.search_filter_preset_combo.currentIndexChanged.connect(
+            self._on_search_filter_preset_changed
+        )
+        search_filter_tip = (
+            "Apply a built-in DREAM search and posterior-filtering profile. "
+            "Less Aggressive keeps broader posterior filtering and lighter "
+            "sampling, Medium matches the default balanced setup, and More "
+            "Aggressive increases search depth while tightening posterior "
+            "filtering."
+        )
+        search_filter_label = QLabel("Search/filter preset")
+        self._set_widget_tooltip(
+            search_filter_label,
+            self.search_filter_preset_combo,
+            search_filter_tip,
+        )
+        layout.addWidget(search_filter_label, row, 0)
+        layout.addWidget(self.search_filter_preset_combo, row, 1, 1, 3)
+
+        row += 1
         self.model_name_edit = QLineEdit()
         self.model_name_edit.setPlaceholderText("dream")
         model_name_tip = (
@@ -133,9 +279,15 @@ class DreamTab(QWidget):
         row += 1
         self.chains_spin = QSpinBox()
         self.chains_spin.setRange(1, 512)
+        self.chains_spin.valueChanged.connect(
+            lambda _value: self._mark_search_filter_preset_custom()
+        )
         self.iterations_spin = QSpinBox()
         self.iterations_spin.setRange(100, 10_000_000)
         self.iterations_spin.setSingleStep(100)
+        self.iterations_spin.valueChanged.connect(
+            lambda _value: self._mark_search_filter_preset_custom()
+        )
         chains_tip = (
             "Number of DREAM MCMC chains to run. The runtime bundle will "
             "increase this if needed so there is at least one chain per "
@@ -162,6 +314,9 @@ class DreamTab(QWidget):
         row += 1
         self.burnin_spin = QSpinBox()
         self.burnin_spin.setRange(0, 95)
+        self.burnin_spin.valueChanged.connect(
+            lambda _value: self._mark_search_filter_preset_custom()
+        )
         self.history_thin_spin = QSpinBox()
         self.history_thin_spin.setRange(1, 1000)
         burnin_tip = (
@@ -191,9 +346,15 @@ class DreamTab(QWidget):
         row += 1
         self.nseedchains_spin = QSpinBox()
         self.nseedchains_spin.setRange(0, 100_000)
+        self.nseedchains_spin.valueChanged.connect(
+            lambda _value: self._mark_search_filter_preset_custom()
+        )
         self.crossover_burnin_spin = QSpinBox()
         self.crossover_burnin_spin.setRange(0, 10_000_000)
         self.crossover_burnin_spin.setSingleStep(100)
+        self.crossover_burnin_spin.valueChanged.connect(
+            lambda _value: self._mark_search_filter_preset_custom()
+        )
         nseedchains_tip = (
             "Number of seed chains DREAM uses to initialize proposals. If "
             "this is too small, the runtime bundle will raise it to at "
@@ -225,10 +386,10 @@ class DreamTab(QWidget):
         self.lambda_spin.setRange(0.0, 100.0)
         self.lambda_spin.setDecimals(6)
         self.lambda_spin.setSingleStep(0.01)
-        self.zeta_spin = QDoubleSpinBox()
+        self.zeta_spin = ScientificDoubleSpinBox()
         self.zeta_spin.setRange(0.0, 1.0)
-        self.zeta_spin.setDecimals(12)
-        self.zeta_spin.setSingleStep(0.000001)
+        self.zeta_spin.setDecimals(16)
+        self.zeta_spin.setSingleStep(1e-12)
         lambda_tip = "DREAM proposal step-size scaling factor (lambda)."
         lambda_label = QLabel("Lambda")
         self._set_widget_tooltip(
@@ -283,11 +444,24 @@ class DreamTab(QWidget):
 
         row += 1
         self.verbose_checkbox = QCheckBox("Verbose sampler output")
+        self.verbose_interval_spin = QDoubleSpinBox()
+        self.verbose_interval_spin.setRange(0.1, 30.0)
+        self.verbose_interval_spin.setDecimals(1)
+        self.verbose_interval_spin.setSingleStep(0.1)
+        self.verbose_checkbox.setChecked(True)
+        self.verbose_interval_spin.setValue(1.0)
         self.parallel_checkbox = QCheckBox("Run chains in parallel")
         self.adapt_checkbox = QCheckBox("Adapt crossover")
         self.restart_checkbox = QCheckBox("Restart previous run")
         self.verbose_checkbox.setToolTip(
             "Print DREAM sampler progress and status updates into the run output."
+        )
+        self.verbose_checkbox.toggled.connect(
+            lambda _checked: self._update_verbose_output_controls()
+        )
+        self.verbose_interval_spin.setToolTip(
+            "Minimum number of seconds between DREAM runtime output updates "
+            "shown in the UI while verbose sampler output is enabled."
         )
         self.parallel_checkbox.setToolTip(
             "Allow DREAM to execute its chains in parallel."
@@ -302,7 +476,13 @@ class DreamTab(QWidget):
         layout.addWidget(self.parallel_checkbox, row, 2, 1, 2)
 
         row += 1
-        layout.addWidget(self.adapt_checkbox, row, 0, 1, 2)
+        verbose_interval_label = QLabel("Verbose interval (s)")
+        verbose_interval_label.setToolTip(self.verbose_interval_spin.toolTip())
+        layout.addWidget(verbose_interval_label, row, 0)
+        layout.addWidget(self.verbose_interval_spin, row, 1)
+        layout.addWidget(self.adapt_checkbox, row, 2, 1, 2)
+
+        row += 1
         layout.addWidget(self.restart_checkbox, row, 2, 1, 2)
 
         row += 1
@@ -371,6 +551,171 @@ class DreamTab(QWidget):
         layout.addWidget(self.bestfit_method_combo, row, 1)
         layout.addWidget(violin_label, row, 2)
         layout.addWidget(self.violin_mode_combo, row, 3)
+
+        row += 1
+        self.weight_order_combo = QComboBox()
+        self.weight_order_combo.addItem("Weight Index", "weight_index")
+        self.weight_order_combo.addItem("Structure Order", "structure_order")
+        self.weight_order_combo.currentIndexChanged.connect(
+            lambda _index: self.visualization_settings_changed.emit()
+        )
+        weight_order_tip = (
+            "Choose whether weight parameters stay in their original w-index "
+            "order or are reordered by the same cluster-structure ordering "
+            "used in the Project Setup prior histograms."
+        )
+        weight_order_label = QLabel("Weight order")
+        self._set_widget_tooltip(
+            weight_order_label,
+            self.weight_order_combo,
+            weight_order_tip,
+        )
+        layout.addWidget(weight_order_label, row, 0)
+        layout.addWidget(self.weight_order_combo, row, 1, 1, 3)
+
+        row += 1
+        self.violin_value_scale_combo = QComboBox()
+        self.violin_value_scale_combo.addItem(
+            "Parameter Value", "parameter_value"
+        )
+        self.violin_value_scale_combo.addItem(
+            "Weights 0-1 Only", "weights_unit_interval"
+        )
+        self.violin_value_scale_combo.addItem(
+            "Normalized 0-1 (All)", "normalized_all"
+        )
+        self.violin_value_scale_combo.currentIndexChanged.connect(
+            lambda _index: self.visualization_settings_changed.emit()
+        )
+        value_scale_tip = (
+            "Choose whether the posterior violin plot uses native parameter "
+            "values, only the weight parameters on a 0-1 fraction scale, or "
+            "all parameters normalized independently onto a 0-1 axis."
+        )
+        value_scale_label = QLabel("Y-axis scale")
+        self._set_widget_tooltip(
+            value_scale_label,
+            self.violin_value_scale_combo,
+            value_scale_tip,
+        )
+        layout.addWidget(value_scale_label, row, 0)
+        layout.addWidget(self.violin_value_scale_combo, row, 1, 1, 3)
+
+        row += 1
+        self.violin_palette_combo = QComboBox()
+        for label, palette in [
+            ("Blues", "Blues"),
+            ("Viridis", "viridis"),
+            ("Plasma", "plasma"),
+            ("Magma", "magma"),
+            ("Inferno", "inferno"),
+            ("Cividis", "cividis"),
+            ("Turbo", "turbo"),
+            ("Cubehelix", "cubehelix"),
+            ("Coolwarm", "coolwarm"),
+            ("Set2", "Set2"),
+            ("Set3", "Set3"),
+            ("tab10", "tab10"),
+            ("tab20", "tab20"),
+            ("Custom Solid", "custom_solid"),
+        ]:
+            self.violin_palette_combo.addItem(label, palette)
+        self.violin_palette_combo.currentIndexChanged.connect(
+            self._on_violin_palette_changed
+        )
+        violin_palette_tip = (
+            "Choose the color palette used to fill the posterior violin "
+            "distributions."
+        )
+        violin_palette_label = QLabel("Violin palette")
+        self._set_widget_tooltip(
+            violin_palette_label,
+            self.violin_palette_combo,
+            violin_palette_tip,
+        )
+        point_color_tip = (
+            "Choose the color used for the selected best-fit scatter points "
+            "overlaid on the violin plot."
+        )
+        self.violin_point_color_button = QPushButton()
+        self.violin_point_color_button.clicked.connect(
+            self._choose_violin_point_color
+        )
+        self._configure_plot_color_button(
+            self.violin_point_color_button,
+            "tab:red",
+            label="Point",
+        )
+        point_color_label = QLabel("Point color")
+        self._set_widget_tooltip(
+            point_color_label,
+            self.violin_point_color_button,
+            point_color_tip,
+        )
+        layout.addWidget(violin_palette_label, row, 0)
+        layout.addWidget(self.violin_palette_combo, row, 1)
+        layout.addWidget(point_color_label, row, 2)
+        layout.addWidget(self.violin_point_color_button, row, 3)
+
+        row += 1
+        self.violin_custom_color_button = QPushButton()
+        self.violin_custom_color_button.clicked.connect(
+            self._choose_violin_custom_color
+        )
+        self._configure_plot_color_button(
+            self.violin_custom_color_button,
+            "#4c72b0",
+            label="Custom violin",
+        )
+        violin_custom_tip = (
+            "Choose the solid fill color used when the violin palette is "
+            "set to Custom Solid."
+        )
+        violin_custom_label = QLabel("Custom violin")
+        self._set_widget_tooltip(
+            violin_custom_label,
+            self.violin_custom_color_button,
+            violin_custom_tip,
+        )
+        self.interval_color_button = QPushButton()
+        self.interval_color_button.clicked.connect(self._choose_interval_color)
+        self._configure_plot_color_button(
+            self.interval_color_button,
+            "#8c8c8c",
+            label="Interval",
+        )
+        interval_color_tip = (
+            "Choose the color used for the posterior interval bars and "
+            "the violin whisker lines."
+        )
+        interval_color_label = QLabel("Interval color")
+        self._set_widget_tooltip(
+            interval_color_label,
+            self.interval_color_button,
+            interval_color_tip,
+        )
+        layout.addWidget(violin_custom_label, row, 0)
+        layout.addWidget(self.violin_custom_color_button, row, 1)
+        layout.addWidget(interval_color_label, row, 2)
+        layout.addWidget(self.interval_color_button, row, 3)
+
+        row += 1
+        self.median_color_button = QPushButton()
+        self.median_color_button.clicked.connect(self._choose_median_color)
+        self._configure_plot_color_button(
+            self.median_color_button,
+            "#4d4d4d",
+            label="Median",
+        )
+        median_color_tip = "Choose the color used for the violin median lines."
+        median_color_label = QLabel("Median color")
+        self._set_widget_tooltip(
+            median_color_label,
+            self.median_color_button,
+            median_color_tip,
+        )
+        layout.addWidget(median_color_label, row, 0)
+        layout.addWidget(self.median_color_button, row, 1)
 
         row += 1
         layout.addWidget(
@@ -454,6 +799,9 @@ class DreamTab(QWidget):
         action_sections_layout.addWidget(self.setup_actions_group)
         action_sections_layout.addWidget(self.analysis_actions_group)
         layout.addWidget(action_sections, row, 0, 1, 4)
+        self._set_combo_data(self.search_filter_preset_combo, "medium")
+        self._update_verbose_output_controls()
+        self._update_violin_style_controls()
         return group
 
     def _build_posterior_filter_group(self) -> QGroupBox:
@@ -495,6 +843,9 @@ class DreamTab(QWidget):
             "MAP Chain Only", "map_chain_only"
         )
         self.violin_sample_source_combo.currentIndexChanged.connect(
+            lambda _index: self._mark_search_filter_preset_custom()
+        )
+        self.violin_sample_source_combo.currentIndexChanged.connect(
             lambda _index: self.visualization_settings_changed.emit()
         )
         violin_source_tip = (
@@ -519,6 +870,9 @@ class DreamTab(QWidget):
         self.posterior_top_percent_spin.setSingleStep(1.0)
         self.posterior_top_percent_spin.setValue(10.0)
         self.posterior_top_percent_spin.valueChanged.connect(
+            lambda _value: self._mark_search_filter_preset_custom()
+        )
+        self.posterior_top_percent_spin.valueChanged.connect(
             lambda _value: self.visualization_settings_changed.emit()
         )
         top_percent_tip = (
@@ -535,6 +889,9 @@ class DreamTab(QWidget):
         self.posterior_top_n_spin = QSpinBox()
         self.posterior_top_n_spin.setRange(1, 10_000_000)
         self.posterior_top_n_spin.setValue(500)
+        self.posterior_top_n_spin.valueChanged.connect(
+            lambda _value: self._mark_search_filter_preset_custom()
+        )
         self.posterior_top_n_spin.valueChanged.connect(
             lambda _value: self.visualization_settings_changed.emit()
         )
@@ -635,17 +992,38 @@ class DreamTab(QWidget):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        layout.addWidget(self._build_model_plot_group(), stretch=1)
-        layout.addWidget(self._build_violin_plot_group(), stretch=1)
+        panel.setMinimumHeight(860)
+        self._plot_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._plot_splitter.setChildrenCollapsible(False)
+        self._plot_splitter.setHandleWidth(10)
+        self._plot_splitter.addWidget(self._build_model_plot_group())
+        self._plot_splitter.addWidget(self._build_violin_plot_group())
+        self._plot_splitter.setStretchFactor(0, 1)
+        self._plot_splitter.setStretchFactor(1, 1)
+        self._plot_splitter.setSizes([430, 430])
+        layout.addWidget(self._plot_splitter, stretch=1)
         return panel
 
     def _build_model_plot_group(self) -> QGroupBox:
         group = QGroupBox("DREAM Model vs Experimental")
         layout = QVBoxLayout(group)
+        controls = QHBoxLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.addStretch(1)
+        self.save_model_button = QPushButton("Save Model Fit Data")
+        self.save_model_button.setToolTip(
+            "Save the currently displayed DREAM model-vs-experimental fit "
+            "data to the project plots folder."
+        )
+        self.save_model_button.clicked.connect(
+            self.save_model_fit_requested.emit
+        )
+        controls.addWidget(self.save_model_button)
+        layout.addLayout(controls)
         self.model_figure = Figure(figsize=(8.0, 4.2))
         self.model_canvas = FigureCanvasQTAgg(self.model_figure)
         self.model_toolbar = NavigationToolbar2QT(self.model_canvas, self)
-        self.model_canvas.setMinimumHeight(240)
+        self.model_canvas.setMinimumHeight(320)
         layout.addWidget(self.model_toolbar)
         layout.addWidget(self.model_canvas)
         return group
@@ -653,10 +1031,23 @@ class DreamTab(QWidget):
     def _build_violin_plot_group(self) -> QGroupBox:
         group = QGroupBox("Posterior Violin Plot")
         layout = QVBoxLayout(group)
+        controls = QHBoxLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.addStretch(1)
+        self.save_violin_button = QPushButton("Save Violin Plot Data")
+        self.save_violin_button.setToolTip(
+            "Save the currently displayed posterior violin plot sample "
+            "data to the project plots folder."
+        )
+        self.save_violin_button.clicked.connect(
+            self.save_violin_data_requested.emit
+        )
+        controls.addWidget(self.save_violin_button)
+        layout.addLayout(controls)
         self.violin_figure = Figure(figsize=(8.0, 4.2))
         self.violin_canvas = FigureCanvasQTAgg(self.violin_figure)
         self.violin_toolbar = NavigationToolbar2QT(self.violin_canvas, self)
-        self.violin_canvas.setMinimumHeight(240)
+        self.violin_canvas.setMinimumHeight(320)
         layout.addWidget(self.violin_toolbar)
         layout.addWidget(self.violin_canvas)
         return group
@@ -716,6 +1107,7 @@ class DreamTab(QWidget):
         *,
         preset_name: str | None = None,
     ) -> None:
+        self._applying_search_filter_preset = True
         self.settings_preset_combo.blockSignals(True)
         self.settings_preset_combo.setCurrentText(
             preset_name or self.ACTIVE_SETTINGS_LABEL
@@ -738,7 +1130,14 @@ class DreamTab(QWidget):
         self.adapt_checkbox.setChecked(settings.adapt_crossover)
         self.restart_checkbox.setChecked(settings.restart)
         self._set_combo_data(
+            self.search_filter_preset_combo,
+            settings.search_filter_preset or "custom",
+        )
+        self._set_combo_data(
             self.bestfit_method_combo, settings.bestfit_method
+        )
+        self.verbose_interval_spin.setValue(
+            settings.verbose_output_interval_seconds
         )
         self._set_combo_data(
             self.posterior_filter_combo,
@@ -762,7 +1161,46 @@ class DreamTab(QWidget):
             self.violin_sample_source_combo,
             settings.violin_sample_source,
         )
+        self._set_combo_data(
+            self.weight_order_combo,
+            settings.violin_weight_order,
+        )
+        self._set_combo_data(
+            self.violin_value_scale_combo,
+            settings.violin_value_scale_mode,
+        )
+        self._configure_plot_color_button(
+            self.violin_custom_color_button,
+            settings.violin_custom_color,
+            label="Custom violin",
+        )
+        if not self._set_combo_data(
+            self.violin_palette_combo,
+            settings.violin_palette,
+        ):
+            self._set_combo_data(
+                self.violin_palette_combo,
+                "custom_solid",
+            )
+        self._configure_plot_color_button(
+            self.violin_point_color_button,
+            settings.violin_point_color,
+            label="Point",
+        )
+        self._configure_plot_color_button(
+            self.interval_color_button,
+            settings.violin_interval_color,
+            label="Interval",
+        )
+        self._configure_plot_color_button(
+            self.median_color_button,
+            settings.violin_median_color,
+            label="Median",
+        )
+        self._applying_search_filter_preset = False
+        self._update_violin_style_controls()
         self._update_posterior_filter_controls()
+        self._update_verbose_output_controls()
 
     def settings_payload(self) -> DreamRunSettings:
         return DreamRunSettings(
@@ -771,6 +1209,9 @@ class DreamTab(QWidget):
             burnin_percent=int(self.burnin_spin.value()),
             restart=bool(self.restart_checkbox.isChecked()),
             verbose=bool(self.verbose_checkbox.isChecked()),
+            verbose_output_interval_seconds=float(
+                self.verbose_interval_spin.value()
+            ),
             parallel=bool(self.parallel_checkbox.isChecked()),
             nseedchains=int(self.nseedchains_spin.value()),
             adapt_crossover=bool(self.adapt_checkbox.isChecked()),
@@ -782,6 +1223,7 @@ class DreamTab(QWidget):
             history_thin=int(self.history_thin_spin.value()),
             history_file=self.history_file_edit.text().strip() or None,
             model_name=self.model_name_edit.text().strip() or None,
+            search_filter_preset=self.selected_search_filter_preset(),
             bestfit_method=self.selected_bestfit_method(),
             posterior_filter_mode=self.selected_posterior_filter_mode(),
             posterior_top_percent=float(
@@ -796,6 +1238,13 @@ class DreamTab(QWidget):
             ),
             violin_parameter_mode=self.selected_violin_mode(),
             violin_sample_source=self.selected_violin_sample_source(),
+            violin_weight_order=self.selected_weight_order(),
+            violin_value_scale_mode=self.selected_violin_value_scale_mode(),
+            violin_palette=self.selected_violin_palette(),
+            violin_custom_color=self.selected_violin_custom_color(),
+            violin_point_color=self.selected_violin_point_color(),
+            violin_interval_color=self.selected_violin_interval_color(),
+            violin_median_color=self.selected_violin_median_color(),
         )
 
     def set_parameter_map_entries(self, entries) -> None:
@@ -846,6 +1295,9 @@ class DreamTab(QWidget):
     def selected_bestfit_method(self) -> str:
         return str(self.bestfit_method_combo.currentData() or "map")
 
+    def selected_search_filter_preset(self) -> str:
+        return str(self.search_filter_preset_combo.currentData() or "custom")
+
     def selected_posterior_filter_mode(self) -> str:
         return str(
             self.posterior_filter_combo.currentData() or "all_post_burnin"
@@ -862,20 +1314,78 @@ class DreamTab(QWidget):
             or "filtered_posterior"
         )
 
+    def selected_weight_order(self) -> str:
+        return str(self.weight_order_combo.currentData() or "weight_index")
+
+    def selected_violin_value_scale_mode(self) -> str:
+        return str(
+            self.violin_value_scale_combo.currentData() or "parameter_value"
+        )
+
+    def selected_violin_palette(self) -> str:
+        return str(self.violin_palette_combo.currentData() or "Blues")
+
+    def selected_violin_custom_color(self) -> str:
+        return self._plot_color_button_value(
+            self.violin_custom_color_button,
+            default="#4c72b0",
+        )
+
+    def selected_violin_point_color(self) -> str:
+        return self._plot_color_button_value(
+            self.violin_point_color_button,
+            default="tab:red",
+        )
+
+    def selected_violin_interval_color(self) -> str:
+        return self._plot_color_button_value(
+            self.interval_color_button,
+            default="#8c8c8c",
+        )
+
+    def selected_violin_median_color(self) -> str:
+        return self._plot_color_button_value(
+            self.median_color_button,
+            default="#4d4d4d",
+        )
+
+    def _update_verbose_output_controls(self) -> None:
+        self.verbose_interval_spin.setEnabled(
+            self.verbose_checkbox.isChecked()
+        )
+
     def append_log(self, message: str) -> None:
         stripped = message.strip()
         if stripped:
             self._history_messages.append(stripped)
+            self._live_output_history_index = None
         self._render_output(scroll_to_end=True)
 
     def set_log_text(self, text: str) -> None:
         self._base_log_text = text.strip()
         self._history_messages = []
+        self._live_output_history_index = None
         self._render_output()
 
     def set_summary_text(self, text: str) -> None:
         self._summary_text = text.strip()
         self._render_output()
+
+    def append_runtime_output(self, message: str) -> None:
+        stripped = message.rstrip()
+        if not stripped:
+            return
+        if self._live_output_history_index is None:
+            self._history_messages.append("DREAM Runtime Output\n" + stripped)
+            self._live_output_history_index = len(self._history_messages) - 1
+        else:
+            self._history_messages[self._live_output_history_index] += (
+                "\n" + stripped
+            )
+        self._render_output(scroll_to_end=True)
+
+    def finish_runtime_output(self) -> None:
+        self._live_output_history_index = None
 
     def clear_plots(self) -> None:
         self.plot_model_fit(None)
@@ -934,6 +1444,26 @@ class DreamTab(QWidget):
         axis.set_xlabel("q (Å⁻¹)")
         axis.set_ylabel("Intensity (arb. units)")
         axis.set_title(f"DREAM refinement: {plot_data.template_name}")
+        metric_lines = [
+            f"RMSE: {plot_data.rmse:.4g}",
+            f"Mean |res|: {plot_data.mean_abs_residual:.4g}",
+            f"R²: {plot_data.r_squared:.4g}",
+        ]
+        axis.text(
+            0.02,
+            0.02,
+            "\n".join(metric_lines),
+            transform=axis.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=9,
+            bbox={
+                "boxstyle": "round,pad=0.35",
+                "facecolor": "white",
+                "edgecolor": "0.6",
+                "alpha": 0.85,
+            },
+        )
         axis.legend(loc="best")
         self.model_figure.tight_layout()
         self.model_canvas.draw()
@@ -962,27 +1492,34 @@ class DreamTab(QWidget):
             self.violin_canvas.draw()
             return
 
-        positions = np.arange(1, len(violin_data.parameter_names) + 1)
-        samples = np.asarray(violin_data.samples, dtype=float)
-        axis.violinplot(samples, positions=positions, showmedians=True)
-
-        summary_lookup = {
-            name: index
-            for index, name in enumerate(summary.full_parameter_names)
-        }
-        selected_values = []
-        interval_low_values = []
-        interval_high_values = []
-        for name in violin_data.parameter_names:
-            index = summary_lookup[name]
-            selected_values.append(summary.bestfit_params[index])
-            interval_low_values.append(summary.interval_low_values[index])
-            interval_high_values.append(summary.interval_high_values[index])
+        payload = self.prepare_violin_plot_payload(summary, violin_data)
+        positions = np.arange(1, len(payload["display_names"]) + 1)
+        violin_parts = axis.violinplot(
+            payload["samples"],
+            positions=positions,
+            showmedians=True,
+        )
+        colors = self._violin_body_colors(len(payload["display_names"]))
+        for body, color in zip(violin_parts["bodies"], colors, strict=True):
+            body.set_facecolor(color)
+            body.set_edgecolor(color)
+            body.set_alpha(0.55)
+        interval_color = self.selected_violin_interval_color()
+        median_color = self.selected_violin_median_color()
+        for key in ("cbars", "cmins", "cmaxes"):
+            artist = violin_parts.get(key)
+            if artist is not None:
+                artist.set_color(interval_color)
+                artist.set_linewidth(1.2)
+        median_artist = violin_parts.get("cmedians")
+        if median_artist is not None:
+            median_artist.set_color(median_color)
+            median_artist.set_linewidth(1.4)
         axis.vlines(
             positions,
-            interval_low_values,
-            interval_high_values,
-            color="0.55",
+            payload["interval_low_values"],
+            payload["interval_high_values"],
+            color=interval_color,
             linewidth=1.8,
             label=(
                 f"p{summary.credible_interval_low:g}-"
@@ -991,23 +1528,147 @@ class DreamTab(QWidget):
         )
         axis.scatter(
             positions,
-            selected_values,
-            color="tab:red",
+            payload["selected_values"],
+            color=self.selected_violin_point_color(),
             s=18,
             zorder=3,
             label=f"Selected {summary.bestfit_method}",
         )
         axis.set_xticks(positions)
         axis.set_xticklabels(
-            violin_data.parameter_names,
+            payload["display_names"],
             rotation=45,
             ha="right",
         )
-        axis.set_ylabel("Parameter value")
-        axis.set_title("Posterior parameter distributions")
+        axis.set_ylabel(str(payload["ylabel"]))
+        axis.set_title(str(payload["title"]))
+        if payload["y_limits"] is not None:
+            axis.set_ylim(*payload["y_limits"])
         axis.legend(loc="best")
         self.violin_figure.tight_layout()
         self.violin_canvas.draw()
+
+    def prepare_violin_plot_payload(
+        self,
+        summary: DreamSummary,
+        violin_data: DreamViolinPlotData,
+    ) -> dict[str, object]:
+        samples = np.asarray(violin_data.samples, dtype=float)
+        if samples.ndim == 1:
+            samples = samples.reshape(1, -1)
+        summary_lookup = {
+            name: index
+            for index, name in enumerate(summary.full_parameter_names)
+        }
+        selected_values = np.asarray(
+            [
+                summary.bestfit_params[summary_lookup[name]]
+                for name in violin_data.parameter_names
+            ],
+            dtype=float,
+        )
+        interval_low_values = np.asarray(
+            [
+                summary.interval_low_values[summary_lookup[name]]
+                for name in violin_data.parameter_names
+            ],
+            dtype=float,
+        )
+        interval_high_values = np.asarray(
+            [
+                summary.interval_high_values[summary_lookup[name]]
+                for name in violin_data.parameter_names
+            ],
+            dtype=float,
+        )
+
+        value_scale_mode = self.selected_violin_value_scale_mode()
+        ylabel = "Parameter value"
+        title = "Posterior parameter distributions"
+        y_limits: tuple[float, float] | None = None
+        if value_scale_mode == "weights_unit_interval":
+            ylabel = "Weight fraction"
+            title = "Posterior weight distributions"
+            y_limits = (0.0, 1.0)
+        elif value_scale_mode == "normalized_all":
+            (
+                samples,
+                selected_values,
+                interval_low_values,
+                interval_high_values,
+            ) = self._normalize_violin_series(
+                samples,
+                selected_values,
+                interval_low_values,
+                interval_high_values,
+            )
+            ylabel = "Normalized parameter value"
+            title = "Posterior parameter distributions (normalized)"
+            y_limits = (0.0, 1.0)
+
+        return {
+            "display_names": list(violin_data.display_names),
+            "samples": samples,
+            "selected_values": selected_values,
+            "interval_low_values": interval_low_values,
+            "interval_high_values": interval_high_values,
+            "ylabel": ylabel,
+            "title": title,
+            "y_limits": y_limits,
+        }
+
+    def _violin_body_colors(self, count: int) -> list[tuple[float, ...]]:
+        palette = self.selected_violin_palette()
+        if palette == "custom_solid":
+            color = QColor(self.selected_violin_custom_color()).name()
+            return [
+                tuple(QColor(color).getRgbF()) for _ in range(max(count, 1))
+            ]
+        cmap = colormaps.get_cmap(palette)
+        if count <= 1:
+            return [tuple(cmap(0.6))]
+        positions = np.linspace(0.2, 0.85, count)
+        return [tuple(cmap(position)) for position in positions]
+
+    @staticmethod
+    def _normalize_violin_series(
+        samples: np.ndarray,
+        selected_values: np.ndarray,
+        interval_low_values: np.ndarray,
+        interval_high_values: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        mins = np.min(samples, axis=0)
+        maxs = np.max(samples, axis=0)
+        spans = maxs - mins
+        normalized_samples = np.empty_like(samples, dtype=float)
+        normalized_selected = np.empty_like(selected_values, dtype=float)
+        normalized_low = np.empty_like(interval_low_values, dtype=float)
+        normalized_high = np.empty_like(interval_high_values, dtype=float)
+        varying = spans > 0
+        if np.any(varying):
+            normalized_samples[:, varying] = (
+                samples[:, varying] - mins[varying]
+            ) / spans[varying]
+            normalized_selected[varying] = (
+                selected_values[varying] - mins[varying]
+            ) / spans[varying]
+            normalized_low[varying] = (
+                interval_low_values[varying] - mins[varying]
+            ) / spans[varying]
+            normalized_high[varying] = (
+                interval_high_values[varying] - mins[varying]
+            ) / spans[varying]
+        if np.any(~varying):
+            normalized_samples[:, ~varying] = 0.5
+            normalized_selected[~varying] = 0.5
+            normalized_low[~varying] = 0.5
+            normalized_high[~varying] = 0.5
+        return (
+            np.clip(normalized_samples, 0.0, 1.0),
+            np.clip(normalized_selected, 0.0, 1.0),
+            np.clip(normalized_low, 0.0, 1.0),
+            np.clip(normalized_high, 0.0, 1.0),
+        )
 
     def blink_edit_priors_button(self) -> None:
         self._start_button_blink(self.edit_button)
@@ -1096,9 +1757,125 @@ class DreamTab(QWidget):
         if selected:
             self.history_file_edit.setText(selected)
 
+    def _on_violin_palette_changed(self, _index: int) -> None:
+        self._update_violin_style_controls()
+        self.visualization_settings_changed.emit()
+
+    def _update_violin_style_controls(self) -> None:
+        self.violin_custom_color_button.setEnabled(
+            self.selected_violin_palette() == "custom_solid"
+        )
+
+    def _choose_violin_custom_color(self) -> None:
+        self._choose_plot_color(
+            self.violin_custom_color_button,
+            title="Choose custom violin color",
+            label="Custom violin",
+            default="#4c72b0",
+        )
+
+    def _choose_violin_point_color(self) -> None:
+        self._choose_plot_color(
+            self.violin_point_color_button,
+            title="Choose point color",
+            label="Point",
+            default="tab:red",
+        )
+
+    def _choose_interval_color(self) -> None:
+        self._choose_plot_color(
+            self.interval_color_button,
+            title="Choose interval color",
+            label="Interval",
+            default="#8c8c8c",
+        )
+
+    def _choose_median_color(self) -> None:
+        self._choose_plot_color(
+            self.median_color_button,
+            title="Choose median color",
+            label="Median",
+            default="#4d4d4d",
+        )
+
+    def _choose_plot_color(
+        self,
+        button: QPushButton,
+        *,
+        title: str,
+        label: str,
+        default: str,
+    ) -> None:
+        current_color = self._plot_color_button_value(
+            button,
+            default=default,
+        )
+        chosen = QColorDialog.getColor(
+            QColor(current_color),
+            self,
+            title,
+        )
+        if not chosen.isValid():
+            return
+        self._configure_plot_color_button(
+            button,
+            chosen.name(),
+            label=label,
+        )
+        self.visualization_settings_changed.emit()
+
     def _on_posterior_filter_mode_changed(self, _index: int) -> None:
+        self._mark_search_filter_preset_custom()
         self._update_posterior_filter_controls()
         self.visualization_settings_changed.emit()
+
+    def _on_search_filter_preset_changed(self, _index: int) -> None:
+        if self._applying_search_filter_preset:
+            return
+        preset_name = self.selected_search_filter_preset()
+        if preset_name == "custom":
+            return
+        self._apply_search_filter_preset(preset_name)
+
+    def _apply_search_filter_preset(self, preset_name: str) -> None:
+        preset = DREAM_SEARCH_FILTER_PRESETS.get(preset_name)
+        if preset is None:
+            return
+        self._applying_search_filter_preset = True
+        try:
+            self.chains_spin.setValue(int(preset["nchains"]))
+            self.iterations_spin.setValue(int(preset["niterations"]))
+            self.burnin_spin.setValue(int(preset["burnin_percent"]))
+            self.nseedchains_spin.setValue(int(preset["nseedchains"]))
+            self.crossover_burnin_spin.setValue(
+                int(preset["crossover_burnin"])
+            )
+            self._set_combo_data(
+                self.posterior_filter_combo,
+                str(preset["posterior_filter_mode"]),
+            )
+            self.posterior_top_percent_spin.setValue(
+                float(preset["posterior_top_percent"])
+            )
+            self.posterior_top_n_spin.setValue(int(preset["posterior_top_n"]))
+            self._set_combo_data(
+                self.violin_sample_source_combo,
+                str(preset["violin_sample_source"]),
+            )
+            self._set_combo_data(self.search_filter_preset_combo, preset_name)
+            self._update_posterior_filter_controls()
+        finally:
+            self._applying_search_filter_preset = False
+        self.visualization_settings_changed.emit()
+
+    def _mark_search_filter_preset_custom(self) -> None:
+        if self._applying_search_filter_preset:
+            return
+        self._applying_search_filter_preset = True
+        try:
+            self._set_combo_data(self.search_filter_preset_combo, "custom")
+        finally:
+            self._applying_search_filter_preset = False
 
     def _update_posterior_filter_controls(self) -> None:
         mode = self.selected_posterior_filter_mode()
@@ -1126,8 +1903,53 @@ class DreamTab(QWidget):
         widget.setToolTip(tooltip)
 
     @staticmethod
-    def _set_combo_data(combo: QComboBox, value: str) -> None:
+    def _set_combo_data(combo: QComboBox, value: str) -> bool:
         for index in range(combo.count()):
             if str(combo.itemData(index) or "") == value:
                 combo.setCurrentIndex(index)
-                return
+                return True
+        return False
+
+    @staticmethod
+    def _configure_plot_color_button(
+        button: QPushButton,
+        color: str,
+        *,
+        label: str,
+    ) -> None:
+        normalized = DreamTab._normalize_plot_color(color)
+        qcolor = QColor(normalized)
+        foreground = "#ffffff"
+        if qcolor.isValid() and qcolor.lightness() > 128:
+            foreground = "#000000"
+        button.setText(normalized)
+        button.setToolTip(f"{label} color: {normalized}")
+        button.setMinimumWidth(88)
+        button.setStyleSheet(
+            "QPushButton {"
+            f"background-color: {normalized};"
+            f"color: {foreground};"
+            "border: 1px solid #666666;"
+            "padding: 2px 8px;"
+            "}"
+        )
+
+    @staticmethod
+    def _plot_color_button_value(
+        button: QPushButton,
+        *,
+        default: str,
+    ) -> str:
+        text = button.text().strip()
+        return DreamTab._normalize_plot_color(text or default)
+
+    @staticmethod
+    def _normalize_plot_color(color: str) -> str:
+        normalized = str(color).strip() or "#000000"
+        qcolor = QColor(normalized)
+        if qcolor.isValid():
+            return qcolor.name()
+        try:
+            return str(to_hex(normalized))
+        except ValueError:
+            return "#000000"

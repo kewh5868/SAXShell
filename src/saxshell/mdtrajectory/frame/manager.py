@@ -24,6 +24,7 @@ class FrameSelectionPreview:
     stop: int | None
     stride: int
     min_time_fs: float | None
+    post_cutoff_stride: int | None
     first_frame_index: int | None
     last_frame_index: int | None
     first_time_fs: float | None
@@ -81,6 +82,7 @@ class TrajectoryManager:
         stop: int | None = None,
         stride: int = 1,
         min_time_fs: float | None = None,
+        post_cutoff_stride: int = 1,
     ) -> list[FrameRecord]:
         if self.frames is None:
             self.load_frames()
@@ -96,6 +98,7 @@ class TrajectoryManager:
             stop=stop,
             stride=stride,
             min_time_fs=min_time_fs,
+            post_cutoff_stride=post_cutoff_stride,
         )
 
     def preview_selection(
@@ -104,6 +107,7 @@ class TrajectoryManager:
         stop: int | None = None,
         stride: int = 1,
         min_time_fs: float | None = None,
+        post_cutoff_stride: int = 1,
     ) -> FrameSelectionPreview:
         if self.frames is None:
             self.load_frames()
@@ -114,6 +118,7 @@ class TrajectoryManager:
             stop=stop,
             stride=stride,
             min_time_fs=min_time_fs,
+            post_cutoff_stride=post_cutoff_stride,
         )
         selected_times = [
             frame.time_fs
@@ -128,6 +133,9 @@ class TrajectoryManager:
             stop=stop,
             stride=stride,
             min_time_fs=min_time_fs,
+            post_cutoff_stride=(
+                post_cutoff_stride if min_time_fs is not None else None
+            ),
             first_frame_index=(
                 selected_frames[0].frame_index if selected_frames else None
             ),
@@ -148,12 +156,14 @@ class TrajectoryManager:
         stop: int | None = None,
         stride: int = 1,
         min_time_fs: float | None = None,
+        post_cutoff_stride: int = 1,
     ) -> list[Path]:
         frames = self.get_selected_frames(
             start=start,
             stop=stop,
             stride=stride,
             min_time_fs=min_time_fs,
+            post_cutoff_stride=post_cutoff_stride,
         )
 
         if not frames:
@@ -256,6 +266,7 @@ class CP2KFrameExtractionWorkflow:
         stop: int | None = None,
         stride: int = 1,
         use_selected_cutoff: bool = False,
+        post_cutoff_stride: int = 1,
     ) -> list[Path]:
         min_time_fs = self.selected_cutoff_fs if use_selected_cutoff else None
         return self.trajectory.export_frames(
@@ -264,4 +275,5 @@ class CP2KFrameExtractionWorkflow:
             stop=stop,
             stride=stride,
             min_time_fs=min_time_fs,
+            post_cutoff_stride=post_cutoff_stride,
         )

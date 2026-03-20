@@ -64,11 +64,12 @@ def lmfit_model_profile(q, solvent_data, model_data, **params):
 
 def log_likelihood_monosq(params):
     """Compute the legacy monodisperse SAXS log-likelihood."""
-    weights = params[:-4]
-    solv_w = params[-4]
-    offset = params[-3]
-    eff_r = params[-2]
-    vol_frac = params[-1]
+    weights = params[:-5]
+    solv_w = params[-5]
+    offset = params[-4]
+    eff_r = params[-3]
+    vol_frac = params[-2]
+    scale = params[-1]
 
     global q_values, experimental_intensities
     global theoretical_intensities, solvent_intensities
@@ -85,7 +86,7 @@ def log_likelihood_monosq(params):
         eff_r, vol_frac, q_values
     )
     model_intensity += solv_w * solvent_intensities
-    model_intensity = model_intensity * 1e-10 + offset
+    model_intensity = model_intensity * scale + offset
 
     return np.sum(
         norm.logpdf(
@@ -98,11 +99,12 @@ def log_likelihood_monosq(params):
 
 def compute_model_profile(params):
     """Return the model intensity and q grid for a parameter vector."""
-    weights = params[:-4]
-    solv_w = params[-4]
-    offset = params[-3]
-    eff_r = params[-2]
-    vol_frac = params[-1]
+    weights = params[:-5]
+    solv_w = params[-5]
+    offset = params[-4]
+    eff_r = params[-3]
+    vol_frac = params[-2]
+    scale = params[-1]
 
     global q_values, theoretical_intensities, solvent_intensities
     try:
@@ -118,5 +120,5 @@ def compute_model_profile(params):
         eff_r, vol_frac, q_values
     )
     iq_intensity += solv_w * solvent_intensities
-    iq_intensity = iq_intensity * 1e-10 + offset
+    iq_intensity = iq_intensity * scale + offset
     return iq_intensity, q_values

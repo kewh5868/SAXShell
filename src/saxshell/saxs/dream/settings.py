@@ -12,6 +12,7 @@ class DreamRunSettings:
     burnin_percent: int = 20
     restart: bool = False
     verbose: bool = True
+    verbose_output_interval_seconds: float = 1.0
     parallel: bool = True
     nseedchains: int = 40
     adapt_crossover: bool = True
@@ -24,6 +25,7 @@ class DreamRunSettings:
     history_file: str | None = None
     model_name: str | None = None
     run_label: str = "dream"
+    search_filter_preset: str = "medium"
     bestfit_method: str = "map"
     posterior_filter_mode: str = "all_post_burnin"
     posterior_top_percent: float = 10.0
@@ -32,6 +34,13 @@ class DreamRunSettings:
     credible_interval_high: float = 84.0
     violin_parameter_mode: str = "varying_parameters"
     violin_sample_source: str = "filtered_posterior"
+    violin_weight_order: str = "weight_index"
+    violin_value_scale_mode: str = "parameter_value"
+    violin_palette: str = "Blues"
+    violin_custom_color: str = "#4c72b0"
+    violin_point_color: str = "tab:red"
+    violin_interval_color: str = "#8c8c8c"
+    violin_median_color: str = "#4d4d4d"
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -62,6 +71,18 @@ class DreamRunSettings:
             ),
             verbose=_coerce_bool(
                 _get_first(payload, "verbose", "Verbose", default=True)
+            ),
+            verbose_output_interval_seconds=max(
+                float(
+                    _get_first(
+                        payload,
+                        "verbose_output_interval_seconds",
+                        "verbose_output_interval_s",
+                        "Verbose Output Interval (s)",
+                        default=1.0,
+                    )
+                ),
+                0.1,
             ),
             parallel=_coerce_bool(
                 _get_first(payload, "parallel", "Parallel", default=True)
@@ -109,6 +130,13 @@ class DreamRunSettings:
                 else None
             ),
             run_label=str(payload.get("run_label", "dream")),
+            search_filter_preset=str(
+                _get_first(
+                    payload,
+                    "search_filter_preset",
+                    default="medium",
+                )
+            ),
             bestfit_method=str(
                 _get_first(
                     payload,
@@ -163,6 +191,55 @@ class DreamRunSettings:
                     payload,
                     "violin_sample_source",
                     default="filtered_posterior",
+                )
+            ),
+            violin_weight_order=str(
+                _get_first(
+                    payload,
+                    "violin_weight_order",
+                    default="weight_index",
+                )
+            ),
+            violin_value_scale_mode=str(
+                _get_first(
+                    payload,
+                    "violin_value_scale_mode",
+                    default="parameter_value",
+                )
+            ),
+            violin_palette=str(
+                _get_first(
+                    payload,
+                    "violin_palette",
+                    default="Blues",
+                )
+            ),
+            violin_custom_color=str(
+                _get_first(
+                    payload,
+                    "violin_custom_color",
+                    default="#4c72b0",
+                )
+            ),
+            violin_point_color=str(
+                _get_first(
+                    payload,
+                    "violin_point_color",
+                    default="tab:red",
+                )
+            ),
+            violin_interval_color=str(
+                _get_first(
+                    payload,
+                    "violin_interval_color",
+                    default="#8c8c8c",
+                )
+            ),
+            violin_median_color=str(
+                _get_first(
+                    payload,
+                    "violin_median_color",
+                    default="#4d4d4d",
                 )
             ),
         )

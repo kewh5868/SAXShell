@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSpinBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -53,10 +54,32 @@ class ExportPanel(QGroupBox):
             "Only export frames at or after the currently selected cutoff "
             "time."
         )
-        self.use_cutoff_box.toggled.connect(
-            lambda _checked: self.settings_changed.emit()
-        )
+        self.use_cutoff_box.toggled.connect(self._handle_use_cutoff_toggled)
         form.addRow("", self.use_cutoff_box)
+
+        self.post_cutoff_stride_box = QCheckBox(
+            "After cutoff, keep every Nth frame"
+        )
+        self.post_cutoff_stride_box.setToolTip(
+            "After the selected cutoff time is applied, keep every Nth "
+            "remaining frame instead of exporting them all."
+        )
+        self.post_cutoff_stride_box.toggled.connect(
+            self._handle_post_cutoff_stride_toggled
+        )
+        form.addRow("", self.post_cutoff_stride_box)
+
+        self.post_cutoff_stride_spin = QSpinBox()
+        self.post_cutoff_stride_spin.setRange(1, 10**9)
+        self.post_cutoff_stride_spin.setValue(1)
+        self.post_cutoff_stride_spin.setToolTip(
+            "Keep every Nth frame after applying the selected cutoff."
+        )
+        self.post_cutoff_stride_spin.valueChanged.connect(
+            lambda _value: self.settings_changed.emit()
+        )
+        form.addRow("Cutoff frame interval", self.post_cutoff_stride_spin)
+        self._update_post_cutoff_stride_controls()
 
         layout.addLayout(form)
 
@@ -126,6 +149,15 @@ class ExportPanel(QGroupBox):
     def use_cutoff(self) -> bool:
         return self.use_cutoff_box.isChecked()
 
+    def use_post_cutoff_stride(self) -> bool:
+        return (
+            self.use_cutoff_box.isChecked()
+            and self.post_cutoff_stride_box.isChecked()
+        )
+
+    def get_post_cutoff_stride(self) -> int:
+        return self.post_cutoff_stride_spin.value()
+
     def set_selection_summary(self, text: str) -> None:
         self.selection_box.setPlainText(text)
 
@@ -138,3 +170,18 @@ class ExportPanel(QGroupBox):
             self.log_box.setPlainText(text)
             return
         self.log_box.setPlainText(f"{current}\n{text}")
+
+    def _handle_use_cutoff_toggled(self, _checked: bool) -> None:
+        self._update_post_cutoff_stride_controls()
+        self.settings_changed.emit()
+
+    def _handle_post_cutoff_stride_toggled(self, _checked: bool) -> None:
+        self._update_post_cutoff_stride_controls()
+        self.settings_changed.emit()
+
+    def _update_post_cutoff_stride_controls(self) -> None:
+        cutoff_enabled = self.use_cutoff_box.isChecked()
+        self.post_cutoff_stride_box.setEnabled(cutoff_enabled)
+        self.post_cutoff_stride_spin.setEnabled(
+            cutoff_enabled and self.post_cutoff_stride_box.isChecked()
+        )
