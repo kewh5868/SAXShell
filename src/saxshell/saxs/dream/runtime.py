@@ -4,7 +4,10 @@ import importlib.util
 import json
 import re
 import shutil
+import subprocess
 import sys
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -39,11 +42,24 @@ class DreamRunBundle:
 class SAXSDreamWorkflow:
     """Create and manage SAXS DREAM runtime bundles."""
 
-    def __init__(self, project_dir: str | Path) -> None:
+    def __init__(
+        self,
+        project_dir: str | Path,
+        *,
+        template_dir: str | Path | None = None,
+    ) -> None:
         self.project_manager = SAXSProjectManager()
         self.settings = self.project_manager.load_project(project_dir)
         self.paths = build_project_paths(self.settings.project_dir)
-        self.prefit_workflow = SAXSPrefitWorkflow(self.paths.project_dir)
+        self.template_dir = (
+            Path(template_dir).expanduser().resolve()
+            if template_dir is not None
+            else None
+        )
+        self.prefit_workflow = SAXSPrefitWorkflow(
+            self.paths.project_dir,
+            template_dir=self.template_dir,
+        )
         self.dream_settings_path = self.paths.dream_dir / "pd_settings.json"
         self.parameter_map_path = self.paths.dream_dir / "pd_param_map.json"
         self.settings_presets_dir = self.paths.dream_dir / "settings_presets"
@@ -186,19 +202,76 @@ class SAXSDreamWorkflow:
             parameter_map_path=parameter_map_path,
         )
 
-    def run_bundle(self, bundle: DreamRunBundle) -> dict[str, object]:
-        module_name, module, added_sys_path = self._load_runtime_module(bundle)
-        try:
-            if not hasattr(module, "run_sampler"):
-                raise AttributeError(
-                    "Generated DREAM runtime script does not define run_sampler()."
+    def run_bundle(
+        self,
+        bundle: DreamRunBundle,
+        *,
+        output_callback: Callable[[str], None] | None = None,
+        output_interval_seconds: float | None = None,
+    ) -> dict[str, object]:
+        captured_lines: list[str] = []
+        buffered_lines: list[str] = []
+        emit_interval = (
+            None
+            if output_interval_seconds is None
+            else max(float(output_interval_seconds), 0.0)
+        )
+        last_emit_time = time.monotonic()
+
+        def emit_buffered_output(*, force: bool = False) -> None:
+            nonlocal last_emit_time
+            if output_callback is None or not buffered_lines:
+                return
+            now = time.monotonic()
+            if not force and emit_interval is not None and emit_interval > 0:
+                if (now - last_emit_time) < emit_interval:
+                    return
+            output_callback("\n".join(buffered_lines))
+            buffered_lines.clear()
+            last_emit_time = now
+
+        with subprocess.Popen(
+            [sys.executable, str(bundle.runtime_script_path)],
+            cwd=str(bundle.run_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        ) as process:
+            if process.stdout is not None:
+                for raw_line in process.stdout:
+                    line = raw_line.rstrip()
+                    if not line:
+                        continue
+                    captured_lines.append(line)
+                    if output_callback is not None:
+                        if emit_interval is None or emit_interval <= 0:
+                            output_callback(line)
+                        else:
+                            buffered_lines.append(line)
+                            emit_buffered_output()
+            returncode = process.wait()
+        emit_buffered_output(force=True)
+        if returncode != 0:
+            details = "\n".join(captured_lines)
+            raise RuntimeError(
+                details
+                or (
+                    "DREAM runtime bundle failed with exit code "
+                    f"{returncode}."
                 )
-            return module.run_sampler()
-        finally:
-            self._unload_runtime_module(
-                module_name,
-                added_sys_path=added_sys_path,
             )
+        sampled_params_path = bundle.run_dir / "dream_sampled_params.npy"
+        log_ps_path = bundle.run_dir / "dream_log_ps.npy"
+        if not sampled_params_path.is_file() or not log_ps_path.is_file():
+            raise FileNotFoundError(
+                "DREAM runtime bundle finished without writing the expected "
+                "sample output files."
+            )
+        return {
+            "sampled_params_path": str(sampled_params_path),
+            "log_ps_path": str(log_ps_path),
+        }
 
     def _load_runtime_module(
         self,
@@ -355,6 +428,9 @@ class SAXSDreamWorkflow:
         return f"""from __future__ import annotations
 
 import json
+import multiprocessing as mp
+import os
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -362,9 +438,12 @@ from scipy import stats
 
 try:
     from pydream.core import run_dream
+    from pydream.Dream import Dream as _PyDreamDream, Dream_shared_vars
     from pydream.parameters import SampledParam
 except ImportError:
     run_dream = None
+    _PyDreamDream = None
+    Dream_shared_vars = None
     SampledParam = None
 
 
@@ -393,6 +472,199 @@ solvent_intensities = np.asarray(
     RUNTIME_METADATA["solvent_intensities"],
     dtype=float,
 )
+
+warnings.filterwarnings(
+    "ignore",
+    message=r".*'where' used without 'out'.*memory in output.*",
+    category=UserWarning,
+    module=r"pydream\\.Dream",
+)
+
+
+def _coerce_runtime_scalar(value):
+    array_value = np.asarray(value)
+    if array_value.ndim == 0:
+        return array_value.item()
+    flat_value = array_value.reshape(-1)
+    if flat_value.size != 1:
+        raise ValueError(
+            "Expected a single DREAM selector value, got "
+            f"shape {{array_value.shape}}."
+        )
+    return flat_value[0].item()
+
+
+def _choose_runtime_index(probabilities):
+    draws = np.random.multinomial(1, np.asarray(probabilities, dtype=float))
+    matches = np.flatnonzero(draws)
+    if matches.size != 1:
+        raise RuntimeError(
+            "Unable to choose a unique DREAM selector index from "
+            f"probabilities={{probabilities!r}}."
+        )
+    return int(matches[0])
+
+
+def _apply_pydream_numpy_compatibility():
+    if _PyDreamDream is None or Dream_shared_vars is None:
+        return
+    if getattr(_PyDreamDream, "_saxshell_numpy_compatibility", False):
+        return
+
+    def _patched_set_snooker(self):
+        if self.snooker == 0:
+            return False
+        return _choose_runtime_index([self.snooker, 1 - self.snooker]) == 0
+
+    def _patched_set_CR(self, CR_probs, CR_vals):
+        return _coerce_runtime_scalar(
+            np.asarray(CR_vals)[_choose_runtime_index(CR_probs)]
+        )
+
+    def _patched_set_gamma_level(self, gamma_level_probs, gamma_level_vals):
+        return int(
+            _coerce_runtime_scalar(
+                np.asarray(gamma_level_vals)[
+                    _choose_runtime_index(gamma_level_probs)
+                ]
+            )
+        )
+
+    def _patched_set_gamma(
+        self,
+        DEpairs,
+        snooker_choice,
+        gamma_level_choice,
+        d_prime,
+    ):
+        if snooker_choice:
+            return np.random.uniform(1.2, 2.2)
+        gamma_unity = _choose_runtime_index(
+            [self.p_gamma_unity, 1 - self.p_gamma_unity]
+        )
+        if gamma_unity == 0:
+            return 1.0
+        gamma_level_index = int(_coerce_runtime_scalar(gamma_level_choice)) - 1
+        depairs_index = int(_coerce_runtime_scalar(DEpairs)) - 1
+        d_prime_index = int(_coerce_runtime_scalar(d_prime)) - 1
+        return self.gamma_arr[gamma_level_index][depairs_index][d_prime_index]
+
+    def _patched_estimate_crossover_probabilities(self, ndim, q0, q_new, CR):
+        cross_probs = Dream_shared_vars.cross_probs[0:self.nCR]
+        cr_value = float(_coerce_runtime_scalar(CR))
+        matches = np.flatnonzero(
+            np.asarray(self.CR_values, dtype=float) == cr_value
+        )
+        if matches.size != 1:
+            raise ValueError(
+                "Unable to match DREAM crossover value "
+                f"{{cr_value}} in {{self.CR_values!r}}."
+            )
+        m_loc = int(matches[0])
+
+        Dream_shared_vars.ncr_updates[m_loc] += 1
+
+        current_positions = np.frombuffer(
+            Dream_shared_vars.current_positions.get_obj()
+        )
+        current_positions = current_positions.reshape((self.nchains, ndim))
+
+        sd_by_dim = np.std(current_positions, axis=0)
+        sd_by_dim[sd_by_dim == 0] = 1e-12
+
+        change = np.nan_to_num(np.sum(((q_new - q0) / sd_by_dim) ** 2))
+        Dream_shared_vars.delta_m[m_loc] = (
+            Dream_shared_vars.delta_m[m_loc] + change
+        )
+
+        delta_ms = np.array(Dream_shared_vars.delta_m[0:self.nCR])
+        ncr_updates = np.array(Dream_shared_vars.ncr_updates[0:self.nCR])
+
+        if np.all(delta_ms != 0):
+            for m in range(self.nCR):
+                cross_probs[m] = (
+                    Dream_shared_vars.delta_m[m]
+                    / ncr_updates[m]
+                ) * self.nchains
+            cross_probs = cross_probs / np.sum(cross_probs)
+
+        Dream_shared_vars.cross_probs[0:self.nCR] = cross_probs
+        self.CR_probabilities = cross_probs
+        return cross_probs
+
+    def _patched_estimate_gamma_level_probs(
+        self,
+        ndim,
+        q0,
+        q_new,
+        gamma_level,
+    ):
+        current_positions = np.frombuffer(
+            Dream_shared_vars.current_positions.get_obj()
+        )
+        current_positions = current_positions.reshape((self.nchains, ndim))
+
+        sd_by_dim = np.std(current_positions, axis=0)
+        gamma_level_probs = Dream_shared_vars.gamma_level_probs[0:self.ngamma]
+
+        gamma_value = int(_coerce_runtime_scalar(gamma_level))
+        matches = np.flatnonzero(
+            np.asarray(self.gamma_level_values, dtype=int) == gamma_value
+        )
+        if matches.size != 1:
+            raise ValueError(
+                "Unable to match DREAM gamma level "
+                f"{{gamma_value}} in {{self.gamma_level_values!r}}."
+            )
+        gamma_loc = int(matches[0])
+
+        Dream_shared_vars.ngamma_updates[gamma_loc] += 1
+        Dream_shared_vars.delta_m_gamma[gamma_loc] = (
+            Dream_shared_vars.delta_m_gamma[gamma_loc]
+            + np.nan_to_num(np.sum(((q_new - q0) / sd_by_dim) ** 2))
+        )
+
+        delta_ms_gamma = np.array(Dream_shared_vars.delta_m_gamma[0:self.ngamma])
+        if np.all(delta_ms_gamma != 0):
+            for m in range(self.ngamma):
+                gamma_level_probs[m] = (
+                    Dream_shared_vars.delta_m_gamma[m]
+                    / Dream_shared_vars.ngamma_updates[m]
+                ) * self.nchains
+            gamma_level_probs = gamma_level_probs / np.sum(gamma_level_probs)
+
+        Dream_shared_vars.gamma_level_probs[0:self.ngamma] = gamma_level_probs
+        return gamma_level_probs
+
+    _PyDreamDream.set_snooker = _patched_set_snooker
+    _PyDreamDream.set_CR = _patched_set_CR
+    _PyDreamDream.set_gamma_level = _patched_set_gamma_level
+    _PyDreamDream.set_gamma = _patched_set_gamma
+    _PyDreamDream.estimate_crossover_probabilities = (
+        _patched_estimate_crossover_probabilities
+    )
+    _PyDreamDream.estimate_gamma_level_probs = (
+        _patched_estimate_gamma_level_probs
+    )
+    _PyDreamDream._saxshell_numpy_compatibility = True
+
+
+_apply_pydream_numpy_compatibility()
+
+
+def _build_runtime_mp_context():
+    # pyDREAM always uses multiprocessing for chain execution. On macOS the
+    # default "spawn" context can miss the live Dream monkeypatches that make
+    # crossover adaptation NumPy-safe, so prefer a fork-based context when the
+    # platform supports it.
+    if os.name == "nt":
+        return None
+    for method_name in ("fork", "forkserver"):
+        try:
+            return mp.get_context(method_name)
+        except ValueError:
+            continue
+    return None
 
 
 {template_source}
@@ -451,11 +723,18 @@ def run_sampler():
             "pydream is not installed. Install pydream to run this bundle."
         )
     sampled_parameters = build_sampled_parameters()
+    mp_context = _build_runtime_mp_context()
     sampled_params, log_ps = run_dream(
         parameters=sampled_parameters,
         likelihood=active_log_likelihood,
         nchains=int(SETTINGS["nchains"]),
         niterations=int(SETTINGS["niterations"]),
+        burnin=int(  # codespell:ignore burnin
+            int(SETTINGS["niterations"])
+            * float(SETTINGS["burnin_percent"])
+            / 100
+        ),
+        mp_context=mp_context,
         restart=bool(SETTINGS["restart"]),
         verbose=bool(SETTINGS["verbose"]),
         parallel=bool(SETTINGS["parallel"]),

@@ -10,6 +10,7 @@ from saxshell.saxs._model_templates import (
     load_template_module,
     load_template_spec,
 )
+from saxshell.saxs.stoichiometry import stoich_sort_key
 
 
 @dataclass(slots=True)
@@ -40,15 +41,20 @@ class DreamModelPlotData:
     model_intensities: np.ndarray
     bestfit_method: str
     template_name: str
+    rmse: float
+    mean_abs_residual: float
+    r_squared: float
 
 
 @dataclass(slots=True)
 class DreamViolinPlotData:
     parameter_names: list[str]
+    display_names: list[str]
     samples: np.ndarray
     mode: str
     sample_source: str
     sample_count: int
+    weight_order: str
 
 
 @dataclass(slots=True)
@@ -114,6 +120,9 @@ class SAXSDreamResultsLoader:
         self.active_entries = list(
             self.metadata.get("active_parameter_entries", [])
         )
+        self.parameter_map_entries = list(
+            self.metadata.get("parameter_map", [])
+        )
         self.active_parameter_names = [
             str(entry.get("param", "")) for entry in self.active_entries
         ]
@@ -140,6 +149,7 @@ class SAXSDreamResultsLoader:
         self._posterior_view_cache: dict[
             tuple[object, ...], _PosteriorView
         ] = {}
+        self._parameter_entry_lookup = self._build_parameter_entry_lookup()
         self._apply_burnin()
 
     def _apply_burnin(self) -> None:
@@ -233,12 +243,31 @@ class SAXSDreamResultsLoader:
             ),
             dtype=float,
         )
+        residuals = np.asarray(
+            model_intensities - self.experimental_intensities,
+            dtype=float,
+        )
+        rmse = float(np.sqrt(np.mean(residuals**2)))
+        mean_abs_residual = float(np.mean(np.abs(residuals)))
+        experimental_mean = float(np.mean(self.experimental_intensities))
+        total_sum_squares = float(
+            np.sum((self.experimental_intensities - experimental_mean) ** 2)
+        )
+        residual_sum_squares = float(np.sum(residuals**2))
+        r_squared = (
+            float(1.0 - (residual_sum_squares / total_sum_squares))
+            if total_sum_squares > 0.0
+            else 1.0
+        )
         return DreamModelPlotData(
             q_values=self.q_values,
             experimental_intensities=self.experimental_intensities,
             model_intensities=model_intensities,
             bestfit_method=bestfit_method,
             template_name=self.template_name,
+            rmse=rmse,
+            mean_abs_residual=mean_abs_residual,
+            r_squared=r_squared,
         )
 
     def build_violin_data(
@@ -251,6 +280,7 @@ class SAXSDreamResultsLoader:
         credible_interval_low: float = 16.0,
         credible_interval_high: float = 84.0,
         sample_source: str = "filtered_posterior",
+        weight_order: str = "weight_index",
     ) -> DreamViolinPlotData:
         view = self._posterior_view(
             filter_mode=posterior_filter_mode,
@@ -288,12 +318,21 @@ class SAXSDreamResultsLoader:
                     "'varying_parameters', 'all_parameters', "
                     "'weights_only', or 'fit_parameters'."
                 )
+        names, samples = self._ordered_violin_columns(
+            names,
+            samples,
+            weight_order=weight_order,
+        )
         return DreamViolinPlotData(
             parameter_names=names,
+            display_names=[
+                self._parameter_display_name(name) for name in names
+            ],
             samples=np.asarray(samples, dtype=float),
             mode=mode,
             sample_source=sample_source,
             sample_count=int(np.asarray(samples).shape[0]),
+            weight_order=weight_order,
         )
 
     def save_statistics_report(
@@ -587,6 +626,83 @@ class SAXSDreamResultsLoader:
         if not indices:
             return names, np.zeros((full_samples.shape[0], 0), dtype=float)
         return names, full_samples[:, indices]
+
+    def _ordered_violin_columns(
+        self,
+        parameter_names: list[str],
+        sample_matrix: np.ndarray,
+        *,
+        weight_order: str,
+    ) -> tuple[list[str], np.ndarray]:
+        if weight_order != "structure_order":
+            return parameter_names, np.asarray(sample_matrix, dtype=float)
+
+        samples = np.asarray(sample_matrix, dtype=float)
+        if samples.ndim == 1:
+            samples = samples.reshape(1, -1)
+        if not parameter_names or samples.shape[1] == 0:
+            return parameter_names, samples
+
+        weight_positions = [
+            index
+            for index, name in enumerate(parameter_names)
+            if name.startswith("w")
+        ]
+        if len(weight_positions) <= 1:
+            return parameter_names, samples
+
+        ordered_weight_positions = sorted(
+            weight_positions,
+            key=lambda index: self._weight_parameter_sort_key(
+                parameter_names[index],
+                index,
+            ),
+        )
+        reordered_indices = list(range(len(parameter_names)))
+        for target_position, source_position in zip(
+            weight_positions,
+            ordered_weight_positions,
+            strict=True,
+        ):
+            reordered_indices[target_position] = source_position
+        ordered_names = [parameter_names[index] for index in reordered_indices]
+        return ordered_names, samples[:, reordered_indices]
+
+    def _weight_parameter_sort_key(
+        self,
+        parameter_name: str,
+        original_index: int,
+    ) -> tuple[object, ...]:
+        entry = self._parameter_entry_lookup.get(parameter_name, {})
+        structure = str(entry.get("structure", "")).strip()
+        motif = str(entry.get("motif", "")).strip()
+        return (
+            stoich_sort_key(structure) if structure else (9, parameter_name),
+            motif,
+            parameter_name,
+            int(original_index),
+        )
+
+    def _parameter_display_name(self, parameter_name: str) -> str:
+        if not parameter_name.startswith("w"):
+            return parameter_name
+        entry = self._parameter_entry_lookup.get(parameter_name, {})
+        structure = str(entry.get("structure", "")).strip()
+        if not structure:
+            return parameter_name
+        return f"{parameter_name} ({structure})"
+
+    def _build_parameter_entry_lookup(self) -> dict[str, dict[str, object]]:
+        lookup: dict[str, dict[str, object]] = {}
+        for entry in self.parameter_map_entries:
+            name = str(entry.get("param", "")).strip()
+            if name and name not in lookup:
+                lookup[name] = dict(entry)
+        for entry in self.active_entries:
+            name = str(entry.get("param", "")).strip()
+            if name and name not in lookup:
+                lookup[name] = dict(entry)
+        return lookup
 
     @staticmethod
     def _normalize_sampled_params(

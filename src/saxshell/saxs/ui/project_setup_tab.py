@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from textwrap import fill
 
 import numpy as np
 from matplotlib.backends.backend_qtagg import (
@@ -120,8 +121,9 @@ class ProjectSetupTab(QWidget):
         right_layout.setSpacing(12)
         self.component_group = self._build_component_group()
         self.prior_group = self._build_prior_group()
-        right_layout.addWidget(self.component_group, stretch=1)
-        right_layout.addWidget(self.prior_group, stretch=1)
+        right_layout.addWidget(self.component_group)
+        right_layout.addWidget(self.prior_group)
+        right_layout.addStretch(1)
 
         self._left_scroll_area = self._wrap_pane_in_scroll_area(left)
         self._right_scroll_area = self._wrap_pane_in_scroll_area(right)
@@ -425,6 +427,10 @@ class ProjectSetupTab(QWidget):
 
     def _build_component_group(self) -> QGroupBox:
         group = QGroupBox("Experimental Data and SAXS Components")
+        group.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Minimum,
+        )
         layout = QVBoxLayout(group)
 
         controls = QHBoxLayout()
@@ -475,6 +481,10 @@ class ProjectSetupTab(QWidget):
 
     def _build_prior_group(self) -> QGroupBox:
         group = QGroupBox("Prior Histograms")
+        group.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Minimum,
+        )
         layout = QVBoxLayout(group)
 
         controls = QHBoxLayout()
@@ -1015,10 +1025,16 @@ class ProjectSetupTab(QWidget):
             axis.text(
                 0.5,
                 0.5,
-                "Select experimental data and build SAXS components to preview "
-                "the experimental range and averaged cluster profiles.",
+                fill(
+                    "Select experimental data and build SAXS components "
+                    "to preview the experimental range and averaged "
+                    "cluster profiles.",
+                    width=42,
+                ),
                 ha="center",
                 va="center",
+                transform=axis.transAxes,
+                wrap=True,
             )
             axis.set_axis_off()
             self._update_component_table_visuals()

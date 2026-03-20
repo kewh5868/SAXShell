@@ -15,6 +15,7 @@ from .bondanalyzer import (
     BondAnalyzer,
     BondPairDefinition,
 )
+from .results import RESULTS_INDEX_FILENAME
 
 ProgressCallback = Callable[[int, int, str], None]
 LogCallback = Callable[[str], None]
@@ -62,7 +63,12 @@ class BondAnalysisBatchResult:
     selected_cluster_types: tuple[str, ...]
     total_structure_files: int
     cluster_results: list[BondAnalysisClusterResult]
-    manifest_path: Path
+    results_index_path: Path
+
+    @property
+    def manifest_path(self) -> Path:
+        """Backward-compatible alias for older callers."""
+        return self.results_index_path
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -70,7 +76,7 @@ class BondAnalysisBatchResult:
             "output_dir": str(self.output_dir),
             "selected_cluster_types": list(self.selected_cluster_types),
             "total_structure_files": self.total_structure_files,
-            "manifest_path": str(self.manifest_path),
+            "results_index_path": str(self.results_index_path),
             "cluster_results": [
                 result.to_dict() for result in self.cluster_results
             ],
@@ -333,8 +339,8 @@ class BondAnalysisWorkflow:
             comparison_angles,
         )
 
-        manifest_path = output_dir / "bondanalysis_manifest.json"
-        manifest_path.write_text(
+        results_index_path = output_dir / RESULTS_INDEX_FILENAME
+        results_index_path.write_text(
             json.dumps(
                 {
                     "clusters_dir": str(self.clusters_dir),
@@ -362,7 +368,10 @@ class BondAnalysisWorkflow:
         )
 
         if log_callback is not None:
-            log_callback(f"Wrote bond-analysis manifest to {manifest_path}.")
+            log_callback(
+                "Wrote bond-analysis results index to "
+                f"{results_index_path}."
+            )
 
         return BondAnalysisBatchResult(
             clusters_dir=self.clusters_dir,
@@ -372,7 +381,7 @@ class BondAnalysisWorkflow:
             ),
             total_structure_files=total_files,
             cluster_results=cluster_results,
-            manifest_path=manifest_path,
+            results_index_path=results_index_path,
         )
 
     def _selected_cluster_summaries(self) -> list[ClusterTypeSummary]:

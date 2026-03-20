@@ -40,23 +40,36 @@ def default_template_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
-def list_template_specs() -> list[TemplateSpec]:
+def _normalize_template_dir(template_dir: str | Path | None) -> Path:
+    if template_dir is None:
+        return default_template_dir()
+    return Path(template_dir).expanduser().resolve()
+
+
+def list_template_specs(
+    template_dir: str | Path | None = None,
+) -> list[TemplateSpec]:
+    resolved_dir = _normalize_template_dir(template_dir)
     return [
-        load_template_spec(path.stem)
-        for path in sorted(default_template_dir().glob("*.py"))
+        load_template_spec(path.stem, resolved_dir)
+        for path in sorted(resolved_dir.glob("*.py"))
         if path.name != "__init__.py"
     ]
 
 
 @lru_cache(maxsize=None)
-def load_template_spec(template_name: str) -> TemplateSpec:
-    module_path = default_template_dir() / f"{template_name}.py"
+def load_template_spec(
+    template_name: str,
+    template_dir: str | Path | None = None,
+) -> TemplateSpec:
+    resolved_dir = _normalize_template_dir(template_dir)
+    module_path = resolved_dir / f"{template_name}.py"
     if not module_path.is_file():
         raise FileNotFoundError(
             f"Unknown SAXS model template: {template_name}"
         )
     directives = _parse_directives(module_path)
-    metadata_path = default_template_dir() / f"{template_name}.json"
+    metadata_path = resolved_dir / f"{template_name}.json"
     metadata = _load_template_metadata(metadata_path, template_name)
     return TemplateSpec(
         name=template_name,
@@ -74,10 +87,17 @@ def load_template_spec(template_name: str) -> TemplateSpec:
 
 
 @lru_cache(maxsize=None)
-def load_template_module(template_name: str) -> ModuleType:
-    spec = load_template_spec(template_name)
+def load_template_module(
+    template_name: str,
+    template_dir: str | Path | None = None,
+) -> ModuleType:
+    resolved_dir = _normalize_template_dir(template_dir)
+    spec = load_template_spec(template_name, resolved_dir)
     import_spec = importlib.util.spec_from_file_location(
-        f"saxshell.saxs._model_templates.{template_name}",
+        (
+            "saxshell.saxs._model_templates."
+            f"{resolved_dir.name}.{template_name}"
+        ),
         spec.module_path,
     )
     if import_spec is None or import_spec.loader is None:
@@ -87,6 +107,11 @@ def load_template_module(template_name: str) -> ModuleType:
     module = importlib.util.module_from_spec(import_spec)
     import_spec.loader.exec_module(module)
     return module
+
+
+def clear_template_caches() -> None:
+    load_template_spec.cache_clear()
+    load_template_module.cache_clear()
 
 
 def _parse_directives(module_path: Path) -> dict[str, str]:
@@ -199,6 +224,7 @@ __all__ = [
     "TemplateSpec",
     "default_template_dir",
     "list_template_specs",
+    "clear_template_caches",
     "load_template_module",
     "load_template_spec",
 ]

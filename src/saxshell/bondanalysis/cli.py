@@ -139,7 +139,7 @@ def _handle_run(args: argparse.Namespace) -> int:
         f"Output directory: {result.output_dir}",
         "Selected cluster types: " + ", ".join(result.selected_cluster_types),
         f"Structure files processed: {result.total_structure_files}",
-        f"Manifest file: {result.manifest_path}",
+        f"Results index file: {result.results_index_path}",
     ]
     for cluster_result in result.cluster_results:
         bond_total = sum(cluster_result.bond_value_counts.values())

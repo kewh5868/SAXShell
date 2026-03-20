@@ -135,6 +135,7 @@ class SAXSPrefitWorkflow:
         project_dir: str | Path,
         *,
         template_name: str | None = None,
+        template_dir: str | Path | None = None,
     ) -> None:
         self.project_manager = SAXSProjectManager()
         self.settings = self.project_manager.load_project(project_dir)
@@ -142,8 +143,16 @@ class SAXSPrefitWorkflow:
         self.experimental_data = self.project_manager.load_experimental_data(
             self.settings
         )
+        self.template_dir = (
+            Path(template_dir).expanduser().resolve()
+            if template_dir is not None
+            else None
+        )
         self.template_spec = self._resolve_template_spec(template_name)
-        self.template_module = load_template_module(self.template_spec.name)
+        self.template_module = load_template_module(
+            self.template_spec.name,
+            self.template_dir,
+        )
         self.component_map_path = self.paths.project_dir / "md_saxs_map.json"
         self.prior_weights_path = (
             self.paths.project_dir / "md_prior_weights.json"
@@ -157,8 +166,10 @@ class SAXSPrefitWorkflow:
         self.parameter_entries = self.load_parameter_entries()
 
     @staticmethod
-    def available_templates() -> list[TemplateSpec]:
-        return list_template_specs()
+    def available_templates(
+        template_dir: str | Path | None = None,
+    ) -> list[TemplateSpec]:
+        return list_template_specs(template_dir)
 
     def load_parameter_entries(self) -> list[PrefitParameterEntry]:
         best_entries = self.load_best_prefit_entries()
@@ -458,7 +469,10 @@ class SAXSPrefitWorkflow:
 
     def set_template(self, template_name: str) -> None:
         self.template_spec = self._resolve_template_spec(template_name)
-        self.template_module = load_template_module(self.template_spec.name)
+        self.template_module = load_template_module(
+            self.template_spec.name,
+            self.template_dir,
+        )
         self.settings.selected_model_template = self.template_spec.name
         self._template_default_entries = (
             self._build_default_parameter_entries()
@@ -844,7 +858,7 @@ class SAXSPrefitWorkflow:
         )
         self.settings.selected_model_template = selected
         self.project_manager.save_project(self.settings)
-        return load_template_spec(selected)
+        return load_template_spec(selected, self.template_dir)
 
     def _default_template_name(self) -> str:
         templates = self.available_templates()

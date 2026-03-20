@@ -1,17 +1,28 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 import os
 import pickle
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from matplotlib import colormaps
+from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.colors import to_hex
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QApplication, QHeaderView, QMessageBox
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFileDialog,
+    QHeaderView,
+    QInputDialog,
+    QMessageBox,
+)
 
 import saxshell.saxs.project_manager.project as project_module
 from saxshell.saxs._model_templates import (
@@ -20,6 +31,7 @@ from saxshell.saxs._model_templates import (
 )
 from saxshell.saxs.dream import (
     DreamParameterEntry,
+    DreamRunSettings,
     SAXSDreamResultsLoader,
     SAXSDreamWorkflow,
 )
@@ -39,6 +51,7 @@ from saxshell.saxs.ui.experimental_data_loader import (
 from saxshell.saxs.ui.main_window import RuntimeBundleOpener, SAXSMainWindow
 from saxshell.saxs.ui.prior_histogram_window import PriorHistogramWindow
 from saxshell.saxs.ui.project_setup_tab import ProjectSetupTab
+from saxshell.version import __version__
 
 
 def _write_component_file(path, q_values, intensities):
@@ -153,6 +166,117 @@ def _write_minimal_dream_results(project_dir):
     return bundle
 
 
+def _write_weight_order_dream_results(tmp_path):
+    run_dir = tmp_path / "dream_order_test"
+    run_dir.mkdir(parents=True)
+    metadata = {
+        "settings": {"burnin_percent": 0},
+        "template_name": "template_pd_likelihood_monosq_decoupled",
+        "parameter_map": [
+            {
+                "structure": "PbI2O",
+                "motif": "m3",
+                "param_type": "Both",
+                "param": "w2",
+                "value": 0.25,
+                "vary": True,
+                "distribution": "lognorm",
+                "dist_params": {"loc": 0.0, "scale": 0.25, "s": 0.1},
+            },
+            {
+                "structure": "I2",
+                "motif": "m1",
+                "param_type": "Both",
+                "param": "w0",
+                "value": 0.35,
+                "vary": True,
+                "distribution": "lognorm",
+                "dist_params": {"loc": 0.0, "scale": 0.35, "s": 0.1},
+            },
+            {
+                "structure": "Pb2",
+                "motif": "m2",
+                "param_type": "Both",
+                "param": "w1",
+                "value": 0.4,
+                "vary": True,
+                "distribution": "lognorm",
+                "dist_params": {"loc": 0.0, "scale": 0.4, "s": 0.1},
+            },
+            {
+                "structure": "",
+                "motif": "",
+                "param_type": "SAXS",
+                "param": "scale",
+                "value": 1.0,
+                "vary": False,
+                "distribution": "norm",
+                "dist_params": {"loc": 1.0, "scale": 0.1},
+            },
+        ],
+        "active_parameter_entries": [
+            {
+                "structure": "PbI2O",
+                "motif": "m3",
+                "param_type": "Both",
+                "param": "w2",
+                "value": 0.25,
+                "vary": True,
+                "distribution": "lognorm",
+                "dist_params": {"loc": 0.0, "scale": 0.25, "s": 0.1},
+            },
+            {
+                "structure": "I2",
+                "motif": "m1",
+                "param_type": "Both",
+                "param": "w0",
+                "value": 0.35,
+                "vary": True,
+                "distribution": "lognorm",
+                "dist_params": {"loc": 0.0, "scale": 0.35, "s": 0.1},
+            },
+            {
+                "structure": "Pb2",
+                "motif": "m2",
+                "param_type": "Both",
+                "param": "w1",
+                "value": 0.4,
+                "vary": True,
+                "distribution": "lognorm",
+                "dist_params": {"loc": 0.0, "scale": 0.4, "s": 0.1},
+            },
+        ],
+        "active_parameter_indices": [0, 1, 2],
+        "full_parameter_names": ["w2", "w0", "w1", "scale"],
+        "fixed_parameter_values": [0.25, 0.35, 0.4, 1.0],
+        "q_values": [0.1, 0.2],
+        "experimental_intensities": [1.0, 0.8],
+        "theoretical_intensities": [[1.0, 0.9]],
+        "solvent_intensities": [0.0, 0.0],
+    }
+    (run_dir / "dream_runtime_metadata.json").write_text(
+        json.dumps(metadata, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    np.save(
+        run_dir / "dream_sampled_params.npy",
+        np.asarray(
+            [
+                [
+                    [0.25, 0.35, 0.40],
+                    [0.26, 0.34, 0.41],
+                ]
+            ],
+            dtype=float,
+        ),
+    )
+    np.save(
+        run_dir / "dream_log_ps.npy",
+        np.asarray([[1.0, 2.0]], dtype=float),
+    )
+    return run_dir
+
+
 @pytest.fixture(scope="module")
 def qapp():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -251,11 +375,161 @@ def test_saxs_main_window_loads_project_prefit_and_dream_tabs(qapp, tmp_path):
     assert "DREAM Console" in window.dream_tab.output_box.toPlainText()
 
 
+def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert window.file_menu.title() == "File"
+    assert window.create_project_action.text() == "Create Project"
+    assert window.open_project_action.text() == "Open Existing Project..."
+    assert window.open_recent_menu.title() == "Open Recent Project"
+    assert window.save_project_action.text() == "Save Project"
+    assert window.save_project_action.shortcuts()
+    assert window.save_project_as_action.text() == "Save Project As..."
+
+    assert window.tools_menu.title() == "Tools"
+    assert window.mdtrajectory_action.text() == "Open mdtrajectory"
+    assert window.cluster_action.text() == "Open Cluster Extraction"
+    assert window.xyz2pdb_action.text() == "Open xyz2pdb Conversion"
+    assert window.bondanalysis_action.text() == "Open Bond Analysis"
+
+    assert window.settings_menu.title() == "Settings"
+    assert (
+        window.dream_output_settings_action.text()
+        == "DREAM Output Settings..."
+    )
+
+    assert window.help_menu.title() == "Help"
+    assert window.version_info_action.text() == "Version Information"
+    assert window.github_action.text() == "Open GitHub Repository"
+    assert window.contact_action.text() == "Contact Developer"
+
+    version_text = window._version_information_text()
+    assert __version__
+    assert "Package version:" in version_text
+    assert "GitHub repository:" in version_text
+    assert "Developer contact:" in version_text
+    assert "keith.white@colorado.edu" in version_text
+
+
+def test_contact_action_opens_developer_contact_window(qapp, monkeypatch):
+    del qapp
+    window = SAXSMainWindow()
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.main_window.QMessageBox.information",
+        lambda parent, title, message: captured.update(
+            {
+                "title": title,
+                "message": message,
+            }
+        ),
+    )
+
+    window._show_contact_information()
+
+    assert captured["title"] == "Developer Contact"
+    assert "contact the developer" in captured["message"].lower()
+    assert "keith.white@colorado.edu" in captured["message"]
+
+
+def test_bondanalysis_tool_uses_active_project_clusters_dir(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    launched: dict[str, object] = {}
+
+    class FakeBondAnalysisWindow:
+        def __init__(self, initial_clusters_dir=None):
+            launched["clusters_dir"] = initial_clusters_dir
+            launched["instance"] = self
+
+        def show(self):
+            launched["shown"] = True
+
+        def raise_(self):
+            launched["raised"] = True
+
+    monkeypatch.setattr(
+        "saxshell.bondanalysis.ui.main_window.BondAnalysisMainWindow",
+        FakeBondAnalysisWindow,
+    )
+
+    window._open_bondanalysis_tool()
+
+    assert launched["clusters_dir"] == window.current_settings.clusters_dir
+    assert launched["shown"] is True
+    assert launched["raised"] is True
+    assert launched["instance"] in window._child_tool_windows
+
+
+def test_save_project_as_copies_project_and_rewrites_internal_paths(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    destination_parent = tmp_path / "copied_projects"
+    destination_parent.mkdir()
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getExistingDirectory",
+        lambda *args, **kwargs: str(destination_parent),
+    )
+    monkeypatch.setattr(
+        QInputDialog,
+        "getText",
+        lambda *args, **kwargs: ("renamed_project", True),
+    )
+
+    window.save_project_as()
+
+    copied_dir = destination_parent / "renamed_project"
+    copied_settings = SAXSProjectManager().load_project(copied_dir)
+
+    assert copied_dir.is_dir()
+    assert copied_settings.project_name == "renamed_project"
+    assert copied_settings.project_dir == str(copied_dir.resolve())
+    assert copied_settings.copied_experimental_data_file == str(
+        (copied_dir / "experimental_data" / "exp_demo.txt").resolve()
+    )
+    assert copied_settings.experimental_data_path == str(
+        (copied_dir / "experimental_data" / "exp_demo.txt").resolve()
+    )
+    assert window.current_settings is not None
+    assert window.current_settings.project_dir == str(copied_dir.resolve())
+
+
 def test_prefit_layout_uses_left_parameter_panel_and_combined_output(qapp):
     del qapp
     window = SAXSMainWindow()
 
     assert window.prefit_tab.parameter_table.parentWidget() is not None
+    assert window.prefit_tab._scroll_area.widget() is not None
+    assert window.prefit_tab._scroll_area.widgetResizable()
+    assert window.prefit_tab._main_splitter.count() == 2
+    assert (
+        window.prefit_tab._main_splitter.widget(0)
+        is window.prefit_tab._pane_splitter
+    )
+    assert (
+        window.prefit_tab._main_splitter.widget(1)
+        is window.prefit_tab._output_group
+    )
+    assert window.prefit_tab._pane_splitter.count() == 2
+    assert (
+        window.prefit_tab._pane_splitter.widget(0)
+        is window.prefit_tab._left_panel
+    )
+    assert (
+        window.prefit_tab._pane_splitter.widget(1)
+        is window.prefit_tab._plot_group
+    )
     assert window.prefit_tab.output_box is window.prefit_tab.log_box
     assert window.prefit_tab.output_box is window.prefit_tab.summary_box
     assert window.prefit_tab.update_button.parentWidget() is not None
@@ -271,10 +545,49 @@ def test_dream_layout_uses_combined_output_and_two_plot_panels(qapp):
     del qapp
     window = SAXSMainWindow()
 
+    assert window.dream_tab._outer_scroll_area.widget() is not None
+    assert window.dream_tab._outer_scroll_area.widgetResizable()
     assert window.dream_tab.output_box is window.dream_tab.log_box
     assert window.dream_tab.output_box is window.dream_tab.summary_box
+    assert window.dream_tab._main_splitter is window.dream_tab._top_splitter
+    assert window.dream_tab._main_splitter.count() == 2
+    assert window.dream_tab.verbose_checkbox.isChecked()
+    assert window.dream_tab.verbose_interval_spin.value() == pytest.approx(1.0)
+    assert window.dream_tab.verbose_interval_spin.isEnabled()
+    assert window.dream_tab.selected_search_filter_preset() == "medium"
+    assert window.dream_tab.chains_spin.value() == 4
+    assert window.dream_tab.iterations_spin.value() == 10000
+    assert window.dream_tab.burnin_spin.value() == 20
+    assert window.dream_tab.history_thin_spin.value() == 10
+    assert window.dream_tab.nseedchains_spin.value() == 40
+    assert window.dream_tab.lambda_spin.value() == pytest.approx(0.05)
+    assert window.dream_tab.zeta_spin.value() == pytest.approx(1e-12)
+    assert window.dream_tab.snooker_spin.value() == pytest.approx(0.1)
+    assert window.dream_tab.p_gamma_unity_spin.value() == pytest.approx(0.2)
+    assert (
+        window.dream_tab._main_splitter.widget(0)
+        is window.dream_tab._settings_scroll_area
+    )
+    assert (
+        window.dream_tab._main_splitter.widget(1)
+        is window.dream_tab._plot_scroll_area
+    )
+    assert (
+        window.dream_tab._plot_scroll_area.widget()
+        is window.dream_tab._plot_panel
+    )
+    assert window.dream_tab._plot_splitter.count() == 2
+    assert window.dream_tab._output_group.parentWidget() is not None
     assert window.dream_tab.model_canvas is not None
     assert window.dream_tab.violin_canvas is not None
+    assert (
+        window.dream_tab._plot_splitter.widget(0)
+        is window.dream_tab.model_canvas.parentWidget()
+    )
+    assert (
+        window.dream_tab._plot_splitter.widget(1)
+        is window.dream_tab.violin_canvas.parentWidget()
+    )
     assert (
         window.dream_tab.posterior_filter_combo.currentData()
         == "all_post_burnin"
@@ -285,6 +598,18 @@ def test_dream_layout_uses_combined_output_and_two_plot_panels(qapp):
         window.dream_tab.violin_sample_source_combo.currentData()
         == "filtered_posterior"
     )
+    assert window.dream_tab.weight_order_combo.currentData() == "weight_index"
+    assert (
+        window.dream_tab.violin_value_scale_combo.currentData()
+        == "parameter_value"
+    )
+    assert window.dream_tab.violin_palette_combo.currentData() == "Blues"
+    assert window.dream_tab.selected_violin_point_color() == to_hex(
+        "tab:red",
+        keep_alpha=False,
+    )
+    assert not window.dream_tab.violin_custom_color_button.isEnabled()
+    assert window.dream_tab.violin_point_color_button.isEnabled()
     assert (
         "highest-log-posterior samples"
         in window.dream_tab.posterior_top_percent_spin.toolTip()
@@ -301,10 +626,90 @@ def test_dream_layout_uses_combined_output_and_two_plot_panels(qapp):
     assert window.dream_tab.run_button.parentWidget() is not None
     assert window.dream_tab.load_button.parentWidget() is not None
     assert window.dream_tab.report_button.parentWidget() is not None
+    assert window.dream_tab.save_model_button.parentWidget() is not None
+    assert window.dream_tab.save_violin_button.parentWidget() is not None
     assert window.dream_tab.setup_actions_group.title() == "DREAM Setup"
     assert window.dream_tab.analysis_actions_group.title() == (
         "DREAM Analysis"
     )
+
+
+def test_dream_zeta_spin_uses_scientific_notation(qapp):
+    del qapp
+    window = SAXSMainWindow()
+
+    window.dream_tab.set_settings(DreamRunSettings(zeta=1e-12))
+
+    assert "e" in window.dream_tab.zeta_spin.text().lower()
+    assert window.dream_tab.zeta_spin.text().lower().endswith("e-12")
+    assert window.dream_tab.settings_payload().zeta == pytest.approx(1e-12)
+
+
+def test_apply_dream_output_settings_updates_verbose_controls(qapp):
+    del qapp
+    window = SAXSMainWindow()
+
+    window._apply_dream_output_settings(verbose=False, interval_seconds=2.5)
+
+    assert not window.dream_tab.verbose_checkbox.isChecked()
+    assert window.dream_tab.verbose_interval_spin.value() == pytest.approx(2.5)
+    assert not window.dream_tab.verbose_interval_spin.isEnabled()
+    assert "Updated DREAM output settings." in (
+        window.dream_tab.output_box.toPlainText()
+    )
+
+
+def test_dream_search_filter_presets_update_and_fall_back_to_custom(qapp):
+    del qapp
+    window = SAXSMainWindow()
+
+    aggressive_index = window.dream_tab.search_filter_preset_combo.findData(
+        "more_aggressive"
+    )
+    window.dream_tab.search_filter_preset_combo.setCurrentIndex(
+        aggressive_index
+    )
+
+    assert (
+        window.dream_tab.selected_search_filter_preset() == "more_aggressive"
+    )
+    assert window.dream_tab.chains_spin.value() == 8
+    assert window.dream_tab.iterations_spin.value() == 20000
+    assert window.dream_tab.burnin_spin.value() == 25
+    assert window.dream_tab.posterior_filter_combo.currentData() == (
+        "top_percent_logp"
+    )
+    assert (
+        window.dream_tab.posterior_top_percent_spin.value()
+        == pytest.approx(5.0)
+    )
+
+    window.dream_tab.iterations_spin.setValue(21000)
+
+    assert window.dream_tab.selected_search_filter_preset() == "custom"
+
+
+def test_main_window_ui_scale_updates_fonts_and_minimum_sizes(qapp):
+    del qapp
+    window = SAXSMainWindow()
+
+    base_font_size = window.font().pointSizeF()
+    base_output_height = window.prefit_tab.output_box.minimumHeight()
+    base_handle_width = window.dream_tab._top_splitter.handleWidth()
+
+    window._set_ui_scale(1.2)
+
+    assert window._ui_scale == 1.2
+    assert window.font().pointSizeF() > base_font_size
+    assert window.prefit_tab.output_box.minimumHeight() > base_output_height
+    assert window.dream_tab._top_splitter.handleWidth() > base_handle_width
+
+    window._reset_ui_scale()
+
+    assert window._ui_scale == 1.0
+    assert window.font().pointSizeF() == pytest.approx(base_font_size)
+    assert window.prefit_tab.output_box.minimumHeight() == base_output_height
+    assert window.dream_tab._top_splitter.handleWidth() == base_handle_width
 
 
 def test_dream_blink_highlight_does_not_override_button_stylesheet(qapp):
@@ -538,6 +943,22 @@ def test_template_dropdowns_use_display_names_and_tooltips(qapp):
     assert tab.selected_template_name() == basic_spec.name
 
 
+def test_project_setup_empty_preview_message_is_wrapped(qapp):
+    del qapp
+    tab = ProjectSetupTab()
+    tab.draw_component_plot(None)
+
+    preview_axis = tab.component_figure.axes[0]
+    text_labels = [text.get_text() for text in preview_axis.texts]
+
+    assert any(
+        "Select experimental data and build SAXS" in label
+        and "averaged cluster profiles." in label
+        and "\n" in label
+        for label in text_labels
+    )
+
+
 def test_run_dream_requires_parameter_map_saved_in_session(
     qapp, tmp_path, monkeypatch
 ):
@@ -737,8 +1158,19 @@ def test_run_dream_shows_progress_and_popup_can_be_closed(
     window._save_distribution_entries(entries)
     window.write_dream_bundle()
 
-    def _fake_run_bundle(self, bundle):
+    def _fake_run_bundle(
+        self,
+        bundle,
+        *,
+        output_callback=None,
+        output_interval_seconds=None,
+    ):
+        del output_interval_seconds
+        if output_callback is not None:
+            output_callback("DREAM sampler: initialization complete")
         time.sleep(0.15)
+        if output_callback is not None:
+            output_callback("DREAM sampler: collecting posterior samples")
         metadata = json.loads(bundle.metadata_path.read_text(encoding="utf-8"))
         active_count = len(metadata["active_parameter_entries"])
         active_values = np.asarray(
@@ -788,6 +1220,21 @@ def test_run_dream_shows_progress_and_popup_can_be_closed(
     assert window._dream_progress_dialog is not None
     assert window._dream_progress_dialog.isVisible()
 
+    deadline = time.time() + 2.0
+    while (
+        "DREAM sampler: initialization complete"
+        not in window.dream_tab.output_box.toPlainText()
+        and time.time() < deadline
+    ):
+        QApplication.processEvents()
+        time.sleep(0.02)
+
+    assert "DREAM Runtime Output" in window.dream_tab.output_box.toPlainText()
+    assert (
+        "DREAM sampler: initialization complete"
+        in window.dream_tab.output_box.toPlainText()
+    )
+
     window._dream_progress_dialog.close()
     QApplication.processEvents()
     assert not window._dream_progress_dialog.isVisible()
@@ -801,6 +1248,10 @@ def test_run_dream_shows_progress_and_popup_can_be_closed(
     assert window.dream_tab.run_button.isEnabled()
     assert window.dream_tab.progress_bar.maximum() == 1
     assert window.dream_tab.progress_bar.value() == 1
+    assert (
+        "DREAM sampler: collecting posterior samples"
+        in window.dream_tab.output_box.toPlainText()
+    )
     assert "DREAM run complete" in window.dream_tab.output_box.toPlainText()
 
 
@@ -946,6 +1397,82 @@ def test_dream_runtime_module_saves_squeezed_log_ps(
     assert saved_log_ps.shape == (2, 1)
 
 
+def test_dream_runtime_module_handles_array_shaped_crossover_values(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    workflow = SAXSDreamWorkflow(project_dir)
+    entries = workflow.create_default_parameter_map(persist=True)
+    bundle = workflow.create_runtime_bundle(entries=entries)
+
+    runtime_source = bundle.runtime_script_path.read_text(encoding="utf-8")
+    assert "def _build_runtime_mp_context()" in runtime_source
+    assert "mp_context=mp_context" in runtime_source
+
+    module_name, module, added_sys_path = workflow._load_runtime_module(bundle)
+    try:
+        shared_vars = SimpleNamespace(
+            cross_probs=mp.Array("d", [0.5, 0.5]),
+            ncr_updates=mp.Array("d", [0.0, 0.0]),
+            current_positions=mp.Array("d", [1.0, 2.0, 1.2, 2.4]),
+            delta_m=mp.Array("d", [0.0, 0.0]),
+            gamma_level_probs=mp.Array("d", [1.0]),
+            ngamma_updates=mp.Array("d", [0.0]),
+            delta_m_gamma=mp.Array("d", [0.0]),
+        )
+        monkeypatch.setattr(module, "Dream_shared_vars", shared_vars)
+        module._PyDreamDream.estimate_crossover_probabilities.__globals__[
+            "Dream_shared_vars"
+        ] = shared_vars
+        module._PyDreamDream.estimate_gamma_level_probs.__globals__[
+            "Dream_shared_vars"
+        ] = shared_vars
+
+        fake_dream = SimpleNamespace(
+            nCR=2,
+            nchains=2,
+            CR_values=np.asarray([0.5, 1.0], dtype=float),
+            CR_probabilities=np.asarray([0.5, 0.5], dtype=float),
+            ngamma=1,
+            gamma_level_values=np.asarray([1], dtype=int),
+        )
+
+        crossover_value = module._PyDreamDream.set_CR(
+            fake_dream,
+            np.asarray([1.0, 0.0], dtype=float),
+            np.asarray([0.5, 1.0], dtype=float),
+        )
+        assert float(crossover_value) == pytest.approx(0.5)
+
+        cross_probs = module._PyDreamDream.estimate_crossover_probabilities(
+            fake_dream,
+            2,
+            np.asarray([1.0, 2.0], dtype=float),
+            np.asarray([1.1, 2.3], dtype=float),
+            np.asarray([0.5], dtype=float),
+        )
+        assert np.asarray(cross_probs, dtype=float).shape == (2,)
+        assert list(shared_vars.ncr_updates[:]) == [1.0, 0.0]
+
+        gamma_probs = module._PyDreamDream.estimate_gamma_level_probs(
+            fake_dream,
+            2,
+            np.asarray([1.0, 2.0], dtype=float),
+            np.asarray([1.1, 2.3], dtype=float),
+            np.asarray([1], dtype=int),
+        )
+        assert np.asarray(gamma_probs, dtype=float).shape == (1,)
+        assert list(shared_vars.ngamma_updates[:]) == [1.0]
+    finally:
+        workflow._unload_runtime_module(
+            module_name,
+            added_sys_path=added_sys_path,
+        )
+
+
 def test_save_dream_settings_creates_named_preset_and_restores_active_state(
     qapp, tmp_path, monkeypatch
 ):
@@ -1073,10 +1600,184 @@ def test_load_latest_dream_results_updates_both_plot_panels(qapp, tmp_path):
         .get_title()
         .startswith("DREAM refinement:")
     )
+    metric_text = "\n".join(
+        text.get_text() for text in window.dream_tab.model_figure.axes[0].texts
+    )
+    assert "RMSE:" in metric_text
+    assert "Mean |res|:" in metric_text
+    assert "R²:" in metric_text
     assert (
         window.dream_tab.violin_figure.axes[0].get_title()
         == "Posterior parameter distributions"
     )
+    tick_labels = [
+        label.get_text()
+        for label in window.dream_tab.violin_figure.axes[0].get_xticklabels()
+    ]
+    assert "w0 (A)" in tick_labels
+
+
+def test_dream_model_metrics_box_updates_with_bestfit_method(qapp, tmp_path):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    _write_minimal_dream_results(project_dir)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    window.load_latest_results()
+    axis = window.dream_tab.model_figure.axes[0]
+    first_metrics = "\n".join(text.get_text() for text in axis.texts)
+
+    window.dream_tab.bestfit_method_combo.setCurrentIndex(2)
+    QApplication.processEvents()
+
+    axis = window.dream_tab.model_figure.axes[0]
+    second_metrics = "\n".join(text.get_text() for text in axis.texts)
+
+    assert "RMSE:" in second_metrics
+    assert "Mean |res|:" in second_metrics
+    assert "R²:" in second_metrics
+    assert first_metrics != second_metrics
+
+
+def test_dream_violin_scale_modes_and_palette_controls(qapp, tmp_path):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    _write_minimal_dream_results(project_dir)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    palette_index = window.dream_tab.violin_palette_combo.findData("plasma")
+    window.load_latest_results()
+    window.dream_tab.violin_value_scale_combo.setCurrentIndex(1)
+    window.dream_tab.violin_palette_combo.setCurrentIndex(palette_index)
+    window.dream_tab._configure_plot_color_button(
+        window.dream_tab.violin_point_color_button,
+        "tab:blue",
+        label="Point",
+    )
+    window.dream_tab.visualization_settings_changed.emit()
+    QApplication.processEvents()
+
+    axis = window.dream_tab.violin_figure.axes[0]
+    tick_labels = [label.get_text() for label in axis.get_xticklabels()]
+    assert tick_labels == ["w0 (A)"]
+    assert axis.get_ylabel() == "Weight fraction"
+    assert axis.get_title() == "Posterior weight distributions"
+    assert axis.get_ylim() == pytest.approx((0.0, 1.0))
+    body = next(
+        collection
+        for collection in axis.collections
+        if isinstance(collection, PolyCollection)
+    )
+    assert to_hex(body.get_facecolor()[0], keep_alpha=False) == to_hex(
+        colormaps["plasma"](0.6),
+        keep_alpha=False,
+    )
+    assert to_hex(
+        axis.collections[-1].get_facecolor()[0], keep_alpha=False
+    ) == to_hex(
+        "tab:blue",
+        keep_alpha=False,
+    )
+
+    window.dream_tab.violin_value_scale_combo.setCurrentIndex(2)
+    QApplication.processEvents()
+
+    axis = window.dream_tab.violin_figure.axes[0]
+    assert axis.get_ylabel() == "Normalized parameter value"
+    assert axis.get_title() == "Posterior parameter distributions (normalized)"
+    assert axis.get_ylim() == pytest.approx((0.0, 1.0))
+    normalized_labels = [
+        label.get_text()
+        for label in axis.get_xticklabels()
+        if label.get_text()
+    ]
+    assert "w0 (A)" in normalized_labels
+    assert "solv_w" in normalized_labels
+
+
+def test_dream_violin_custom_color_controls_apply_to_plot(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    _write_minimal_dream_results(project_dir)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    chosen_colors = iter(
+        [
+            QColor("#123456"),
+            QColor("#fedcba"),
+            QColor("#654321"),
+            QColor("#abcdef"),
+        ]
+    )
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.dream_tab.QColorDialog.getColor",
+        lambda *args, **kwargs: next(chosen_colors),
+    )
+
+    palette_index = window.dream_tab.violin_palette_combo.findData(
+        "custom_solid"
+    )
+    window.load_latest_results()
+    window.dream_tab.violin_palette_combo.setCurrentIndex(palette_index)
+    window.dream_tab._choose_violin_custom_color()
+    window.dream_tab._choose_violin_point_color()
+    window.dream_tab._choose_interval_color()
+    window.dream_tab._choose_median_color()
+    QApplication.processEvents()
+
+    axis = window.dream_tab.violin_figure.axes[0]
+    body = next(
+        collection
+        for collection in axis.collections
+        if isinstance(collection, PolyCollection)
+    )
+    assert to_hex(body.get_facecolor()[0], keep_alpha=False) == "#123456"
+    assert (
+        to_hex(
+            axis.collections[-1].get_facecolor()[0],
+            keep_alpha=False,
+        )
+        == "#fedcba"
+    )
+    line_colors = [
+        to_hex(color, keep_alpha=False)
+        for collection in axis.collections
+        if isinstance(collection, LineCollection)
+        for color in collection.get_colors()
+    ]
+    assert "#654321" in line_colors
+    assert "#abcdef" in line_colors
+
+
+def test_dream_results_loader_can_order_weight_violin_labels_by_structure(
+    tmp_path,
+):
+    run_dir = _write_weight_order_dream_results(tmp_path)
+    loader = SAXSDreamResultsLoader(run_dir, burnin_percent=0)
+
+    weight_index_plot = loader.build_violin_data(
+        mode="weights_only",
+        weight_order="weight_index",
+    )
+    structure_order_plot = loader.build_violin_data(
+        mode="weights_only",
+        weight_order="structure_order",
+    )
+
+    assert weight_index_plot.parameter_names == ["w2", "w0", "w1"]
+    assert weight_index_plot.display_names == [
+        "w2 (PbI2O)",
+        "w0 (I2)",
+        "w1 (Pb2)",
+    ]
+    assert structure_order_plot.parameter_names == ["w0", "w1", "w2"]
+    assert structure_order_plot.display_names == [
+        "w0 (I2)",
+        "w1 (Pb2)",
+        "w2 (PbI2O)",
+    ]
 
 
 def test_dream_results_loader_filters_posterior_samples(tmp_path):
@@ -1137,6 +1838,58 @@ def test_dream_runtime_bundle_carries_selected_solvent_trace(qapp, tmp_path):
     metadata = json.loads(bundle.metadata_path.read_text(encoding="utf-8"))
 
     assert np.allclose(metadata["solvent_intensities"], solvent_intensity)
+
+
+def test_dream_plot_data_exports_save_into_project_plots(qapp, tmp_path):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    _write_minimal_dream_results(project_dir)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    class _AcceptedDialog:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            self.selected_options = SimpleNamespace(
+                output_dir=paths.plots_dir,
+                base_name="dream_violin_export_test",
+                save_csv=True,
+                save_pkl=True,
+            )
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.main_window.DreamViolinExportDialog",
+        _AcceptedDialog,
+    )
+
+    window.load_latest_results()
+    window.dream_tab.violin_mode_combo.setCurrentIndex(2)
+    window.save_dream_model_fit()
+    window.save_dream_violin_data()
+    monkeypatch.undo()
+
+    model_exports = sorted(paths.plots_dir.glob("dream_model_fit_*.csv"))
+    violin_csv_exports = sorted(paths.plots_dir.glob("dream_violin_*.csv"))
+    violin_pkl_exports = sorted(paths.plots_dir.glob("dream_violin_*.pkl"))
+    dialog_csv_export = paths.plots_dir / "dream_violin_export_test.csv"
+    dialog_pkl_export = paths.plots_dir / "dream_violin_export_test.pkl"
+
+    assert model_exports
+    assert violin_csv_exports
+    assert violin_pkl_exports
+    assert dialog_csv_export.is_file()
+    assert dialog_pkl_export.is_file()
+    assert "q,experimental_intensity,model_intensity" in model_exports[
+        -1
+    ].read_text(encoding="utf-8")
+    assert "w0 (A)" in dialog_csv_export.read_text(encoding="utf-8")
+    violin_payload = pickle.loads(dialog_pkl_export.read_bytes())
+    assert violin_payload["violin_plot"]["display_names"] == ["w0 (A)"]
+    assert violin_payload["plot_payload"]["ylabel"] == "Parameter value"
+    assert np.asarray(violin_payload["plot_payload"]["samples"]).shape[1] == 1
 
 
 def test_prefit_template_change_warning_can_be_cancelled(
@@ -2210,6 +2963,14 @@ def test_project_setup_uses_scrollable_resizable_side_panes(qapp):
     assert tab._pane_splitter.widget(1) is tab._right_scroll_area
     assert tab._left_scroll_area.widget() is not None
     assert tab._right_scroll_area.widget() is not None
+    assert (
+        tab._right_scroll_area.verticalScrollBarPolicy()
+        == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+    )
+    assert (
+        tab.component_group.parentWidget() is tab._right_scroll_area.widget()
+    )
+    assert tab.prior_group.parentWidget() is tab._right_scroll_area.widget()
 
 
 def test_project_setup_activity_progress_updates(qapp):

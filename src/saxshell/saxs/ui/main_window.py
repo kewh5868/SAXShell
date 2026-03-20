@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import pickle
 import shutil
 import subprocess
 import sys
@@ -9,15 +11,32 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, QSize, QThread, Signal, Slot
+from PySide6.QtCore import (
+    QObject,
+    QSettings,
+    QSize,
+    Qt,
+    QThread,
+    QUrl,
+    Signal,
+    Slot,
+)
+from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QInputDialog,
     QMainWindow,
     QMessageBox,
+    QSplitter,
     QTabWidget,
+    QVBoxLayout,
+    QWidget,
 )
 
 from saxshell.saxs._model_templates import list_template_specs
@@ -36,10 +55,18 @@ from saxshell.saxs.project_manager import (
 )
 from saxshell.saxs.ui.distribution_window import DistributionSetupWindow
 from saxshell.saxs.ui.dream_tab import DreamTab
+from saxshell.saxs.ui.dream_violin_export_dialog import DreamViolinExportDialog
 from saxshell.saxs.ui.prefit_tab import PrefitTab
 from saxshell.saxs.ui.prior_histogram_window import PriorHistogramWindow
 from saxshell.saxs.ui.progress_dialog import SAXSProgressDialog
 from saxshell.saxs.ui.project_setup_tab import ProjectSetupTab
+from saxshell.version import __version__
+
+GITHUB_REPOSITORY_URL = "https://github.com/kewh5868/SAXShell"
+CONTACT_EMAIL = "keith.white@colorado.edu"
+RECENT_PROJECTS_KEY = "recent_project_dirs"
+MAX_RECENT_PROJECTS = 10
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +110,7 @@ class SAXSDreamRunWorker(QObject):
     """Background worker for DREAM runtime execution."""
 
     status = Signal(str)
+    output = Signal(str)
     finished = Signal(str, object)
     failed = Signal(str)
 
@@ -90,17 +118,27 @@ class SAXSDreamRunWorker(QObject):
         self,
         project_dir: str | Path,
         bundle: DreamRunBundle,
+        *,
+        verbose_output_interval_seconds: float = 1.0,
     ) -> None:
         super().__init__()
         self.project_dir = str(Path(project_dir).expanduser().resolve())
         self.bundle = bundle
+        self.verbose_output_interval_seconds = max(
+            float(verbose_output_interval_seconds),
+            0.1,
+        )
 
     @Slot()
     def run(self) -> None:
         try:
             self.status.emit("Executing DREAM runtime bundle...")
             workflow = SAXSDreamWorkflow(self.project_dir)
-            result = workflow.run_bundle(self.bundle)
+            result = workflow.run_bundle(
+                self.bundle,
+                output_callback=self.output.emit,
+                output_interval_seconds=self.verbose_output_interval_seconds,
+            )
         except Exception as exc:
             self.failed.emit(str(exc))
             return
@@ -139,7 +177,14 @@ class SAXSMainWindow(QMainWindow):
         self._active_dream_run_settings: DreamRunSettings | None = None
         self._warn_on_prefit_template_change = True
         self._restoring_prefit_template = False
+        self._ui_scale = 1.0
+        self._base_font_point_size = self._resolve_base_font_point_size()
+        self._scale_shortcuts: list[QShortcut] = []
+        self._child_tool_windows: list[QWidget] = []
         self._build_ui()
+        self._capture_scale_baselines(self)
+        self._register_scale_shortcuts()
+        self._apply_ui_scale(announce=False)
         template_specs = list_template_specs()
         self.project_setup_tab.set_available_templates(template_specs, None)
         self.prefit_tab.set_templates(template_specs, None)
@@ -157,6 +202,7 @@ class SAXSMainWindow(QMainWindow):
         self.setWindowTitle("SAXShell (saxs)")
         self.resize(self._default_window_size())
 
+        self._build_menu_bar()
         self.tabs = QTabWidget()
         self.project_setup_tab = ProjectSetupTab()
         self.prefit_tab = PrefitTab()
@@ -234,12 +280,210 @@ class SAXSMainWindow(QMainWindow):
         self.dream_tab.run_dream_requested.connect(self.run_dream_bundle)
         self.dream_tab.load_results_requested.connect(self.load_latest_results)
         self.dream_tab.save_report_requested.connect(self.save_dream_report)
+        self.dream_tab.save_model_fit_requested.connect(
+            self.save_dream_model_fit
+        )
+        self.dream_tab.save_violin_data_requested.connect(
+            self.save_dream_violin_data
+        )
         self.dream_tab.settings_preset_changed.connect(
             self._on_dream_settings_preset_changed
         )
         self.dream_tab.visualization_settings_changed.connect(
             self._refresh_loaded_dream_results
         )
+        self._refresh_recent_projects_menu()
+        self._update_file_menu_state()
+
+    def _build_menu_bar(self) -> None:
+        menu_bar = self.menuBar()
+
+        self.file_menu = menu_bar.addMenu("File")
+        self.create_project_action = QAction("Create Project", self)
+        self.create_project_action.triggered.connect(
+            self._create_project_from_menu
+        )
+        self.file_menu.addAction(self.create_project_action)
+
+        self.open_project_action = QAction("Open Existing Project...", self)
+        self.open_project_action.triggered.connect(
+            self._open_project_from_menu
+        )
+        self.file_menu.addAction(self.open_project_action)
+
+        self.open_recent_menu = self.file_menu.addMenu("Open Recent Project")
+
+        self.save_project_action = QAction("Save Project", self)
+        save_shortcuts = QKeySequence.keyBindings(
+            QKeySequence.StandardKey.Save
+        )
+        if save_shortcuts:
+            self.save_project_action.setShortcuts(save_shortcuts)
+        self.save_project_action.triggered.connect(self.save_project_state)
+        self.file_menu.addAction(self.save_project_action)
+
+        self.save_project_as_action = QAction("Save Project As...", self)
+        self.save_project_as_action.triggered.connect(self.save_project_as)
+        self.file_menu.addAction(self.save_project_as_action)
+
+        self.tools_menu = menu_bar.addMenu("Tools")
+        self.mdtrajectory_action = QAction("Open mdtrajectory", self)
+        self.mdtrajectory_action.triggered.connect(
+            self._open_mdtrajectory_tool
+        )
+        self.tools_menu.addAction(self.mdtrajectory_action)
+
+        self.cluster_action = QAction("Open Cluster Extraction", self)
+        self.cluster_action.triggered.connect(self._open_cluster_tool)
+        self.tools_menu.addAction(self.cluster_action)
+
+        self.xyz2pdb_action = QAction("Open xyz2pdb Conversion", self)
+        self.xyz2pdb_action.triggered.connect(self._open_xyz2pdb_tool)
+        self.tools_menu.addAction(self.xyz2pdb_action)
+
+        self.bondanalysis_action = QAction("Open Bond Analysis", self)
+        self.bondanalysis_action.triggered.connect(
+            self._open_bondanalysis_tool
+        )
+        self.tools_menu.addAction(self.bondanalysis_action)
+
+        self.tools_menu.addSeparator()
+        placeholder_specs = [
+            ("PDF Calculation (Coming Soon)", "PDF Calculation"),
+            (
+                "Number Density Estimate (Coming Soon)",
+                "Number Density Estimate",
+            ),
+            (
+                "Volume Fraction Estimate (Coming Soon)",
+                "Volume Fraction Estimate",
+            ),
+            (
+                "Bond Association/Dissociation Analysis (Coming Soon)",
+                "Bond Association/Dissociation Analysis",
+            ),
+            ("fullrmc Setup (Coming Soon)", "fullrmc Setup"),
+        ]
+        self._placeholder_tool_actions: list[QAction] = []
+        for label, tool_name in placeholder_specs:
+            action = QAction(label, self)
+            action.triggered.connect(
+                lambda checked=False, name=tool_name: self._show_placeholder_tool_message(
+                    name
+                )
+            )
+            self.tools_menu.addAction(action)
+            self._placeholder_tool_actions.append(action)
+
+        self.settings_menu = menu_bar.addMenu("Settings")
+        self.dream_output_settings_action = QAction(
+            "DREAM Output Settings...",
+            self,
+        )
+        self.dream_output_settings_action.triggered.connect(
+            self._open_dream_output_settings_dialog
+        )
+        self.settings_menu.addAction(self.dream_output_settings_action)
+
+        self.help_menu = menu_bar.addMenu("Help")
+        self.version_info_action = QAction("Version Information", self)
+        self.version_info_action.triggered.connect(
+            self._show_version_information
+        )
+        self.help_menu.addAction(self.version_info_action)
+
+        self.github_action = QAction("Open GitHub Repository", self)
+        self.github_action.triggered.connect(self._open_github_repository)
+        self.help_menu.addAction(self.github_action)
+
+        self.contact_action = QAction("Contact Developer", self)
+        self.contact_action.triggered.connect(self._show_contact_information)
+        self.help_menu.addAction(self.contact_action)
+
+    def _resolve_base_font_point_size(self) -> float:
+        font = self.font()
+        point_size = font.pointSizeF()
+        if point_size <= 0:
+            app = QApplication.instance()
+            if app is not None:
+                point_size = app.font().pointSizeF()
+        return point_size if point_size > 0 else 12.0
+
+    def _register_scale_shortcuts(self) -> None:
+        shortcut_map = [
+            ("Meta+=", lambda: self._adjust_ui_scale(0.1)),
+            ("Meta++", lambda: self._adjust_ui_scale(0.1)),
+            ("Ctrl+=", lambda: self._adjust_ui_scale(0.1)),
+            ("Ctrl++", lambda: self._adjust_ui_scale(0.1)),
+            ("Meta+-", lambda: self._adjust_ui_scale(-0.1)),
+            ("Ctrl+-", lambda: self._adjust_ui_scale(-0.1)),
+            ("Meta+0", self._reset_ui_scale),
+            ("Ctrl+0", self._reset_ui_scale),
+        ]
+        for sequence, handler in shortcut_map:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(handler)
+            self._scale_shortcuts.append(shortcut)
+
+    def _adjust_ui_scale(self, delta: float) -> None:
+        self._set_ui_scale(self._ui_scale + delta)
+
+    def _reset_ui_scale(self) -> None:
+        self._set_ui_scale(1.0)
+
+    def _set_ui_scale(self, scale: float) -> None:
+        bounded = max(0.7, min(1.6, round(float(scale), 2)))
+        if abs(bounded - self._ui_scale) < 1e-9:
+            return
+        self._ui_scale = bounded
+        self._apply_ui_scale(announce=True)
+
+    def _apply_ui_scale(self, *, announce: bool) -> None:
+        scaled_font = self.font()
+        scaled_font.setPointSizeF(self._base_font_point_size * self._ui_scale)
+        self.setFont(scaled_font)
+        self._apply_scale_to_widget_tree(self)
+        if announce:
+            self.statusBar().showMessage(
+                f"Interface scale: {int(round(self._ui_scale * 100))}%"
+            )
+
+    def _capture_scale_baselines(self, widget: QWidget) -> None:
+        if widget.property("_saxs_base_min_width") is None:
+            widget.setProperty("_saxs_base_min_width", widget.minimumWidth())
+            widget.setProperty("_saxs_base_min_height", widget.minimumHeight())
+        if isinstance(widget, QSplitter):
+            if widget.property("_saxs_base_handle_width") is None:
+                widget.setProperty(
+                    "_saxs_base_handle_width", widget.handleWidth()
+                )
+        for child in widget.findChildren(
+            QWidget, options=Qt.FindChildOption.FindDirectChildrenOnly
+        ):
+            self._capture_scale_baselines(child)
+
+    def _apply_scale_to_widget_tree(self, widget: QWidget) -> None:
+        base_min_width = widget.property("_saxs_base_min_width")
+        base_min_height = widget.property("_saxs_base_min_height")
+        if isinstance(base_min_width, int) and base_min_width > 0:
+            widget.setMinimumWidth(
+                max(1, round(base_min_width * self._ui_scale))
+            )
+        if isinstance(base_min_height, int) and base_min_height > 0:
+            widget.setMinimumHeight(
+                max(1, round(base_min_height * self._ui_scale))
+            )
+        if isinstance(widget, QSplitter):
+            base_handle_width = widget.property("_saxs_base_handle_width")
+            if isinstance(base_handle_width, int) and base_handle_width > 0:
+                widget.setHandleWidth(
+                    max(2, round(base_handle_width * self._ui_scale))
+                )
+        for child in widget.findChildren(
+            QWidget, options=Qt.FindChildOption.FindDirectChildrenOnly
+        ):
+            self._apply_scale_to_widget_tree(child)
 
     def _default_window_size(self) -> QSize:
         app = QApplication.instance()
@@ -290,12 +534,17 @@ class SAXSMainWindow(QMainWindow):
             )
             self.current_settings = settings
             self._apply_project_settings(settings)
+            self._remember_recent_project(settings.project_dir)
             self.project_setup_tab.append_summary(
                 f"Created project {settings.project_name} at {settings.project_dir}"
             )
             self.statusBar().showMessage("Project created")
         except Exception as exc:
             self._show_error("Create project failed", str(exc))
+
+    def _create_project_from_menu(self) -> None:
+        self.tabs.setCurrentWidget(self.project_setup_tab)
+        self.create_project_from_tab()
 
     def open_project_from_dialog(self) -> None:
         try:
@@ -313,10 +562,29 @@ class SAXSMainWindow(QMainWindow):
         except Exception as exc:
             self._show_error("Open project failed", str(exc))
 
+    def _open_project_from_menu(self) -> None:
+        try:
+            start_dir = (
+                self.current_settings.project_dir
+                if self.current_settings is not None
+                else str(Path.home())
+            )
+            selected = QFileDialog.getExistingDirectory(
+                self,
+                "Open SAXS project folder",
+                start_dir,
+            )
+            if selected:
+                self.tabs.setCurrentWidget(self.project_setup_tab)
+                self.load_project(self._validated_project_dir(selected))
+        except Exception as exc:
+            self._show_error("Open project failed", str(exc))
+
     def load_project(self, project_dir: str | Path) -> None:
         settings = self.project_manager.load_project(project_dir)
         self.current_settings = settings
         self._apply_project_settings(settings)
+        self._remember_recent_project(settings.project_dir)
         if settings.clusters_dir:
             self.project_setup_tab.request_cluster_scan()
         self.project_setup_tab.append_summary(
@@ -420,9 +688,82 @@ class SAXSMainWindow(QMainWindow):
     ) -> Path:
         self.current_settings = settings
         saved_path = self.project_manager.save_project(settings)
+        self._remember_recent_project(settings.project_dir)
         if status_message is not None:
             self.statusBar().showMessage(status_message)
+        self._update_file_menu_state()
         return saved_path
+
+    def save_project_as(self) -> None:
+        if self.current_settings is None:
+            self._show_error(
+                "Save Project As failed",
+                "Load or create a project first.",
+            )
+            return
+        try:
+            current_settings = self._settings_from_project_tab()
+            source_dir = (
+                Path(current_settings.project_dir).expanduser().resolve()
+            )
+            if not source_dir.is_dir():
+                raise ValueError(
+                    "The active project folder could not be found on disk."
+                )
+            self._save_settings(
+                current_settings,
+                status_message="Project saved before Save Project As",
+            )
+            parent_dir = QFileDialog.getExistingDirectory(
+                self,
+                "Select destination parent folder",
+                str(source_dir.parent),
+            )
+            if not parent_dir:
+                self.statusBar().showMessage("Save Project As canceled")
+                return
+            project_name, accepted = QInputDialog.getText(
+                self,
+                "Save Project As",
+                "New project folder name:",
+                text=f"{source_dir.name}_copy",
+            )
+            project_name = str(project_name).strip()
+            if not accepted or not project_name:
+                self.statusBar().showMessage("Save Project As canceled")
+                return
+            destination_dir = (
+                Path(parent_dir).expanduser().resolve() / project_name
+            )
+            if destination_dir.exists():
+                raise ValueError(
+                    "The selected Save Project As destination already exists. "
+                    "Choose a new folder name."
+                )
+            shutil.copytree(source_dir, destination_dir)
+            new_settings = ProjectSettings.from_dict(
+                current_settings.to_dict()
+            )
+            new_settings.project_name = destination_dir.name
+            new_settings.project_dir = str(destination_dir)
+            self._remap_copied_project_paths(
+                new_settings,
+                old_project_dir=source_dir,
+                new_project_dir=destination_dir,
+            )
+            saved_path = self._save_settings(
+                new_settings,
+                status_message="Project saved to new folder",
+            )
+            self.current_settings = new_settings
+            self._apply_project_settings(new_settings)
+            self.tabs.setCurrentWidget(self.project_setup_tab)
+            self.project_setup_tab.append_summary(
+                f"Saved project as {destination_dir}\nProject file: {saved_path}"
+            )
+            self.statusBar().showMessage("Project saved to new folder")
+        except Exception as exc:
+            self._show_error("Save Project As failed", str(exc))
 
     def _start_project_task(
         self,
@@ -604,10 +945,14 @@ class SAXSMainWindow(QMainWindow):
         self._dream_task_worker = SAXSDreamRunWorker(
             self.current_settings.project_dir,
             bundle,
+            verbose_output_interval_seconds=(
+                settings.verbose_output_interval_seconds
+            ),
         )
         self._dream_task_worker.moveToThread(self._dream_task_thread)
         self._dream_task_thread.started.connect(self._dream_task_worker.run)
         self._dream_task_worker.status.connect(self._on_dream_run_status)
+        self._dream_task_worker.output.connect(self._on_dream_run_output)
         self._dream_task_worker.finished.connect(self._on_dream_run_finished)
         self._dream_task_worker.failed.connect(self._on_dream_run_failed)
         self._dream_task_worker.finished.connect(self._dream_task_thread.quit)
@@ -625,6 +970,7 @@ class SAXSMainWindow(QMainWindow):
 
     @Slot(str)
     def _on_dream_run_status(self, message: str) -> None:
+        self.dream_tab.append_log(message)
         self.dream_tab.start_progress(message)
         if (
             self._dream_progress_dialog is not None
@@ -655,6 +1001,7 @@ class SAXSMainWindow(QMainWindow):
             f"Samples: {result_payload.get('sampled_params_path', 'unknown')}\n"
             f"Log-posteriors: {result_payload.get('log_ps_path', 'unknown')}"
         )
+        self.dream_tab.finish_runtime_output()
         self.dream_tab.finish_progress("DREAM refinement complete.")
         self._close_dream_progress_dialog()
         self.dream_tab.run_button.setEnabled(True)
@@ -662,11 +1009,30 @@ class SAXSMainWindow(QMainWindow):
 
     @Slot(str)
     def _on_dream_run_failed(self, message: str) -> None:
+        self.dream_tab.finish_runtime_output()
         self.dream_tab.append_log("DREAM run failed.\n" + message)
         self.dream_tab.finish_progress("DREAM refinement failed.")
         self._close_dream_progress_dialog()
         self.dream_tab.run_button.setEnabled(True)
         self._show_error("Run DREAM failed", message)
+
+    @Slot(str)
+    def _on_dream_run_output(self, message: str) -> None:
+        stripped = message.strip()
+        if not stripped:
+            return
+        self.dream_tab.append_runtime_output(stripped)
+        latest_line = next(
+            (line for line in reversed(stripped.splitlines()) if line.strip()),
+            stripped,
+        )
+        self.dream_tab.progress_label.setText(latest_line)
+        if (
+            self._dream_progress_dialog is not None
+            and self._dream_progress_dialog.isVisible()
+        ):
+            self._dream_progress_dialog.message_label.setText(latest_line)
+        self.statusBar().showMessage(latest_line)
 
     def _cleanup_dream_task_thread(self) -> None:
         if self._dream_task_worker is not None:
@@ -1373,6 +1739,204 @@ class SAXSMainWindow(QMainWindow):
         except Exception as exc:
             self._show_error("Save report failed", str(exc))
 
+    def save_dream_model_fit(self) -> None:
+        if self._last_results_loader is None:
+            self._show_error(
+                "Save model fit failed",
+                "Load DREAM results first.",
+            )
+            return
+        if self.current_settings is None:
+            self._show_error(
+                "Save model fit failed",
+                "Load or build a project first.",
+            )
+            return
+        try:
+            settings = self.dream_tab.settings_payload()
+            paths = build_project_paths(self.current_settings.project_dir)
+            paths.plots_dir.mkdir(parents=True, exist_ok=True)
+            output_path = paths.plots_dir / (
+                "dream_model_fit_"
+                f"{settings.bestfit_method}_"
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            )
+            model_plot = self._last_results_loader.build_model_fit_data(
+                bestfit_method=settings.bestfit_method,
+                posterior_filter_mode=settings.posterior_filter_mode,
+                posterior_top_percent=settings.posterior_top_percent,
+                posterior_top_n=settings.posterior_top_n,
+                credible_interval_low=settings.credible_interval_low,
+                credible_interval_high=settings.credible_interval_high,
+            )
+            np.savetxt(
+                output_path,
+                np.column_stack(
+                    [
+                        model_plot.q_values,
+                        model_plot.experimental_intensities,
+                        model_plot.model_intensities,
+                    ]
+                ),
+                delimiter=",",
+                header="q,experimental_intensity,model_intensity",
+                comments="",
+            )
+            self.dream_tab.append_log(
+                f"Saved DREAM model fit data to {output_path}"
+            )
+            self.statusBar().showMessage("DREAM model fit data saved")
+        except Exception as exc:
+            self._show_error("Save model fit failed", str(exc))
+
+    def save_dream_violin_data(self) -> None:
+        if self._last_results_loader is None:
+            self._show_error(
+                "Save violin data failed",
+                "Load DREAM results first.",
+            )
+            return
+        if self.current_settings is None:
+            self._show_error(
+                "Save violin data failed",
+                "Load or build a project first.",
+            )
+            return
+        try:
+            settings = self.dream_tab.settings_payload()
+            paths = build_project_paths(self.current_settings.project_dir)
+            paths.plots_dir.mkdir(parents=True, exist_ok=True)
+            base_name = (
+                "dream_violin_"
+                f"{self._effective_dream_violin_mode(settings)}_"
+                f"{settings.violin_weight_order}_"
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
+            dialog = DreamViolinExportDialog(
+                default_output_dir=paths.plots_dir,
+                default_base_name=base_name,
+                parent=self,
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            export_options = dialog.selected_options
+            if export_options is None:
+                return
+            export_options.output_dir.mkdir(parents=True, exist_ok=True)
+            violin_plot = self._last_results_loader.build_violin_data(
+                mode=self._effective_dream_violin_mode(settings),
+                posterior_filter_mode=settings.posterior_filter_mode,
+                posterior_top_percent=settings.posterior_top_percent,
+                posterior_top_n=settings.posterior_top_n,
+                credible_interval_low=settings.credible_interval_low,
+                credible_interval_high=settings.credible_interval_high,
+                sample_source=settings.violin_sample_source,
+                weight_order=settings.violin_weight_order,
+            )
+            summary = self._last_results_loader.get_summary(
+                bestfit_method=settings.bestfit_method,
+                posterior_filter_mode=settings.posterior_filter_mode,
+                posterior_top_percent=settings.posterior_top_percent,
+                posterior_top_n=settings.posterior_top_n,
+                credible_interval_low=settings.credible_interval_low,
+                credible_interval_high=settings.credible_interval_high,
+            )
+            plot_payload = self.dream_tab.prepare_violin_plot_payload(
+                summary,
+                violin_plot,
+            )
+            saved_paths: list[Path] = []
+            if export_options.save_csv:
+                csv_output_path = (
+                    export_options.output_dir
+                    / f"{export_options.base_name}.csv"
+                )
+                with csv_output_path.open(
+                    "w",
+                    encoding="utf-8",
+                    newline="",
+                ) as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow(plot_payload["display_names"])
+                    writer.writerows(
+                        np.asarray(plot_payload["samples"], dtype=float)
+                    )
+                saved_paths.append(csv_output_path)
+            if export_options.save_pkl:
+                pkl_output_path = (
+                    export_options.output_dir
+                    / f"{export_options.base_name}.pkl"
+                )
+                payload = {
+                    "exported_at": datetime.now().isoformat(),
+                    "project_dir": str(self.current_settings.project_dir),
+                    "settings": settings.to_dict(),
+                    "summary": {
+                        "bestfit_method": summary.bestfit_method,
+                        "posterior_filter_mode": summary.posterior_filter_mode,
+                        "posterior_sample_count": summary.posterior_sample_count,
+                        "credible_interval_low": summary.credible_interval_low,
+                        "credible_interval_high": summary.credible_interval_high,
+                        "full_parameter_names": list(
+                            summary.full_parameter_names
+                        ),
+                        "active_parameter_names": list(
+                            summary.active_parameter_names
+                        ),
+                        "map_chain": summary.map_chain,
+                        "map_step": summary.map_step,
+                        "run_dir": str(summary.run_dir),
+                    },
+                    "violin_plot": {
+                        "parameter_names": list(violin_plot.parameter_names),
+                        "display_names": list(violin_plot.display_names),
+                        "mode": violin_plot.mode,
+                        "sample_source": violin_plot.sample_source,
+                        "sample_count": violin_plot.sample_count,
+                        "weight_order": violin_plot.weight_order,
+                    },
+                    "plot_payload": {
+                        "display_names": list(plot_payload["display_names"]),
+                        "samples": np.asarray(
+                            plot_payload["samples"],
+                            dtype=float,
+                        ),
+                        "selected_values": np.asarray(
+                            plot_payload["selected_values"],
+                            dtype=float,
+                        ),
+                        "interval_low_values": np.asarray(
+                            plot_payload["interval_low_values"],
+                            dtype=float,
+                        ),
+                        "interval_high_values": np.asarray(
+                            plot_payload["interval_high_values"],
+                            dtype=float,
+                        ),
+                        "ylabel": str(plot_payload["ylabel"]),
+                        "title": str(plot_payload["title"]),
+                        "y_limits": plot_payload["y_limits"],
+                    },
+                }
+                with pkl_output_path.open("wb") as handle:
+                    pickle.dump(payload, handle)
+                saved_paths.append(pkl_output_path)
+            self.dream_tab.append_log(
+                "Saved DREAM violin plot data to:\n"
+                + "\n".join(str(path) for path in saved_paths)
+            )
+            self.statusBar().showMessage("DREAM violin data saved")
+        except Exception as exc:
+            self._show_error("Save violin data failed", str(exc))
+
+    @staticmethod
+    def _effective_dream_violin_mode(settings: DreamRunSettings) -> str:
+        if settings.violin_value_scale_mode == "weights_unit_interval":
+            return "weights_only"
+        if settings.violin_value_scale_mode == "normalized_all":
+            return "all_parameters"
+        return settings.violin_parameter_mode
+
     def save_prior_plot_data_as(self) -> None:
         if self.current_settings is None:
             self._show_error(
@@ -1440,6 +2004,7 @@ class SAXSMainWindow(QMainWindow):
                 "DREAM summary is not available yet.\n" f"{exc}"
             )
             self.dream_tab.clear_plots()
+        self._update_file_menu_state()
 
     def _settings_from_project_tab(self) -> ProjectSettings:
         project_dir = self.project_setup_tab.project_dir()
@@ -1749,6 +2314,342 @@ class SAXSMainWindow(QMainWindow):
     ) -> DreamRunSettings:
         return DreamRunSettings.from_dict(settings.to_dict())
 
+    def _recent_projects_settings(self) -> QSettings:
+        return QSettings("SAXShell", "SAXS")
+
+    def _recent_project_paths(self) -> list[str]:
+        raw_value = self._recent_projects_settings().value(
+            RECENT_PROJECTS_KEY,
+            [],
+        )
+        if isinstance(raw_value, str):
+            candidates = [raw_value]
+        elif isinstance(raw_value, (list, tuple)):
+            candidates = [str(item) for item in raw_value]
+        else:
+            candidates = []
+        existing_paths: list[str] = []
+        for candidate in candidates:
+            normalized = candidate.strip()
+            if not normalized:
+                continue
+            if Path(normalized).expanduser().exists():
+                existing_paths.append(normalized)
+        if existing_paths != candidates:
+            self._recent_projects_settings().setValue(
+                RECENT_PROJECTS_KEY,
+                existing_paths,
+            )
+        return existing_paths[:MAX_RECENT_PROJECTS]
+
+    def _remember_recent_project(self, project_dir: str | Path) -> None:
+        normalized = str(Path(project_dir).expanduser().resolve())
+        recent = [
+            path for path in self._recent_project_paths() if path != normalized
+        ]
+        recent.insert(0, normalized)
+        self._recent_projects_settings().setValue(
+            RECENT_PROJECTS_KEY,
+            recent[:MAX_RECENT_PROJECTS],
+        )
+        self._refresh_recent_projects_menu()
+
+    def _refresh_recent_projects_menu(self) -> None:
+        self.open_recent_menu.clear()
+        recent_paths = self._recent_project_paths()
+        if not recent_paths:
+            empty_action = self.open_recent_menu.addAction(
+                "No recent projects"
+            )
+            empty_action.setEnabled(False)
+            return
+        for project_path in recent_paths:
+            action = self.open_recent_menu.addAction(project_path)
+            action.triggered.connect(
+                lambda checked=False, path=project_path: self._open_recent_project(
+                    path
+                )
+            )
+
+    def _open_recent_project(self, project_path: str | Path) -> None:
+        try:
+            self.tabs.setCurrentWidget(self.project_setup_tab)
+            self.load_project(self._validated_project_dir(project_path))
+        except Exception as exc:
+            self._show_error("Open recent project failed", str(exc))
+
+    def _update_file_menu_state(self) -> None:
+        has_project = self.current_settings is not None
+        self.save_project_action.setEnabled(has_project)
+        self.save_project_as_action.setEnabled(has_project)
+
+    def _remap_copied_project_paths(
+        self,
+        settings: ProjectSettings,
+        *,
+        old_project_dir: Path,
+        new_project_dir: Path,
+    ) -> None:
+        for attribute in (
+            "experimental_data_path",
+            "copied_experimental_data_file",
+            "solvent_data_path",
+            "copied_solvent_data_file",
+            "clusters_dir",
+        ):
+            current_value = getattr(settings, attribute)
+            if not current_value:
+                continue
+            remapped = self._remap_if_within_project(
+                current_value,
+                old_project_dir=old_project_dir,
+                new_project_dir=new_project_dir,
+            )
+            setattr(settings, attribute, remapped)
+        self._restore_internal_staged_paths(settings, new_project_dir)
+
+    @staticmethod
+    def _restore_internal_staged_paths(
+        settings: ProjectSettings,
+        project_dir: Path,
+    ) -> None:
+        experimental_dir = (project_dir / "experimental_data").resolve()
+        if (
+            not settings.copied_experimental_data_file
+            and settings.experimental_data_path
+        ):
+            experimental_path = Path(settings.experimental_data_path).resolve()
+            if experimental_dir in experimental_path.parents:
+                settings.copied_experimental_data_file = str(experimental_path)
+        if (
+            not settings.copied_solvent_data_file
+            and settings.solvent_data_path
+        ):
+            solvent_path = Path(settings.solvent_data_path).resolve()
+            if experimental_dir in solvent_path.parents:
+                settings.copied_solvent_data_file = str(solvent_path)
+
+    @staticmethod
+    def _remap_if_within_project(
+        path_text: str,
+        *,
+        old_project_dir: Path,
+        new_project_dir: Path,
+    ) -> str:
+        try:
+            resolved_path = Path(path_text).expanduser().resolve()
+            relative = resolved_path.relative_to(old_project_dir.resolve())
+        except Exception:
+            return path_text
+        return str((new_project_dir / relative).resolve())
+
+    def _open_mdtrajectory_tool(self) -> None:
+        from saxshell.mdtrajectory.ui.main_window import (
+            launch_mdtrajectory_app,
+        )
+
+        window = launch_mdtrajectory_app()
+        self._child_tool_windows.append(window)
+        self.statusBar().showMessage("Opened mdtrajectory")
+
+    def _open_cluster_tool(self) -> None:
+        from saxshell.cluster.ui.main_window import launch_cluster_ui
+
+        launch_cluster_ui()
+        self.statusBar().showMessage("Opened cluster extraction")
+
+    def _open_xyz2pdb_tool(self) -> None:
+        from saxshell.xyz2pdb.ui.main_window import launch_xyz2pdb_ui
+
+        window = launch_xyz2pdb_ui()
+        self._child_tool_windows.append(window)
+        self.statusBar().showMessage("Opened xyz2pdb conversion")
+
+    def _open_bondanalysis_tool(self) -> None:
+        from saxshell.bondanalysis.ui.main_window import BondAnalysisMainWindow
+
+        clusters_dir = None
+        if (
+            self.current_settings is not None
+            and self.current_settings.clusters_dir
+        ):
+            clusters_dir = self.current_settings.clusters_dir
+        window = BondAnalysisMainWindow(initial_clusters_dir=clusters_dir)
+        window.show()
+        window.raise_()
+        self._child_tool_windows.append(window)
+        if clusters_dir:
+            self.statusBar().showMessage(
+                f"Opened bond analysis for {clusters_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened bond analysis")
+
+    def _show_placeholder_tool_message(self, tool_name: str) -> None:
+        QMessageBox.information(
+            self,
+            "Coming soon",
+            (
+                f"{tool_name} is listed in the Tools menu as a placeholder "
+                "for future SAXShell integration."
+            ),
+        )
+        self.statusBar().showMessage(f"{tool_name} is not available yet", 5000)
+
+    def _open_dream_output_settings_dialog(self) -> None:
+        settings = self.dream_tab.settings_payload()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("DREAM Output Settings")
+        layout = QVBoxLayout(dialog)
+
+        form_layout = QFormLayout()
+        verbose_checkbox = QCheckBox("Verbose sampler output")
+        verbose_checkbox.setChecked(settings.verbose)
+        verbose_checkbox.setToolTip(
+            "Enable or disable verbose DREAM sampler progress output."
+        )
+        interval_spin = QDoubleSpinBox()
+        interval_spin.setRange(0.1, 30.0)
+        interval_spin.setDecimals(1)
+        interval_spin.setSingleStep(0.1)
+        interval_spin.setValue(settings.verbose_output_interval_seconds)
+        interval_spin.setToolTip(
+            "Minimum number of seconds between DREAM runtime output "
+            "updates shown in the UI while verbose output is enabled."
+        )
+        interval_spin.setEnabled(verbose_checkbox.isChecked())
+        verbose_checkbox.toggled.connect(interval_spin.setEnabled)
+        form_layout.addRow(verbose_checkbox)
+        form_layout.addRow("Output interval (s)", interval_spin)
+        layout.addLayout(form_layout)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._apply_dream_output_settings(
+            verbose=verbose_checkbox.isChecked(),
+            interval_seconds=interval_spin.value(),
+        )
+
+    def _apply_dream_output_settings(
+        self,
+        *,
+        verbose: bool,
+        interval_seconds: float,
+    ) -> None:
+        settings = self.dream_tab.settings_payload()
+        settings.verbose = bool(verbose)
+        settings.verbose_output_interval_seconds = max(
+            float(interval_seconds),
+            0.1,
+        )
+        self.dream_tab.set_settings(
+            settings,
+            preset_name=self.dream_tab.selected_settings_preset_name(),
+        )
+        self.dream_tab.append_log(
+            "Updated DREAM output settings.\n"
+            f"Verbose sampler output: {'on' if settings.verbose else 'off'}\n"
+            "Runtime output interval: "
+            f"{settings.verbose_output_interval_seconds:.1f} s\n"
+            "Save DREAM settings if you want to persist this change."
+        )
+        self.statusBar().showMessage("DREAM output settings updated")
+
+    def _show_version_information(self) -> None:
+        QMessageBox.information(
+            self,
+            "Version Information",
+            self._version_information_text(),
+        )
+
+    def _version_information_text(self) -> str:
+        branch = self._git_output("rev-parse", "--abbrev-ref", "HEAD")
+        commit = self._git_output("rev-parse", "--short", "HEAD")
+        origin_url = self._normalize_repository_url(
+            self._git_output("remote", "get-url", "origin")
+            or GITHUB_REPOSITORY_URL
+        )
+        upstream_url = self._normalize_repository_url(
+            self._git_output("remote", "get-url", "upstream") or ""
+        )
+        lines = [
+            "SAXShell Version Information",
+            "",
+            f"Package version: {__version__}",
+            f"Git branch: {branch or 'unavailable'}",
+            f"Git commit: {commit or 'unavailable'}",
+            f"GitHub repository: {origin_url or GITHUB_REPOSITORY_URL}",
+        ]
+        if upstream_url:
+            lines.append(f"Upstream repository: {upstream_url}")
+        lines.extend(
+            [
+                "",
+                "This information is read from the local Git checkout so it "
+                "stays aligned with the GitHub-backed repository state for "
+                "the branch you have open.",
+                f"Developer contact: {CONTACT_EMAIL}",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _open_github_repository(self) -> None:
+        repository_url = self._normalize_repository_url(
+            self._git_output("remote", "get-url", "origin")
+            or GITHUB_REPOSITORY_URL
+        )
+        QDesktopServices.openUrl(QUrl(repository_url))
+        self.statusBar().showMessage("Opened SAXShell GitHub repository")
+
+    def _show_contact_information(self) -> None:
+        QMessageBox.information(
+            self,
+            "Developer Contact",
+            (
+                "For SAXShell questions, template requests, or bug reports, "
+                "contact the developer at:\n\n"
+                f"{CONTACT_EMAIL}"
+            ),
+        )
+        self.statusBar().showMessage("Opened developer contact information")
+
+    @staticmethod
+    def _normalize_repository_url(url: str) -> str:
+        normalized = str(url or "").strip()
+        if not normalized:
+            return ""
+        if normalized.startswith("git@github.com:"):
+            normalized = normalized.replace(
+                "git@github.com:",
+                "https://github.com/",
+                1,
+            )
+        if normalized.endswith(".git"):
+            normalized = normalized[:-4]
+        return normalized
+
+    @staticmethod
+    def _git_output(*args: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(REPO_ROOT), *args],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except Exception:
+            return None
+        output = result.stdout.strip()
+        return output or None
+
     def _prompt_dream_settings_preset_name(
         self,
         *,
@@ -1882,13 +2783,14 @@ class SAXSMainWindow(QMainWindow):
                 credible_interval_high=settings.credible_interval_high,
             )
             violin_plot = self._last_results_loader.build_violin_data(
-                mode=settings.violin_parameter_mode,
+                mode=self._effective_dream_violin_mode(settings),
                 posterior_filter_mode=settings.posterior_filter_mode,
                 posterior_top_percent=settings.posterior_top_percent,
                 posterior_top_n=settings.posterior_top_n,
                 credible_interval_low=settings.credible_interval_low,
                 credible_interval_high=settings.credible_interval_high,
                 sample_source=settings.violin_sample_source,
+                weight_order=settings.violin_weight_order,
             )
             self.dream_tab.set_summary_text(
                 self._format_dream_summary(summary, settings=settings)
@@ -1919,6 +2821,10 @@ class SAXSMainWindow(QMainWindow):
             ),
             f"Violin data mode: {settings.violin_parameter_mode}",
             f"Violin sample source: {settings.violin_sample_source}",
+            f"Weight order: {settings.violin_weight_order}",
+            f"Y-axis scale: {settings.violin_value_scale_mode}",
+            f"Violin palette: {settings.violin_palette}",
+            f"Point color: {settings.violin_point_color}",
             (
                 "MAP location: "
                 f"chain {summary.map_chain + 1}, step {summary.map_step + 1}"
@@ -1952,6 +2858,10 @@ class SAXSMainWindow(QMainWindow):
             f"Posterior filter: {self._describe_posterior_filter(settings)}\n"
             f"Violin data mode: {settings.violin_parameter_mode}\n"
             f"Violin sample source: {settings.violin_sample_source}\n"
+            f"Weight order: {settings.violin_weight_order}\n"
+            f"Y-axis scale: {settings.violin_value_scale_mode}\n"
+            f"Violin palette: {settings.violin_palette}\n"
+            f"Point color: {settings.violin_point_color}\n"
             "Recommendation: all refinable parameters are usually allowed "
             "to vary during DREAM refinement."
         )

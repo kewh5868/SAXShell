@@ -87,6 +87,7 @@ class MDTrajectorySelectionResult:
             "start": preview.start,
             "stop": preview.stop,
             "stride": preview.stride,
+            "post_cutoff_stride": preview.post_cutoff_stride,
             "time_metadata_frames": preview.time_metadata_frames,
             "first_frame_index": preview.first_frame_index,
             "last_frame_index": preview.last_frame_index,
@@ -202,6 +203,7 @@ class MDTrajectoryWorkflow:
         start: int | None = None,
         stop: int | None = None,
         stride: int = 1,
+        post_cutoff_stride: int = 1,
         use_cutoff: bool = False,
         cutoff_fs: float | None = None,
         output_dir: str | Path | None = None,
@@ -217,6 +219,7 @@ class MDTrajectoryWorkflow:
             stop=stop,
             stride=stride,
             min_time_fs=applied_cutoff_fs,
+            post_cutoff_stride=post_cutoff_stride,
         )
         resolved_output_dir = (
             Path(output_dir)
@@ -239,6 +242,7 @@ class MDTrajectoryWorkflow:
         start: int | None = None,
         stop: int | None = None,
         stride: int = 1,
+        post_cutoff_stride: int = 1,
         use_cutoff: bool = False,
         cutoff_fs: float | None = None,
     ) -> MDTrajectoryExportResult:
@@ -247,6 +251,7 @@ class MDTrajectoryWorkflow:
             start=start,
             stop=stop,
             stride=stride,
+            post_cutoff_stride=post_cutoff_stride,
             use_cutoff=use_cutoff,
             cutoff_fs=cutoff_fs,
             output_dir=output_dir,
@@ -260,6 +265,7 @@ class MDTrajectoryWorkflow:
             stop=stop,
             stride=stride,
             min_time_fs=selection.applied_cutoff_fs,
+            post_cutoff_stride=post_cutoff_stride,
         )
         return MDTrajectoryExportResult(
             output_dir=selection.output_dir,

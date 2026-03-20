@@ -71,6 +71,40 @@ def test_workflow_supports_notebook_style_end_to_end_usage(tmp_path):
     ]
 
 
+def test_workflow_can_keep_every_nth_frame_after_cutoff(tmp_path):
+    trajectory_file = tmp_path / "traj.xyz"
+    energy_file = tmp_path / "traj.ener"
+    _write_sample_xyz(trajectory_file)
+    _write_sample_ener(energy_file)
+
+    workflow = MDTrajectoryWorkflow(
+        trajectory_file=trajectory_file,
+        energy_file=energy_file,
+    )
+
+    suggested = workflow.suggest_cutoff(
+        temp_target_k=300.0,
+        temp_tol_k=1.0,
+        window=2,
+    )
+    workflow.set_selected_cutoff(suggested.cutoff_time_fs)
+    selection = workflow.preview_selection(
+        use_cutoff=True,
+        post_cutoff_stride=2,
+    )
+    export = workflow.export_frames(
+        use_cutoff=True,
+        post_cutoff_stride=2,
+    )
+
+    assert selection.preview.selected_frames == 2
+    assert selection.preview.post_cutoff_stride == 2
+    assert [path.name for path in export.written_files] == [
+        "frame_0001.xyz",
+        "frame_0003.xyz",
+    ]
+
+
 def test_mdtrajectory_cli_export_runs_complete_headless_workflow(
     tmp_path,
     capsys,
