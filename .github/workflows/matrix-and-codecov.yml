@@ -17,5 +17,6 @@ jobs:
       project: saxshell
       c_extension: false
       headless: true
+      python_version: "3.12"
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
