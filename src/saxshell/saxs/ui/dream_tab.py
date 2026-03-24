@@ -9,9 +9,10 @@ from matplotlib.backends.backend_qtagg import (
 from matplotlib.colors import to_hex
 from matplotlib.figure import Figure
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QValidator
+from PySide6.QtGui import QColor, QTextOption, QValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractScrollArea,
     QCheckBox,
     QColorDialog,
     QComboBox,
@@ -137,6 +138,9 @@ class DreamTab(QWidget):
         self._history_messages: list[str] = []
         self._live_output_history_index: int | None = None
         self._applying_search_filter_preset = False
+        self._current_model_plot_data: DreamModelPlotData | None = None
+        self._model_legend_line_map: dict[object, object] = {}
+        self._model_legend_handle_lookup: dict[str, object] = {}
         self._blink_timer = QTimer(self)
         self._blink_timer.setInterval(180)
         self._blink_timer.timeout.connect(self._advance_button_blink)
@@ -714,8 +718,52 @@ class DreamTab(QWidget):
             self.median_color_button,
             median_color_tip,
         )
+        outline_color_tip = (
+            "Choose the outline color drawn around each violin body."
+        )
+        self.violin_outline_color_button = QPushButton()
+        self.violin_outline_color_button.clicked.connect(
+            self._choose_outline_color
+        )
+        self._configure_plot_color_button(
+            self.violin_outline_color_button,
+            "#000000",
+            label="Outline",
+        )
+        outline_color_label = QLabel("Outline")
+        self._set_widget_tooltip(
+            outline_color_label,
+            self.violin_outline_color_button,
+            outline_color_tip,
+        )
+        outline_width_tip = (
+            "Set the thickness of the violin outline stroke in points."
+        )
+        self.violin_outline_width_spin = QDoubleSpinBox()
+        self.violin_outline_width_spin.setDecimals(1)
+        self.violin_outline_width_spin.setRange(0.1, 5.0)
+        self.violin_outline_width_spin.setSingleStep(0.1)
+        self.violin_outline_width_spin.setValue(0.8)
+        self.violin_outline_width_spin.valueChanged.connect(
+            lambda _value: self.visualization_settings_changed.emit()
+        )
+        outline_width_label = QLabel("Width")
+        self._set_widget_tooltip(
+            outline_width_label,
+            self.violin_outline_width_spin,
+            outline_width_tip,
+        )
+        outline_widget = QWidget()
+        outline_layout = QHBoxLayout(outline_widget)
+        outline_layout.setContentsMargins(0, 0, 0, 0)
+        outline_layout.setSpacing(6)
+        outline_layout.addWidget(outline_color_label)
+        outline_layout.addWidget(self.violin_outline_color_button)
+        outline_layout.addWidget(outline_width_label)
+        outline_layout.addWidget(self.violin_outline_width_spin)
         layout.addWidget(median_color_label, row, 0)
         layout.addWidget(self.median_color_button, row, 1)
+        layout.addWidget(outline_widget, row, 2, 1, 2)
 
         row += 1
         layout.addWidget(
@@ -876,10 +924,11 @@ class DreamTab(QWidget):
             lambda _value: self.visualization_settings_changed.emit()
         )
         top_percent_tip = (
-            "When 'Top % by Log-posterior' is selected, keep this percent "
-            "of the highest-log-posterior samples across all chains."
+            "Default percent used whenever Top % log-posterior screening is "
+            "evaluated or selected. The automatic post-run filter "
+            "assessment also uses this value."
         )
-        top_percent_label = QLabel("Top %")
+        top_percent_label = QLabel("Top % default")
         self._set_widget_tooltip(
             top_percent_label,
             self.posterior_top_percent_spin,
@@ -896,10 +945,11 @@ class DreamTab(QWidget):
             lambda _value: self.visualization_settings_changed.emit()
         )
         top_n_tip = (
-            "When 'Top N by Log-posterior' is selected, keep this many of "
-            "the highest-log-posterior samples across all chains."
+            "Default count used whenever Top N log-posterior screening is "
+            "evaluated or selected. The automatic post-run filter "
+            "assessment also uses this value."
         )
-        top_n_label = QLabel("Top N")
+        top_n_label = QLabel("Top N default")
         self._set_widget_tooltip(
             top_n_label,
             self.posterior_top_n_spin,
@@ -909,6 +959,18 @@ class DreamTab(QWidget):
         layout.addWidget(self.posterior_top_percent_spin, 1, 1)
         layout.addWidget(top_n_label, 1, 2)
         layout.addWidget(self.posterior_top_n_spin, 1, 3)
+
+        self.auto_filter_assessment_checkbox = QCheckBox(
+            "Auto-select best filter after run"
+        )
+        self.auto_filter_assessment_checkbox.setChecked(True)
+        self.auto_filter_assessment_checkbox.setToolTip(
+            "After a DREAM refinement completes, evaluate All Post-burnin, "
+            "Top % by log-posterior, and Top N by log-posterior using the "
+            "default Top % / Top N values above, then automatically apply "
+            "the filter with the best fit quality."
+        )
+        layout.addWidget(self.auto_filter_assessment_checkbox, 2, 0, 1, 4)
 
         self.credible_interval_low_spin = QDoubleSpinBox()
         self.credible_interval_low_spin.setRange(0.0, 99.9)
@@ -947,10 +1009,10 @@ class DreamTab(QWidget):
             self.credible_interval_high_spin,
             interval_high_tip,
         )
-        layout.addWidget(interval_low_label, 2, 0)
-        layout.addWidget(self.credible_interval_low_spin, 2, 1)
-        layout.addWidget(interval_high_label, 2, 2)
-        layout.addWidget(self.credible_interval_high_spin, 2, 3)
+        layout.addWidget(interval_low_label, 3, 0)
+        layout.addWidget(self.credible_interval_low_spin, 3, 1)
+        layout.addWidget(interval_high_label, 3, 2)
+        layout.addWidget(self.credible_interval_high_spin, 3, 3)
 
         self._update_posterior_filter_controls()
         return group
@@ -1009,11 +1071,43 @@ class DreamTab(QWidget):
         layout = QVBoxLayout(group)
         controls = QHBoxLayout()
         controls.setContentsMargins(0, 0, 0, 0)
+        self.show_experimental_trace_checkbox = QCheckBox("Experimental")
+        self.show_experimental_trace_checkbox.setChecked(True)
+        self.show_experimental_trace_checkbox.toggled.connect(
+            self._redraw_current_model_plot
+        )
+        self.show_model_trace_checkbox = QCheckBox("Model")
+        self.show_model_trace_checkbox.setChecked(True)
+        self.show_model_trace_checkbox.toggled.connect(
+            self._redraw_current_model_plot
+        )
+        self.show_solvent_trace_checkbox = QCheckBox("Solvent")
+        self.show_solvent_trace_checkbox.setChecked(False)
+        self.show_solvent_trace_checkbox.toggled.connect(
+            self._redraw_current_model_plot
+        )
+        self.model_log_x_checkbox = QCheckBox("Log X")
+        self.model_log_x_checkbox.setChecked(True)
+        self.model_log_x_checkbox.toggled.connect(
+            self._redraw_current_model_plot
+        )
+        self.model_log_y_checkbox = QCheckBox("Log Y")
+        self.model_log_y_checkbox.setChecked(True)
+        self.model_log_y_checkbox.toggled.connect(
+            self._redraw_current_model_plot
+        )
+        controls.addWidget(self.show_experimental_trace_checkbox)
+        controls.addWidget(self.show_model_trace_checkbox)
+        controls.addWidget(self.show_solvent_trace_checkbox)
+        controls.addWidget(self.model_log_x_checkbox)
+        controls.addWidget(self.model_log_y_checkbox)
         controls.addStretch(1)
-        self.save_model_button = QPushButton("Save Model Fit Data")
+        self.save_model_button = QPushButton("Export Data")
         self.save_model_button.setToolTip(
-            "Save the currently displayed DREAM model-vs-experimental fit "
-            "data to the project plots folder."
+            "Export a condensed copy of the displayed DREAM model-fit "
+            "data to exported_results/data, alongside companion metadata "
+            "and a fit report. Full DREAM run artifacts remain in the "
+            "DREAM run folder."
         )
         self.save_model_button.clicked.connect(
             self.save_model_fit_requested.emit
@@ -1022,6 +1116,9 @@ class DreamTab(QWidget):
         layout.addLayout(controls)
         self.model_figure = Figure(figsize=(8.0, 4.2))
         self.model_canvas = FigureCanvasQTAgg(self.model_figure)
+        self.model_canvas.mpl_connect(
+            "pick_event", self._handle_model_legend_pick
+        )
         self.model_toolbar = NavigationToolbar2QT(self.model_canvas, self)
         self.model_canvas.setMinimumHeight(320)
         layout.addWidget(self.model_toolbar)
@@ -1034,10 +1131,12 @@ class DreamTab(QWidget):
         controls = QHBoxLayout()
         controls.setContentsMargins(0, 0, 0, 0)
         controls.addStretch(1)
-        self.save_violin_button = QPushButton("Save Violin Plot Data")
+        self.save_violin_button = QPushButton("Export Data")
         self.save_violin_button.setToolTip(
-            "Save the currently displayed posterior violin plot sample "
-            "data to the project plots folder."
+            "Export a condensed copy of the displayed posterior violin "
+            "data to exported_results/data, alongside companion metadata "
+            "and a fit report. Full DREAM run artifacts remain in the "
+            "DREAM run folder."
         )
         self.save_violin_button.clicked.connect(
             self.save_violin_data_requested.emit
@@ -1064,6 +1163,14 @@ class DreamTab(QWidget):
         layout.addWidget(self.progress_bar)
         self.output_box = QTextEdit()
         self.output_box.setReadOnly(True)
+        self.output_box.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.output_box.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
+        self.output_box.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.output_box.setSizeAdjustPolicy(
+            QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored
+        )
         self.output_box.setMinimumHeight(220)
         layout.addWidget(self.output_box)
         self.log_box = self.output_box
@@ -1147,6 +1254,9 @@ class DreamTab(QWidget):
             settings.posterior_top_percent
         )
         self.posterior_top_n_spin.setValue(settings.posterior_top_n)
+        self.auto_filter_assessment_checkbox.setChecked(
+            settings.auto_select_best_posterior_filter
+        )
         self.credible_interval_low_spin.setValue(
             settings.credible_interval_low
         )
@@ -1197,6 +1307,14 @@ class DreamTab(QWidget):
             settings.violin_median_color,
             label="Median",
         )
+        self._configure_plot_color_button(
+            self.violin_outline_color_button,
+            settings.violin_outline_color,
+            label="Outline",
+        )
+        self.violin_outline_width_spin.setValue(
+            float(settings.violin_outline_width)
+        )
         self._applying_search_filter_preset = False
         self._update_violin_style_controls()
         self._update_posterior_filter_controls()
@@ -1230,6 +1348,9 @@ class DreamTab(QWidget):
                 self.posterior_top_percent_spin.value()
             ),
             posterior_top_n=int(self.posterior_top_n_spin.value()),
+            auto_select_best_posterior_filter=bool(
+                self.auto_filter_assessment_checkbox.isChecked()
+            ),
             credible_interval_low=float(
                 self.credible_interval_low_spin.value()
             ),
@@ -1245,6 +1366,8 @@ class DreamTab(QWidget):
             violin_point_color=self.selected_violin_point_color(),
             violin_interval_color=self.selected_violin_interval_color(),
             violin_median_color=self.selected_violin_median_color(),
+            violin_outline_color=self.selected_violin_outline_color(),
+            violin_outline_width=float(self.violin_outline_width_spin.value()),
         )
 
     def set_parameter_map_entries(self, entries) -> None:
@@ -1349,6 +1472,12 @@ class DreamTab(QWidget):
             default="#4d4d4d",
         )
 
+    def selected_violin_outline_color(self) -> str:
+        return self._plot_color_button_value(
+            self.violin_outline_color_button,
+            default="#000000",
+        )
+
     def _update_verbose_output_controls(self) -> None:
         self.verbose_interval_spin.setEnabled(
             self.verbose_checkbox.isChecked()
@@ -1410,7 +1539,11 @@ class DreamTab(QWidget):
         self.progress_bar.setFormat("%v / %m runs")
 
     def plot_model_fit(self, plot_data: DreamModelPlotData | None) -> None:
+        self._current_model_plot_data = plot_data
+        self._model_legend_line_map.clear()
+        self._model_legend_handle_lookup.clear()
         self.model_figure.clear()
+        self._update_model_trace_toggle_state(plot_data)
         axis = self.model_figure.add_subplot(111)
         if plot_data is None:
             axis.text(
@@ -1424,23 +1557,52 @@ class DreamTab(QWidget):
             self.model_canvas.draw()
             return
 
-        axis.scatter(
-            plot_data.q_values,
-            plot_data.experimental_intensities,
-            color="black",
-            s=14,
-            label="Experimental",
-            zorder=3,
+        plotted_lines: list[object] = []
+        if self.show_experimental_trace_checkbox.isChecked():
+            experimental_artist = axis.scatter(
+                plot_data.q_values,
+                plot_data.experimental_intensities,
+                color="black",
+                s=14,
+                label="Experimental",
+                zorder=3,
+            )
+            plotted_lines.append(experimental_artist)
+        if (
+            self.show_solvent_trace_checkbox.isChecked()
+            and plot_data.solvent_contribution is not None
+        ):
+            solvent_values = np.asarray(
+                plot_data.solvent_contribution,
+                dtype=float,
+            )
+            solvent_mask = np.isfinite(solvent_values)
+            if self.model_log_y_checkbox.isChecked():
+                solvent_mask &= solvent_values > 0.0
+            if np.any(solvent_mask):
+                (solvent_line,) = axis.plot(
+                    np.asarray(plot_data.q_values, dtype=float)[solvent_mask],
+                    solvent_values[solvent_mask],
+                    color="green",
+                    linewidth=1.5,
+                    label="Solvent contribution",
+                )
+                plotted_lines.append(solvent_line)
+        if self.show_model_trace_checkbox.isChecked():
+            (model_line,) = axis.plot(
+                plot_data.q_values,
+                plot_data.model_intensities,
+                color="tab:red",
+                linewidth=2,
+                label=f"Model ({plot_data.bestfit_method})",
+            )
+            plotted_lines.append(model_line)
+        axis.set_xscale(
+            "log" if self.model_log_x_checkbox.isChecked() else "linear"
         )
-        axis.plot(
-            plot_data.q_values,
-            plot_data.model_intensities,
-            color="tab:red",
-            linewidth=2,
-            label=f"Model ({plot_data.bestfit_method})",
+        axis.set_yscale(
+            "log" if self.model_log_y_checkbox.isChecked() else "linear"
         )
-        axis.set_xscale("log")
-        axis.set_yscale("log")
         axis.set_xlabel("q (Å⁻¹)")
         axis.set_ylabel("Intensity (arb. units)")
         axis.set_title(f"DREAM refinement: {plot_data.template_name}")
@@ -1464,9 +1626,62 @@ class DreamTab(QWidget):
                 "alpha": 0.85,
             },
         )
-        axis.legend(loc="best")
+        if plotted_lines:
+            self._build_interactive_model_legend(axis, plotted_lines)
         self.model_figure.tight_layout()
         self.model_canvas.draw()
+
+    def _redraw_current_model_plot(self) -> None:
+        self.plot_model_fit(self._current_model_plot_data)
+
+    def _update_model_trace_toggle_state(
+        self,
+        plot_data: DreamModelPlotData | None,
+    ) -> None:
+        has_plot_data = plot_data is not None
+        has_solvent = (
+            has_plot_data and plot_data.solvent_contribution is not None
+        )
+        self.show_experimental_trace_checkbox.setEnabled(has_plot_data)
+        self.show_model_trace_checkbox.setEnabled(has_plot_data)
+        self.show_solvent_trace_checkbox.setEnabled(bool(has_solvent))
+
+    def _build_interactive_model_legend(
+        self, axis, lines: list[object]
+    ) -> None:
+        legend = axis.legend(loc="best")
+        if legend is None:
+            return
+        legend_handles = getattr(legend, "legend_handles", None)
+        if legend_handles is None:
+            legend_handles = getattr(legend, "legendHandles", [])
+        for legend_handle, original_line in zip(legend_handles, lines):
+            if hasattr(legend_handle, "set_picker"):
+                legend_handle.set_picker(True)
+                legend_handle.set_pickradius(6)
+            legend_handle.set_alpha(
+                1.0 if original_line.get_visible() else 0.25
+            )
+            self._model_legend_line_map[legend_handle] = original_line
+            label = str(original_line.get_label()).strip()
+            if label:
+                self._model_legend_handle_lookup[label] = legend_handle
+
+    def _handle_model_legend_pick(self, event) -> None:
+        original_line = self._model_legend_line_map.get(event.artist)
+        if original_line is None:
+            return
+        is_visible = not original_line.get_visible()
+        original_line.set_visible(is_visible)
+        if hasattr(event.artist, "set_alpha"):
+            event.artist.set_alpha(1.0 if is_visible else 0.25)
+        for axis in self.model_figure.axes:
+            try:
+                axis.relim(visible_only=True)
+                axis.autoscale_view()
+            except Exception:
+                continue
+        self.model_canvas.draw_idle()
 
     def plot_violin_plot(
         self,
@@ -1500,10 +1715,13 @@ class DreamTab(QWidget):
             showmedians=True,
         )
         colors = self._violin_body_colors(len(payload["display_names"]))
+        outline_color = self.selected_violin_outline_color()
+        outline_width = float(self.violin_outline_width_spin.value())
         for body, color in zip(violin_parts["bodies"], colors, strict=True):
-            body.set_facecolor(color)
-            body.set_edgecolor(color)
-            body.set_alpha(0.55)
+            red, green, blue, _alpha = color
+            body.set_facecolor((red, green, blue, 0.62))
+            body.set_edgecolor(outline_color)
+            body.set_linewidth(outline_width)
         interval_color = self.selected_violin_interval_color()
         median_color = self.selected_violin_median_color()
         for key in ("cbars", "cmins", "cmaxes"):
@@ -1626,8 +1844,8 @@ class DreamTab(QWidget):
             ]
         cmap = colormaps.get_cmap(palette)
         if count <= 1:
-            return [tuple(cmap(0.6))]
-        positions = np.linspace(0.2, 0.85, count)
+            return [tuple(cmap(0.72))]
+        positions = np.linspace(0.35, 0.9, count)
         return [tuple(cmap(position)) for position in positions]
 
     @staticmethod
@@ -1798,6 +2016,14 @@ class DreamTab(QWidget):
             default="#4d4d4d",
         )
 
+    def _choose_outline_color(self) -> None:
+        self._choose_plot_color(
+            self.violin_outline_color_button,
+            title="Choose violin outline color",
+            label="Outline",
+            default="#000000",
+        )
+
     def _choose_plot_color(
         self,
         button: QPushButton,
@@ -1878,9 +2104,8 @@ class DreamTab(QWidget):
             self._applying_search_filter_preset = False
 
     def _update_posterior_filter_controls(self) -> None:
-        mode = self.selected_posterior_filter_mode()
-        self.posterior_top_percent_spin.setEnabled(mode == "top_percent_logp")
-        self.posterior_top_n_spin.setEnabled(mode == "top_n_logp")
+        self.posterior_top_percent_spin.setEnabled(True)
+        self.posterior_top_n_spin.setEnabled(True)
 
     @staticmethod
     def _build_action_group(

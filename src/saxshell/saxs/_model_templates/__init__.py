@@ -18,6 +18,24 @@ class TemplateParameter:
 
 
 @dataclass(slots=True, frozen=True)
+class TemplateRuntimeMetadataBinding:
+    runtime_name: str
+    metadata_field: str
+
+
+@dataclass(slots=True, frozen=True)
+class TemplateClusterGeometrySupport:
+    supported: bool
+    mapping_target: str = "component_weights"
+    metadata_fields: tuple[str, ...] = ()
+    runtime_bindings: tuple[TemplateRuntimeMetadataBinding, ...] = ()
+
+    @property
+    def runtime_input_names(self) -> tuple[str, ...]:
+        return tuple(binding.runtime_name for binding in self.runtime_bindings)
+
+
+@dataclass(slots=True, frozen=True)
 class TemplateSpec:
     name: str
     module_path: Path
@@ -30,10 +48,17 @@ class TemplateSpec:
     dream_inputs: tuple[str, ...]
     param_columns: tuple[str, ...]
     parameters: tuple[TemplateParameter, ...]
+    cluster_geometry_support: TemplateClusterGeometrySupport
 
     @property
     def label(self) -> str:
         return self.display_name
+
+    @property
+    def extra_lmfit_inputs(self) -> tuple[str, ...]:
+        if len(self.lmfit_inputs) < 4:
+            return ()
+        return self.lmfit_inputs[3:-1]
 
 
 def default_template_dir() -> Path:
@@ -70,8 +95,12 @@ def load_template_spec(
         )
     directives = _parse_directives(module_path)
     metadata_path = resolved_dir / f"{template_name}.json"
-    metadata = _load_template_metadata(metadata_path, template_name)
-    return TemplateSpec(
+    metadata = _load_template_metadata(
+        metadata_path,
+        template_name,
+        directives=directives,
+    )
+    spec = TemplateSpec(
         name=template_name,
         module_path=module_path,
         metadata_path=metadata_path if metadata_path.is_file() else None,
@@ -83,7 +112,10 @@ def load_template_spec(
         dream_inputs=_split_csv(directives["inputs_pydream"]),
         param_columns=_split_csv(directives["param_columns"]),
         parameters=tuple(_parse_param_lines(module_path)),
+        cluster_geometry_support=metadata["cluster_geometry_support"],
     )
+    _validate_template_runtime_contract(spec)
+    return spec
 
 
 @lru_cache(maxsize=None)
@@ -123,6 +155,10 @@ def _parse_directives(module_path: Path) -> dict[str, str]:
         "inputs_pydream",
         "param_columns",
     }
+    optional = {
+        "cluster_geometry_metadata",
+    }
+    recognized = required | optional
     with module_path.open("r", encoding="utf-8") as handle:
         for line in handle:
             stripped = line.strip()
@@ -132,7 +168,7 @@ def _parse_directives(module_path: Path) -> dict[str, str]:
                 continue
             key, raw_value = stripped[2:].split(":", 1)
             key = key.strip()
-            if key in required:
+            if key in recognized:
                 directives[key] = raw_value.strip()
     missing = required - set(directives)
     if missing:
@@ -187,7 +223,9 @@ def _split_csv(value: str) -> tuple[str, ...]:
 def _load_template_metadata(
     metadata_path: Path,
     template_name: str,
-) -> dict[str, str]:
+    *,
+    directives: dict[str, str],
+) -> dict[str, object]:
     if not metadata_path.is_file():
         fallback_name = template_name.replace("_", " ")
         return {
@@ -198,6 +236,9 @@ def _load_template_metadata(
                 "SAXS model template. Add a paired JSON metadata file in "
                 "the _model_templates folder to provide a friendly display "
                 "name and a detailed description."
+            ),
+            "cluster_geometry_support": TemplateClusterGeometrySupport(
+                supported=False
             ),
         }
     payload = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -213,14 +254,172 @@ def _load_template_metadata(
             f"Template metadata file {metadata_path.name} is missing "
             "'description'."
         )
+    cluster_geometry_support = _parse_cluster_geometry_support(
+        payload,
+        metadata_path=metadata_path,
+        directives=directives,
+    )
     return {
         "display_name": display_name,
         "description": description,
+        "cluster_geometry_support": cluster_geometry_support,
     }
 
 
+def _validate_template_runtime_contract(spec: TemplateSpec) -> None:
+    if not spec.cluster_geometry_support.supported:
+        return
+
+    runtime_names = set(spec.cluster_geometry_support.runtime_input_names)
+    missing_from_lmfit = sorted(
+        runtime_name
+        for runtime_name in runtime_names
+        if runtime_name not in spec.extra_lmfit_inputs
+    )
+    if missing_from_lmfit:
+        raise ValueError(
+            f"Template {spec.name} declares cluster geometry runtime "
+            "bindings that are missing from inputs_lmfit: "
+            + ", ".join(missing_from_lmfit)
+        )
+
+    missing_from_dream = sorted(
+        runtime_name
+        for runtime_name in runtime_names
+        if runtime_name not in spec.dream_inputs
+    )
+    if missing_from_dream:
+        raise ValueError(
+            f"Template {spec.name} declares cluster geometry runtime "
+            "bindings that are missing from inputs_pydream: "
+            + ", ".join(missing_from_dream)
+        )
+
+
+def _parse_cluster_geometry_support(
+    payload: dict[str, object],
+    *,
+    metadata_path: Path,
+    directives: dict[str, str],
+) -> TemplateClusterGeometrySupport:
+    capabilities = payload.get("capabilities", {})
+    if not isinstance(capabilities, dict):
+        capabilities = {}
+    raw_support = capabilities.get("cluster_geometry_metadata", {})
+    if raw_support is None:
+        raw_support = {}
+    if not isinstance(raw_support, dict):
+        raise ValueError(
+            f"Template metadata file {metadata_path.name} defines "
+            "'capabilities.cluster_geometry_metadata' with an invalid "
+            "schema."
+        )
+
+    supported = bool(raw_support.get("supported", False))
+    directive_text = directives.get("cluster_geometry_metadata")
+    if supported and directive_text is None:
+        raise ValueError(
+            f"Template metadata file {metadata_path.name} enables "
+            "cluster_geometry_metadata but the paired Python template "
+            "header does not declare '# cluster_geometry_metadata: true'."
+        )
+    if directive_text is not None:
+        directive_supported = _parse_bool_directive(
+            directive_text,
+            field_name="cluster_geometry_metadata",
+            source_name=metadata_path.name,
+        )
+        if directive_supported != supported:
+            raise ValueError(
+                f"Template metadata file {metadata_path.name} and the paired "
+                "Python template header disagree about "
+                "cluster_geometry_metadata support."
+            )
+    if not supported:
+        return TemplateClusterGeometrySupport(supported=False)
+
+    mapping_target = (
+        str(raw_support.get("mapping_target", "component_weights")).strip()
+        or "component_weights"
+    )
+    if mapping_target != "component_weights":
+        raise ValueError(
+            f"Template metadata file {metadata_path.name} uses unsupported "
+            f"cluster geometry mapping_target {mapping_target!r}."
+        )
+
+    metadata_fields = tuple(
+        str(field_name).strip()
+        for field_name in raw_support.get("metadata_fields", [])
+        if str(field_name).strip()
+    )
+    if not metadata_fields:
+        raise ValueError(
+            f"Template metadata file {metadata_path.name} must declare at "
+            "least one cluster geometry metadata field when support is "
+            "enabled."
+        )
+
+    runtime_bindings_payload = raw_support.get("runtime_bindings", {})
+    if not isinstance(runtime_bindings_payload, dict):
+        raise ValueError(
+            f"Template metadata file {metadata_path.name} defines "
+            "'runtime_bindings' with an invalid schema."
+        )
+    runtime_bindings = tuple(
+        TemplateRuntimeMetadataBinding(
+            runtime_name=str(runtime_name).strip(),
+            metadata_field=str(metadata_field).strip(),
+        )
+        for runtime_name, metadata_field in runtime_bindings_payload.items()
+        if str(runtime_name).strip() and str(metadata_field).strip()
+    )
+    if not runtime_bindings:
+        raise ValueError(
+            f"Template metadata file {metadata_path.name} must declare "
+            "runtime_bindings when cluster geometry metadata support is "
+            "enabled."
+        )
+    invalid_fields = [
+        binding.metadata_field
+        for binding in runtime_bindings
+        if binding.metadata_field not in metadata_fields
+    ]
+    if invalid_fields:
+        raise ValueError(
+            f"Template metadata file {metadata_path.name} references unknown "
+            "cluster geometry metadata fields in runtime_bindings: "
+            + ", ".join(sorted(set(invalid_fields)))
+        )
+    return TemplateClusterGeometrySupport(
+        supported=True,
+        mapping_target=mapping_target,
+        metadata_fields=metadata_fields,
+        runtime_bindings=runtime_bindings,
+    )
+
+
+def _parse_bool_directive(
+    value: str,
+    *,
+    field_name: str,
+    source_name: str,
+) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{source_name} defines {field_name!r} with unsupported boolean "
+        f"value {value!r}."
+    )
+
+
 __all__ = [
+    "TemplateClusterGeometrySupport",
     "TemplateParameter",
+    "TemplateRuntimeMetadataBinding",
     "TemplateSpec",
     "default_template_dir",
     "list_template_specs",

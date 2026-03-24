@@ -33,6 +33,9 @@ src/saxshell/_deprecated/
 src/saxshell/saxs/_deprecated/
 examples/
 src/saxsshell_updates_planned.txt
+src/saxshell/fullrmc/_deprecated/
+src/saxshell/debyer/_deprecated/
+src/saxshell/toolbox/_deprecated/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -95,3 +98,4 @@ target/
 
 # Ipython Notebook
 .ipynb_checkpoints
+src/saxshell/fullrmc/_solution_property_presets/user_solution_property_presets.json

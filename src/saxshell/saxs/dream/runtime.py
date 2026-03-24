@@ -395,6 +395,9 @@ class SAXSDreamWorkflow:
             active_entries.append(dream_entry.to_dict())
 
         evaluation = self.prefit_workflow.evaluate()
+        template_runtime_inputs = (
+            self.prefit_workflow.template_runtime_inputs_payload()
+        )
         metadata = {
             "project_dir": str(self.paths.project_dir),
             "template_name": self.prefit_workflow.template_spec.name,
@@ -416,6 +419,15 @@ class SAXSDreamWorkflow:
                 self.prefit_workflow.solvent_data.tolist()
                 if self.prefit_workflow.solvent_data is not None
                 else [0.0] * len(evaluation.q_values)
+            ),
+            "template_runtime_inputs": template_runtime_inputs,
+            "lmfit_extra_inputs": list(
+                self.prefit_workflow.template_spec.extra_lmfit_inputs
+            ),
+            "cluster_geometry_metadata": (
+                None
+                if self.prefit_workflow.cluster_geometry_table is None
+                else self.prefit_workflow.cluster_geometry_table.to_dict()
             ),
         }
         return metadata
@@ -472,6 +484,14 @@ solvent_intensities = np.asarray(
     RUNTIME_METADATA["solvent_intensities"],
     dtype=float,
 )
+TEMPLATE_RUNTIME_INPUTS = {{
+    str(name): np.asarray(values, dtype=float)
+    for name, values in dict(
+        RUNTIME_METADATA.get("template_runtime_inputs", {{}})
+    ).items()
+}}
+LMFIT_EXTRA_INPUTS = list(RUNTIME_METADATA.get("lmfit_extra_inputs", []))
+globals().update(TEMPLATE_RUNTIME_INPUTS)
 
 warnings.filterwarnings(
     "ignore",
@@ -689,10 +709,15 @@ def full_params_to_kwargs(full_params):
 def model_from_active_params(active_params):
     full_params = expand_active_params(active_params)
     params = full_params_to_kwargs(full_params)
+    extra_inputs = [
+        np.asarray(TEMPLATE_RUNTIME_INPUTS[name], dtype=float)
+        for name in LMFIT_EXTRA_INPUTS
+    ]
     return {lmfit_model_name}(
         q_values,
         solvent_intensities,
         theoretical_intensities,
+        *extra_inputs,
         **params,
     )
 

@@ -5,10 +5,12 @@ from pathlib import Path
 from textwrap import fill
 
 import numpy as np
+from matplotlib import colormaps, rcParams
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg,
     NavigationToolbar2QT,
 )
+from matplotlib.colors import to_hex
 from matplotlib.figure import Figure
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
@@ -58,6 +60,16 @@ from saxshell.saxs.ui.template_help import (
     show_template_help,
 )
 
+HISTOGRAM_COLORMAP_NAMES = [
+    "summer",
+    "viridis",
+    "plasma",
+    "cividis",
+    "Greens",
+    "Blues",
+    "magma",
+]
+
 
 class ProjectSetupTab(QWidget):
     create_project_requested = Signal()
@@ -69,6 +81,8 @@ class ProjectSetupTab(QWidget):
     build_prior_weights_requested = Signal()
     generate_prior_plot_requested = Signal()
     save_prior_png_requested = Signal()
+    save_component_plot_data_requested = Signal()
+    save_prior_plot_data_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -95,6 +109,7 @@ class ProjectSetupTab(QWidget):
         self._updating_cluster_table = False
         self._build_ui()
         self._update_data_trace_control_state()
+        self._update_component_trace_control_state()
         self.set_project_selected(False)
 
     def _build_ui(self) -> None:
@@ -457,10 +472,35 @@ class ProjectSetupTab(QWidget):
         self.component_model_range_button.toggled.connect(
             self._redraw_saxs_preview
         )
+        self.component_all_traces_button = QPushButton("Hide Computed Traces")
+        self.component_all_traces_button.clicked.connect(
+            self._toggle_all_component_traces
+        )
+        self.component_trace_color_scheme_combo = QComboBox()
+        self.component_trace_color_scheme_combo.addItem(
+            "Current",
+            userData="default",
+        )
+        for cmap_name in HISTOGRAM_COLORMAP_NAMES:
+            self.component_trace_color_scheme_combo.addItem(
+                cmap_name,
+                userData=cmap_name,
+            )
+        self.component_trace_color_scheme_combo.currentIndexChanged.connect(
+            self._on_component_trace_color_scheme_changed
+        )
+        self.save_component_plot_data_button = QPushButton("Export Plot Data")
+        self.save_component_plot_data_button.clicked.connect(
+            self.save_component_plot_data_requested.emit
+        )
         controls.addWidget(self.component_log_x_checkbox)
         controls.addWidget(self.component_log_y_checkbox)
         controls.addWidget(self.component_legend_toggle_button)
         controls.addWidget(self.component_model_range_button)
+        controls.addWidget(self.component_all_traces_button)
+        controls.addWidget(QLabel("Trace Colors"))
+        controls.addWidget(self.component_trace_color_scheme_combo)
+        controls.addWidget(self.save_component_plot_data_button)
         controls.addStretch(1)
         layout.addLayout(controls)
 
@@ -514,18 +554,14 @@ class ProjectSetupTab(QWidget):
             self._redraw_prior_preview_if_needed
         )
         self.prior_color_combo = QComboBox()
-        self.prior_color_combo.addItems(
-            [
-                "summer",
-                "viridis",
-                "plasma",
-                "cividis",
-                "Greens",
-                "Blues",
-                "magma",
-            ]
-        )
+        self.prior_color_combo.addItems(HISTOGRAM_COLORMAP_NAMES)
         self.prior_color_combo.currentTextChanged.connect(
+            self._redraw_prior_preview_if_needed
+        )
+        self.prior_match_trace_colors_checkbox = QCheckBox(
+            "Match Trace Colors"
+        )
+        self.prior_match_trace_colors_checkbox.toggled.connect(
             self._redraw_prior_preview_if_needed
         )
         self.generate_prior_plot_button = QPushButton("Generate Plot")
@@ -536,6 +572,10 @@ class ProjectSetupTab(QWidget):
         self.save_prior_png_button.clicked.connect(
             self.save_prior_png_requested.emit
         )
+        self.save_prior_plot_data_button = QPushButton("Export Plot Data")
+        self.save_prior_plot_data_button.clicked.connect(
+            self.save_prior_plot_data_requested.emit
+        )
         controls.addWidget(QLabel("Mode"))
         controls.addWidget(self.prior_mode_combo)
         controls.addWidget(self.secondary_filter_label)
@@ -543,7 +583,9 @@ class ProjectSetupTab(QWidget):
         controls.addWidget(self.generate_prior_plot_button)
         controls.addWidget(QLabel("Color"))
         controls.addWidget(self.prior_color_combo)
+        controls.addWidget(self.prior_match_trace_colors_checkbox)
         controls.addWidget(self.save_prior_png_button)
+        controls.addWidget(self.save_prior_plot_data_button)
         controls.addStretch(1)
         layout.addLayout(controls)
 
@@ -593,6 +635,8 @@ class ProjectSetupTab(QWidget):
         self.prior_mode_combo.setEnabled(selected)
         self.generate_prior_plot_button.setEnabled(selected)
         self.save_prior_png_button.setEnabled(selected)
+        self.save_component_plot_data_button.setEnabled(selected)
+        self.save_prior_plot_data_button.setEnabled(selected)
         self.save_project_button.setEnabled(selected)
         self._update_prior_control_state()
         if not selected:
@@ -660,6 +704,9 @@ class ProjectSetupTab(QWidget):
         self.resample_points_spin.setValue(settings.q_points or 500)
         self.exclude_elements_edit.setText(" ".join(settings.exclude_elements))
         self._component_color_overrides = dict(settings.component_trace_colors)
+        self.set_component_trace_color_scheme(
+            settings.component_trace_color_scheme
+        )
         self.set_experimental_trace_settings(
             visible=settings.experimental_trace_visible,
             color=settings.experimental_trace_color,
@@ -674,7 +721,14 @@ class ProjectSetupTab(QWidget):
             settings.selected_model_template,
         )
 
-        if settings.clusters_dir:
+        if settings.cluster_inventory_rows:
+            self._recognized_cluster_rows = list(
+                settings.cluster_inventory_rows
+            )
+            self._populate_recognized_clusters_table(
+                self._recognized_cluster_rows
+            )
+        elif settings.clusters_dir:
             self._recognized_cluster_rows = []
             self._populate_recognized_clusters_table([])
         else:
@@ -847,11 +901,23 @@ class ProjectSetupTab(QWidget):
             if self.available_elements_list.item(index).text().strip()
         ]
 
+    def recognized_cluster_rows(self) -> list[dict[str, object]]:
+        return [dict(row) for row in self._recognized_cluster_rows]
+
     def exclude_elements(self) -> list[str]:
         return self._parse_elements(self.exclude_elements_edit.text())
 
     def component_trace_colors(self) -> dict[str, str]:
         return dict(self._component_color_overrides)
+
+    def component_trace_color_scheme(self) -> str:
+        return (
+            str(
+                self.component_trace_color_scheme_combo.currentData()
+                or "default"
+            ).strip()
+            or "default"
+        )
 
     def experimental_trace_visible(self) -> bool:
         return bool(self.experimental_trace_visible_checkbox.isChecked())
@@ -897,8 +963,73 @@ class ProjectSetupTab(QWidget):
     def prior_cmap(self) -> str:
         return self.prior_color_combo.currentText().strip() or "summer"
 
+    def prior_match_trace_colors(self) -> bool:
+        return bool(self.prior_match_trace_colors_checkbox.isChecked())
+
+    def _prior_uses_component_color_sync(self) -> bool:
+        if (
+            self._prior_mode_uses_secondary_filter()
+            or not self._component_paths
+        ):
+            return False
+        return self.prior_match_trace_colors() or (
+            self.component_trace_color_scheme() != "default"
+        )
+
+    def current_prior_json_path(self) -> Path | None:
+        return self._current_prior_json_path
+
+    def prior_structure_motif_colors(self) -> dict[str, str] | None:
+        if not self._prior_uses_component_color_sync():
+            return None
+        scheme_colors = self._component_scheme_colors(self._component_paths)
+        colors: dict[str, str] = {}
+        for component_path in self._component_paths:
+            component_key = component_path.stem
+            colors[component_key] = (
+                self._component_color_overrides.get(component_key)
+                or self._component_color_lookup.get(component_key)
+                or scheme_colors.get(component_key)
+                or "#1f77b4"
+            )
+        return colors or None
+
     def append_summary(self, message: str) -> None:
         self.summary_box.append(message)
+
+    def component_plot_export_payload(self) -> dict[str, object]:
+        traces: list[dict[str, object]] = []
+        for axis_index, axis in enumerate(self.component_figure.axes):
+            for line in axis.get_lines():
+                traces.append(
+                    {
+                        "series": str(line.get_label()),
+                        "component_key": str(line.get_gid() or ""),
+                        "axis_index": axis_index,
+                        "axis_ylabel": str(axis.get_ylabel()),
+                        "color": str(line.get_color()),
+                        "visible": bool(line.get_visible()),
+                        "x": np.asarray(
+                            line.get_xdata(orig=False),
+                            dtype=float,
+                        ),
+                        "y": np.asarray(
+                            line.get_ydata(orig=False),
+                            dtype=float,
+                        ),
+                    }
+                )
+        return {
+            "title": (
+                str(self.component_figure.axes[0].get_title())
+                if self.component_figure.axes
+                else ""
+            ),
+            "trace_color_scheme": self.component_trace_color_scheme(),
+            "log_x": bool(self.component_log_x_checkbox.isChecked()),
+            "log_y": bool(self.component_log_y_checkbox.isChecked()),
+            "traces": traces,
+        }
 
     def set_component_trace_colors(
         self,
@@ -906,6 +1037,16 @@ class ProjectSetupTab(QWidget):
     ) -> None:
         self._component_color_overrides = dict(colors or {})
         self._redraw_saxs_preview()
+
+    def set_component_trace_color_scheme(
+        self,
+        scheme: str | None,
+    ) -> None:
+        normalized = str(scheme or "default").strip() or "default"
+        index = self.component_trace_color_scheme_combo.findData(normalized)
+        if index < 0:
+            index = self.component_trace_color_scheme_combo.findData("default")
+        self.component_trace_color_scheme_combo.setCurrentIndex(max(index, 0))
 
     def set_experimental_trace_settings(
         self,
@@ -941,6 +1082,7 @@ class ProjectSetupTab(QWidget):
     def draw_component_plot(self, component_paths: list[Path] | None) -> None:
         self._component_paths = component_paths
         self._redraw_saxs_preview()
+        self._redraw_prior_preview_if_needed()
 
     def request_cluster_scan(self) -> None:
         clusters_dir = self.clusters_dir()
@@ -1038,6 +1180,7 @@ class ProjectSetupTab(QWidget):
             )
             axis.set_axis_off()
             self._update_component_table_visuals()
+            self._update_component_trace_control_state()
             self.component_figure.tight_layout()
             self.component_canvas.draw()
             return
@@ -1112,6 +1255,7 @@ class ProjectSetupTab(QWidget):
             self._build_interactive_legend(anchor_axis, plotted_lines)
 
         self._update_component_table_visuals()
+        self._update_component_trace_control_state()
         self.component_figure.tight_layout()
         self.component_canvas.draw()
 
@@ -1140,6 +1284,7 @@ class ProjectSetupTab(QWidget):
                     mode=self.prior_mode(),
                     secondary_element=self.prior_secondary_element(),
                     cmap=self.prior_cmap(),
+                    structure_motif_colors=self.prior_structure_motif_colors(),
                     ax=axis,
                 )
             except Exception as exc:
@@ -1880,12 +2025,19 @@ class ProjectSetupTab(QWidget):
     def _update_prior_control_state(self) -> None:
         uses_secondary = self._prior_mode_uses_secondary_filter()
         has_secondary_options = self.secondary_filter_combo.count() > 0
+        can_match_trace_colors = not uses_secondary
         self.secondary_filter_label.setVisible(uses_secondary)
         self.secondary_filter_combo.setVisible(uses_secondary)
         self.secondary_filter_combo.setEnabled(
             uses_secondary
             and self.prior_mode_combo.isEnabled()
             and has_secondary_options
+        )
+        self.prior_match_trace_colors_checkbox.setVisible(
+            can_match_trace_colors
+        )
+        self.prior_match_trace_colors_checkbox.setEnabled(
+            can_match_trace_colors and bool(self._component_paths)
         )
         if uses_secondary and not has_secondary_options:
             self.secondary_filter_combo.setToolTip(
@@ -1899,6 +2051,10 @@ class ProjectSetupTab(QWidget):
         if self._current_prior_json_path is None:
             return
         self.draw_prior_plot(self._current_prior_json_path)
+
+    def _on_component_trace_color_scheme_changed(self) -> None:
+        self._redraw_saxs_preview()
+        self._redraw_prior_preview_if_needed()
 
     def _draw_experimental_preview(
         self,
@@ -2004,6 +2160,7 @@ class ProjectSetupTab(QWidget):
             return []
 
         lines: list[object] = []
+        scheme_colors = self._component_scheme_colors(component_paths)
         for component_path in component_paths:
             data = np.loadtxt(component_path, comments="#")
             q_values = np.asarray(data[:, 0], dtype=float)
@@ -2011,13 +2168,14 @@ class ProjectSetupTab(QWidget):
             component_key = component_path.stem
             visible = self._component_visibility.get(component_key, True)
             color_override = self._component_color_overrides.get(component_key)
+            line_color = color_override or scheme_colors.get(component_key)
             (line,) = axis.plot(
                 q_values,
                 intensities,
                 label=component_path.stem,
                 linewidth=1.4,
                 visible=visible,
-                color=color_override,
+                color=line_color,
             )
             line.set_gid(component_key)
             self._component_visibility.setdefault(component_key, visible)
@@ -2026,6 +2184,36 @@ class ProjectSetupTab(QWidget):
             lines.append(line)
         self._apply_saxs_axis_style(axis, is_component_axis=True)
         return lines
+
+    def _component_scheme_colors(
+        self,
+        component_paths: list[Path],
+    ) -> dict[str, str]:
+        scheme = self.component_trace_color_scheme()
+        if not component_paths:
+            return {}
+        if scheme == "default":
+            default_cycle = list(
+                rcParams["axes.prop_cycle"]
+                .by_key()
+                .get(
+                    "color",
+                    ["#1f77b4"],
+                )
+            )
+            return {
+                path.stem: default_cycle[index % len(default_cycle)]
+                for index, path in enumerate(component_paths)
+            }
+        cmap = colormaps[scheme]
+        if len(component_paths) == 1:
+            positions = np.asarray([0.6], dtype=float)
+        else:
+            positions = np.linspace(0.15, 0.85, len(component_paths))
+        return {
+            path.stem: to_hex(cmap(float(position)), keep_alpha=False)
+            for path, position in zip(component_paths, positions)
+        }
 
     def _apply_saxs_axis_style(self, axis, *, is_component_axis: bool) -> None:
         axis.set_xscale(
@@ -2136,6 +2324,7 @@ class ProjectSetupTab(QWidget):
         if hasattr(event.artist, "set_alpha"):
             event.artist.set_alpha(1.0 if is_visible else 0.25)
         self._update_component_table_visuals()
+        self._update_component_trace_control_state()
         self._refresh_component_axes()
         self.component_canvas.draw_idle()
 
@@ -2158,6 +2347,7 @@ class ProjectSetupTab(QWidget):
         legend_line = self._component_legend_lookup.get(str(component_key))
         if legend_line is not None and hasattr(legend_line, "set_alpha"):
             legend_line.set_alpha(1.0 if visible else 0.25)
+        self._update_component_trace_control_state()
         self._refresh_component_axes()
         self.component_canvas.draw_idle()
 
@@ -2201,6 +2391,47 @@ class ProjectSetupTab(QWidget):
             legend_line.set_color(color)
         self._update_component_table_visuals()
         self.component_canvas.draw_idle()
+        self._redraw_prior_preview_if_needed()
+
+    def _toggle_all_component_traces(self) -> None:
+        if not self._component_paths:
+            return
+        component_keys = [path.stem for path in self._component_paths]
+        any_visible = any(
+            self._component_visibility.get(component_key, True)
+            for component_key in component_keys
+        )
+        target_visible = not any_visible
+        for component_key in component_keys:
+            self._component_visibility[component_key] = target_visible
+            line = self._component_line_lookup.get(component_key)
+            if line is not None:
+                line.set_visible(target_visible)
+            legend_line = self._component_legend_lookup.get(component_key)
+            if legend_line is not None and hasattr(legend_line, "set_alpha"):
+                legend_line.set_alpha(1.0 if target_visible else 0.25)
+        self._update_component_table_visuals()
+        self._update_component_trace_control_state()
+        self._refresh_component_axes()
+        self.component_canvas.draw_idle()
+
+    def _update_component_trace_control_state(self) -> None:
+        has_components = bool(self._component_paths)
+        component_keys = (
+            [path.stem for path in self._component_paths]
+            if self._component_paths
+            else []
+        )
+        any_visible = any(
+            self._component_visibility.get(component_key, True)
+            for component_key in component_keys
+        )
+        self.component_all_traces_button.setEnabled(has_components)
+        self.component_trace_color_scheme_combo.setEnabled(has_components)
+        self.component_all_traces_button.setText(
+            "Hide Computed Traces" if any_visible else "Show Computed Traces"
+        )
+        self._update_prior_control_state()
 
     def _build_visibility_table_item(
         self,

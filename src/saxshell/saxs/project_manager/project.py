@@ -28,8 +28,12 @@ class ProjectPaths:
     project_file: Path
     experimental_data_dir: Path
     scattering_components_dir: Path
+    exported_results_dir: Path
+    exported_plots_dir: Path
+    exported_data_dir: Path
     plots_dir: Path
     prefit_dir: Path
+    cluster_geometry_metadata_file: Path
     dream_dir: Path
     dream_runtime_dir: Path
     reports_dir: Path
@@ -42,8 +46,14 @@ def build_project_paths(project_dir: str | Path) -> ProjectPaths:
         project_file=project_dir / "saxs_project.json",
         experimental_data_dir=project_dir / "experimental_data",
         scattering_components_dir=project_dir / "scattering_components",
+        exported_results_dir=project_dir / "exported_results",
+        exported_plots_dir=project_dir / "exported_results" / "plots",
+        exported_data_dir=project_dir / "exported_results" / "data",
         plots_dir=project_dir / "plots",
         prefit_dir=project_dir / "prefit",
+        cluster_geometry_metadata_file=(
+            project_dir / "prefit" / "cluster_geometry_metadata.json"
+        ),
         dream_dir=project_dir / "dream",
         dream_runtime_dir=project_dir / "dream" / "runtime_scripts",
         reports_dir=project_dir / "reports",
@@ -100,6 +110,64 @@ class _ClusterInventory:
 
 
 @dataclass(slots=True)
+class DreamBestFitSelection:
+    run_name: str
+    run_relative_path: str
+    bestfit_method: str = "map"
+    posterior_filter_mode: str = "all_post_burnin"
+    posterior_top_percent: float = 10.0
+    posterior_top_n: int = 500
+    credible_interval_low: float = 16.0
+    credible_interval_high: float = 84.0
+    label: str | None = None
+    template_name: str | None = None
+    model_name: str | None = None
+    selection_source: str | None = None
+    selected_at: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: dict[str, object],
+    ) -> "DreamBestFitSelection":
+        return cls(
+            run_name=str(payload.get("run_name", "")).strip(),
+            run_relative_path=str(
+                payload.get("run_relative_path", "")
+            ).strip(),
+            bestfit_method=str(payload.get("bestfit_method", "map")).strip()
+            or "map",
+            posterior_filter_mode=str(
+                payload.get("posterior_filter_mode", "all_post_burnin")
+            ).strip()
+            or "all_post_burnin",
+            posterior_top_percent=float(
+                payload.get("posterior_top_percent", 10.0)
+            ),
+            posterior_top_n=int(payload.get("posterior_top_n", 500)),
+            credible_interval_low=float(
+                payload.get("credible_interval_low", 16.0)
+            ),
+            credible_interval_high=float(
+                payload.get("credible_interval_high", 84.0)
+            ),
+            label=_optional_str(payload.get("label")),
+            template_name=_optional_str(payload.get("template_name")),
+            model_name=_optional_str(payload.get("model_name")),
+            selection_source=_optional_str(payload.get("selection_source")),
+            selected_at=_optional_str(payload.get("selected_at")),
+        )
+
+    def resolved_run_dir(self, project_dir: str | Path) -> Path:
+        return (
+            Path(project_dir).expanduser().resolve() / self.run_relative_path
+        ).resolve()
+
+
+@dataclass(slots=True)
 class ProjectSettings:
     project_name: str
     project_dir: str
@@ -121,9 +189,13 @@ class ProjectSettings:
     use_experimental_grid: bool = True
     q_points: int | None = None
     available_elements: list[str] = field(default_factory=list)
+    cluster_inventory_rows: list[dict[str, object]] = field(
+        default_factory=list
+    )
     include_elements: list[str] = field(default_factory=list)
     exclude_elements: list[str] = field(default_factory=list)
     component_trace_colors: dict[str, str] = field(default_factory=dict)
+    component_trace_color_scheme: str = "default"
     experimental_trace_visible: bool = True
     experimental_trace_color: str = "#000000"
     solvent_trace_visible: bool = True
@@ -135,6 +207,10 @@ class ProjectSettings:
     )
     best_prefit_template: str | None = None
     best_prefit_parameter_entries: list[dict[str, object]] = field(
+        default_factory=list
+    )
+    dream_favorite_selection: DreamBestFitSelection | None = None
+    dream_favorite_history: list[DreamBestFitSelection] = field(
         default_factory=list
     )
     selected_model_template: str | None = None
@@ -181,7 +257,13 @@ class ProjectSettings:
         payload = asdict(self)
         payload["include_elements"] = list(self.include_elements)
         payload["exclude_elements"] = list(self.exclude_elements)
+        payload["cluster_inventory_rows"] = [
+            dict(row) for row in self.cluster_inventory_rows
+        ]
         payload["component_trace_colors"] = dict(self.component_trace_colors)
+        payload["component_trace_color_scheme"] = (
+            str(self.component_trace_color_scheme).strip() or "default"
+        )
         payload["experimental_trace_visible"] = bool(
             self.experimental_trace_visible
         )
@@ -198,6 +280,14 @@ class ProjectSettings:
         ]
         payload["best_prefit_parameter_entries"] = [
             dict(entry) for entry in self.best_prefit_parameter_entries
+        ]
+        payload["dream_favorite_selection"] = (
+            None
+            if self.dream_favorite_selection is None
+            else self.dream_favorite_selection.to_dict()
+        )
+        payload["dream_favorite_history"] = [
+            entry.to_dict() for entry in self.dream_favorite_history
         ]
         return payload
 
@@ -253,6 +343,9 @@ class ProjectSettings:
             available_elements=_normalized_elements(
                 payload.get("available_elements", [])
             ),
+            cluster_inventory_rows=_normalized_cluster_inventory_rows(
+                payload.get("cluster_inventory_rows", [])
+            ),
             include_elements=_normalized_elements(
                 payload.get("include_elements", [])
             ),
@@ -262,6 +355,10 @@ class ProjectSettings:
             component_trace_colors=_normalized_text_map(
                 payload.get("component_trace_colors", {})
             ),
+            component_trace_color_scheme=str(
+                payload.get("component_trace_color_scheme", "default")
+            ).strip()
+            or "default",
             experimental_trace_visible=bool(
                 payload.get("experimental_trace_visible", True)
             ),
@@ -290,6 +387,12 @@ class ProjectSettings:
             ),
             best_prefit_parameter_entries=_normalized_parameter_payloads(
                 payload.get("best_prefit_parameter_entries", [])
+            ),
+            dream_favorite_selection=_optional_dream_bestfit_selection(
+                payload.get("dream_favorite_selection")
+            ),
+            dream_favorite_history=_normalized_dream_bestfit_history(
+                payload.get("dream_favorite_history", [])
             ),
             selected_model_template=_optional_str(
                 payload.get("selected_model_template")
@@ -353,6 +456,73 @@ def _normalized_parameter_payloads(values: object) -> list[dict[str, object]]:
     return payloads
 
 
+def _normalized_cluster_inventory_rows(
+    values: object,
+) -> list[dict[str, object]]:
+    if not isinstance(values, list):
+        return []
+    rows: list[dict[str, object]] = []
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        structure = str(value.get("structure", "")).strip()
+        motif = str(value.get("motif", "no_motif")).strip() or "no_motif"
+        if not structure:
+            continue
+        count = int(_optional_int(value.get("count")) or 0)
+        row: dict[str, object] = {
+            "structure": structure,
+            "motif": motif,
+            "count": count,
+        }
+        for key in (
+            "source_kind",
+            "source_dir",
+            "source_file",
+            "source_file_name",
+            "representative",
+            "profile_file",
+        ):
+            normalized_value = _optional_str(value.get(key))
+            if normalized_value is not None:
+                row[key] = normalized_value
+        for key in (
+            "weight",
+            "atom_fraction_percent",
+            "structure_fraction_percent",
+        ):
+            number = _optional_float(value.get(key))
+            if number is not None:
+                row[key] = number
+        rows.append(row)
+    return rows
+
+
+def _optional_dream_bestfit_selection(
+    value: object,
+) -> DreamBestFitSelection | None:
+    if not isinstance(value, dict):
+        return None
+    run_name = str(value.get("run_name", "")).strip()
+    run_relative_path = str(value.get("run_relative_path", "")).strip()
+    if not run_name or not run_relative_path:
+        return None
+    return DreamBestFitSelection.from_dict(dict(value))
+
+
+def _normalized_dream_bestfit_history(
+    values: object,
+) -> list[DreamBestFitSelection]:
+    if not isinstance(values, list):
+        return []
+    history: list[DreamBestFitSelection] = []
+    for value in values:
+        entry = _optional_dream_bestfit_selection(value)
+        if entry is not None:
+            history.append(entry)
+    return history
+
+
 class SAXSProjectManager:
     """Persist project settings and build SAXS component files inside
     one project directory."""
@@ -404,6 +574,9 @@ class SAXSProjectManager:
             paths.project_dir,
             paths.experimental_data_dir,
             paths.scattering_components_dir,
+            paths.exported_results_dir,
+            paths.exported_plots_dir,
+            paths.exported_data_dir,
             paths.plots_dir,
             paths.prefit_dir,
             paths.dream_dir,
@@ -531,6 +704,7 @@ class SAXSProjectManager:
             progress_callback=progress_callback,
         )
         settings.available_elements = cluster_inventory.available_elements
+        settings.cluster_inventory_rows = cluster_inventory.cluster_rows
         averaged_components = builder.build_profiles(
             cluster_bins=cluster_inventory.cluster_bins,
             progress_callback=progress_callback,
@@ -583,6 +757,7 @@ class SAXSProjectManager:
             progress_callback=progress_callback,
         )
         settings.available_elements = cluster_inventory.available_elements
+        settings.cluster_inventory_rows = cluster_inventory.cluster_rows
         component_entries = self._component_entries_from_cluster_bins(
             cluster_inventory.cluster_bins
         )
@@ -874,6 +1049,16 @@ class SAXSProjectManager:
             cluster_bin = cluster_bin_lookup.get(
                 (entry.structure, entry.motif)
             )
+            source_file = (
+                str(
+                    (
+                        Path(entry.source_dir).expanduser().resolve()
+                        / entry.representative
+                    ).resolve()
+                )
+                if entry.representative
+                else ""
+            )
             structures_payload.setdefault(entry.structure, {})
             structures_payload[entry.structure][entry.motif] = {
                 "count": entry.file_count,
@@ -884,6 +1069,10 @@ class SAXSProjectManager:
                 ),
                 "representative": entry.representative or "",
                 "profile_file": entry.profile_file,
+                "source_kind": "cluster_dir",
+                "source_dir": entry.source_dir,
+                "source_file": source_file,
+                "source_file_name": entry.representative or "",
                 "secondary_atom_distributions": self._build_secondary_atom_distributions(
                     cluster_bin
                 ),

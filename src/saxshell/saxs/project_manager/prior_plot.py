@@ -282,6 +282,7 @@ def plot_md_prior_histogram(
     secondary_element: str | None = None,
     figsize: tuple[float, float] = (10.0, 6.0),
     cmap: str = "summer",
+    structure_motif_colors: dict[str, str] | None = None,
     show_percent: bool = True,
     ax=None,
 ):
@@ -293,6 +294,7 @@ def plot_md_prior_histogram(
         secondary_element=secondary_element,
     )
     labels = [str(label) for label in export_payload["labels"]]
+    segments = [str(segment) for segment in export_payload["segments"]]
     segment_labels = [str(label) for label in export_payload["segment_labels"]]
     plot_mode = str(export_payload["plot_mode"])
     matrix = np.asarray(export_payload["matrix"], dtype=float)
@@ -315,12 +317,24 @@ def plot_md_prior_histogram(
     bottoms = np.zeros(len(labels), dtype=float)
     for index, segment_label in enumerate(segment_labels):
         heights_array = matrix[:, index]
+        bar_colors = colors[index]
+        if structure_motif_colors and not plot_mode.startswith("solvent_sort"):
+            bar_colors = [
+                structure_motif_colors.get(
+                    f"{label}_{segments[index]}",
+                    fallback_color,
+                )
+                for label, fallback_color in zip(
+                    labels,
+                    [colors[index]] * len(labels),
+                )
+            ]
         ax.bar(
             labels,
             heights_array,
             bottom=bottoms,
             label=segment_label,
-            color=colors[index],
+            color=bar_colors,
             edgecolor="white",
             width=0.8,
         )

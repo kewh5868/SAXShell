@@ -14,8 +14,9 @@ from matplotlib import colormaps
 from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.colors import to_hex
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QTextOption
 from PySide6.QtWidgets import (
+    QAbstractScrollArea,
     QApplication,
     QDialog,
     QFileDialog,
@@ -35,7 +36,10 @@ from saxshell.saxs.dream import (
     SAXSDreamResultsLoader,
     SAXSDreamWorkflow,
 )
-from saxshell.saxs.prefit import SAXSPrefitWorkflow
+from saxshell.saxs.prefit import (
+    SAXSPrefitWorkflow,
+    compute_cluster_geometry_metadata,
+)
 from saxshell.saxs.project_manager import (
     ClusterImportResult,
     ExperimentalDataSummary,
@@ -133,6 +137,95 @@ def _build_minimal_saxs_project(tmp_path):
     settings.experimental_data_path = str(experimental_path)
     settings.copied_experimental_data_file = str(experimental_path)
     settings.selected_model_template = template_name
+    manager.save_project(settings)
+    return project_dir, paths
+
+
+def _build_poly_lma_geometry_project(tmp_path):
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "poly_lma_project"
+    settings = manager.create_project(project_dir)
+    paths = build_project_paths(project_dir)
+
+    q_values = np.linspace(0.05, 0.3, 8)
+    component = np.linspace(10.0, 17.0, 8)
+    template_name = "template_pydream_poly_lma_hs"
+
+    clusters_dir = paths.project_dir / "clusters"
+    structure_dir = clusters_dir / "A"
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    (structure_dir / "frame_0001.xyz").write_text(
+        "4\nframe 1\nPb 0.0 0.0 0.0\nI 2.0 0.0 0.0\n"
+        "I 0.0 2.0 0.0\nI 0.0 0.0 2.0\n",
+        encoding="utf-8",
+    )
+    (structure_dir / "frame_0002.xyz").write_text(
+        "4\nframe 2\nPb 0.0 0.0 0.0\nI 2.2 0.0 0.0\n"
+        "I 0.0 1.8 0.0\nI 0.0 0.0 2.1\n",
+        encoding="utf-8",
+    )
+    geometry_table = compute_cluster_geometry_metadata(
+        clusters_dir,
+        template_name=template_name,
+    )
+    effective_radius = geometry_table.rows[0].effective_radius
+
+    template_module = load_template_module(template_name)
+    experimental = template_module.lmfit_model_profile(
+        q_values,
+        np.zeros_like(q_values),
+        [component],
+        np.asarray([effective_radius], dtype=float),
+        w0=1.0,
+        phi_solute=0.02,
+        phi_int=0.02,
+        solvent_scale=1.0,
+        scale=1.0,
+        offset=0.0,
+        log_sigma=-9.21,
+    )
+
+    experimental_path = paths.experimental_data_dir / "exp_demo.txt"
+    np.savetxt(experimental_path, np.column_stack([q_values, experimental]))
+    _write_component_file(
+        paths.scattering_components_dir / "A_no_motif.txt",
+        q_values,
+        component,
+    )
+    (paths.project_dir / "md_prior_weights.json").write_text(
+        json.dumps(
+            {
+                "origin": "clusters",
+                "total_files": 2,
+                "structures": {
+                    "A": {
+                        "no_motif": {
+                            "count": 2,
+                            "weight": 1.0,
+                            "representative": "frame_0001.xyz",
+                            "profile_file": "A_no_motif.txt",
+                        }
+                    }
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (paths.project_dir / "md_saxs_map.json").write_text(
+        json.dumps(
+            {"saxs_map": {"A": {"no_motif": "A_no_motif.txt"}}},
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    settings.experimental_data_path = str(experimental_path)
+    settings.copied_experimental_data_file = str(experimental_path)
+    settings.selected_model_template = template_name
+    settings.clusters_dir = str(clusters_dir)
     manager.save_project(settings)
     return project_dir, paths
 
@@ -298,7 +391,7 @@ def test_saxs_main_window_loads_project_prefit_and_dream_tabs(qapp, tmp_path):
         window.project_setup_tab.selected_template_name()
         == "template_pd_likelihood_monosq_decoupled"
     )
-    assert window.project_setup_tab.template_combo.currentText() == (
+    assert window.project_setup_tab.template_combo.currentText().startswith(
         "MonoSQ Decoupled"
     )
     assert (
@@ -323,7 +416,7 @@ def test_saxs_main_window_loads_project_prefit_and_dream_tabs(qapp, tmp_path):
     assert window.prefit_tab.selected_template_name() == (
         "template_pd_likelihood_monosq_decoupled"
     )
-    assert window.prefit_tab.template_combo.currentText() == (
+    assert window.prefit_tab.template_combo.currentText().startswith(
         "MonoSQ Decoupled"
     )
     assert "Form Factor:" in window.prefit_tab.template_combo.toolTip()
@@ -356,23 +449,73 @@ def test_saxs_main_window_loads_project_prefit_and_dream_tabs(qapp, tmp_path):
         in window.prefit_tab.summary_box.toPlainText()
     )
     assert "Prefit Console" in window.prefit_tab.summary_box.toPlainText()
-    assert window.dream_tab.chains_spin.value() == 4
-    assert (
-        window.dream_tab.settings_preset_combo.currentText()
-        == window.dream_tab.ACTIVE_SETTINGS_LABEL
+
+
+def test_prefit_cluster_geometry_section_is_template_aware(qapp, tmp_path):
+    del qapp
+    base_project_dir, _base_paths = _build_minimal_saxs_project(
+        tmp_path / "basic"
     )
-    assert window.dream_tab.model_name_edit is not None
-    assert window.dream_tab.nseedchains_spin.value() == 40
-    assert window.dream_tab.output_box is window.dream_tab.log_box
-    assert window.dream_tab.output_box is window.dream_tab.summary_box
-    assert window.dream_tab.model_toolbar is not None
-    assert window.dream_tab.violin_toolbar is not None
-    assert window.dream_tab.settings_preset_combo.toolTip()
-    assert window.dream_tab.model_name_edit.toolTip()
-    assert window.dream_tab.chains_spin.toolTip()
-    assert window.dream_tab.run_button.toolTip()
-    assert "DREAM Summary" in window.dream_tab.output_box.toPlainText()
-    assert "DREAM Console" in window.dream_tab.output_box.toPlainText()
+    base_window = SAXSMainWindow(initial_project_dir=base_project_dir)
+
+    assert not base_window.prefit_workflow.supports_cluster_geometry_metadata()
+    assert base_window.prefit_tab._cluster_geometry_group.isHidden()
+    assert "waiting on template metadata" not in (
+        base_window.prefit_tab._summary_text.lower()
+    )
+
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(
+        tmp_path / "poly"
+    )
+    poly_window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+
+    assert poly_window.prefit_workflow.supports_cluster_geometry_metadata()
+    assert not poly_window.prefit_tab._cluster_geometry_group.isHidden()
+    assert "Compute cluster geometry metadata" in (
+        poly_window.prefit_tab.cluster_geometry_status_label.text()
+    )
+    assert poly_window.prefit_tab.cluster_geometry_table.rowCount() == 0
+    assert "waiting on template metadata" in (
+        poly_window.prefit_tab._summary_text.lower()
+    )
+    assert "cluster geometry metadata" in (
+        poly_window.prefit_tab._summary_text.lower()
+    )
+
+    poly_window.compute_prefit_cluster_geometry()
+
+    assert poly_window.prefit_tab.cluster_geometry_table.rowCount() == 1
+    mapping_combo = poly_window.prefit_tab.cluster_geometry_table.cellWidget(
+        0, 6
+    )
+    assert mapping_combo is not None
+    assert str(mapping_combo.currentData()) == "w0"
+    assert "effective_radii" in (
+        poly_window.prefit_tab.cluster_geometry_status_label.text()
+    )
+    assert "waiting on template metadata" not in (
+        poly_window.prefit_tab._summary_text.lower()
+    )
+    assert "Prefit summary:" in poly_window.prefit_tab._summary_text
+    assert poly_window.dream_tab.chains_spin.value() == 4
+    assert (
+        poly_window.dream_tab.settings_preset_combo.currentText()
+        == poly_window.dream_tab.ACTIVE_SETTINGS_LABEL
+    )
+    assert poly_window.dream_tab.model_name_edit is not None
+    assert poly_window.dream_tab.nseedchains_spin.value() == 40
+    assert poly_window.dream_tab.output_box is poly_window.dream_tab.log_box
+    assert (
+        poly_window.dream_tab.output_box is poly_window.dream_tab.summary_box
+    )
+    assert poly_window.dream_tab.model_toolbar is not None
+    assert poly_window.dream_tab.violin_toolbar is not None
+    assert poly_window.dream_tab.settings_preset_combo.toolTip()
+    assert poly_window.dream_tab.model_name_edit.toolTip()
+    assert poly_window.dream_tab.chains_spin.toolTip()
+    assert poly_window.dream_tab.run_button.toolTip()
+    assert "DREAM Summary" in poly_window.dream_tab.output_box.toPlainText()
+    assert "DREAM Console" in poly_window.dream_tab.output_box.toPlainText()
 
 
 def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
@@ -393,6 +536,7 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert window.cluster_action.text() == "Open Cluster Extraction"
     assert window.xyz2pdb_action.text() == "Open xyz2pdb Conversion"
     assert window.bondanalysis_action.text() == "Open Bond Analysis"
+    assert window.fullrmc_action.text() == "Open fullrmc Setup"
 
     assert window.settings_menu.title() == "Settings"
     assert (
@@ -462,6 +606,36 @@ def test_bondanalysis_tool_uses_active_project_clusters_dir(
     window._open_bondanalysis_tool()
 
     assert launched["clusters_dir"] == window.current_settings.clusters_dir
+    assert launched["shown"] is True
+    assert launched["raised"] is True
+    assert launched["instance"] in window._child_tool_windows
+
+
+def test_fullrmc_tool_uses_active_project_dir(qapp, tmp_path, monkeypatch):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    launched: dict[str, object] = {}
+
+    class FakeRMCSetupWindow:
+        def __init__(self, initial_project_dir=None):
+            launched["project_dir"] = initial_project_dir
+            launched["instance"] = self
+
+        def show(self):
+            launched["shown"] = True
+
+        def raise_(self):
+            launched["raised"] = True
+
+    monkeypatch.setattr(
+        "saxshell.fullrmc.ui.main_window.RMCSetupMainWindow",
+        FakeRMCSetupWindow,
+    )
+
+    window._open_fullrmc_tool()
+
+    assert launched["project_dir"] == window.current_settings.project_dir
     assert launched["shown"] is True
     assert launched["raised"] is True
     assert launched["instance"] in window._child_tool_windows
@@ -549,6 +723,22 @@ def test_dream_layout_uses_combined_output_and_two_plot_panels(qapp):
     assert window.dream_tab._outer_scroll_area.widgetResizable()
     assert window.dream_tab.output_box is window.dream_tab.log_box
     assert window.dream_tab.output_box is window.dream_tab.summary_box
+    assert (
+        window.dream_tab.output_box.lineWrapMode()
+        == window.dream_tab.output_box.LineWrapMode.WidgetWidth
+    )
+    assert (
+        window.dream_tab.output_box.wordWrapMode()
+        == QTextOption.WrapMode.WrapAnywhere
+    )
+    assert (
+        window.dream_tab.output_box.sizeAdjustPolicy()
+        == QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored
+    )
+    assert (
+        window.dream_tab.output_box.horizontalScrollBarPolicy()
+        == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    )
     assert window.dream_tab._main_splitter is window.dream_tab._top_splitter
     assert window.dream_tab._main_splitter.count() == 2
     assert window.dream_tab.verbose_checkbox.isChecked()
@@ -580,6 +770,11 @@ def test_dream_layout_uses_combined_output_and_two_plot_panels(qapp):
     assert window.dream_tab._output_group.parentWidget() is not None
     assert window.dream_tab.model_canvas is not None
     assert window.dream_tab.violin_canvas is not None
+    assert window.dream_tab.show_experimental_trace_checkbox.isChecked()
+    assert window.dream_tab.show_model_trace_checkbox.isChecked()
+    assert not window.dream_tab.show_solvent_trace_checkbox.isChecked()
+    assert window.dream_tab.model_log_x_checkbox.isChecked()
+    assert window.dream_tab.model_log_y_checkbox.isChecked()
     assert (
         window.dream_tab._plot_splitter.widget(0)
         is window.dream_tab.model_canvas.parentWidget()
@@ -592,8 +787,9 @@ def test_dream_layout_uses_combined_output_and_two_plot_panels(qapp):
         window.dream_tab.posterior_filter_combo.currentData()
         == "all_post_burnin"
     )
-    assert not window.dream_tab.posterior_top_percent_spin.isEnabled()
-    assert not window.dream_tab.posterior_top_n_spin.isEnabled()
+    assert window.dream_tab.posterior_top_percent_spin.isEnabled()
+    assert window.dream_tab.posterior_top_n_spin.isEnabled()
+    assert window.dream_tab.auto_filter_assessment_checkbox.isChecked()
     assert (
         window.dream_tab.violin_sample_source_combo.currentData()
         == "filtered_posterior"
@@ -608,10 +804,14 @@ def test_dream_layout_uses_combined_output_and_two_plot_panels(qapp):
         "tab:red",
         keep_alpha=False,
     )
+    assert window.dream_tab.selected_violin_outline_color() == "#000000"
+    assert window.dream_tab.violin_outline_width_spin.value() == pytest.approx(
+        0.8
+    )
     assert not window.dream_tab.violin_custom_color_button.isEnabled()
     assert window.dream_tab.violin_point_color_button.isEnabled()
     assert (
-        "highest-log-posterior samples"
+        "automatic post-run filter assessment"
         in window.dream_tab.posterior_top_percent_spin.toolTip()
     )
     assert window.dream_tab.parameter_map_table.rowCount() == 0
@@ -935,7 +1135,7 @@ def test_template_dropdowns_use_display_names_and_tooltips(qapp):
 
     tab.set_available_templates([basic_spec, decoupled_spec], basic_spec.name)
 
-    assert tab.template_combo.itemText(0) == "MonoSQ Basic"
+    assert tab.template_combo.itemText(0).startswith("MonoSQ Basic")
     assert (
         tab.template_combo.itemData(0, Qt.ItemDataRole.ToolTipRole)
         == basic_spec.description
@@ -1543,7 +1743,7 @@ def test_save_dream_settings_creates_named_preset_and_restores_active_state(
     )
 
 
-def test_dream_posterior_filter_controls_enable_only_relevant_inputs(
+def test_dream_posterior_filter_controls_keep_default_thresholds_editable(
     qapp, tmp_path
 ):
     del qapp
@@ -1554,12 +1754,12 @@ def test_dream_posterior_filter_controls_enable_only_relevant_inputs(
     QApplication.processEvents()
 
     assert window.dream_tab.posterior_top_percent_spin.isEnabled()
-    assert not window.dream_tab.posterior_top_n_spin.isEnabled()
+    assert window.dream_tab.posterior_top_n_spin.isEnabled()
 
     window.dream_tab.posterior_filter_combo.setCurrentIndex(2)
     QApplication.processEvents()
 
-    assert not window.dream_tab.posterior_top_percent_spin.isEnabled()
+    assert window.dream_tab.posterior_top_percent_spin.isEnabled()
     assert window.dream_tab.posterior_top_n_spin.isEnabled()
 
 
@@ -1669,7 +1869,7 @@ def test_dream_violin_scale_modes_and_palette_controls(qapp, tmp_path):
         if isinstance(collection, PolyCollection)
     )
     assert to_hex(body.get_facecolor()[0], keep_alpha=False) == to_hex(
-        colormaps["plasma"](0.6),
+        colormaps["plasma"](0.72),
         keep_alpha=False,
     )
     assert to_hex(
@@ -1709,6 +1909,7 @@ def test_dream_violin_custom_color_controls_apply_to_plot(
             QColor("#fedcba"),
             QColor("#654321"),
             QColor("#abcdef"),
+            QColor("#111111"),
         ]
     )
     monkeypatch.setattr(
@@ -1725,6 +1926,8 @@ def test_dream_violin_custom_color_controls_apply_to_plot(
     window.dream_tab._choose_violin_point_color()
     window.dream_tab._choose_interval_color()
     window.dream_tab._choose_median_color()
+    window.dream_tab._choose_outline_color()
+    window.dream_tab.violin_outline_width_spin.setValue(1.7)
     QApplication.processEvents()
 
     axis = window.dream_tab.violin_figure.axes[0]
@@ -1734,6 +1937,8 @@ def test_dream_violin_custom_color_controls_apply_to_plot(
         if isinstance(collection, PolyCollection)
     )
     assert to_hex(body.get_facecolor()[0], keep_alpha=False) == "#123456"
+    assert to_hex(body.get_edgecolor()[0], keep_alpha=False) == "#111111"
+    assert body.get_linewidths()[0] == pytest.approx(1.7)
     assert (
         to_hex(
             axis.collections[-1].get_facecolor()[0],
@@ -1749,6 +1954,22 @@ def test_dream_violin_custom_color_controls_apply_to_plot(
     ]
     assert "#654321" in line_colors
     assert "#abcdef" in line_colors
+
+
+def test_dream_default_violin_palette_starts_with_higher_contrast_color(
+    qapp,
+):
+    del qapp
+    window = SAXSMainWindow()
+
+    colors = window.dream_tab._violin_body_colors(4)
+    first_color = colors[0]
+    expected = colormaps.get_cmap("Blues")(0.35)
+
+    assert to_hex(first_color, keep_alpha=False) == to_hex(
+        expected,
+        keep_alpha=False,
+    )
 
 
 def test_dream_results_loader_can_order_weight_violin_labels_by_structure(
@@ -1840,7 +2061,9 @@ def test_dream_runtime_bundle_carries_selected_solvent_trace(qapp, tmp_path):
     assert np.allclose(metadata["solvent_intensities"], solvent_intensity)
 
 
-def test_dream_plot_data_exports_save_into_project_plots(qapp, tmp_path):
+def test_dream_plot_data_exports_save_into_exported_results_data(
+    qapp, tmp_path
+):
     del qapp
     project_dir, paths = _build_minimal_saxs_project(tmp_path)
     _write_minimal_dream_results(project_dir)
@@ -1850,7 +2073,7 @@ def test_dream_plot_data_exports_save_into_project_plots(qapp, tmp_path):
         def __init__(self, *args, **kwargs):
             del args, kwargs
             self.selected_options = SimpleNamespace(
-                output_dir=paths.plots_dir,
+                output_dir=paths.exported_data_dir,
                 base_name="dream_violin_export_test",
                 save_csv=True,
                 save_pkl=True,
@@ -1871,25 +2094,301 @@ def test_dream_plot_data_exports_save_into_project_plots(qapp, tmp_path):
     window.save_dream_violin_data()
     monkeypatch.undo()
 
-    model_exports = sorted(paths.plots_dir.glob("dream_model_fit_*.csv"))
-    violin_csv_exports = sorted(paths.plots_dir.glob("dream_violin_*.csv"))
-    violin_pkl_exports = sorted(paths.plots_dir.glob("dream_violin_*.pkl"))
-    dialog_csv_export = paths.plots_dir / "dream_violin_export_test.csv"
-    dialog_pkl_export = paths.plots_dir / "dream_violin_export_test.pkl"
+    model_exports = sorted(
+        paths.exported_data_dir.glob("dream_model_fit_*.csv")
+    )
+    violin_csv_exports = sorted(
+        paths.exported_data_dir.glob("dream_violin_*.csv")
+    )
+    violin_pkl_exports = sorted(
+        paths.exported_data_dir.glob("dream_violin_*.pkl")
+    )
+    dialog_csv_export = (
+        paths.exported_data_dir / "dream_violin_export_test.csv"
+    )
+    dialog_pkl_export = (
+        paths.exported_data_dir / "dream_violin_export_test.pkl"
+    )
+    dialog_metadata_export = (
+        paths.exported_data_dir / "dream_violin_export_test.metadata.json"
+    )
+    dialog_report_export = (
+        paths.exported_data_dir / "dream_violin_export_test.report.txt"
+    )
 
     assert model_exports
     assert violin_csv_exports
     assert violin_pkl_exports
     assert dialog_csv_export.is_file()
     assert dialog_pkl_export.is_file()
+    assert dialog_metadata_export.is_file()
+    assert dialog_report_export.is_file()
     assert "q,experimental_intensity,model_intensity" in model_exports[
         -1
     ].read_text(encoding="utf-8")
+    model_metadata = json.loads(
+        model_exports[-1]
+        .with_name(f"{model_exports[-1].stem}.metadata.json")
+        .read_text(encoding="utf-8")
+    )
+    model_report = model_exports[-1].with_name(
+        f"{model_exports[-1].stem}.report.txt"
+    )
+    assert model_report.is_file()
+    assert model_metadata["export_kind"] == "dream_model_fit"
+    assert model_metadata["model_fit"]["fit_metrics"]["rmse"] >= 0.0
+    assert "Model fit metrics:" in model_report.read_text(encoding="utf-8")
     assert "w0 (A)" in dialog_csv_export.read_text(encoding="utf-8")
     violin_payload = pickle.loads(dialog_pkl_export.read_bytes())
+    violin_metadata = json.loads(
+        dialog_metadata_export.read_text(encoding="utf-8")
+    )
     assert violin_payload["violin_plot"]["display_names"] == ["w0 (A)"]
+    assert violin_payload["screening_metrics"]["posterior_filter_mode"]
+    assert violin_metadata["export_kind"] == "dream_violin"
+    assert violin_metadata["screening_metrics"]["posterior_filter_mode"]
     assert violin_payload["plot_payload"]["ylabel"] == "Parameter value"
     assert np.asarray(violin_payload["plot_payload"]["samples"]).shape[1] == 1
+    assert "Posterior violin data:" in dialog_report_export.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_dream_run_finish_auto_exports_condensed_results(qapp, tmp_path):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    bundle = _write_minimal_dream_results(project_dir)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    window._on_dream_run_finished(
+        str(bundle.run_dir),
+        {
+            "sampled_params_path": str(
+                bundle.run_dir / "dream_sampled_params.npy"
+            ),
+            "log_ps_path": str(bundle.run_dir / "dream_log_ps.npy"),
+        },
+    )
+
+    auto_model_exports = sorted(
+        paths.exported_data_dir.glob("dream_model_fit_auto_*.csv")
+    )
+    auto_violin_exports = sorted(
+        paths.exported_data_dir.glob("dream_violin_auto_*.csv")
+    )
+
+    assert auto_model_exports
+    assert auto_violin_exports
+    auto_model_base = auto_model_exports[-1].stem
+    auto_violin_base = auto_violin_exports[-1].stem
+    assert (
+        paths.exported_data_dir / f"{auto_model_base}.metadata.json"
+    ).is_file()
+    assert (
+        paths.exported_data_dir / f"{auto_model_base}.report.txt"
+    ).is_file()
+    assert (
+        paths.exported_data_dir / f"{auto_violin_base}.metadata.json"
+    ).is_file()
+    assert (
+        paths.exported_data_dir / f"{auto_violin_base}.report.txt"
+    ).is_file()
+
+
+def test_dream_overconstraint_warning_can_set_all_vary_to_yes(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    bundle = _write_minimal_dream_results(project_dir)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    workflow = SAXSDreamWorkflow(project_dir)
+    entries = workflow.load_parameter_map()
+    for entry in entries:
+        if entry.param == "scale":
+            entry.vary = False
+        if entry.param == "w0":
+            entry.vary = False
+    workflow.save_parameter_map(entries)
+    window._last_results_loader = SAXSDreamResultsLoader(
+        bundle.run_dir,
+        burnin_percent=0,
+    )
+
+    prefit_evaluation = window.prefit_workflow.evaluate()
+    worse_model = (
+        np.asarray(
+            prefit_evaluation.model_intensities,
+            dtype=float,
+        )
+        + 0.5
+    )
+    worse_metrics = window._fit_quality_metrics_from_curves(
+        prefit_evaluation.experimental_intensities,
+        worse_model,
+    )
+    monkeypatch.setattr(
+        window._last_results_loader,
+        "build_model_fit_data",
+        lambda **kwargs: SimpleNamespace(
+            q_values=prefit_evaluation.q_values,
+            experimental_intensities=(
+                prefit_evaluation.experimental_intensities
+            ),
+            model_intensities=worse_model,
+            bestfit_method="map",
+            template_name="template_pd_likelihood_monosq_decoupled",
+            rmse=worse_metrics.rmse,
+            mean_abs_residual=worse_metrics.mean_abs_residual,
+            r_squared=worse_metrics.r_squared,
+        ),
+    )
+
+    captured: dict[str, object] = {}
+
+    def _accept_prompt(comparison):
+        captured["comparison"] = comparison
+        return True
+
+    monkeypatch.setattr(
+        window, "_prompt_dream_constraint_update", _accept_prompt
+    )
+
+    window._maybe_warn_about_dream_overconstraints(
+        window.dream_tab.settings_payload()
+    )
+
+    updated_entries = workflow.load_parameter_map()
+    assert all(entry.vary for entry in updated_entries)
+    comparison = captured["comparison"]
+    assert "scale" in comparison.fixed_non_weight_parameters
+    assert "w0" in comparison.fixed_weight_parameters
+    assert window._dream_parameter_map_saved_in_session is True
+    assert "All DREAM parameters now have vary=yes" in (
+        window.dream_tab.output_box.toPlainText()
+    )
+
+
+def test_dream_overconstraint_warning_skips_prompt_when_dream_not_worse(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    bundle = _write_minimal_dream_results(project_dir)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    workflow = SAXSDreamWorkflow(project_dir)
+    entries = workflow.load_parameter_map()
+    for entry in entries:
+        if entry.param == "scale":
+            entry.vary = False
+    workflow.save_parameter_map(entries)
+    window._last_results_loader = SAXSDreamResultsLoader(
+        bundle.run_dir,
+        burnin_percent=0,
+    )
+
+    prefit_evaluation = window.prefit_workflow.evaluate()
+    better_model = np.asarray(
+        prefit_evaluation.experimental_intensities,
+        dtype=float,
+    )
+    better_metrics = window._fit_quality_metrics_from_curves(
+        prefit_evaluation.experimental_intensities,
+        better_model,
+    )
+    monkeypatch.setattr(
+        window._last_results_loader,
+        "build_model_fit_data",
+        lambda **kwargs: SimpleNamespace(
+            q_values=prefit_evaluation.q_values,
+            experimental_intensities=(
+                prefit_evaluation.experimental_intensities
+            ),
+            model_intensities=better_model,
+            bestfit_method="map",
+            template_name="template_pd_likelihood_monosq_decoupled",
+            rmse=better_metrics.rmse,
+            mean_abs_residual=better_metrics.mean_abs_residual,
+            r_squared=better_metrics.r_squared,
+        ),
+    )
+
+    monkeypatch.setattr(
+        window,
+        "_prompt_dream_constraint_update",
+        lambda comparison: pytest.fail(
+            f"Unexpected overconstraint prompt: {comparison}"
+        ),
+    )
+
+    window._maybe_warn_about_dream_overconstraints(
+        window.dream_tab.settings_payload()
+    )
+
+    assert any(not entry.vary for entry in workflow.load_parameter_map())
+
+
+def test_dream_run_finish_auto_applies_recommended_filter(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    bundle = _write_minimal_dream_results(project_dir)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    monkeypatch.setattr(
+        window,
+        "_evaluate_dream_posterior_filters",
+        lambda settings: (
+            [
+                {
+                    "mode": "all_post_burnin",
+                    "description": "all_post_burnin",
+                    "rmse": 1.2,
+                    "mean_abs_residual": 1.0,
+                    "r_squared": 0.1,
+                    "posterior_sample_count": 8,
+                },
+                {
+                    "mode": "top_n_logp",
+                    "description": "top_n_logp (top 500 samples by log-posterior)",
+                    "rmse": 0.2,
+                    "mean_abs_residual": 0.15,
+                    "r_squared": 0.95,
+                    "posterior_sample_count": 4,
+                },
+            ],
+            {
+                "mode": "top_n_logp",
+                "description": "top_n_logp (top 500 samples by log-posterior)",
+                "rmse": 0.2,
+                "mean_abs_residual": 0.15,
+                "r_squared": 0.95,
+                "posterior_sample_count": 4,
+            },
+        ),
+    )
+
+    window._on_dream_run_finished(
+        str(bundle.run_dir),
+        {
+            "sampled_params_path": str(
+                bundle.run_dir / "dream_sampled_params.npy"
+            ),
+            "log_ps_path": str(bundle.run_dir / "dream_log_ps.npy"),
+        },
+    )
+
+    assert window.dream_tab.posterior_filter_combo.currentData() == (
+        "top_n_logp"
+    )
+    assert window.dream_tab.selected_search_filter_preset() == "custom"
+    assert "Recommended posterior filter by fit quality" in (
+        window.dream_tab.output_box.toPlainText()
+    )
+    assert "Applied recommended posterior filter automatically." in (
+        window.dream_tab.output_box.toPlainText()
+    )
 
 
 def test_prefit_template_change_warning_can_be_cancelled(
@@ -2310,15 +2809,65 @@ def test_solvent_sort_mode_populates_secondary_atom_filter(qapp):
     assert tab.secondary_filter_combo.currentText() == "O"
 
 
-def test_save_prior_plot_png_writes_to_project_plots_dir(qapp, tmp_path):
+def test_save_prior_plot_png_writes_to_exported_results_plots(qapp, tmp_path):
     del qapp
     project_dir, paths = _build_minimal_saxs_project(tmp_path)
     window = SAXSMainWindow(initial_project_dir=project_dir)
 
     window.save_prior_plot_png()
 
-    saved_images = list(paths.plots_dir.glob("prior_histogram_*.png"))
+    saved_images = list(paths.exported_plots_dir.glob("prior_histogram_*.png"))
     assert saved_images
+
+
+def test_save_component_plot_data_exports_csv(qapp, tmp_path, monkeypatch):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    export_path = tmp_path / "component_plot_export.csv"
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (
+            str(export_path),
+            "CSV files (*.csv)",
+        ),
+    )
+
+    window.save_component_plot_data()
+
+    assert export_path.is_file()
+    contents = export_path.read_text(encoding="utf-8")
+    assert "series,component_key,axis_index,axis_ylabel,color,visible,x,y" in (
+        contents
+    )
+    assert "Experimental data" in contents
+    assert "A_no_motif" in contents
+
+
+def test_save_prior_plot_data_exports_npy(qapp, tmp_path, monkeypatch):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    export_path = tmp_path / "prior_plot_export.npy"
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (
+            str(export_path),
+            "NumPy files (*.npy)",
+        ),
+    )
+
+    window.save_prior_plot_data()
+
+    assert export_path.is_file()
+    payload = np.load(export_path, allow_pickle=True).item()
+    assert payload["plot_mode"] == "structure_fraction"
+    assert list(payload["labels"]) == ["A"]
+    np.testing.assert_allclose(payload["matrix"], np.asarray([[100.0]]))
 
 
 def test_prior_histogram_window_uses_secondary_filter_and_colormap(
@@ -2393,6 +2942,91 @@ def test_prior_histogram_window_uses_secondary_filter_and_colormap(
     assert prior_window.mode == "solvent_sort_structure_fraction"
     assert prior_window.secondary_element == "O"
     assert prior_window.cmap == "viridis"
+
+
+def test_prior_histogram_can_match_component_trace_colors(qapp, tmp_path):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    component_path = paths.scattering_components_dir / "A_no_motif.txt"
+
+    plasma_index = (
+        window.project_setup_tab.component_trace_color_scheme_combo.findData(
+            "plasma"
+        )
+    )
+    window.project_setup_tab.component_trace_color_scheme_combo.setCurrentIndex(
+        plasma_index
+    )
+    window.project_setup_tab.draw_component_plot([component_path])
+    window.project_setup_tab.draw_prior_plot(
+        paths.project_dir / "md_prior_weights.json"
+    )
+
+    trace_color = to_hex(
+        window.project_setup_tab._component_line_lookup[
+            "A_no_motif"
+        ].get_color()
+    )
+    bar_color = to_hex(
+        window.project_setup_tab.prior_figure.axes[0]
+        .patches[0]
+        .get_facecolor()
+    )
+
+    assert (
+        not window.project_setup_tab.prior_match_trace_colors_checkbox.isHidden()
+    )
+    assert bar_color == trace_color
+
+    window.show_prior_histogram_window()
+
+    prior_window = window._prior_histogram_windows[-1]
+    assert prior_window.structure_motif_colors == {"A_no_motif": trace_color}
+
+
+def test_solvent_sort_prior_histogram_does_not_auto_match_component_colors(
+    qapp, tmp_path
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    component_path = paths.scattering_components_dir / "A_no_motif.txt"
+
+    window.project_setup_tab.apply_cluster_import_data(
+        ["A", "O"],
+        [
+            {
+                "structure": "A",
+                "motif": "no_motif",
+                "count": 1,
+                "weight": 1.0,
+                "atom_fraction_percent": 100.0,
+                "structure_fraction_percent": 100.0,
+            }
+        ],
+    )
+    window.project_setup_tab.prior_mode_combo.setCurrentText(
+        "Solvent Sort - Structure Fraction"
+    )
+    plasma_index = (
+        window.project_setup_tab.component_trace_color_scheme_combo.findData(
+            "plasma"
+        )
+    )
+    window.project_setup_tab.component_trace_color_scheme_combo.setCurrentIndex(
+        plasma_index
+    )
+    window.project_setup_tab.prior_match_trace_colors_checkbox.setChecked(True)
+    window.project_setup_tab.draw_component_plot([component_path])
+
+    assert window.project_setup_tab.prior_structure_motif_colors() is None
+
+    window.show_prior_histogram_window()
+
+    prior_window = window._prior_histogram_windows[-1]
+    assert prior_window.mode == "solvent_sort_structure_fraction"
+    assert prior_window.structure_motif_colors is None
 
 
 def test_create_project_warns_before_overwriting_existing_folder(
@@ -2834,6 +3468,114 @@ def test_component_autoscale_to_model_range_uses_model_q_limits(
     assert x_limits[1] == pytest.approx(0.18)
 
 
+def test_component_show_hide_all_button_toggles_all_model_traces(
+    qapp, tmp_path
+):
+    del qapp
+    q_values = np.asarray([0.05, 0.08, 0.12, 0.18], dtype=float)
+    component_edge = tmp_path / "PbI2_edge.txt"
+    component_face = tmp_path / "PbI2_face.txt"
+    _write_component_file(
+        component_edge,
+        q_values,
+        np.asarray([4.8, 4.6, 4.4, 4.2], dtype=float),
+    )
+    _write_component_file(
+        component_face,
+        q_values,
+        np.asarray([3.8, 3.6, 3.4, 3.2], dtype=float),
+    )
+
+    tab = ProjectSetupTab()
+    tab.apply_cluster_import_data(
+        ["Pb", "I"],
+        [
+            {
+                "structure": "PbI2",
+                "motif": "edge",
+                "count": 7,
+                "weight": 0.55,
+                "atom_fraction_percent": 55.0,
+                "structure_fraction_percent": 55.0,
+            },
+            {
+                "structure": "PbI2",
+                "motif": "face",
+                "count": 5,
+                "weight": 0.45,
+                "atom_fraction_percent": 45.0,
+                "structure_fraction_percent": 45.0,
+            },
+        ],
+    )
+    tab.draw_component_plot([component_edge, component_face])
+
+    assert tab.component_all_traces_button.text() == "Hide Computed Traces"
+
+    tab.component_all_traces_button.click()
+
+    assert not tab._component_line_lookup["PbI2_edge"].get_visible()
+    assert not tab._component_line_lookup["PbI2_face"].get_visible()
+    assert (
+        tab.recognized_clusters_table.item(0, 6).checkState()
+        == Qt.CheckState.Unchecked
+    )
+    assert (
+        tab.recognized_clusters_table.item(1, 6).checkState()
+        == Qt.CheckState.Unchecked
+    )
+    assert tab.component_all_traces_button.text() == "Show Computed Traces"
+
+    tab.component_all_traces_button.click()
+
+    assert tab._component_line_lookup["PbI2_edge"].get_visible()
+    assert tab._component_line_lookup["PbI2_face"].get_visible()
+    assert (
+        tab.recognized_clusters_table.item(0, 6).checkState()
+        == Qt.CheckState.Checked
+    )
+    assert (
+        tab.recognized_clusters_table.item(1, 6).checkState()
+        == Qt.CheckState.Checked
+    )
+    assert tab.component_all_traces_button.text() == "Hide Computed Traces"
+
+
+def test_component_trace_color_scheme_applies_histogram_colormap(
+    qapp, tmp_path
+):
+    del qapp
+    q_values = np.asarray([0.05, 0.08, 0.12, 0.18], dtype=float)
+    component_edge = tmp_path / "PbI2_edge.txt"
+    component_face = tmp_path / "PbI2_face.txt"
+    _write_component_file(
+        component_edge,
+        q_values,
+        np.asarray([4.8, 4.6, 4.4, 4.2], dtype=float),
+    )
+    _write_component_file(
+        component_face,
+        q_values,
+        np.asarray([3.8, 3.6, 3.4, 3.2], dtype=float),
+    )
+
+    tab = ProjectSetupTab()
+    tab.draw_component_plot([component_edge, component_face])
+    plasma_index = tab.component_trace_color_scheme_combo.findData("plasma")
+    tab.component_trace_color_scheme_combo.setCurrentIndex(plasma_index)
+
+    expected_colors = tab._component_scheme_colors(
+        [component_edge, component_face]
+    )
+
+    assert to_hex(tab._component_line_lookup["PbI2_edge"].get_color()) == (
+        expected_colors["PbI2_edge"]
+    )
+    assert to_hex(tab._component_line_lookup["PbI2_face"].get_color()) == (
+        expected_colors["PbI2_face"]
+    )
+
+
 def test_component_table_toggle_and_legend_pick_stay_synced(qapp, tmp_path):
     del qapp
     q_values = np.asarray([0.05, 0.08, 0.12, 0.18], dtype=float)
@@ -2897,6 +3639,34 @@ def test_component_table_toggle_and_legend_pick_stay_synced(qapp, tmp_path):
     assert refreshed_item.checkState() == Qt.CheckState.Checked
 
 
+def test_component_trace_color_scheme_persists_with_project_state(
+    qapp, tmp_path
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    plasma_index = (
+        window.project_setup_tab.component_trace_color_scheme_combo.findData(
+            "plasma"
+        )
+    )
+    window.project_setup_tab.component_trace_color_scheme_combo.setCurrentIndex(
+        plasma_index
+    )
+
+    window.save_project_state()
+
+    settings = SAXSProjectManager().load_project(project_dir)
+    assert settings.component_trace_color_scheme == "plasma"
+
+    reloaded_window = SAXSMainWindow(initial_project_dir=project_dir)
+    assert (
+        reloaded_window.project_setup_tab.component_trace_color_scheme()
+        == "plasma"
+    )
+
+
 def test_prefit_plot_shows_solvent_contribution_and_legend_pick_toggles_model(
     qapp, tmp_path
 ):
@@ -2943,6 +3713,165 @@ def test_prefit_plot_shows_solvent_contribution_and_legend_pick_toggles_model(
     assert window.prefit_tab._legend_handle_lookup[
         "Model"
     ].get_alpha() == pytest.approx(0.25)
+
+
+def test_dream_plot_shows_solvent_contribution_and_legend_pick_toggles_model(
+    qapp, tmp_path
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    solvent_q = np.linspace(0.05, 0.3, 8)
+    solvent_intensity = np.linspace(1.5, 2.2, 8)
+    solvent_path = tmp_path / "dream_solvent_trace.dat"
+    np.savetxt(solvent_path, np.column_stack([solvent_q, solvent_intensity]))
+
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.solvent_data_path = str(solvent_path)
+    settings.copied_solvent_data_file = None
+    manager.save_project(settings)
+
+    _write_minimal_dream_results(project_dir)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    window.load_latest_results()
+    window.dream_tab.show_solvent_trace_checkbox.setChecked(True)
+
+    top_axis = window.dream_tab.model_figure.axes[0]
+    labels = [line.get_label() for line in top_axis.get_lines()]
+    model_label = next(
+        line.get_label()
+        for line in top_axis.get_lines()
+        if str(line.get_label()).startswith("Model (")
+    )
+    model_line = next(
+        line
+        for line in top_axis.get_lines()
+        if line.get_label() == model_label
+    )
+
+    assert "Solvent contribution" in labels
+
+    event = type(
+        "LegendEvent",
+        (),
+        {"artist": window.dream_tab._model_legend_handle_lookup[model_label]},
+    )()
+    window.dream_tab._handle_model_legend_pick(event)
+
+    assert not model_line.get_visible()
+    assert window.dream_tab._model_legend_handle_lookup[
+        model_label
+    ].get_alpha() == pytest.approx(0.25)
+
+
+def test_dream_plot_trace_toggles_control_visible_series(qapp, tmp_path):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    solvent_q = np.linspace(0.05, 0.3, 8)
+    solvent_intensity = np.linspace(1.5, 2.2, 8)
+    solvent_path = tmp_path / "dream_toggle_solvent_trace.dat"
+    np.savetxt(solvent_path, np.column_stack([solvent_q, solvent_intensity]))
+
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.solvent_data_path = str(solvent_path)
+    settings.copied_solvent_data_file = None
+    manager.save_project(settings)
+
+    _write_minimal_dream_results(project_dir)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    window.load_latest_results()
+
+    assert window.dream_tab.show_experimental_trace_checkbox.isEnabled()
+    assert window.dream_tab.show_model_trace_checkbox.isEnabled()
+    assert window.dream_tab.show_solvent_trace_checkbox.isEnabled()
+
+    top_axis = window.dream_tab.model_figure.axes[0]
+    labels = [line.get_label() for line in top_axis.get_lines()]
+    assert "Solvent contribution" not in labels
+
+    window.dream_tab.show_solvent_trace_checkbox.setChecked(True)
+    top_axis = window.dream_tab.model_figure.axes[0]
+    labels = [line.get_label() for line in top_axis.get_lines()]
+    assert "Solvent contribution" in labels
+
+    window.dream_tab.show_experimental_trace_checkbox.setChecked(False)
+    top_axis = window.dream_tab.model_figure.axes[0]
+    collection_labels = [
+        collection.get_label() for collection in top_axis.collections
+    ]
+    assert "Experimental" not in collection_labels
+
+    window.dream_tab.show_model_trace_checkbox.setChecked(False)
+    top_axis = window.dream_tab.model_figure.axes[0]
+    line_labels = [line.get_label() for line in top_axis.get_lines()]
+    assert not any(str(label).startswith("Model (") for label in line_labels)
+
+
+def test_save_prefit_plot_data_exports_csv_with_metadata(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    export_path = tmp_path / "prefit_plot_export.csv"
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (
+            str(export_path),
+            "CSV files (*.csv)",
+        ),
+    )
+
+    window.save_prefit_plot_data()
+
+    assert export_path.is_file()
+    contents = export_path.read_text(encoding="utf-8")
+    assert "# fit_conditions:" in contents
+    assert "# fit_metrics:" in contents
+    assert (
+        "q,experimental_intensity,model_intensity,residual,"
+        "solvent_intensity,solvent_contribution" in contents
+    )
+
+
+def test_save_prefit_plot_data_exports_npy_with_metadata_sidecar(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    export_path = tmp_path / "prefit_plot_export.npy"
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (
+            str(export_path),
+            "NumPy files (*.npy)",
+        ),
+    )
+
+    window.save_prefit_plot_data()
+
+    assert export_path.is_file()
+    metadata_path = export_path.with_suffix(".metadata.json")
+    assert metadata_path.is_file()
+    matrix = np.load(export_path)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert matrix.shape[1] == 6
+    assert metadata["columns"] == [
+        "q",
+        "experimental_intensity",
+        "model_intensity",
+        "residual",
+        "solvent_intensity",
+        "solvent_contribution",
+    ]
+    assert "fit_conditions" in metadata
+    assert "fit_metrics" in metadata
 
 
 def test_experimental_status_note_is_wrapped_and_multiline(qapp):

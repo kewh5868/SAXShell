@@ -342,6 +342,7 @@ class BondAnalysisMainWindow(QMainWindow):
         self.use_checked_cluster_types_box = QCheckBox(
             "Analyze only checked cluster types"
         )
+        self.use_checked_cluster_types_box.setChecked(True)
         self.use_checked_cluster_types_box.toggled.connect(
             lambda _checked: self._update_selection_summary()
         )

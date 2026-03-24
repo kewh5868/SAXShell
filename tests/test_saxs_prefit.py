@@ -6,7 +6,10 @@ import numpy as np
 import pytest
 
 from saxshell.saxs._model_templates import load_template_module
-from saxshell.saxs.prefit import SAXSPrefitWorkflow
+from saxshell.saxs.prefit import (
+    SAXSPrefitWorkflow,
+    compute_cluster_geometry_metadata,
+)
 from saxshell.saxs.project_manager import (
     SAXSProjectManager,
     build_project_paths,
@@ -95,6 +98,98 @@ def _build_minimal_saxs_project(tmp_path):
     settings.selected_model_template = template_name
     manager.save_project(settings)
     return project_dir, paths
+
+
+def _build_poly_lma_geometry_project(tmp_path):
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "poly_lma_project"
+    settings = manager.create_project(project_dir)
+    paths = build_project_paths(project_dir)
+
+    q_values = np.linspace(0.05, 0.3, 8)
+    component = np.linspace(10.0, 17.0, 8)
+    template_name = "template_pydream_poly_lma_hs"
+
+    clusters_dir = paths.project_dir / "clusters"
+    structure_dir = clusters_dir / "A"
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    (structure_dir / "frame_0001.xyz").write_text(
+        "4\nframe 1\nPb 0.0 0.0 0.0\nI 2.0 0.0 0.0\n"
+        "I 0.0 2.0 0.0\nI 0.0 0.0 2.0\n",
+        encoding="utf-8",
+    )
+    (structure_dir / "frame_0002.xyz").write_text(
+        "4\nframe 2\nPb 0.0 0.0 0.0\nI 2.2 0.0 0.0\n"
+        "I 0.0 1.8 0.0\nI 0.0 0.0 2.1\n",
+        encoding="utf-8",
+    )
+    geometry_table = compute_cluster_geometry_metadata(
+        clusters_dir,
+        template_name=template_name,
+    )
+    effective_radius = geometry_table.rows[0].effective_radius
+
+    template_module = load_template_module(template_name)
+    experimental = template_module.lmfit_model_profile(
+        q_values,
+        np.zeros_like(q_values),
+        [component],
+        np.asarray([effective_radius], dtype=float),
+        w0=1.0,
+        phi_solute=0.02,
+        phi_int=0.02,
+        solvent_scale=1.0,
+        scale=1.0,
+        offset=0.0,
+        log_sigma=-9.21,
+    )
+
+    experimental_path = paths.experimental_data_dir / "exp_demo.txt"
+    np.savetxt(
+        experimental_path,
+        np.column_stack([q_values, experimental]),
+    )
+    _write_component_file(
+        paths.scattering_components_dir / "A_no_motif.txt",
+        q_values,
+        component,
+    )
+    (paths.project_dir / "md_prior_weights.json").write_text(
+        json.dumps(
+            {
+                "origin": "clusters",
+                "total_files": 2,
+                "structures": {
+                    "A": {
+                        "no_motif": {
+                            "count": 2,
+                            "weight": 1.0,
+                            "representative": "frame_0001.xyz",
+                            "profile_file": "A_no_motif.txt",
+                        }
+                    }
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (paths.project_dir / "md_saxs_map.json").write_text(
+        json.dumps(
+            {"saxs_map": {"A": {"no_motif": "A_no_motif.txt"}}},
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    settings.experimental_data_path = str(experimental_path)
+    settings.copied_experimental_data_file = str(experimental_path)
+    settings.selected_model_template = template_name
+    settings.clusters_dir = str(clusters_dir)
+    manager.save_project(settings)
+    return project_dir, paths, effective_radius
 
 
 def test_saxs_prefit_workflow_evaluates_and_autosaves_when_enabled(tmp_path):
@@ -260,3 +355,35 @@ def test_saxs_prefit_workflow_loads_saved_snapshot_state(tmp_path):
     assert saved_state.autosave_prefits is True
     assert loaded_entries["scale"].value == pytest.approx(7e-4)
     assert loaded_entries["offset"].value == pytest.approx(0.125)
+
+
+def test_poly_lma_prefit_workflow_computes_and_uses_cluster_geometry(
+    tmp_path,
+):
+    project_dir, paths, effective_radius = _build_poly_lma_geometry_project(
+        tmp_path
+    )
+    workflow = SAXSPrefitWorkflow(project_dir)
+
+    assert workflow.supports_cluster_geometry_metadata()
+    assert workflow.cluster_geometry_rows() == []
+
+    with pytest.raises(ValueError, match="cluster geometry metadata"):
+        workflow.evaluate()
+
+    table = workflow.compute_cluster_geometry_table()
+
+    assert paths.cluster_geometry_metadata_file.is_file()
+    assert len(table.rows) == 1
+    assert table.rows[0].mapped_parameter == "w0"
+    assert table.rows[0].effective_radius == pytest.approx(effective_radius)
+
+    evaluation = workflow.evaluate()
+
+    assert np.allclose(
+        evaluation.model_intensities,
+        evaluation.experimental_intensities,
+    )
+    assert workflow.template_runtime_inputs_payload()["effective_radii"] == (
+        pytest.approx([effective_radius])
+    )

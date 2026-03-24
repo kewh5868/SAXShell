@@ -507,15 +507,10 @@ class DebyeProfileBuilder:
                 continue
 
             f0_dictionary = build_f0_dictionary(unique_elements, self.q_values)
-            traces = [
-                compute_debye_intensity(
-                    filtered_coords,
-                    filtered_elements,
-                    self.q_values,
-                    f0_dictionary=f0_dictionary,
-                )
-                for filtered_coords, filtered_elements in filtered_structures
-            ]
+            traces = self._compute_cluster_traces(
+                filtered_structures,
+                f0_dictionary=f0_dictionary,
+            )
             stacked = np.asarray(traces, dtype=float)
             mean_trace = stacked.mean(axis=0)
             std_trace = stacked.std(axis=0)
@@ -561,6 +556,47 @@ class DebyeProfileBuilder:
             include_elements=self.include_elements or None,
             exclude_elements=self.exclude_elements or None,
         )
+
+    def _compute_cluster_traces(
+        self,
+        filtered_structures: list[tuple[np.ndarray, list[str]]],
+        *,
+        f0_dictionary: dict[str, np.ndarray],
+    ) -> list[np.ndarray]:
+        if self._all_single_atom_structures_are_equivalent(
+            filtered_structures
+        ):
+            filtered_coords, filtered_elements = filtered_structures[0]
+            trace = compute_debye_intensity(
+                filtered_coords,
+                filtered_elements,
+                self.q_values,
+                f0_dictionary=f0_dictionary,
+            )
+            return [np.asarray(trace, dtype=float)] * len(filtered_structures)
+
+        return [
+            compute_debye_intensity(
+                filtered_coords,
+                filtered_elements,
+                self.q_values,
+                f0_dictionary=f0_dictionary,
+            )
+            for filtered_coords, filtered_elements in filtered_structures
+        ]
+
+    @staticmethod
+    def _all_single_atom_structures_are_equivalent(
+        filtered_structures: list[tuple[np.ndarray, list[str]]],
+    ) -> bool:
+        if not filtered_structures:
+            return False
+        atom_signatures: set[tuple[str, ...]] = set()
+        for filtered_coords, filtered_elements in filtered_structures:
+            if len(filtered_coords) != 1 or len(filtered_elements) != 1:
+                return False
+            atom_signatures.add(tuple(filtered_elements))
+        return len(atom_signatures) == 1
 
     def _write_component_file(
         self,
