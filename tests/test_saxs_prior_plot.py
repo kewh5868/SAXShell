@@ -5,6 +5,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import to_hex
 
 from saxshell.saxs.project_manager import (
     build_prior_histogram_export_payload,
@@ -181,3 +182,51 @@ def test_solvent_sort_payload_groups_secondary_atom_count_subbins(
         [1.0, 1.0, 0.0],
         [1.0, 0.0, 2.0],
     ]
+
+
+def test_prior_histogram_can_use_structure_motif_trace_colors(
+    tmp_path: Path,
+) -> None:
+    json_path = tmp_path / "md_prior_weights.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "origin": "clusters",
+                "total_files": 5,
+                "structures": {
+                    "PbI2": {
+                        "motif_A": {
+                            "count": 2,
+                            "weight": 0.4,
+                            "profile_file": "PbI2_motif_A.txt",
+                        }
+                    },
+                    "Pb2I4": {
+                        "motif_B": {
+                            "count": 3,
+                            "weight": 0.6,
+                            "profile_file": "Pb2I4_motif_B.txt",
+                        }
+                    },
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    fig, axis = plot_md_prior_histogram(
+        json_path,
+        mode="structure_fraction",
+        structure_motif_colors={
+            "PbI2_motif_A": "#112233",
+            "Pb2I4_motif_B": "#445566",
+        },
+    )
+
+    patch_colors = [to_hex(patch.get_facecolor()) for patch in axis.patches]
+
+    assert patch_colors[0] == "#112233"
+    assert patch_colors[-1] == "#445566"
+    plt.close(fig)

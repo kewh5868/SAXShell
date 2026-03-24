@@ -127,7 +127,7 @@ def test_bondanalysis_main_window_prefills_cluster_types_and_output_dir(
     window = BondAnalysisMainWindow(initial_clusters_dir=clusters_dir)
 
     assert window.cluster_type_list.count() == 2
-    assert not window.use_checked_cluster_types_box.isChecked()
+    assert window.use_checked_cluster_types_box.isChecked()
     assert (
         window.cluster_type_list.item(0).checkState() == Qt.CheckState.Checked
     )
@@ -143,6 +143,9 @@ def test_bondanalysis_main_window_prefills_cluster_types_and_output_dir(
     ]
     assert "DMSO (Built-in)" in preset_names
     assert "DMF (Built-in)" in preset_names
+    assert "Analyzing checked cluster types: PbI2, PbO" in (
+        window.selection_box.toPlainText()
+    )
     preview_text = window.selection_box.toPlainText()
     assert "Cluster types detected: 2" in preview_text
     assert "Checked cluster types: 2" in preview_text

@@ -4,13 +4,17 @@ import io
 import json
 
 import numpy as np
+import pytest
 
 from saxshell.saxs._model_templates import (
     list_template_specs,
     load_template_module,
 )
 from saxshell.saxs.dream import SAXSDreamWorkflow
-from saxshell.saxs.prefit import SAXSPrefitWorkflow
+from saxshell.saxs.prefit import (
+    SAXSPrefitWorkflow,
+    compute_cluster_geometry_metadata,
+)
 from saxshell.saxs.project_manager import (
     SAXSProjectManager,
     build_project_paths,
@@ -100,6 +104,95 @@ def _build_minimal_saxs_project(tmp_path):
     return project_dir, paths
 
 
+def _build_poly_lma_geometry_project(tmp_path):
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "poly_lma_project"
+    settings = manager.create_project(project_dir)
+    paths = build_project_paths(project_dir)
+
+    q_values = np.linspace(0.05, 0.3, 8)
+    component = np.linspace(10.0, 17.0, 8)
+    template_name = "template_pydream_poly_lma_hs"
+
+    clusters_dir = paths.project_dir / "clusters"
+    structure_dir = clusters_dir / "A"
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    (structure_dir / "frame_0001.xyz").write_text(
+        "4\nframe 1\nPb 0.0 0.0 0.0\nI 2.0 0.0 0.0\n"
+        "I 0.0 2.0 0.0\nI 0.0 0.0 2.0\n",
+        encoding="utf-8",
+    )
+    (structure_dir / "frame_0002.xyz").write_text(
+        "4\nframe 2\nPb 0.0 0.0 0.0\nI 2.2 0.0 0.0\n"
+        "I 0.0 1.8 0.0\nI 0.0 0.0 2.1\n",
+        encoding="utf-8",
+    )
+    geometry_table = compute_cluster_geometry_metadata(
+        clusters_dir,
+        template_name=template_name,
+    )
+    effective_radius = geometry_table.rows[0].effective_radius
+
+    template_module = load_template_module(template_name)
+    experimental = template_module.lmfit_model_profile(
+        q_values,
+        np.zeros_like(q_values),
+        [component],
+        np.asarray([effective_radius], dtype=float),
+        w0=1.0,
+        phi_solute=0.02,
+        phi_int=0.02,
+        solvent_scale=1.0,
+        scale=1.0,
+        offset=0.0,
+        log_sigma=-9.21,
+    )
+
+    experimental_path = paths.experimental_data_dir / "exp_demo.txt"
+    np.savetxt(experimental_path, np.column_stack([q_values, experimental]))
+    _write_component_file(
+        paths.scattering_components_dir / "A_no_motif.txt",
+        q_values,
+        component,
+    )
+    (paths.project_dir / "md_prior_weights.json").write_text(
+        json.dumps(
+            {
+                "origin": "clusters",
+                "total_files": 2,
+                "structures": {
+                    "A": {
+                        "no_motif": {
+                            "count": 2,
+                            "weight": 1.0,
+                            "representative": "frame_0001.xyz",
+                            "profile_file": "A_no_motif.txt",
+                        }
+                    }
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (paths.project_dir / "md_saxs_map.json").write_text(
+        json.dumps(
+            {"saxs_map": {"A": {"no_motif": "A_no_motif.txt"}}},
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    settings.experimental_data_path = str(experimental_path)
+    settings.copied_experimental_data_file = str(experimental_path)
+    settings.selected_model_template = template_name
+    settings.clusters_dir = str(clusters_dir)
+    manager.save_project(settings)
+    return project_dir, paths, effective_radius
+
+
 def test_saxs_templates_support_runtime_contract():
     q_values = np.linspace(0.05, 0.3, 8)
     component = np.linspace(10.0, 17.0, 8)
@@ -107,27 +200,30 @@ def test_saxs_templates_support_runtime_contract():
 
     for template_spec in list_template_specs():
         module = load_template_module(template_spec.name)
-        assert template_spec.lmfit_inputs == (
+        assert template_spec.lmfit_inputs[0:3] == (
             "q",
             "solvent_data",
             "model_data",
-            "params",
         )
-        assert template_spec.dream_inputs == (
-            "q",
-            "solvent_data",
-            "model_data",
-            "params",
-        )
+        assert template_spec.lmfit_inputs[-1] == "params"
 
         fit_params = {
             parameter.name: parameter.initial_value
             for parameter in template_spec.parameters
         }
+        template_runtime_inputs = {
+            binding.runtime_name: np.asarray([9.0], dtype=float)
+            for binding in template_spec.cluster_geometry_support.runtime_bindings
+        }
+        extra_inputs = [
+            template_runtime_inputs[input_name]
+            for input_name in template_spec.extra_lmfit_inputs
+        ]
         profile = getattr(module, template_spec.lmfit_model_name)(
             q_values,
             solvent,
             [component],
+            *extra_inputs,
             w0=0.6,
             **fit_params,
         )
@@ -138,6 +234,8 @@ def test_saxs_templates_support_runtime_contract():
         module.experimental_intensities = np.asarray(profile, dtype=float)
         module.theoretical_intensities = [component]
         module.solvent_intensities = np.asarray(solvent, dtype=float)
+        for input_name, values in template_runtime_inputs.items():
+            setattr(module, input_name, np.asarray(values, dtype=float))
 
         dream_params = np.asarray(
             [0.6]
@@ -151,6 +249,26 @@ def test_saxs_templates_support_runtime_contract():
             dream_params
         )
         assert np.isfinite(float(log_likelihood))
+
+
+def test_poly_lma_runtime_bundle_includes_cluster_geometry_inputs(tmp_path):
+    project_dir, _paths, effective_radius = _build_poly_lma_geometry_project(
+        tmp_path
+    )
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.compute_cluster_geometry_table()
+    prefit.save_fit(prefit.parameter_entries)
+
+    workflow = SAXSDreamWorkflow(project_dir)
+    entries = workflow.create_default_parameter_map(persist=True)
+    bundle = workflow.create_runtime_bundle(entries=entries)
+    metadata = json.loads(bundle.metadata_path.read_text(encoding="utf-8"))
+
+    assert metadata["template_name"] == "template_pydream_poly_lma_hs"
+    assert metadata["lmfit_extra_inputs"] == ["effective_radii"]
+    assert metadata["template_runtime_inputs"]["effective_radii"] == (
+        pytest.approx([effective_radius])
+    )
 
 
 def test_dream_runtime_bundle_smoke_executes_and_writes_outputs(tmp_path):

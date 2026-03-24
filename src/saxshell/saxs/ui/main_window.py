@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import pickle
 import shutil
 import subprocess
@@ -52,6 +53,8 @@ from saxshell.saxs.project_manager import (
     ProjectSettings,
     SAXSProjectManager,
     build_project_paths,
+    export_prior_histogram_npy,
+    export_prior_histogram_table,
 )
 from saxshell.saxs.ui.distribution_window import DistributionSetupWindow
 from saxshell.saxs.ui.dream_tab import DreamTab
@@ -75,6 +78,22 @@ class RuntimeBundleOpener:
     stored_value: str
     launch_target: str
     launch_mode: str
+
+
+@dataclass(frozen=True, slots=True)
+class FitQualityMetrics:
+    rmse: float
+    mean_abs_residual: float
+    r_squared: float
+
+
+@dataclass(frozen=True, slots=True)
+class DreamFitConstraintComparison:
+    prefit_metrics: FitQualityMetrics
+    dream_metrics: FitQualityMetrics
+    fixed_parameters: tuple[str, ...]
+    fixed_non_weight_parameters: tuple[str, ...]
+    fixed_weight_parameters: tuple[str, ...]
 
 
 class SAXSProjectTaskWorker(QObject):
@@ -165,6 +184,11 @@ class SAXSMainWindow(QMainWindow):
         self._dream_parameter_map_saved_in_session = False
         self._active_dream_settings_snapshot: DreamRunSettings | None = None
         self._current_dream_preset_name: str | None = None
+        self._last_dream_filter_assessments: list[dict[str, object]] = []
+        self._last_dream_filter_recommendation: dict[str, object] | None = None
+        self._last_dream_constraint_warning_signature: (
+            tuple[object, ...] | None
+        ) = None
         self._prior_histogram_windows: list[PriorHistogramWindow] = []
         self._task_thread: QThread | None = None
         self._task_worker: SAXSProjectTaskWorker | None = None
@@ -240,6 +264,12 @@ class SAXSMainWindow(QMainWindow):
         self.project_setup_tab.generate_prior_plot_requested.connect(
             self.show_prior_histogram_window
         )
+        self.project_setup_tab.save_component_plot_data_requested.connect(
+            self.save_component_plot_data
+        )
+        self.project_setup_tab.save_prior_plot_data_requested.connect(
+            self.save_prior_plot_data
+        )
         self.project_setup_tab.save_prior_png_requested.connect(
             self.save_prior_plot_png
         )
@@ -255,6 +285,9 @@ class SAXSMainWindow(QMainWindow):
         self.prefit_tab.apply_recommended_scale_requested.connect(
             self.apply_recommended_scale_settings
         )
+        self.prefit_tab.save_plot_data_requested.connect(
+            self.save_prefit_plot_data
+        )
         self.prefit_tab.set_best_prefit_requested.connect(
             self.set_best_prefit_parameters
         )
@@ -266,6 +299,12 @@ class SAXSMainWindow(QMainWindow):
             self.restore_prefit_state
         )
         self.prefit_tab.reset_requested.connect(self.reset_prefit_entries)
+        self.prefit_tab.compute_cluster_geometry_requested.connect(
+            self.compute_prefit_cluster_geometry
+        )
+        self.prefit_tab.cluster_geometry_mapping_changed.connect(
+            self._sync_prefit_cluster_geometry_rows
+        )
 
         self.dream_tab.edit_parameter_map_requested.connect(
             self.open_distribution_editor
@@ -347,6 +386,10 @@ class SAXSMainWindow(QMainWindow):
         )
         self.tools_menu.addAction(self.bondanalysis_action)
 
+        self.fullrmc_action = QAction("Open fullrmc Setup", self)
+        self.fullrmc_action.triggered.connect(self._open_fullrmc_tool)
+        self.tools_menu.addAction(self.fullrmc_action)
+
         self.tools_menu.addSeparator()
         placeholder_specs = [
             ("PDF Calculation (Coming Soon)", "PDF Calculation"),
@@ -362,7 +405,6 @@ class SAXSMainWindow(QMainWindow):
                 "Bond Association/Dissociation Analysis (Coming Soon)",
                 "Bond Association/Dissociation Analysis",
             ),
-            ("fullrmc Setup (Coming Soon)", "fullrmc Setup"),
         ]
         self._placeholder_tool_actions: list[QAction] = []
         for label, tool_name in placeholder_specs:
@@ -830,6 +872,9 @@ class SAXSMainWindow(QMainWindow):
                     self.current_settings.available_elements = (
                         cluster_result.available_elements
                     )
+                    self.current_settings.cluster_inventory_rows = (
+                        cluster_result.cluster_rows
+                    )
                 self.project_setup_tab.append_summary(
                     "Imported cluster files for project setup.\n"
                     f"Files scanned: {cluster_result.total_files}\n"
@@ -841,6 +886,7 @@ class SAXSMainWindow(QMainWindow):
                 self.statusBar().showMessage("Cluster import complete")
         elif task_name == "build_components":
             settings, build_result = result
+            settings.cluster_inventory_rows = build_result.cluster_rows
             self.current_settings = settings
             self._apply_project_settings(settings)
             self.project_setup_tab.apply_cluster_import_data(
@@ -865,6 +911,7 @@ class SAXSMainWindow(QMainWindow):
             self.statusBar().showMessage("Project components built")
         elif task_name == "build_prior_weights":
             settings, build_result = result
+            settings.cluster_inventory_rows = build_result.cluster_rows
             self.current_settings = settings
             self._apply_project_settings(settings)
             self.project_setup_tab.apply_cluster_import_data(
@@ -993,7 +1040,30 @@ class SAXSMainWindow(QMainWindow):
             run_dir,
             burnin_percent=settings.burnin_percent,
         )
+        assessment_message: str | None = None
+        assessment_error: str | None = None
+        self._last_dream_filter_assessments = []
+        self._last_dream_filter_recommendation = None
+        try:
+            (
+                settings,
+                assessment_message,
+            ) = self._assess_and_apply_dream_filter_recommendation(settings)
+            self._active_dream_run_settings = self._copy_dream_settings(
+                settings
+            )
+            self.dream_tab.set_settings(settings, preset_name=None)
+        except Exception as exc:  # pragma: no cover - defensive UI logging
+            assessment_error = str(exc)
         self._refresh_loaded_dream_results()
+        auto_export_paths: list[Path] = []
+        auto_export_error: str | None = None
+        try:
+            auto_export_paths = self._auto_export_dream_condensed_outputs(
+                settings
+            )
+        except Exception as exc:  # pragma: no cover - defensive UI logging
+            auto_export_error = str(exc)
         result_payload = dict(result) if isinstance(result, dict) else {}
         self.dream_tab.append_log(
             "DREAM run complete.\n"
@@ -1001,11 +1071,39 @@ class SAXSMainWindow(QMainWindow):
             f"Samples: {result_payload.get('sampled_params_path', 'unknown')}\n"
             f"Log-posteriors: {result_payload.get('log_ps_path', 'unknown')}"
         )
+        if assessment_message:
+            self.dream_tab.append_log(assessment_message)
+        if assessment_error:
+            self.dream_tab.append_log(
+                "Automatic DREAM filter assessment warning.\n"
+                "The refinement completed, but the post-run filter "
+                f"assessment could not be completed.\n{assessment_error}"
+            )
+        if auto_export_paths:
+            self.dream_tab.append_log(
+                "Saved condensed DREAM exports for easy access in "
+                "exported_results/data:\n"
+                + "\n".join(str(path) for path in auto_export_paths)
+                + "\nFull DREAM run artifacts remain in the DREAM run "
+                "folder."
+            )
+        if auto_export_error:
+            self.dream_tab.append_log(
+                "Automatic DREAM export warning.\n"
+                "The refinement completed, but the condensed export copy "
+                "could not be written to exported_results/data.\n"
+                f"{auto_export_error}"
+            )
         self.dream_tab.finish_runtime_output()
         self.dream_tab.finish_progress("DREAM refinement complete.")
         self._close_dream_progress_dialog()
         self.dream_tab.run_button.setEnabled(True)
-        self.statusBar().showMessage("DREAM run complete")
+        if auto_export_paths:
+            self.statusBar().showMessage(
+                "DREAM run complete; condensed exports saved"
+            )
+        else:
+            self.statusBar().showMessage("DREAM run complete")
 
     @Slot(str)
     def _on_dream_run_failed(self, message: str) -> None:
@@ -1043,6 +1141,102 @@ class SAXSMainWindow(QMainWindow):
             self._dream_task_thread = None
         self._active_dream_run_settings = None
 
+    def _refresh_prefit_cluster_geometry_section(self) -> None:
+        if self.prefit_workflow is None:
+            self.prefit_tab.set_cluster_geometry_visible(False)
+            return
+        visible = self.prefit_workflow.supports_cluster_geometry_metadata()
+        self.prefit_tab.set_cluster_geometry_visible(visible)
+        if not visible:
+            return
+        self.prefit_tab.populate_cluster_geometry_table(
+            self.prefit_workflow.cluster_geometry_rows(),
+            mapping_options=(
+                self.prefit_workflow.cluster_geometry_mapping_options()
+            ),
+        )
+        self.prefit_tab.set_cluster_geometry_status_text(
+            self.prefit_workflow.cluster_geometry_status_text()
+        )
+
+    def _sync_prefit_cluster_geometry_rows(self) -> None:
+        if (
+            self.prefit_workflow is None
+            or not self.prefit_workflow.supports_cluster_geometry_metadata()
+        ):
+            return
+        self.prefit_workflow.set_cluster_geometry_rows(
+            self.prefit_tab.cluster_geometry_rows()
+        )
+        self.prefit_tab.set_cluster_geometry_status_text(
+            self.prefit_workflow.cluster_geometry_status_text()
+        )
+
+    def _load_prefit_preview(
+        self,
+        *,
+        append_blocked_log: bool = False,
+    ):
+        if self.prefit_workflow is None:
+            self.prefit_tab.plot_evaluation(None)
+            self.prefit_tab.set_summary_text(
+                "Build a SAXS project to preview the prefit model."
+            )
+            return None
+        try:
+            evaluation = self.prefit_workflow.evaluate()
+        except Exception as exc:
+            self.prefit_tab.plot_evaluation(None)
+            self.prefit_tab.set_summary_text(
+                "Prefit preview is waiting on template metadata.\n\n" f"{exc}"
+            )
+            if append_blocked_log:
+                self.prefit_tab.append_log(
+                    "Prefit preview is waiting on additional template "
+                    "metadata before the model can be evaluated.\n"
+                    f"{exc}"
+                )
+            return None
+        self.prefit_tab.plot_evaluation(evaluation)
+        self.prefit_tab.set_summary_text(
+            self._format_prefit_summary(evaluation)
+        )
+        self._maybe_append_scale_recommendation(
+            self.prefit_workflow.parameter_entries
+        )
+        return evaluation
+
+    def compute_prefit_cluster_geometry(self) -> None:
+        if self.prefit_workflow is None:
+            self._show_error(
+                "Prefit unavailable",
+                "Build a project and load its SAXS components first.",
+            )
+            return
+        try:
+            table = self.prefit_workflow.compute_cluster_geometry_table()
+            self.prefit_tab.populate_cluster_geometry_table(
+                table.rows,
+                mapping_options=(
+                    self.prefit_workflow.cluster_geometry_mapping_options()
+                ),
+            )
+            self.prefit_tab.set_cluster_geometry_status_text(
+                self.prefit_workflow.cluster_geometry_status_text()
+            )
+            self.prefit_tab.append_log(
+                "Computed cluster geometry metadata.\n"
+                f"Template: {self.prefit_workflow.template_spec.name}\n"
+                f"Clusters: {len(table.rows)}"
+            )
+            self._load_prefit_preview()
+            self.statusBar().showMessage("Cluster geometry metadata computed")
+        except Exception as exc:
+            self._show_error(
+                "Compute cluster geometry failed",
+                str(exc),
+            )
+
     def update_prefit_model(self) -> None:
         if self.prefit_workflow is None:
             self._show_error(
@@ -1051,6 +1245,7 @@ class SAXSMainWindow(QMainWindow):
             )
             return
         try:
+            self._sync_prefit_cluster_geometry_rows()
             entries = self.prefit_tab.parameter_entries()
             evaluation = self.prefit_workflow.evaluate(entries)
             self.prefit_tab.plot_evaluation(evaluation)
@@ -1076,6 +1271,7 @@ class SAXSMainWindow(QMainWindow):
             )
             return
         try:
+            self._sync_prefit_cluster_geometry_rows()
             config = self.prefit_tab.run_config()
             self.prefit_tab.append_log(
                 "Running prefit.\n"
@@ -1131,6 +1327,7 @@ class SAXSMainWindow(QMainWindow):
             )
             return
         try:
+            self._sync_prefit_cluster_geometry_rows()
             entries = self.prefit_tab.parameter_entries()
             evaluation = self.prefit_workflow.evaluate(entries)
             config = self.prefit_tab.run_config()
@@ -1162,6 +1359,94 @@ class SAXSMainWindow(QMainWindow):
             self.statusBar().showMessage("Prefit saved")
         except Exception as exc:
             self._show_error("Save fit failed", str(exc))
+
+    def save_prefit_plot_data(self) -> None:
+        if self.prefit_workflow is None:
+            self._show_error(
+                "Save prefit plot data failed",
+                "Build a project and load its SAXS components first.",
+            )
+            return
+        if self.current_settings is None:
+            self._show_error(
+                "Save prefit plot data failed",
+                "Load or build a project first.",
+            )
+            return
+        try:
+            entries = self.prefit_tab.parameter_entries()
+            evaluation = self.prefit_workflow.evaluate(entries)
+            config = self.prefit_tab.run_config()
+            metadata = self._build_prefit_plot_export_metadata(
+                entries=entries,
+                evaluation=evaluation,
+                method=config.method,
+                max_nfev=config.max_nfev,
+            )
+            destination = self._prompt_project_plot_export_path(
+                dialog_title="Export prefit plot data",
+                default_filename=(
+                    "prefit_plot_data_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                ),
+                export_kind="data",
+            )
+            if destination is None:
+                return
+            columns = [
+                "q",
+                "experimental_intensity",
+                "model_intensity",
+                "residual",
+                "solvent_intensity",
+                "solvent_contribution",
+            ]
+            matrix = np.column_stack(
+                [
+                    np.asarray(evaluation.q_values, dtype=float),
+                    np.asarray(
+                        evaluation.experimental_intensities,
+                        dtype=float,
+                    ),
+                    np.asarray(evaluation.model_intensities, dtype=float),
+                    np.asarray(evaluation.residuals, dtype=float),
+                    (
+                        np.asarray(evaluation.solvent_intensities, dtype=float)
+                        if evaluation.solvent_intensities is not None
+                        else np.full_like(evaluation.q_values, np.nan)
+                    ),
+                    (
+                        np.asarray(
+                            evaluation.solvent_contribution,
+                            dtype=float,
+                        )
+                        if evaluation.solvent_contribution is not None
+                        else np.full_like(evaluation.q_values, np.nan)
+                    ),
+                ]
+            )
+            if destination.suffix.lower() == ".csv":
+                self._write_prefit_plot_csv(
+                    destination,
+                    metadata=metadata,
+                    columns=columns,
+                    matrix=matrix,
+                )
+            else:
+                np.save(destination, matrix)
+                metadata_path = destination.with_suffix(".metadata.json")
+                metadata_with_columns = dict(metadata)
+                metadata_with_columns["columns"] = columns
+                metadata_path.write_text(
+                    json.dumps(metadata_with_columns, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+            self.prefit_tab.append_log(
+                f"Saved prefit plot data to {destination}"
+            )
+            self.statusBar().showMessage("Prefit plot data exported")
+        except Exception as exc:
+            self._show_error("Save prefit plot data failed", str(exc))
 
     def reset_prefit_entries(self) -> None:
         if self.prefit_workflow is None:
@@ -1714,23 +1999,26 @@ class SAXSMainWindow(QMainWindow):
             return
         try:
             settings = self.dream_tab.settings_payload()
-            reports_dir = build_project_paths(
+            summary, model_plot, _violin_plot, _plot_payload = (
+                self._build_dream_export_context(settings)
+            )
+            export_dir = build_project_paths(
                 self.current_settings.project_dir
-            ).reports_dir
-            reports_dir.mkdir(parents=True, exist_ok=True)
-            output_path = reports_dir / (
+            ).exported_data_dir
+            export_dir.mkdir(parents=True, exist_ok=True)
+            output_path = export_dir / (
                 f"dream_statistics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             )
-            self._last_results_loader.save_statistics_report(
-                output_path,
-                bestfit_method=settings.bestfit_method,
-                posterior_filter_mode=settings.posterior_filter_mode,
-                posterior_top_percent=settings.posterior_top_percent,
-                posterior_top_n=settings.posterior_top_n,
-                credible_interval_low=settings.credible_interval_low,
-                credible_interval_high=settings.credible_interval_high,
-                violin_parameter_mode=settings.violin_parameter_mode,
-                violin_sample_source=settings.violin_sample_source,
+            output_path.write_text(
+                self._build_dream_export_report_text(
+                    export_kind="dream_statistics",
+                    data_paths=[output_path],
+                    settings=settings,
+                    summary=summary,
+                    model_plot=model_plot,
+                    auto_generated=False,
+                ),
+                encoding="utf-8",
             )
             self.dream_tab.append_log(
                 f"Saved DREAM statistics to {output_path}"
@@ -1738,6 +2026,639 @@ class SAXSMainWindow(QMainWindow):
             self.statusBar().showMessage("DREAM statistics saved")
         except Exception as exc:
             self._show_error("Save report failed", str(exc))
+
+    def _build_dream_export_context(
+        self,
+        settings: DreamRunSettings,
+    ) -> tuple[object, object, object, dict[str, object]]:
+        if self._last_results_loader is None:
+            raise RuntimeError("Load DREAM results first.")
+        summary = self._last_results_loader.get_summary(
+            bestfit_method=settings.bestfit_method,
+            posterior_filter_mode=settings.posterior_filter_mode,
+            posterior_top_percent=settings.posterior_top_percent,
+            posterior_top_n=settings.posterior_top_n,
+            credible_interval_low=settings.credible_interval_low,
+            credible_interval_high=settings.credible_interval_high,
+        )
+        model_plot = self._last_results_loader.build_model_fit_data(
+            bestfit_method=settings.bestfit_method,
+            posterior_filter_mode=settings.posterior_filter_mode,
+            posterior_top_percent=settings.posterior_top_percent,
+            posterior_top_n=settings.posterior_top_n,
+            credible_interval_low=settings.credible_interval_low,
+            credible_interval_high=settings.credible_interval_high,
+        )
+        violin_plot = self._last_results_loader.build_violin_data(
+            mode=self._effective_dream_violin_mode(settings),
+            posterior_filter_mode=settings.posterior_filter_mode,
+            posterior_top_percent=settings.posterior_top_percent,
+            posterior_top_n=settings.posterior_top_n,
+            credible_interval_low=settings.credible_interval_low,
+            credible_interval_high=settings.credible_interval_high,
+            sample_source=settings.violin_sample_source,
+            weight_order=settings.violin_weight_order,
+        )
+        plot_payload = self.dream_tab.prepare_violin_plot_payload(
+            summary,
+            violin_plot,
+        )
+        return summary, model_plot, violin_plot, plot_payload
+
+    def _dream_parameter_summary_rows(
+        self, summary: object
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for index, name in enumerate(summary.full_parameter_names):
+            rows.append(
+                {
+                    "name": str(name),
+                    "selected_value": float(summary.bestfit_params[index]),
+                    "map_value": float(summary.map_params[index]),
+                    "chain_mean_value": float(
+                        summary.chain_mean_params[index]
+                    ),
+                    "median_value": float(summary.median_params[index]),
+                    "interval_low_value": float(
+                        summary.interval_low_values[index]
+                    ),
+                    "interval_high_value": float(
+                        summary.interval_high_values[index]
+                    ),
+                }
+            )
+        return rows
+
+    def _dream_screening_metrics_payload(
+        self,
+        settings: DreamRunSettings,
+        summary: object,
+    ) -> dict[str, object]:
+        payload = {
+            "bestfit_method": str(settings.bestfit_method),
+            "burnin_percent": int(settings.burnin_percent),
+            "posterior_filter_mode": str(settings.posterior_filter_mode),
+            "posterior_filter_description": self._describe_posterior_filter(
+                settings
+            ),
+            "posterior_top_percent": float(settings.posterior_top_percent),
+            "posterior_top_n": int(settings.posterior_top_n),
+            "auto_select_best_posterior_filter": bool(
+                settings.auto_select_best_posterior_filter
+            ),
+            "posterior_sample_count": int(summary.posterior_sample_count),
+            "credible_interval_low": float(summary.credible_interval_low),
+            "credible_interval_high": float(summary.credible_interval_high),
+            "map_chain": int(summary.map_chain),
+            "map_step": int(summary.map_step),
+            "violin_parameter_mode": str(settings.violin_parameter_mode),
+            "violin_sample_source": str(settings.violin_sample_source),
+            "violin_weight_order": str(settings.violin_weight_order),
+            "violin_value_scale_mode": str(settings.violin_value_scale_mode),
+        }
+        if self._last_dream_filter_assessments:
+            payload["filter_assessments"] = [
+                dict(assessment)
+                for assessment in self._last_dream_filter_assessments
+            ]
+        if self._last_dream_filter_recommendation is not None:
+            payload["recommended_posterior_filter"] = dict(
+                self._last_dream_filter_recommendation
+            )
+        return payload
+
+    def _dream_summary_payload(self, summary: object) -> dict[str, object]:
+        return {
+            "run_dir": str(summary.run_dir),
+            "bestfit_method": str(summary.bestfit_method),
+            "posterior_filter_mode": str(summary.posterior_filter_mode),
+            "posterior_sample_count": int(summary.posterior_sample_count),
+            "credible_interval_low": float(summary.credible_interval_low),
+            "credible_interval_high": float(summary.credible_interval_high),
+            "full_parameter_names": [
+                str(name) for name in summary.full_parameter_names
+            ],
+            "active_parameter_names": [
+                str(name) for name in summary.active_parameter_names
+            ],
+            "map_chain": int(summary.map_chain),
+            "map_step": int(summary.map_step),
+            "parameter_summary": self._dream_parameter_summary_rows(summary),
+        }
+
+    def _dream_export_metadata_payload(
+        self,
+        *,
+        export_kind: str,
+        data_paths: list[Path],
+        settings: DreamRunSettings,
+        summary: object,
+        model_plot: object | None = None,
+        violin_plot: object | None = None,
+        plot_payload: dict[str, object] | None = None,
+        auto_generated: bool,
+    ) -> dict[str, object]:
+        metadata: dict[str, object] = {
+            "export_kind": export_kind,
+            "exported_at": datetime.now().isoformat(),
+            "auto_generated": bool(auto_generated),
+            "purpose": (
+                "Condensed user-facing DREAM export saved in "
+                "exported_results/data for easy access. Full DREAM run "
+                "artifacts and intermediate metadata remain in the DREAM "
+                "run folder."
+            ),
+            "project_dir": (
+                str(self.current_settings.project_dir)
+                if self.current_settings is not None
+                else ""
+            ),
+            "data_files": [str(path) for path in data_paths],
+            "dream_settings": settings.to_dict(),
+            "screening_metrics": self._dream_screening_metrics_payload(
+                settings,
+                summary,
+            ),
+            "summary": self._dream_summary_payload(summary),
+        }
+        if model_plot is not None:
+            metadata["model_fit"] = {
+                "template_name": str(model_plot.template_name),
+                "bestfit_method": str(model_plot.bestfit_method),
+                "point_count": int(np.asarray(model_plot.q_values).size),
+                "includes_solvent_contribution": bool(
+                    model_plot.solvent_contribution is not None
+                ),
+                "fit_metrics": {
+                    "rmse": float(model_plot.rmse),
+                    "mean_abs_residual": float(model_plot.mean_abs_residual),
+                    "r_squared": float(model_plot.r_squared),
+                },
+            }
+        if violin_plot is not None:
+            metadata["violin_plot"] = {
+                "parameter_names": [
+                    str(name) for name in violin_plot.parameter_names
+                ],
+                "display_names": [
+                    str(name) for name in violin_plot.display_names
+                ],
+                "mode": str(violin_plot.mode),
+                "sample_source": str(violin_plot.sample_source),
+                "sample_count": int(violin_plot.sample_count),
+                "weight_order": str(violin_plot.weight_order),
+                "sample_matrix_shape": list(
+                    np.asarray(violin_plot.samples).shape
+                ),
+            }
+        if plot_payload is not None:
+            y_limits = plot_payload.get("y_limits")
+            metadata["plot_view"] = {
+                "display_names": [
+                    str(name) for name in plot_payload.get("display_names", [])
+                ],
+                "selected_values": [
+                    float(value)
+                    for value in np.asarray(
+                        plot_payload.get("selected_values", []),
+                        dtype=float,
+                    )
+                ],
+                "interval_low_values": [
+                    float(value)
+                    for value in np.asarray(
+                        plot_payload.get("interval_low_values", []),
+                        dtype=float,
+                    )
+                ],
+                "interval_high_values": [
+                    float(value)
+                    for value in np.asarray(
+                        plot_payload.get("interval_high_values", []),
+                        dtype=float,
+                    )
+                ],
+                "ylabel": str(plot_payload.get("ylabel", "")),
+                "title": str(plot_payload.get("title", "")),
+                "y_limits": (
+                    None
+                    if y_limits is None
+                    else [float(y_limits[0]), float(y_limits[1])]
+                ),
+            }
+        return metadata
+
+    def _build_dream_export_report_text(
+        self,
+        *,
+        export_kind: str,
+        data_paths: list[Path],
+        settings: DreamRunSettings,
+        summary: object,
+        model_plot: object | None = None,
+        violin_plot: object | None = None,
+        auto_generated: bool,
+    ) -> str:
+        lines = [
+            "DREAM condensed export",
+            (
+                "This export is an easy-to-find copy saved in "
+                "exported_results/data."
+            ),
+            (
+                "Full DREAM run artifacts and intermediate metadata remain "
+                "in the DREAM run folder."
+            ),
+            f"Export kind: {export_kind}",
+            f"Auto-generated after refinement: {'yes' if auto_generated else 'no'}",
+            "Exported data files:",
+        ]
+        lines.extend(f"  {path}" for path in data_paths)
+        lines.extend(
+            [
+                "",
+                self._format_dream_summary(summary, settings=settings),
+            ]
+        )
+        if model_plot is not None:
+            lines.extend(
+                [
+                    "",
+                    "Model fit metrics:",
+                    f"  RMSE: {model_plot.rmse:.6g}",
+                    (
+                        "  Mean absolute residual: "
+                        f"{model_plot.mean_abs_residual:.6g}"
+                    ),
+                    f"  R^2: {model_plot.r_squared:.6g}",
+                ]
+            )
+        if violin_plot is not None:
+            lines.extend(
+                [
+                    "",
+                    "Posterior violin data:",
+                    f"  Mode: {violin_plot.mode}",
+                    f"  Sample source: {violin_plot.sample_source}",
+                    f"  Weight order: {violin_plot.weight_order}",
+                    f"  Sample count: {violin_plot.sample_count}",
+                ]
+            )
+        if self._last_dream_filter_assessments:
+            lines.extend(["", "Posterior filter assessment:"])
+            for assessment in self._last_dream_filter_assessments:
+                lines.append(
+                    "  "
+                    f"{assessment['description']}: "
+                    f"RMSE={assessment['rmse']:.6g}, "
+                    f"Mean |res|={assessment['mean_abs_residual']:.6g}, "
+                    f"R^2={assessment['r_squared']:.6g}, "
+                    f"samples={assessment['posterior_sample_count']}"
+                )
+            if self._last_dream_filter_recommendation is not None:
+                lines.append(
+                    "  Recommended: "
+                    f"{self._last_dream_filter_recommendation['description']}"
+                )
+        return "\n".join(lines) + "\n"
+
+    def _write_dream_export_sidecars(
+        self,
+        *,
+        base_path: Path,
+        data_paths: list[Path],
+        settings: DreamRunSettings,
+        summary: object,
+        model_plot: object | None = None,
+        violin_plot: object | None = None,
+        plot_payload: dict[str, object] | None = None,
+        auto_generated: bool,
+        export_kind: str,
+    ) -> list[Path]:
+        metadata_path = base_path.parent / f"{base_path.name}.metadata.json"
+        report_path = base_path.parent / f"{base_path.name}.report.txt"
+        metadata_path.write_text(
+            json.dumps(
+                self._dream_export_metadata_payload(
+                    export_kind=export_kind,
+                    data_paths=data_paths,
+                    settings=settings,
+                    summary=summary,
+                    model_plot=model_plot,
+                    violin_plot=violin_plot,
+                    plot_payload=plot_payload,
+                    auto_generated=auto_generated,
+                ),
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        report_path.write_text(
+            self._build_dream_export_report_text(
+                export_kind=export_kind,
+                data_paths=data_paths,
+                settings=settings,
+                summary=summary,
+                model_plot=model_plot,
+                violin_plot=violin_plot,
+                auto_generated=auto_generated,
+            ),
+            encoding="utf-8",
+        )
+        return [metadata_path, report_path]
+
+    def _export_dream_model_fit_bundle(
+        self,
+        *,
+        base_path: Path,
+        settings: DreamRunSettings,
+        summary: object,
+        model_plot: object,
+        auto_generated: bool,
+    ) -> list[Path]:
+        output_path = base_path.parent / f"{base_path.name}.csv"
+        solvent_contribution = (
+            np.asarray(model_plot.solvent_contribution, dtype=float)
+            if model_plot.solvent_contribution is not None
+            else np.full_like(
+                np.asarray(model_plot.q_values, dtype=float),
+                np.nan,
+                dtype=float,
+            )
+        )
+        np.savetxt(
+            output_path,
+            np.column_stack(
+                [
+                    model_plot.q_values,
+                    model_plot.experimental_intensities,
+                    model_plot.model_intensities,
+                    solvent_contribution,
+                ]
+            ),
+            delimiter=",",
+            header=(
+                "q,experimental_intensity,model_intensity,"
+                "solvent_contribution"
+            ),
+            comments="",
+        )
+        return [
+            output_path,
+            *self._write_dream_export_sidecars(
+                base_path=base_path,
+                data_paths=[output_path],
+                settings=settings,
+                summary=summary,
+                model_plot=model_plot,
+                auto_generated=auto_generated,
+                export_kind="dream_model_fit",
+            ),
+        ]
+
+    def _export_dream_violin_bundle(
+        self,
+        *,
+        base_path: Path,
+        settings: DreamRunSettings,
+        summary: object,
+        violin_plot: object,
+        plot_payload: dict[str, object],
+        save_csv: bool,
+        save_pkl: bool,
+        auto_generated: bool,
+    ) -> list[Path]:
+        saved_paths: list[Path] = []
+        if save_csv:
+            csv_output_path = base_path.parent / f"{base_path.name}.csv"
+            with csv_output_path.open(
+                "w",
+                encoding="utf-8",
+                newline="",
+            ) as handle:
+                writer = csv.writer(handle)
+                writer.writerow(plot_payload["display_names"])
+                writer.writerows(
+                    np.asarray(plot_payload["samples"], dtype=float)
+                )
+            saved_paths.append(csv_output_path)
+        if save_pkl:
+            pkl_output_path = base_path.parent / f"{base_path.name}.pkl"
+            payload = {
+                "exported_at": datetime.now().isoformat(),
+                "project_dir": str(self.current_settings.project_dir),
+                "settings": settings.to_dict(),
+                "screening_metrics": self._dream_screening_metrics_payload(
+                    settings,
+                    summary,
+                ),
+                "summary": self._dream_summary_payload(summary),
+                "violin_plot": {
+                    "parameter_names": list(violin_plot.parameter_names),
+                    "display_names": list(violin_plot.display_names),
+                    "mode": violin_plot.mode,
+                    "sample_source": violin_plot.sample_source,
+                    "sample_count": violin_plot.sample_count,
+                    "weight_order": violin_plot.weight_order,
+                },
+                "plot_payload": {
+                    "display_names": list(plot_payload["display_names"]),
+                    "samples": np.asarray(
+                        plot_payload["samples"],
+                        dtype=float,
+                    ),
+                    "selected_values": np.asarray(
+                        plot_payload["selected_values"],
+                        dtype=float,
+                    ),
+                    "interval_low_values": np.asarray(
+                        plot_payload["interval_low_values"],
+                        dtype=float,
+                    ),
+                    "interval_high_values": np.asarray(
+                        plot_payload["interval_high_values"],
+                        dtype=float,
+                    ),
+                    "ylabel": str(plot_payload["ylabel"]),
+                    "title": str(plot_payload["title"]),
+                    "y_limits": plot_payload["y_limits"],
+                },
+            }
+            with pkl_output_path.open("wb") as handle:
+                pickle.dump(payload, handle)
+            saved_paths.append(pkl_output_path)
+        if not saved_paths:
+            return []
+        return [
+            *saved_paths,
+            *self._write_dream_export_sidecars(
+                base_path=base_path,
+                data_paths=saved_paths,
+                settings=settings,
+                summary=summary,
+                violin_plot=violin_plot,
+                plot_payload=plot_payload,
+                auto_generated=auto_generated,
+                export_kind="dream_violin",
+            ),
+        ]
+
+    def _auto_export_dream_condensed_outputs(
+        self,
+        settings: DreamRunSettings,
+    ) -> list[Path]:
+        if self.current_settings is None:
+            return []
+        export_dir = build_project_paths(
+            self.current_settings.project_dir
+        ).exported_data_dir
+        export_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        summary, model_plot, violin_plot, plot_payload = (
+            self._build_dream_export_context(settings)
+        )
+        model_base = export_dir / (
+            f"dream_model_fit_auto_{settings.bestfit_method}_{timestamp}"
+        )
+        violin_base = export_dir / (
+            "dream_violin_auto_"
+            f"{self._effective_dream_violin_mode(settings)}_"
+            f"{settings.violin_weight_order}_{timestamp}"
+        )
+        saved_paths = self._export_dream_model_fit_bundle(
+            base_path=model_base,
+            settings=settings,
+            summary=summary,
+            model_plot=model_plot,
+            auto_generated=True,
+        )
+        saved_paths.extend(
+            self._export_dream_violin_bundle(
+                base_path=violin_base,
+                settings=settings,
+                summary=summary,
+                violin_plot=violin_plot,
+                plot_payload=plot_payload,
+                save_csv=True,
+                save_pkl=False,
+                auto_generated=True,
+            )
+        )
+        return saved_paths
+
+    def _evaluate_dream_posterior_filters(
+        self,
+        settings: DreamRunSettings,
+    ) -> tuple[list[dict[str, object]], dict[str, object] | None]:
+        if self._last_results_loader is None:
+            return [], None
+        assessments: list[dict[str, object]] = []
+        for mode in (
+            "all_post_burnin",
+            "top_percent_logp",
+            "top_n_logp",
+        ):
+            candidate_settings = self._copy_dream_settings(settings)
+            candidate_settings.posterior_filter_mode = mode
+            summary = self._last_results_loader.get_summary(
+                bestfit_method=candidate_settings.bestfit_method,
+                posterior_filter_mode=candidate_settings.posterior_filter_mode,
+                posterior_top_percent=candidate_settings.posterior_top_percent,
+                posterior_top_n=candidate_settings.posterior_top_n,
+                credible_interval_low=candidate_settings.credible_interval_low,
+                credible_interval_high=(
+                    candidate_settings.credible_interval_high
+                ),
+            )
+            model_plot = self._last_results_loader.build_model_fit_data(
+                bestfit_method=candidate_settings.bestfit_method,
+                posterior_filter_mode=candidate_settings.posterior_filter_mode,
+                posterior_top_percent=candidate_settings.posterior_top_percent,
+                posterior_top_n=candidate_settings.posterior_top_n,
+                credible_interval_low=candidate_settings.credible_interval_low,
+                credible_interval_high=(
+                    candidate_settings.credible_interval_high
+                ),
+            )
+            assessments.append(
+                {
+                    "mode": mode,
+                    "description": self._describe_posterior_filter(
+                        candidate_settings
+                    ),
+                    "rmse": float(model_plot.rmse),
+                    "mean_abs_residual": float(model_plot.mean_abs_residual),
+                    "r_squared": float(model_plot.r_squared),
+                    "posterior_sample_count": int(
+                        summary.posterior_sample_count
+                    ),
+                }
+            )
+        if not assessments:
+            return [], None
+        recommended = min(
+            assessments,
+            key=lambda assessment: (
+                float(assessment["rmse"]),
+                float(assessment["mean_abs_residual"]),
+                -float(assessment["r_squared"]),
+            ),
+        )
+        return assessments, dict(recommended)
+
+    def _assess_and_apply_dream_filter_recommendation(
+        self,
+        settings: DreamRunSettings,
+    ) -> tuple[DreamRunSettings, str | None]:
+        assessments, recommendation = self._evaluate_dream_posterior_filters(
+            settings
+        )
+        self._last_dream_filter_assessments = assessments
+        self._last_dream_filter_recommendation = recommendation
+        if not assessments or recommendation is None:
+            return settings, None
+
+        lines = [
+            "DREAM posterior filter assessment.",
+            (
+                "Evaluated All Post-burnin, Top % by Log-posterior, and "
+                "Top N by Log-posterior using the current best-fit method "
+                f"and the default thresholds Top % = "
+                f"{settings.posterior_top_percent:g}, Top N = "
+                f"{settings.posterior_top_n}."
+            ),
+        ]
+        for assessment in assessments:
+            lines.append(
+                f"{assessment['description']}: "
+                f"RMSE={assessment['rmse']:.6g}, "
+                f"Mean |res|={assessment['mean_abs_residual']:.6g}, "
+                f"R^2={assessment['r_squared']:.6g}, "
+                f"samples={assessment['posterior_sample_count']}"
+            )
+        lines.append(
+            "Recommended posterior filter by fit quality: "
+            f"{recommendation['description']}"
+        )
+
+        updated_settings = self._copy_dream_settings(settings)
+        if bool(settings.auto_select_best_posterior_filter):
+            if (
+                str(recommendation["mode"])
+                != updated_settings.posterior_filter_mode
+            ):
+                updated_settings.search_filter_preset = "custom"
+            updated_settings.posterior_filter_mode = str(
+                recommendation["mode"]
+            )
+            lines.append("Applied recommended posterior filter automatically.")
+        else:
+            lines.append(
+                "Automatic posterior filter selection is off, so the "
+                "current filter setting was left unchanged."
+            )
+        return updated_settings, "\n".join(lines)
 
     def save_dream_model_fit(self) -> None:
         if self._last_results_loader is None:
@@ -1755,37 +2676,30 @@ class SAXSMainWindow(QMainWindow):
         try:
             settings = self.dream_tab.settings_payload()
             paths = build_project_paths(self.current_settings.project_dir)
-            paths.plots_dir.mkdir(parents=True, exist_ok=True)
-            output_path = paths.plots_dir / (
+            paths.exported_data_dir.mkdir(parents=True, exist_ok=True)
+            base_path = paths.exported_data_dir / (
                 "dream_model_fit_"
                 f"{settings.bestfit_method}_"
                 f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             )
-            model_plot = self._last_results_loader.build_model_fit_data(
-                bestfit_method=settings.bestfit_method,
-                posterior_filter_mode=settings.posterior_filter_mode,
-                posterior_top_percent=settings.posterior_top_percent,
-                posterior_top_n=settings.posterior_top_n,
-                credible_interval_low=settings.credible_interval_low,
-                credible_interval_high=settings.credible_interval_high,
+            base_path = base_path.with_suffix("")
+            summary, model_plot, _violin_plot, _plot_payload = (
+                self._build_dream_export_context(settings)
             )
-            np.savetxt(
-                output_path,
-                np.column_stack(
-                    [
-                        model_plot.q_values,
-                        model_plot.experimental_intensities,
-                        model_plot.model_intensities,
-                    ]
-                ),
-                delimiter=",",
-                header="q,experimental_intensity,model_intensity",
-                comments="",
+            saved_paths = self._export_dream_model_fit_bundle(
+                base_path=base_path,
+                settings=settings,
+                summary=summary,
+                model_plot=model_plot,
+                auto_generated=False,
             )
             self.dream_tab.append_log(
-                f"Saved DREAM model fit data to {output_path}"
+                "Exported DREAM model fit bundle to:\n"
+                + "\n".join(str(path) for path in saved_paths)
+                + "\nThis condensed export lives in exported_results/data. "
+                "Full DREAM run artifacts remain in the DREAM run folder."
             )
-            self.statusBar().showMessage("DREAM model fit data saved")
+            self.statusBar().showMessage("DREAM model fit exported")
         except Exception as exc:
             self._show_error("Save model fit failed", str(exc))
 
@@ -1805,7 +2719,7 @@ class SAXSMainWindow(QMainWindow):
         try:
             settings = self.dream_tab.settings_payload()
             paths = build_project_paths(self.current_settings.project_dir)
-            paths.plots_dir.mkdir(parents=True, exist_ok=True)
+            paths.exported_data_dir.mkdir(parents=True, exist_ok=True)
             base_name = (
                 "dream_violin_"
                 f"{self._effective_dream_violin_mode(settings)}_"
@@ -1813,7 +2727,7 @@ class SAXSMainWindow(QMainWindow):
                 f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             )
             dialog = DreamViolinExportDialog(
-                default_output_dir=paths.plots_dir,
+                default_output_dir=paths.exported_data_dir,
                 default_base_name=base_name,
                 parent=self,
             )
@@ -1823,109 +2737,28 @@ class SAXSMainWindow(QMainWindow):
             if export_options is None:
                 return
             export_options.output_dir.mkdir(parents=True, exist_ok=True)
-            violin_plot = self._last_results_loader.build_violin_data(
-                mode=self._effective_dream_violin_mode(settings),
-                posterior_filter_mode=settings.posterior_filter_mode,
-                posterior_top_percent=settings.posterior_top_percent,
-                posterior_top_n=settings.posterior_top_n,
-                credible_interval_low=settings.credible_interval_low,
-                credible_interval_high=settings.credible_interval_high,
-                sample_source=settings.violin_sample_source,
-                weight_order=settings.violin_weight_order,
+            summary, _model_plot, violin_plot, plot_payload = (
+                self._build_dream_export_context(settings)
             )
-            summary = self._last_results_loader.get_summary(
-                bestfit_method=settings.bestfit_method,
-                posterior_filter_mode=settings.posterior_filter_mode,
-                posterior_top_percent=settings.posterior_top_percent,
-                posterior_top_n=settings.posterior_top_n,
-                credible_interval_low=settings.credible_interval_low,
-                credible_interval_high=settings.credible_interval_high,
+            saved_paths = self._export_dream_violin_bundle(
+                base_path=(
+                    export_options.output_dir / export_options.base_name
+                ),
+                settings=settings,
+                summary=summary,
+                violin_plot=violin_plot,
+                plot_payload=plot_payload,
+                save_csv=bool(export_options.save_csv),
+                save_pkl=bool(export_options.save_pkl),
+                auto_generated=False,
             )
-            plot_payload = self.dream_tab.prepare_violin_plot_payload(
-                summary,
-                violin_plot,
-            )
-            saved_paths: list[Path] = []
-            if export_options.save_csv:
-                csv_output_path = (
-                    export_options.output_dir
-                    / f"{export_options.base_name}.csv"
-                )
-                with csv_output_path.open(
-                    "w",
-                    encoding="utf-8",
-                    newline="",
-                ) as handle:
-                    writer = csv.writer(handle)
-                    writer.writerow(plot_payload["display_names"])
-                    writer.writerows(
-                        np.asarray(plot_payload["samples"], dtype=float)
-                    )
-                saved_paths.append(csv_output_path)
-            if export_options.save_pkl:
-                pkl_output_path = (
-                    export_options.output_dir
-                    / f"{export_options.base_name}.pkl"
-                )
-                payload = {
-                    "exported_at": datetime.now().isoformat(),
-                    "project_dir": str(self.current_settings.project_dir),
-                    "settings": settings.to_dict(),
-                    "summary": {
-                        "bestfit_method": summary.bestfit_method,
-                        "posterior_filter_mode": summary.posterior_filter_mode,
-                        "posterior_sample_count": summary.posterior_sample_count,
-                        "credible_interval_low": summary.credible_interval_low,
-                        "credible_interval_high": summary.credible_interval_high,
-                        "full_parameter_names": list(
-                            summary.full_parameter_names
-                        ),
-                        "active_parameter_names": list(
-                            summary.active_parameter_names
-                        ),
-                        "map_chain": summary.map_chain,
-                        "map_step": summary.map_step,
-                        "run_dir": str(summary.run_dir),
-                    },
-                    "violin_plot": {
-                        "parameter_names": list(violin_plot.parameter_names),
-                        "display_names": list(violin_plot.display_names),
-                        "mode": violin_plot.mode,
-                        "sample_source": violin_plot.sample_source,
-                        "sample_count": violin_plot.sample_count,
-                        "weight_order": violin_plot.weight_order,
-                    },
-                    "plot_payload": {
-                        "display_names": list(plot_payload["display_names"]),
-                        "samples": np.asarray(
-                            plot_payload["samples"],
-                            dtype=float,
-                        ),
-                        "selected_values": np.asarray(
-                            plot_payload["selected_values"],
-                            dtype=float,
-                        ),
-                        "interval_low_values": np.asarray(
-                            plot_payload["interval_low_values"],
-                            dtype=float,
-                        ),
-                        "interval_high_values": np.asarray(
-                            plot_payload["interval_high_values"],
-                            dtype=float,
-                        ),
-                        "ylabel": str(plot_payload["ylabel"]),
-                        "title": str(plot_payload["title"]),
-                        "y_limits": plot_payload["y_limits"],
-                    },
-                }
-                with pkl_output_path.open("wb") as handle:
-                    pickle.dump(payload, handle)
-                saved_paths.append(pkl_output_path)
             self.dream_tab.append_log(
-                "Saved DREAM violin plot data to:\n"
+                "Exported DREAM violin data bundle to:\n"
                 + "\n".join(str(path) for path in saved_paths)
+                + "\nThis condensed export lives in exported_results/data. "
+                "Full DREAM run artifacts remain in the DREAM run folder."
             )
-            self.statusBar().showMessage("DREAM violin data saved")
+            self.statusBar().showMessage("DREAM violin data exported")
         except Exception as exc:
             self._show_error("Save violin data failed", str(exc))
 
@@ -1955,7 +2788,7 @@ class SAXSMainWindow(QMainWindow):
             destination, _ = QFileDialog.getSaveFileName(
                 self,
                 "Save prior histogram data",
-                str(source),
+                str(paths.exported_data_dir / source.name),
                 "JSON files (*.json)",
             )
             if destination:
@@ -1968,6 +2801,236 @@ class SAXSMainWindow(QMainWindow):
                 )
         except Exception as exc:
             self._show_error("Save prior data failed", str(exc))
+
+    def save_component_plot_data(self) -> None:
+        if self.current_settings is None:
+            self._show_error(
+                "Save component plot data failed",
+                "Load or build a project first.",
+            )
+            return
+        try:
+            payload = self.project_setup_tab.component_plot_export_payload()
+            traces = list(payload.get("traces", []))
+            if not traces:
+                raise ValueError(
+                    "No experimental or component traces are currently "
+                    "available to export."
+                )
+            destination = self._prompt_project_plot_export_path(
+                dialog_title="Export component plot data",
+                default_filename=(
+                    "component_plot_data_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                ),
+                export_kind="data",
+            )
+            if destination is None:
+                return
+            if destination.suffix.lower() == ".csv":
+                self._write_component_plot_csv(destination, payload)
+            else:
+                np.save(destination, payload, allow_pickle=True)
+            self.project_setup_tab.append_summary(
+                f"Saved component plot data to {destination}"
+            )
+            self.statusBar().showMessage("Component plot data exported")
+        except Exception as exc:
+            self._show_error("Save component plot data failed", str(exc))
+
+    def save_prior_plot_data(self) -> None:
+        if self.current_settings is None:
+            self._show_error(
+                "Save prior plot data failed",
+                "Load or build a project first.",
+            )
+            return
+        prior_json = self.project_setup_tab.current_prior_json_path()
+        if prior_json is None or not prior_json.is_file():
+            self._show_error(
+                "Save prior plot data failed",
+                "Generate prior weights first.",
+            )
+            return
+        mode = self.project_setup_tab.prior_mode()
+        secondary = self.project_setup_tab.prior_secondary_element()
+        if mode.startswith("solvent_sort") and secondary is None:
+            self._show_error(
+                "Save prior plot data failed",
+                "Select a secondary atom filter before exporting a solvent-sort prior histogram.",
+            )
+            return
+        try:
+            destination = self._prompt_project_plot_export_path(
+                dialog_title="Export prior histogram data",
+                default_filename=(
+                    "prior_histogram_data_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                ),
+                export_kind="data",
+            )
+            if destination is None:
+                return
+            if destination.suffix.lower() == ".csv":
+                export_prior_histogram_table(
+                    prior_json,
+                    destination,
+                    mode=mode,
+                    value_mode="percent",
+                    secondary_element=secondary,
+                )
+            else:
+                export_prior_histogram_npy(
+                    prior_json,
+                    destination,
+                    mode=mode,
+                    value_mode="percent",
+                    secondary_element=secondary,
+                )
+            self.project_setup_tab.append_summary(
+                f"Saved prior histogram plot data to {destination}"
+            )
+            self.statusBar().showMessage("Prior histogram plot data exported")
+        except Exception as exc:
+            self._show_error("Save prior plot data failed", str(exc))
+
+    def _prompt_project_plot_export_path(
+        self,
+        *,
+        dialog_title: str,
+        default_filename: str,
+        export_kind: str = "data",
+    ) -> Path | None:
+        if self.current_settings is None:
+            return None
+        paths = build_project_paths(self.current_settings.project_dir)
+        if export_kind == "plots":
+            target_dir = paths.exported_plots_dir
+        else:
+            target_dir = paths.exported_data_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        destination, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            dialog_title,
+            str(target_dir / default_filename),
+            "CSV files (*.csv);;NumPy files (*.npy)",
+        )
+        if not destination:
+            return None
+        output_path = Path(destination)
+        if output_path.suffix.lower() not in {".csv", ".npy"}:
+            if "npy" in selected_filter.lower():
+                output_path = output_path.with_suffix(".npy")
+            else:
+                output_path = output_path.with_suffix(".csv")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        return output_path
+
+    @staticmethod
+    def _write_component_plot_csv(
+        output_path: Path,
+        payload: dict[str, object],
+    ) -> None:
+        with output_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(
+                [
+                    "series",
+                    "component_key",
+                    "axis_index",
+                    "axis_ylabel",
+                    "color",
+                    "visible",
+                    "x",
+                    "y",
+                ]
+            )
+            for trace in payload.get("traces", []):
+                x_values = np.asarray(trace.get("x", []), dtype=float)
+                y_values = np.asarray(trace.get("y", []), dtype=float)
+                count = min(len(x_values), len(y_values))
+                for index in range(count):
+                    writer.writerow(
+                        [
+                            str(trace.get("series", "")),
+                            str(trace.get("component_key", "")),
+                            int(trace.get("axis_index", 0)),
+                            str(trace.get("axis_ylabel", "")),
+                            str(trace.get("color", "")),
+                            bool(trace.get("visible", True)),
+                            f"{x_values[index]:.10g}",
+                            f"{y_values[index]:.10g}",
+                        ]
+                    )
+
+    @staticmethod
+    def _write_prefit_plot_csv(
+        output_path: Path,
+        *,
+        metadata: dict[str, object],
+        columns: list[str],
+        matrix: np.ndarray,
+    ) -> None:
+        with output_path.open("w", encoding="utf-8", newline="") as handle:
+            for key, value in metadata.items():
+                handle.write(f"# {key}: {json.dumps(value, sort_keys=True)}\n")
+            writer = csv.writer(handle)
+            writer.writerow(columns)
+            writer.writerows(matrix.tolist())
+
+    def _build_prefit_plot_export_metadata(
+        self,
+        *,
+        entries,
+        evaluation,
+        method: str,
+        max_nfev: int,
+    ) -> dict[str, object]:
+        residuals = np.asarray(evaluation.residuals, dtype=float)
+        q_values = np.asarray(evaluation.q_values, dtype=float)
+        chi_square = float(np.sum(residuals**2))
+        dof = max(
+            len(q_values) - sum(1 for entry in entries if entry.vary),
+            1,
+        )
+        reduced_chi_square = chi_square / dof
+        experimental = np.asarray(
+            evaluation.experimental_intensities,
+            dtype=float,
+        )
+        ss_total = float(np.sum((experimental - np.mean(experimental)) ** 2))
+        r_squared = (
+            1.0 - chi_square / ss_total if ss_total > 0.0 else float("nan")
+        )
+        return {
+            "exported_at": datetime.now().isoformat(),
+            "project_dir": str(self.current_settings.project_dir),
+            "template_name": (
+                self.prefit_workflow.template_spec.name
+                if self.prefit_workflow is not None
+                else None
+            ),
+            "fit_conditions": {
+                "method": method,
+                "max_nfev": int(max_nfev),
+                "autosave_prefits": bool(
+                    self.prefit_tab.autosave_checkbox.isChecked()
+                ),
+                "log_x": bool(self.prefit_tab.log_x_checkbox.isChecked()),
+                "log_y": bool(self.prefit_tab.log_y_checkbox.isChecked()),
+                "point_count": int(len(q_values)),
+                "q_min": float(np.min(q_values)) if len(q_values) else None,
+                "q_max": float(np.max(q_values)) if len(q_values) else None,
+            },
+            "fit_metrics": {
+                "chi_square": chi_square,
+                "reduced_chi_square": reduced_chi_square,
+                "r_squared": r_squared,
+                "residual_rms": float(np.sqrt(np.mean(residuals**2))),
+                "mean_absolute_residual": float(np.mean(np.abs(residuals))),
+            },
+            "parameter_entries": [entry.to_dict() for entry in entries],
+        }
 
     def _apply_project_settings(self, settings: ProjectSettings) -> None:
         template_specs = list_template_specs()
@@ -2064,10 +3127,16 @@ class SAXSMainWindow(QMainWindow):
         )
         base.q_points = self.project_setup_tab.q_points()
         base.available_elements = self.project_setup_tab.available_elements()
+        base.cluster_inventory_rows = (
+            self.project_setup_tab.recognized_cluster_rows()
+        )
         base.include_elements = []
         base.exclude_elements = self.project_setup_tab.exclude_elements()
         base.component_trace_colors = (
             self.project_setup_tab.component_trace_colors()
+        )
+        base.component_trace_color_scheme = (
+            self.project_setup_tab.component_trace_color_scheme()
         )
         base.experimental_trace_visible = (
             self.project_setup_tab.experimental_trace_visible()
@@ -2107,20 +3176,14 @@ class SAXSMainWindow(QMainWindow):
         self.prefit_tab.populate_parameter_table(
             self.prefit_workflow.parameter_entries
         )
-        evaluation = self.prefit_workflow.evaluate()
-        self.prefit_tab.plot_evaluation(evaluation)
+        self._refresh_prefit_cluster_geometry_section()
+        self._load_prefit_preview()
         self.prefit_tab.set_log_text(self._format_prefit_console_intro())
-        self.prefit_tab.set_summary_text(
-            self._format_prefit_summary(evaluation)
-        )
         if self.prefit_workflow.has_best_prefit_entries():
             self.prefit_tab.append_log(
                 "Loaded the Best Prefit preset from the project file."
             )
         self._refresh_saved_prefit_states()
-        self._maybe_append_scale_recommendation(
-            self.prefit_workflow.parameter_entries
-        )
         return self.prefit_workflow
 
     def _load_dream_workflow(self) -> SAXSDreamWorkflow:
@@ -2143,6 +3206,7 @@ class SAXSMainWindow(QMainWindow):
             self._current_dream_preset_name = selected_preset
         if is_new_project:
             self._invalidate_written_dream_bundle()
+            self._last_dream_constraint_warning_signature = None
             settings = self.dream_workflow.load_settings_preset(
                 selected_preset
             )
@@ -2204,6 +3268,7 @@ class SAXSMainWindow(QMainWindow):
             workflow.save_parameter_map(entries)
             self._dream_parameter_map_saved_in_session = True
             self._invalidate_written_dream_bundle()
+            self._last_dream_constraint_warning_signature = None
             self.dream_tab.set_parameter_map_entries(entries)
             self.dream_tab.append_log(
                 "Updated DREAM parameter map.\n"
@@ -2243,8 +3308,8 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_tab.populate_parameter_table(
                 self.prefit_workflow.parameter_entries
             )
-            evaluation = self.prefit_workflow.evaluate()
-            self.prefit_tab.plot_evaluation(evaluation)
+            self._refresh_prefit_cluster_geometry_section()
+            evaluation = self._load_prefit_preview(append_blocked_log=True)
             self.prefit_tab.append_log(
                 "Prefit template changed.\n"
                 f"Previous template: {current_name}\n"
@@ -2254,10 +3319,11 @@ class SAXSMainWindow(QMainWindow):
                 "saved Best Prefit preset from the previous template was "
                 "cleared."
             )
-            self.prefit_tab.set_summary_text(
-                self._format_prefit_summary(evaluation)
-            )
-            self._maybe_append_scale_recommendation()
+            if evaluation is None:
+                self.prefit_tab.append_log(
+                    "This template also requires cluster geometry metadata "
+                    "before the prefit model can be evaluated."
+                )
             self.statusBar().showMessage("Prefit template updated")
         except Exception as exc:
             self._restore_prefit_template_selection(current_name)
@@ -2485,6 +3551,23 @@ class SAXSMainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Opened bond analysis")
 
+    def _open_fullrmc_tool(self) -> None:
+        from saxshell.fullrmc.ui.main_window import RMCSetupMainWindow
+
+        project_dir = None
+        if self.current_settings is not None:
+            project_dir = self.current_settings.project_dir
+        window = RMCSetupMainWindow(initial_project_dir=project_dir)
+        window.show()
+        window.raise_()
+        self._child_tool_windows.append(window)
+        if project_dir:
+            self.statusBar().showMessage(
+                f"Opened fullrmc setup for {project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened fullrmc setup")
+
     def _show_placeholder_tool_message(self, tool_name: str) -> None:
         QMessageBox.information(
             self,
@@ -2697,6 +3780,9 @@ class SAXSMainWindow(QMainWindow):
             mode=self.project_setup_tab.prior_mode(),
             secondary_element=self.project_setup_tab.prior_secondary_element(),
             cmap=self.project_setup_tab.prior_cmap(),
+            structure_motif_colors=(
+                self.project_setup_tab.prior_structure_motif_colors()
+            ),
             parent=None,
         )
         self._prior_histogram_windows.append(window)
@@ -2728,10 +3814,10 @@ class SAXSMainWindow(QMainWindow):
                 "Select a secondary atom filter before saving a solvent-sort prior histogram image.",
             )
             return
-        paths.plots_dir.mkdir(parents=True, exist_ok=True)
+        paths.exported_plots_dir.mkdir(parents=True, exist_ok=True)
         secondary = self.project_setup_tab.prior_secondary_element()
         suffix = f"_{secondary}" if secondary else ""
-        output_path = paths.plots_dir / (
+        output_path = paths.exported_plots_dir / (
             f"prior_histogram_{mode}{suffix}_"
             f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         )
@@ -2800,6 +3886,241 @@ class SAXSMainWindow(QMainWindow):
         except Exception as exc:
             self._show_error("Render DREAM results failed", str(exc))
 
+    @staticmethod
+    def _fit_quality_metrics_from_curves(
+        experimental: np.ndarray,
+        model: np.ndarray,
+    ) -> FitQualityMetrics:
+        experimental_values = np.asarray(experimental, dtype=float)
+        model_values = np.asarray(model, dtype=float)
+        residuals = np.asarray(
+            model_values - experimental_values,
+            dtype=float,
+        )
+        rmse = float(np.sqrt(np.mean(residuals**2)))
+        mean_abs_residual = float(np.mean(np.abs(residuals)))
+        experimental_mean = float(np.mean(experimental_values))
+        total_sum_squares = float(
+            np.sum((experimental_values - experimental_mean) ** 2)
+        )
+        residual_sum_squares = float(np.sum(residuals**2))
+        r_squared = (
+            float(1.0 - (residual_sum_squares / total_sum_squares))
+            if total_sum_squares > 0.0
+            else 1.0
+        )
+        return FitQualityMetrics(
+            rmse=rmse,
+            mean_abs_residual=mean_abs_residual,
+            r_squared=r_squared,
+        )
+
+    @staticmethod
+    def _is_weight_parameter_name(name: str) -> bool:
+        return name.startswith("w") and name[1:].isdigit()
+
+    @staticmethod
+    def _is_prefit_better_than_dream(
+        prefit_metrics: FitQualityMetrics,
+        dream_metrics: FitQualityMetrics,
+    ) -> bool:
+        if prefit_metrics.rmse < dream_metrics.rmse - 1e-9:
+            return True
+        if np.isclose(prefit_metrics.rmse, dream_metrics.rmse):
+            return prefit_metrics.r_squared > dream_metrics.r_squared + 1e-9
+        return False
+
+    def _build_dream_constraint_comparison(
+        self,
+        *,
+        model_plot,
+        entries: list,
+    ) -> DreamFitConstraintComparison | None:
+        if self.prefit_workflow is None:
+            return None
+        prefit_evaluation = self.prefit_workflow.evaluate()
+        prefit_metrics = self._fit_quality_metrics_from_curves(
+            prefit_evaluation.experimental_intensities,
+            prefit_evaluation.model_intensities,
+        )
+        dream_metrics = FitQualityMetrics(
+            rmse=float(model_plot.rmse),
+            mean_abs_residual=float(model_plot.mean_abs_residual),
+            r_squared=float(model_plot.r_squared),
+        )
+        fixed_parameters = tuple(
+            str(entry.param) for entry in entries if not bool(entry.vary)
+        )
+        fixed_non_weight_parameters = tuple(
+            name
+            for name in fixed_parameters
+            if not self._is_weight_parameter_name(name)
+        )
+        fixed_weight_parameters = tuple(
+            name
+            for name in fixed_parameters
+            if self._is_weight_parameter_name(name)
+        )
+        return DreamFitConstraintComparison(
+            prefit_metrics=prefit_metrics,
+            dream_metrics=dream_metrics,
+            fixed_parameters=fixed_parameters,
+            fixed_non_weight_parameters=fixed_non_weight_parameters,
+            fixed_weight_parameters=fixed_weight_parameters,
+        )
+
+    def _format_dream_fit_comparison_log(
+        self,
+        comparison: DreamFitConstraintComparison,
+    ) -> str:
+        lines = [
+            "DREAM vs Prefit fit-quality comparison:",
+            f"  Prefit RMSE: {comparison.prefit_metrics.rmse:.6g}",
+            (
+                "  Prefit Mean |res|: "
+                f"{comparison.prefit_metrics.mean_abs_residual:.6g}"
+            ),
+            f"  Prefit R^2: {comparison.prefit_metrics.r_squared:.6g}",
+            f"  DREAM RMSE: {comparison.dream_metrics.rmse:.6g}",
+            (
+                "  DREAM Mean |res|: "
+                f"{comparison.dream_metrics.mean_abs_residual:.6g}"
+            ),
+            f"  DREAM R^2: {comparison.dream_metrics.r_squared:.6g}",
+        ]
+        if comparison.fixed_parameters:
+            lines.append(
+                "  DREAM vary=off parameters: "
+                + ", ".join(comparison.fixed_parameters)
+            )
+        else:
+            lines.append("  DREAM vary=off parameters: none")
+        return "\n".join(lines)
+
+    def _prompt_dream_constraint_update(
+        self,
+        comparison: DreamFitConstraintComparison,
+    ) -> bool:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("DREAM fit appears overconstrained")
+        dialog.setText(
+            "The saved prefit currently fits the experimental SAXS data "
+            "better than the current DREAM best fit."
+        )
+        fixed_non_weight_text = (
+            ", ".join(comparison.fixed_non_weight_parameters)
+            if comparison.fixed_non_weight_parameters
+            else "none"
+        )
+        fixed_weight_text = (
+            ", ".join(comparison.fixed_weight_parameters)
+            if comparison.fixed_weight_parameters
+            else "none"
+        )
+        dialog.setInformativeText(
+            "This usually means the DREAM prior distributions are "
+            "overconstrained.\n\n"
+            f"Prefit RMSE: {comparison.prefit_metrics.rmse:.6g}\n"
+            f"DREAM RMSE: {comparison.dream_metrics.rmse:.6g}\n"
+            f"Prefit R^2: {comparison.prefit_metrics.r_squared:.6g}\n"
+            f"DREAM R^2: {comparison.dream_metrics.r_squared:.6g}\n\n"
+            f"Fixed non-weight parameters: {fixed_non_weight_text}\n"
+            f"Fixed weight parameters: {fixed_weight_text}\n\n"
+            "Recommended next step: retry DREAM without constraining the "
+            "non-weight parameters listed above, and allow all model "
+            "weight parameters w<##> to vary.\n\n"
+            "Do you want to update the current DREAM parameter map now and "
+            "set vary=yes for all parameters?"
+        )
+        update_button = dialog.addButton(
+            "Set All Vary = Yes",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        dialog.addButton(
+            "Keep Current Settings",
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        dialog.setDefaultButton(update_button)
+        dialog.exec()
+        return dialog.clickedButton() is update_button
+
+    def _maybe_warn_about_dream_overconstraints(
+        self,
+        settings: DreamRunSettings,
+    ) -> None:
+        if self._last_results_loader is None:
+            return
+        workflow = self._load_dream_workflow()
+        try:
+            entries = workflow.load_parameter_map(persist_if_missing=False)
+        except Exception:
+            return
+        if not entries:
+            return
+        model_plot = self._last_results_loader.build_model_fit_data(
+            bestfit_method=settings.bestfit_method,
+            posterior_filter_mode=settings.posterior_filter_mode,
+            posterior_top_percent=settings.posterior_top_percent,
+            posterior_top_n=settings.posterior_top_n,
+            credible_interval_low=settings.credible_interval_low,
+            credible_interval_high=settings.credible_interval_high,
+        )
+        comparison = self._build_dream_constraint_comparison(
+            model_plot=model_plot,
+            entries=entries,
+        )
+        if comparison is None:
+            return
+        self.dream_tab.append_log(
+            self._format_dream_fit_comparison_log(comparison)
+        )
+        if (
+            not comparison.fixed_parameters
+            or not self._is_prefit_better_than_dream(
+                comparison.prefit_metrics,
+                comparison.dream_metrics,
+            )
+        ):
+            return
+        signature = (
+            str(self._last_results_loader.run_dir),
+            str(settings.bestfit_method),
+            str(settings.posterior_filter_mode),
+            float(settings.posterior_top_percent),
+            int(settings.posterior_top_n),
+            tuple(comparison.fixed_parameters),
+            round(comparison.prefit_metrics.rmse, 12),
+            round(comparison.dream_metrics.rmse, 12),
+        )
+        if signature == self._last_dream_constraint_warning_signature:
+            return
+        self._last_dream_constraint_warning_signature = signature
+        if not self._prompt_dream_constraint_update(comparison):
+            return
+        updated_entries = [
+            entry.__class__(
+                structure=entry.structure,
+                motif=entry.motif,
+                param_type=entry.param_type,
+                param=entry.param,
+                value=entry.value,
+                vary=True,
+                distribution=entry.distribution,
+                dist_params=dict(entry.dist_params),
+            )
+            for entry in entries
+        ]
+        self._save_distribution_entries(updated_entries)
+        self.dream_tab.append_log(
+            "Updated DREAM parameter map from the overconstraint warning.\n"
+            "All DREAM parameters now have vary=yes.\n"
+            "Rewrite the Runtime Bundle before rerunning DREAM."
+        )
+        self.statusBar().showMessage(
+            "Updated DREAM parameter map; rewrite the runtime bundle"
+        )
+
     def _format_dream_summary(
         self,
         summary,
@@ -2812,6 +4133,15 @@ class SAXSMainWindow(QMainWindow):
             (
                 "Posterior filter: "
                 f"{self._describe_posterior_filter(settings)}"
+            ),
+            (
+                "Auto-select best filter after run: "
+                f"{'on' if settings.auto_select_best_posterior_filter else 'off'}"
+            ),
+            (
+                "Filter defaults: "
+                f"Top % = {settings.posterior_top_percent:g}, "
+                f"Top N = {settings.posterior_top_n}"
             ),
             f"Posterior samples kept: {summary.posterior_sample_count}",
             (
@@ -2856,6 +4186,10 @@ class SAXSMainWindow(QMainWindow):
             "Map before running DREAM.\n"
             f"Best-fit method: {settings.bestfit_method}\n"
             f"Posterior filter: {self._describe_posterior_filter(settings)}\n"
+            "Auto-select best filter after run: "
+            f"{'on' if settings.auto_select_best_posterior_filter else 'off'}\n"
+            f"Filter defaults: Top % = {settings.posterior_top_percent:g}, "
+            f"Top N = {settings.posterior_top_n}\n"
             f"Violin data mode: {settings.violin_parameter_mode}\n"
             f"Violin sample source: {settings.violin_sample_source}\n"
             f"Weight order: {settings.violin_weight_order}\n"
@@ -2900,7 +4234,18 @@ class SAXSMainWindow(QMainWindow):
         if self.prefit_workflow is None:
             return "Prefit workflow is not loaded."
         settings = self.prefit_workflow.settings
-        q_values = self.prefit_workflow.evaluate().q_values
+        preview_block_reason: str | None = None
+        try:
+            q_values = self.prefit_workflow.evaluate().q_values
+        except Exception as exc:
+            preview_block_reason = str(exc).strip() or None
+            try:
+                q_values = self.prefit_workflow._component_q_values()
+            except Exception:
+                q_values = np.asarray(
+                    self.prefit_workflow.experimental_data.q_values,
+                    dtype=float,
+                )
         run_config = self.prefit_tab.run_config()
         if settings.use_experimental_grid:
             grid_text = (
@@ -2928,7 +4273,13 @@ class SAXSMainWindow(QMainWindow):
                 else "; no Best Prefit preset is saved yet."
             )
             + "\n"
-            "Recommended order: refine scale first, then scale + offset. "
+            + (
+                "Prefit preview is currently waiting on template metadata.\n"
+                f"{preview_block_reason}\n"
+                if preview_block_reason is not None
+                else ""
+            )
+            + "Recommended order: refine scale first, then scale + offset. "
             "Component weights w<##> are not recommended for prefit refinement.\n"
             f"Default minimizer: {run_config.method}\n"
             f"Default max nfev: {run_config.max_nfev}\n"

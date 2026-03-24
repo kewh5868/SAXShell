@@ -62,6 +62,7 @@ dependencies = { file = ["requirements/pip.txt"] }
 
 [tool.setuptools.package-data]
 "saxshell.xyz2pdb" = ["reference_library/*.pdb", "reference_library/*.txt"]
+"saxshell.fullrmc" = ["_solution_property_presets/*.json"]
 
 [tool.codespell]
 exclude-file = ".codespell/ignore_lines.txt"

@@ -3,9 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 import saxshell.saxs.debye.profiles as profiles
 from saxshell.saxs.debye import (
+    DebyeProfileBuilder,
     compute_debye_intensity,
     discover_available_elements,
     load_structure_file,
@@ -130,3 +132,64 @@ def test_discover_available_elements_collects_unique_cluster_elements(
         "O",
         "Zn",
     ]
+
+
+def test_build_profiles_computes_single_atom_cluster_only_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clusters_dir = tmp_path / "clusters"
+    single_atom_dir = clusters_dir / "Zn1"
+    single_atom_dir.mkdir(parents=True)
+    for index in range(3):
+        (single_atom_dir / f"frame_{index:04d}.xyz").write_text(
+            "1\ncomment\nZn 0.0 0.0 0.0\n",
+            encoding="utf-8",
+        )
+
+    q_values = np.asarray([0.1, 0.2, 0.3], dtype=float)
+    call_counter = {"count": 0}
+
+    def fake_build_f0_dictionary(elements, q_values):
+        del q_values
+        return {str(element): np.ones(3, dtype=float) for element in elements}
+
+    def fake_compute_debye_intensity(
+        coordinates,
+        elements,
+        q_values,
+        *,
+        exclude_elements=None,
+        f0_dictionary=None,
+    ):
+        del coordinates, elements, exclude_elements, f0_dictionary
+        call_counter["count"] += 1
+        return np.asarray(q_values, dtype=float) + 5.0
+
+    monkeypatch.setattr(
+        profiles,
+        "build_f0_dictionary",
+        fake_build_f0_dictionary,
+    )
+    monkeypatch.setattr(
+        profiles,
+        "compute_debye_intensity",
+        fake_compute_debye_intensity,
+    )
+
+    builder = DebyeProfileBuilder(
+        q_values=q_values,
+        output_dir=tmp_path / "components",
+    )
+
+    components = builder.build_profiles(clusters_dir)
+
+    assert call_counter["count"] == 1
+    assert len(components) == 1
+    component = components[0]
+    np.testing.assert_allclose(component.mean_intensity, q_values + 5.0)
+    np.testing.assert_allclose(
+        component.std_intensity, np.zeros_like(q_values)
+    )
+    np.testing.assert_allclose(component.se_intensity, np.zeros_like(q_values))
+    assert component.file_count == 3

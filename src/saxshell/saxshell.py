@@ -80,6 +80,18 @@ def main(argv: list[str] | None = None) -> int:
         nargs=argparse.REMAINDER,
         help="Arguments passed through to the SAXS command.",
     )
+    fullrmc_parser = subparsers.add_parser(
+        "fullrmc",
+        help=(
+            "Launch the rmcsetup fullrmc-preparation UI or future "
+            "fullrmc setup helpers."
+        ),
+    )
+    fullrmc_parser.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="Arguments passed through to the fullrmc command.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -122,6 +134,14 @@ def main(argv: list[str] | None = None) -> int:
         if forwarded_args[:1] == ["--"]:
             forwarded_args = forwarded_args[1:]
         return saxs_main(forwarded_args)
+
+    if args.command == "fullrmc":
+        from saxshell.fullrmc.cli import main as fullrmc_main
+
+        forwarded_args = list(args.args)
+        if forwarded_args[:1] == ["--"]:
+            forwarded_args = forwarded_args[1:]
+        return fullrmc_main(forwarded_args)
 
     parser.print_help()
     return 0

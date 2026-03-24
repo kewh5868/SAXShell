@@ -15,6 +15,15 @@ from saxshell.saxs._model_templates import (
     load_template_module,
     load_template_spec,
 )
+from saxshell.saxs.prefit.cluster_geometry import (
+    ClusterGeometryMetadataRow,
+    ClusterGeometryMetadataTable,
+    apply_default_component_mapping,
+    compute_cluster_geometry_metadata,
+    copy_cluster_geometry_rows,
+    load_cluster_geometry_metadata,
+    save_cluster_geometry_metadata,
+)
 from saxshell.saxs.project_manager import (
     SAXSProjectManager,
     build_project_paths,
@@ -159,6 +168,10 @@ class SAXSPrefitWorkflow:
         )
         self.solvent_data = self._load_solvent_trace()
         self.components = self._load_components()
+        self.cluster_geometry_metadata_path = (
+            self.paths.cluster_geometry_metadata_file
+        )
+        self.cluster_geometry_table = self._load_cluster_geometry_table()
         self._template_default_entries = (
             self._build_default_parameter_entries()
         )
@@ -209,10 +222,12 @@ class SAXSPrefitWorkflow:
             if self.solvent_data is not None
             else None
         )
+        extra_inputs = self._lmfit_extra_inputs()
         model_intensities = self._lmfit_model_function()(
             q_values,
             solvent_data,
             model_data,
+            *extra_inputs,
             **params,
         )
         solvent_contribution = self._evaluate_solvent_contribution(
@@ -220,6 +235,7 @@ class SAXSPrefitWorkflow:
             solvent_data=solvent_data,
             model_data=model_data,
             params=params,
+            extra_inputs=extra_inputs,
         )
         residuals = model_intensities - experimental
         return PrefitEvaluation(
@@ -255,6 +271,7 @@ class SAXSPrefitWorkflow:
         )
         model_data = [component.intensities for component in self.components]
         lmfit_model = self._lmfit_model_function()
+        extra_inputs = self._lmfit_extra_inputs()
         lmfit_params = Parameters()
         for entry in entries:
             lmfit_params.add(
@@ -271,6 +288,7 @@ class SAXSPrefitWorkflow:
                 q_values,
                 solvent_data,
                 model_data,
+                *extra_inputs,
                 **params,
             )
             return np.asarray(model, dtype=float) - experimental
@@ -388,6 +406,7 @@ class SAXSPrefitWorkflow:
         weights_payload = []
         fit_parameters_payload: dict[str, float] = {}
         fit_parameter_meta: dict[str, dict[str, object]] = {}
+        template_runtime_inputs = self.template_runtime_inputs_payload()
         for entry in entries:
             meta = {
                 "vary": entry.vary,
@@ -424,6 +443,12 @@ class SAXSPrefitWorkflow:
                 }
                 for component in self.components
             ],
+            "template_runtime_inputs": template_runtime_inputs,
+            "cluster_geometry_metadata": (
+                None
+                if self.cluster_geometry_table is None
+                else self.cluster_geometry_table.to_dict()
+            ),
         }
         prefit_json_path = self.paths.prefit_dir / "pd_prefit_params.json"
         prefit_json_path.write_text(
@@ -435,6 +460,11 @@ class SAXSPrefitWorkflow:
             json.dumps(pd_prefit_payload, indent=2) + "\n",
             encoding="utf-8",
         )
+        if self.cluster_geometry_table is not None:
+            save_cluster_geometry_metadata(
+                snapshot_dir / self.cluster_geometry_metadata_path.name,
+                self.cluster_geometry_table,
+            )
 
         curve_path = self.paths.prefit_dir / "latest_prefit_curve.txt"
         curve_data = np.column_stack(
@@ -474,6 +504,7 @@ class SAXSPrefitWorkflow:
             self.template_dir,
         )
         self.settings.selected_model_template = self.template_spec.name
+        self.cluster_geometry_table = self._load_cluster_geometry_table()
         self._template_default_entries = (
             self._build_default_parameter_entries()
         )
@@ -655,6 +686,122 @@ class SAXSPrefitWorkflow:
             adjustment_factor=adjustment_factor,
             points_used=int(np.count_nonzero(mask)),
         )
+
+    def supports_cluster_geometry_metadata(self) -> bool:
+        return bool(self.template_spec.cluster_geometry_support.supported)
+
+    def cluster_geometry_rows(self) -> list[ClusterGeometryMetadataRow]:
+        if self.cluster_geometry_table is None:
+            return []
+        return copy_cluster_geometry_rows(self.cluster_geometry_table.rows)
+
+    def cluster_geometry_mapping_options(self) -> list[tuple[str, str]]:
+        return [
+            (
+                component.param_name,
+                (
+                    f"{component.param_name} "
+                    f"({component.structure}/{component.motif})"
+                ),
+            )
+            for component in self.components
+        ]
+
+    def cluster_geometry_status_text(self) -> str:
+        if not self.supports_cluster_geometry_metadata():
+            return (
+                "The active template does not use per-cluster geometry "
+                "metadata."
+            )
+        if self.settings.resolved_clusters_dir is None:
+            return (
+                "Select a clusters directory in Project Setup before "
+                "computing cluster geometry metadata."
+            )
+        if (
+            self.cluster_geometry_table is None
+            or not self.cluster_geometry_table.rows
+        ):
+            return (
+                "Compute cluster geometry metadata to provide per-cluster "
+                "effective radii and structure-factor recommendations for "
+                f"{self.template_spec.display_name}."
+            )
+        try:
+            runtime_inputs = sorted(self.template_runtime_inputs().keys())
+        except Exception as exc:
+            return str(exc)
+        return (
+            f"Loaded cluster geometry metadata for "
+            f"{len(self.cluster_geometry_table.rows)} clusters. "
+            "Runtime inputs: " + ", ".join(runtime_inputs)
+        )
+
+    def compute_cluster_geometry_table(self) -> ClusterGeometryMetadataTable:
+        clusters_dir = self.settings.resolved_clusters_dir
+        if clusters_dir is None:
+            raise ValueError(
+                "Select a clusters directory in Project Setup before "
+                "computing cluster geometry metadata."
+            )
+        table = compute_cluster_geometry_metadata(
+            clusters_dir,
+            template_name=self.template_spec.name,
+        )
+        apply_default_component_mapping(table.rows, self.components)
+        self.cluster_geometry_table = table
+        self._save_cluster_geometry_table()
+        return table
+
+    def set_cluster_geometry_rows(
+        self,
+        rows: list[ClusterGeometryMetadataRow],
+    ) -> None:
+        if self.cluster_geometry_table is None:
+            self.cluster_geometry_table = ClusterGeometryMetadataTable(
+                source_clusters_dir=(
+                    str(self.settings.resolved_clusters_dir)
+                    if self.settings.resolved_clusters_dir is not None
+                    else None
+                ),
+                template_name=self.template_spec.name,
+            )
+        self.cluster_geometry_table.rows = copy_cluster_geometry_rows(rows)
+        self.cluster_geometry_table.template_name = self.template_spec.name
+        apply_default_component_mapping(
+            self.cluster_geometry_table.rows,
+            self.components,
+        )
+        self._save_cluster_geometry_table()
+
+    def template_runtime_inputs(self) -> dict[str, np.ndarray]:
+        required_names = {
+            *self.template_spec.extra_lmfit_inputs,
+            *self.template_spec.cluster_geometry_support.runtime_input_names,
+        }
+        if not required_names:
+            return {}
+        available_inputs = self._available_template_runtime_inputs()
+        missing = [
+            name
+            for name in sorted(required_names)
+            if name not in available_inputs
+        ]
+        if missing:
+            raise ValueError(
+                "The selected template requires runtime metadata inputs that "
+                "are not available: " + ", ".join(missing)
+            )
+        return {
+            name: np.asarray(available_inputs[name], dtype=float)
+            for name in sorted(required_names)
+        }
+
+    def template_runtime_inputs_payload(self) -> dict[str, list[float]]:
+        return {
+            name: np.asarray(values, dtype=float).tolist()
+            for name, values in self.template_runtime_inputs().items()
+        }
 
     def _build_default_parameter_entries(self) -> list[PrefitParameterEntry]:
         entries: list[PrefitParameterEntry] = []
@@ -892,6 +1039,7 @@ class SAXSPrefitWorkflow:
         solvent_data: np.ndarray,
         model_data: list[np.ndarray],
         params: dict[str, float],
+        extra_inputs: list[np.ndarray],
     ) -> np.ndarray | None:
         if self.solvent_data is None:
             return None
@@ -907,9 +1055,129 @@ class SAXSPrefitWorkflow:
             q_values,
             np.asarray(solvent_data, dtype=float),
             zero_model_data,
+            *extra_inputs,
             **isolated_params,
         )
         return np.asarray(contribution, dtype=float)
+
+    def _lmfit_extra_inputs(self) -> list[np.ndarray]:
+        runtime_inputs = self.template_runtime_inputs()
+        return [
+            np.asarray(runtime_inputs[input_name], dtype=float)
+            for input_name in self.template_spec.extra_lmfit_inputs
+        ]
+
+    def _load_cluster_geometry_table(
+        self,
+    ) -> ClusterGeometryMetadataTable | None:
+        if not self.cluster_geometry_metadata_path.is_file():
+            return None
+        table = load_cluster_geometry_metadata(
+            self.cluster_geometry_metadata_path
+        )
+        table.template_name = self.template_spec.name
+        if apply_default_component_mapping(table.rows, self.components):
+            save_cluster_geometry_metadata(
+                self.cluster_geometry_metadata_path,
+                table,
+            )
+        return table
+
+    def _save_cluster_geometry_table(self) -> None:
+        if self.cluster_geometry_table is None:
+            return
+        self.cluster_geometry_table.template_name = self.template_spec.name
+        if (
+            self.cluster_geometry_table.source_clusters_dir is None
+            and self.settings.resolved_clusters_dir is not None
+        ):
+            self.cluster_geometry_table.source_clusters_dir = str(
+                self.settings.resolved_clusters_dir
+            )
+        save_cluster_geometry_metadata(
+            self.cluster_geometry_metadata_path,
+            self.cluster_geometry_table,
+        )
+
+    def _available_template_runtime_inputs(self) -> dict[str, np.ndarray]:
+        runtime_inputs: dict[str, np.ndarray] = {}
+        cluster_geometry_inputs = self._cluster_geometry_runtime_inputs()
+        runtime_inputs.update(cluster_geometry_inputs)
+        return runtime_inputs
+
+    def _cluster_geometry_runtime_inputs(self) -> dict[str, np.ndarray]:
+        capability = self.template_spec.cluster_geometry_support
+        if not capability.supported:
+            return {}
+        if (
+            self.cluster_geometry_table is None
+            or not self.cluster_geometry_table.rows
+        ):
+            raise ValueError(
+                "This template requires computed cluster geometry metadata. "
+                "Use the Cluster Geometry Metadata section in SAXS Prefit "
+                "to compute and map effective radii before updating the "
+                "model or running a fit."
+            )
+        rows = copy_cluster_geometry_rows(self.cluster_geometry_table.rows)
+        if apply_default_component_mapping(rows, self.components):
+            self.cluster_geometry_table.rows = rows
+            self._save_cluster_geometry_table()
+        row_by_parameter: dict[str, ClusterGeometryMetadataRow] = {}
+        duplicate_parameters: list[str] = []
+        unmapped_clusters: list[str] = []
+        for row in rows:
+            mapped_parameter = (
+                str(row.mapped_parameter).strip()
+                if row.mapped_parameter is not None
+                else ""
+            )
+            if not mapped_parameter:
+                unmapped_clusters.append(row.cluster_id)
+                continue
+            if mapped_parameter in row_by_parameter:
+                duplicate_parameters.append(mapped_parameter)
+                continue
+            row_by_parameter[mapped_parameter] = row
+        if unmapped_clusters:
+            raise ValueError(
+                "Cluster geometry metadata rows must be mapped to the "
+                "component weight parameters before this template can run. "
+                "Unmapped clusters: " + ", ".join(unmapped_clusters)
+            )
+        if duplicate_parameters:
+            raise ValueError(
+                "Cluster geometry metadata maps multiple rows to the same "
+                "component weight parameter: "
+                + ", ".join(sorted(set(duplicate_parameters)))
+            )
+        missing_components = [
+            component.param_name
+            for component in self.components
+            if component.param_name not in row_by_parameter
+        ]
+        if missing_components:
+            raise ValueError(
+                "Cluster geometry metadata is missing mappings for the "
+                "component weight parameters: " + ", ".join(missing_components)
+            )
+        runtime_inputs = {
+            binding.runtime_name: [] for binding in capability.runtime_bindings
+        }
+        for component in self.components:
+            row = row_by_parameter[component.param_name]
+            for binding in capability.runtime_bindings:
+                runtime_inputs[binding.runtime_name].append(
+                    _coerce_runtime_metadata_value(
+                        getattr(row, binding.metadata_field),
+                        runtime_name=binding.runtime_name,
+                        cluster_id=row.cluster_id,
+                    )
+                )
+        return {
+            name: np.asarray(values, dtype=float)
+            for name, values in runtime_inputs.items()
+        }
 
     def _build_report_text(
         self,
@@ -952,6 +1220,21 @@ class SAXSPrefitWorkflow:
                 ]
             )
         return "\n".join(lines) + "\n"
+
+
+def _coerce_runtime_metadata_value(
+    value: object,
+    *,
+    runtime_name: str,
+    cluster_id: str,
+) -> float:
+    try:
+        return float(value)
+    except Exception as exc:
+        raise ValueError(
+            f"Cluster geometry metadata for {cluster_id} provides a "
+            f"non-numeric value {value!r} for runtime input {runtime_name!r}."
+        ) from exc
 
 
 __all__ = [

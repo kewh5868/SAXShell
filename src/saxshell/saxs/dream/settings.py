@@ -30,6 +30,7 @@ class DreamRunSettings:
     posterior_filter_mode: str = "all_post_burnin"
     posterior_top_percent: float = 10.0
     posterior_top_n: int = 500
+    auto_select_best_posterior_filter: bool = True
     credible_interval_low: float = 16.0
     credible_interval_high: float = 84.0
     violin_parameter_mode: str = "varying_parameters"
@@ -41,6 +42,8 @@ class DreamRunSettings:
     violin_point_color: str = "tab:red"
     violin_interval_color: str = "#8c8c8c"
     violin_median_color: str = "#4d4d4d"
+    violin_outline_color: str = "#000000"
+    violin_outline_width: float = 0.8
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -165,6 +168,13 @@ class DreamRunSettings:
                     default=500,
                 )
             ),
+            auto_select_best_posterior_filter=_coerce_bool(
+                _get_first(
+                    payload,
+                    "auto_select_best_posterior_filter",
+                    default=True,
+                )
+            ),
             credible_interval_low=float(
                 _get_first(
                     payload,
@@ -240,6 +250,20 @@ class DreamRunSettings:
                     payload,
                     "violin_median_color",
                     default="#4d4d4d",
+                )
+            ),
+            violin_outline_color=str(
+                _get_first(
+                    payload,
+                    "violin_outline_color",
+                    default="#000000",
+                )
+            ),
+            violin_outline_width=float(
+                _get_first(
+                    payload,
+                    "violin_outline_width",
+                    default=0.8,
                 )
             ),
         )

@@ -39,6 +39,7 @@ class DreamModelPlotData:
     q_values: np.ndarray
     experimental_intensities: np.ndarray
     model_intensities: np.ndarray
+    solvent_contribution: np.ndarray | None
     bestfit_method: str
     template_name: str
     rmse: float
@@ -145,6 +146,15 @@ class SAXSDreamResultsLoader:
             self.metadata.get("solvent_intensities", []),
             dtype=float,
         )
+        self.template_runtime_inputs = {
+            str(name): np.asarray(values, dtype=float)
+            for name, values in dict(
+                self.metadata.get("template_runtime_inputs", {})
+            ).items()
+        }
+        self.lmfit_extra_inputs = list(
+            self.metadata.get("lmfit_extra_inputs", [])
+        )
         self._expanded_samples_flat: np.ndarray | None = None
         self._posterior_view_cache: dict[
             tuple[object, ...], _PosteriorView
@@ -234,14 +244,24 @@ class SAXSDreamResultsLoader:
             name: float(summary.bestfit_params[index])
             for index, name in enumerate(self.full_parameter_names)
         }
+        extra_inputs = [
+            np.asarray(self.template_runtime_inputs[name], dtype=float)
+            for name in self.lmfit_extra_inputs
+        ]
         model_intensities = np.asarray(
             model_function(
                 self.q_values,
                 self.solvent_intensities,
                 self.theoretical_intensities,
+                *extra_inputs,
                 **params,
             ),
             dtype=float,
+        )
+        solvent_contribution = self._evaluate_solvent_contribution(
+            model_function,
+            params=params,
+            extra_inputs=extra_inputs,
         )
         residuals = np.asarray(
             model_intensities - self.experimental_intensities,
@@ -263,6 +283,7 @@ class SAXSDreamResultsLoader:
             q_values=self.q_values,
             experimental_intensities=self.experimental_intensities,
             model_intensities=model_intensities,
+            solvent_contribution=solvent_contribution,
             bestfit_method=bestfit_method,
             template_name=self.template_name,
             rmse=rmse,
@@ -403,6 +424,32 @@ class SAXSDreamResultsLoader:
         report_path = Path(output_path)
         report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return report_path
+
+    def _evaluate_solvent_contribution(
+        self,
+        model_function,
+        *,
+        params: dict[str, float],
+        extra_inputs: list[np.ndarray],
+    ) -> np.ndarray | None:
+        solvent_data = np.asarray(self.solvent_intensities, dtype=float)
+        if solvent_data.size == 0 or not np.any(np.abs(solvent_data) > 0.0):
+            return None
+        isolated_params = dict(params)
+        if "offset" in isolated_params:
+            isolated_params["offset"] = 0.0
+        zero_model_data = [
+            np.zeros_like(np.asarray(component, dtype=float))
+            for component in self.theoretical_intensities
+        ]
+        contribution = model_function(
+            self.q_values,
+            solvent_data,
+            zero_model_data,
+            *extra_inputs,
+            **isolated_params,
+        )
+        return np.asarray(contribution, dtype=float)
 
     def _select_best_params(
         self,

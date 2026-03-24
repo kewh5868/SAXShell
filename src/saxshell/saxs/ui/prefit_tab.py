@@ -30,7 +30,11 @@ from PySide6.QtWidgets import (
 )
 
 from saxshell.saxs._model_templates import TemplateSpec
-from saxshell.saxs.prefit import PrefitEvaluation, PrefitParameterEntry
+from saxshell.saxs.prefit import (
+    ClusterGeometryMetadataRow,
+    PrefitEvaluation,
+    PrefitParameterEntry,
+)
 from saxshell.saxs.ui.template_help import (
     TEMPLATE_HELP_TEXT,
     show_template_help,
@@ -52,8 +56,11 @@ class PrefitTab(QWidget):
     set_best_prefit_requested = Signal()
     reset_best_prefit_requested = Signal()
     save_fit_requested = Signal()
+    save_plot_data_requested = Signal()
     restore_state_requested = Signal()
     reset_requested = Signal()
+    compute_cluster_geometry_requested = Signal()
+    cluster_geometry_mapping_changed = Signal()
 
     PREFIT_HELP_TEXT = (
         "Recommended prefit workflow:\n"
@@ -71,6 +78,8 @@ class PrefitTab(QWidget):
         self._history_messages: list[str] = []
         self._legend_line_map: dict[object, object] = {}
         self._legend_handle_lookup: dict[str, object] = {}
+        self._cluster_geometry_rows: list[ClusterGeometryMetadataRow] = []
+        self._cluster_geometry_mapping_options: list[tuple[str, str]] = []
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -105,6 +114,8 @@ class PrefitTab(QWidget):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(12)
         left_layout.addWidget(self._build_controls_group())
+        self._cluster_geometry_group = self._build_cluster_geometry_group()
+        left_layout.addWidget(self._cluster_geometry_group)
         left_layout.addWidget(self._build_parameter_group(), stretch=1)
         self._plot_group = self._build_plot_group()
         self._pane_splitter.addWidget(self._left_panel)
@@ -270,8 +281,13 @@ class PrefitTab(QWidget):
         self.log_y_checkbox = QCheckBox("Log Y")
         self.log_y_checkbox.setChecked(True)
         self.log_y_checkbox.toggled.connect(self._redraw_current_plot)
+        self.save_plot_data_button = QPushButton("Export Plot Data")
+        self.save_plot_data_button.clicked.connect(
+            self.save_plot_data_requested.emit
+        )
         controls.addWidget(self.log_x_checkbox)
         controls.addWidget(self.log_y_checkbox)
+        controls.addWidget(self.save_plot_data_button)
         controls.addStretch(1)
         layout.addLayout(controls)
 
@@ -295,6 +311,50 @@ class PrefitTab(QWidget):
         header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.parameter_table.setMinimumWidth(520)
         layout.addWidget(self.parameter_table)
+        return group
+
+    def _build_cluster_geometry_group(self) -> QGroupBox:
+        group = QGroupBox("Cluster Geometry Metadata")
+        layout = QVBoxLayout(group)
+
+        header_row = QHBoxLayout()
+        self.cluster_geometry_status_label = QLabel(
+            "This template does not use per-cluster geometry metadata."
+        )
+        self.cluster_geometry_status_label.setWordWrap(True)
+        self.compute_cluster_geometry_button = QPushButton(
+            "Compute Cluster Geometry"
+        )
+        self.compute_cluster_geometry_button.setToolTip(
+            "Compute average cluster geometry descriptors for each cluster "
+            "folder and map the results to the generated component weight "
+            "parameters."
+        )
+        self.compute_cluster_geometry_button.clicked.connect(
+            self.compute_cluster_geometry_requested.emit
+        )
+        header_row.addWidget(self.cluster_geometry_status_label, stretch=1)
+        header_row.addWidget(self.compute_cluster_geometry_button)
+        layout.addLayout(header_row)
+
+        self.cluster_geometry_table = QTableWidget(0, 8)
+        self.cluster_geometry_table.setHorizontalHeaderLabels(
+            [
+                "Cluster",
+                "Path",
+                "Avg Size",
+                "Effective Radius",
+                "S.F. Approx.",
+                "Anisotropy",
+                "Map To",
+                "Notes",
+            ]
+        )
+        header = self.cluster_geometry_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.cluster_geometry_table.setMinimumHeight(220)
+        layout.addWidget(self.cluster_geometry_table)
+        group.setVisible(False)
         return group
 
     def _build_output_group(self) -> QGroupBox:
@@ -406,6 +466,89 @@ class PrefitTab(QWidget):
                 QTableWidgetItem(f"{entry.maximum:.6g}"),
             )
         self.parameter_table.resizeRowsToContents()
+
+    def set_cluster_geometry_visible(self, visible: bool) -> None:
+        self._cluster_geometry_group.setVisible(bool(visible))
+
+    def set_cluster_geometry_status_text(self, text: str) -> None:
+        self.cluster_geometry_status_label.setText(text.strip())
+
+    def populate_cluster_geometry_table(
+        self,
+        rows: list[ClusterGeometryMetadataRow],
+        *,
+        mapping_options: list[tuple[str, str]],
+    ) -> None:
+        self._cluster_geometry_rows = [
+            ClusterGeometryMetadataRow.from_dict(row.to_dict()) for row in rows
+        ]
+        self._cluster_geometry_mapping_options = list(mapping_options)
+        self.cluster_geometry_table.setRowCount(
+            len(self._cluster_geometry_rows)
+        )
+        for row_index, row in enumerate(self._cluster_geometry_rows):
+            self.cluster_geometry_table.setItem(
+                row_index,
+                0,
+                QTableWidgetItem(row.cluster_id),
+            )
+            path_item = QTableWidgetItem(row.cluster_path)
+            path_item.setToolTip(row.cluster_path)
+            self.cluster_geometry_table.setItem(row_index, 1, path_item)
+            self.cluster_geometry_table.setItem(
+                row_index,
+                2,
+                QTableWidgetItem(f"{row.avg_size_metric:.4g}"),
+            )
+            self.cluster_geometry_table.setItem(
+                row_index,
+                3,
+                QTableWidgetItem(f"{row.effective_radius:.4g}"),
+            )
+            self.cluster_geometry_table.setItem(
+                row_index,
+                4,
+                QTableWidgetItem(row.structure_factor_recommendation),
+            )
+            self.cluster_geometry_table.setItem(
+                row_index,
+                5,
+                QTableWidgetItem(f"{row.anisotropy_metric:.4g}"),
+            )
+            mapping_combo = QComboBox()
+            mapping_combo.addItem("", userData=None)
+            selected_index = 0
+            for option_index, (param_name, label) in enumerate(
+                self._cluster_geometry_mapping_options,
+                start=1,
+            ):
+                mapping_combo.addItem(label, userData=param_name)
+                if (
+                    row.mapped_parameter is not None
+                    and row.mapped_parameter == param_name
+                ):
+                    selected_index = option_index
+            mapping_combo.setCurrentIndex(selected_index)
+            mapping_combo.currentIndexChanged.connect(
+                lambda _index, row_idx=row_index, combo=mapping_combo: (
+                    self._on_cluster_geometry_mapping_changed(row_idx, combo)
+                )
+            )
+            self.cluster_geometry_table.setCellWidget(
+                row_index,
+                6,
+                mapping_combo,
+            )
+            notes_item = QTableWidgetItem(row.notes)
+            notes_item.setToolTip(row.notes)
+            self.cluster_geometry_table.setItem(row_index, 7, notes_item)
+        self.cluster_geometry_table.resizeRowsToContents()
+
+    def cluster_geometry_rows(self) -> list[ClusterGeometryMetadataRow]:
+        return [
+            ClusterGeometryMetadataRow.from_dict(row.to_dict())
+            for row in self._cluster_geometry_rows
+        ]
 
     def parameter_entries(self) -> list[PrefitParameterEntry]:
         entries: list[PrefitParameterEntry] = []
@@ -561,6 +704,9 @@ class PrefitTab(QWidget):
         self.figure.tight_layout()
         self.canvas.draw()
 
+    def current_evaluation(self) -> PrefitEvaluation | None:
+        return self._current_evaluation
+
     def append_log(self, message: str) -> None:
         stripped = message.strip()
         if stripped:
@@ -581,6 +727,21 @@ class PrefitTab(QWidget):
 
     def _redraw_current_plot(self) -> None:
         self.plot_evaluation(self._current_evaluation)
+
+    def _on_cluster_geometry_mapping_changed(
+        self,
+        row_index: int,
+        combo: QComboBox,
+    ) -> None:
+        if row_index < 0 or row_index >= len(self._cluster_geometry_rows):
+            return
+        mapped_parameter = combo.currentData()
+        self._cluster_geometry_rows[row_index].mapped_parameter = (
+            str(mapped_parameter).strip()
+            if mapped_parameter not in (None, "")
+            else None
+        )
+        self.cluster_geometry_mapping_changed.emit()
 
     def _build_interactive_legend(self, axis, lines: list[object]) -> None:
         legend = axis.legend()

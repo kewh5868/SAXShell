@@ -35,6 +35,7 @@ class PriorHistogramWindow(QMainWindow):
         mode: str,
         secondary_element: str | None = None,
         cmap: str = "summer",
+        structure_motif_colors: dict[str, str] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -42,6 +43,11 @@ class PriorHistogramWindow(QMainWindow):
         self.mode = mode
         self.secondary_element = secondary_element
         self.cmap = cmap
+        self.structure_motif_colors = (
+            dict(structure_motif_colors or {})
+            if structure_motif_colors is not None
+            else None
+        )
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowFlag(Qt.WindowType.Window, True)
         self._build_ui()
@@ -85,6 +91,7 @@ class PriorHistogramWindow(QMainWindow):
             mode=self.mode,
             secondary_element=self.secondary_element,
             cmap=self.cmap,
+            structure_motif_colors=self.structure_motif_colors,
             ax=axis,
         )
         self.canvas.draw()

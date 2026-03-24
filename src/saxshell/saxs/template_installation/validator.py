@@ -16,7 +16,12 @@ from saxshell.saxs._model_templates import (
     load_template_spec,
 )
 from saxshell.saxs.dream import SAXSDreamWorkflow
-from saxshell.saxs.prefit import SAXSPrefitWorkflow
+from saxshell.saxs.prefit import (
+    ClusterGeometryMetadataRow,
+    ClusterGeometryMetadataTable,
+    SAXSPrefitWorkflow,
+    save_cluster_geometry_metadata,
+)
 from saxshell.saxs.project_manager import (
     SAXSProjectManager,
     build_project_paths,
@@ -266,11 +271,17 @@ def _run_function_contract_validation(
         parameter.name: parameter.initial_value
         for parameter in spec.parameters
     }
+    template_runtime_inputs = _build_synthetic_template_runtime_inputs(spec)
+    extra_lmfit_inputs = [
+        template_runtime_inputs[input_name]
+        for input_name in spec.extra_lmfit_inputs
+    ]
     try:
         profile = getattr(module, spec.lmfit_model_name)(
             q_values,
             solvent,
             [component],
+            *extra_lmfit_inputs,
             w0=0.6,
             **fit_params,
         )
@@ -298,6 +309,8 @@ def _run_function_contract_validation(
         module.experimental_intensities = profile_array
         module.theoretical_intensities = [component]
         module.solvent_intensities = solvent
+        for input_name, values in template_runtime_inputs.items():
+            setattr(module, input_name, np.asarray(values, dtype=float))
         dream_params = np.asarray(
             [0.6]
             + [fit_params[parameter.name] for parameter in spec.parameters],
@@ -344,10 +357,18 @@ def _build_validation_project(
             parameter.name: parameter.initial_value
             for parameter in spec.parameters
         }
+        template_runtime_inputs = _build_synthetic_template_runtime_inputs(
+            spec
+        )
+        extra_lmfit_inputs = [
+            template_runtime_inputs[input_name]
+            for input_name in spec.extra_lmfit_inputs
+        ]
         experimental = getattr(module, spec.lmfit_model_name)(
             q_values,
             solvent,
             [component],
+            *extra_lmfit_inputs,
             w0=0.6,
             **fit_params,
         )
@@ -403,8 +424,45 @@ def _build_validation_project(
         settings.copied_experimental_data_file = str(experimental_path)
         settings.solvent_data_path = str(solvent_path)
         settings.copied_solvent_data_file = str(solvent_path)
+        clusters_dir = paths.project_dir / "clusters"
+        cluster_dir = clusters_dir / "A"
+        cluster_dir.mkdir(parents=True, exist_ok=True)
+        (cluster_dir / "frame_0001.xyz").write_text(
+            "1\nvalidation cluster\nPb 0.0 0.0 0.0\n",
+            encoding="utf-8",
+        )
+        settings.clusters_dir = str(clusters_dir)
         settings.selected_model_template = spec.name
         manager.save_project(settings)
+        if spec.cluster_geometry_support.supported:
+            save_cluster_geometry_metadata(
+                paths.cluster_geometry_metadata_file,
+                ClusterGeometryMetadataTable(
+                    rows=[
+                        ClusterGeometryMetadataRow(
+                            cluster_id="A",
+                            structure="A",
+                            motif="no_motif",
+                            cluster_path=str(cluster_dir),
+                            avg_size_metric=18.0,
+                            effective_radius=9.0,
+                            structure_factor_recommendation="sphere",
+                            anisotropy_metric=1.0,
+                            notes="Validation geometry seed.",
+                            mapped_parameter="w0",
+                            mean_semiaxis_a=9.0,
+                            mean_semiaxis_b=9.0,
+                            mean_semiaxis_c=9.0,
+                            mean_radius_of_gyration=6.0,
+                            mean_max_radius=9.0,
+                            mean_atom_count=1.0,
+                            file_count=1,
+                        )
+                    ],
+                    source_clusters_dir=str(clusters_dir),
+                    template_name=spec.name,
+                ),
+            )
 
         persistent_project_dir = template_dir / "validation_project"
         if persistent_project_dir.exists():
@@ -425,8 +483,20 @@ def _build_validation_project(
         persistent_settings.copied_solvent_data_file = str(
             persistent_paths.experimental_data_dir / solvent_path.name
         )
+        persistent_settings.clusters_dir = str(
+            persistent_paths.project_dir / "clusters"
+        )
         manager.save_project(persistent_settings)
         return persistent_project_dir
+
+
+def _build_synthetic_template_runtime_inputs(
+    spec: TemplateSpec,
+) -> dict[str, np.ndarray]:
+    runtime_inputs: dict[str, np.ndarray] = {}
+    for binding in spec.cluster_geometry_support.runtime_bindings:
+        runtime_inputs[binding.runtime_name] = np.asarray([9.0], dtype=float)
+    return runtime_inputs
 
 
 def _run_prefit_validation(
@@ -484,29 +554,61 @@ def _run_dream_validation(
         settings.adapt_crossover = False
         settings.crossover_burnin = 1000
 
+        expected_min_chains = settings.nchains
+        expected_iterations = settings.niterations
+        expected_active_parameters = sum(1 for entry in entries if entry.vary)
         bundle = workflow.create_runtime_bundle(
             settings=settings, entries=entries
         )
         run_result = workflow.run_bundle(bundle)
         sampled_params = np.load(run_result["sampled_params_path"])
         log_ps = np.load(run_result["log_ps_path"])
-        if sampled_params.shape[0:2] != (5, 3):
+        if sampled_params.ndim != 3:
             raise ValueError(
-                "DREAM runtime wrote unexpected sampled parameter shape "
-                f"{sampled_params.shape}."
+                "DREAM runtime wrote sampled parameters with unexpected "
+                f"rank {sampled_params.ndim}; expected 3."
             )
-        if log_ps.shape != (5, 3):
+        if sampled_params.shape[0] < expected_min_chains:
             raise ValueError(
-                "DREAM runtime wrote unexpected log probability shape "
-                f"{log_ps.shape}."
+                "DREAM runtime wrote fewer chains than requested: "
+                f"{sampled_params.shape[0]} < {expected_min_chains}."
+            )
+        if sampled_params.shape[1] != expected_iterations:
+            raise ValueError(
+                "DREAM runtime wrote unexpected iteration count in "
+                "sampled parameters: "
+                f"{sampled_params.shape[1]} != {expected_iterations}."
+            )
+        if sampled_params.shape[2] != expected_active_parameters:
+            raise ValueError(
+                "DREAM runtime wrote unexpected active-parameter width in "
+                "sampled parameters: "
+                f"{sampled_params.shape[2]} != {expected_active_parameters}."
+            )
+        if log_ps.ndim != 2:
+            raise ValueError(
+                "DREAM runtime wrote log probabilities with unexpected "
+                f"rank {log_ps.ndim}; expected 2."
+            )
+        if log_ps.shape[0] != sampled_params.shape[0]:
+            raise ValueError(
+                "DREAM runtime wrote mismatched chain counts for sampled "
+                f"parameters and log probabilities: "
+                f"{sampled_params.shape[0]} != {log_ps.shape[0]}."
+            )
+        if log_ps.shape[1] != expected_iterations:
+            raise ValueError(
+                "DREAM runtime wrote unexpected iteration count in log "
+                f"probabilities: {log_ps.shape[1]} != {expected_iterations}."
             )
         if not np.all(np.isfinite(sampled_params)):
             raise ValueError(
                 "DREAM runtime produced non-finite sampled parameters."
             )
-        if not np.all(np.isfinite(log_ps)):
+        if np.any(np.isnan(log_ps)) or np.any(np.isposinf(log_ps)):
             raise ValueError(
-                "DREAM runtime produced non-finite log probabilities."
+                "DREAM runtime produced invalid log probabilities "
+                "(NaN or +inf)."
             )
     except Exception as exc:
         _append_check(

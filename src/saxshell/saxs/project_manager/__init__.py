@@ -8,6 +8,7 @@ from .prior_plot import (
 )
 from .project import (
     ClusterImportResult,
+    DreamBestFitSelection,
     ExperimentalDataSummary,
     ProjectBuildResult,
     ProjectComponentEntry,
@@ -24,6 +25,7 @@ from .project import (
 __all__ = [
     "ExperimentalDataSummary",
     "ClusterImportResult",
+    "DreamBestFitSelection",
     "ProjectBuildResult",
     "ProjectComponentEntry",
     "ProjectPaths",
