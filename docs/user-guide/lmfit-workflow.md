@@ -3,7 +3,7 @@
 In this repository, **Prefit** is the lmfit-facing side of the SAXS workflow.
 It gives you a fast, editable model preview before you commit to a pyDREAM run.
 
-## Role of lmfit in SAXShell
+## Role of lmfit in SAXSShell
 
 The template system defines an lmfit-compatible profile function. Prefit then
 uses that function together with the current parameter table to compute the

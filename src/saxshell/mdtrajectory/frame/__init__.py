@@ -1,4 +1,4 @@
-"""Frame extraction and cutoff-selection tools for SAXShell."""
+"""Frame extraction and cutoff-selection tools for SAXSShell."""
 
 from .base import FrameRecord
 from .manager import (

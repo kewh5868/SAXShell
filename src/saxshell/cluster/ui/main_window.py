@@ -377,7 +377,7 @@ class ClusterMainWindow(QMainWindow):
             self._update_suggested_output_dir(initial_frames_dir)
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("SAXShell (cluster)")
+        self.setWindowTitle("SAXSShell (cluster)")
         self.resize(1360, 860)
 
         central = QWidget()
@@ -1170,7 +1170,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="cluster-ui",
         description=(
-            "Launch the SAXShell cluster extraction UI for extracted PDB "
+            "Launch the SAXSShell cluster extraction UI for extracted PDB "
             "or XYZ frame folders."
         ),
     )

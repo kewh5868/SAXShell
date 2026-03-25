@@ -1,4 +1,4 @@
-SAXShell Complete Code and Workflow Outline
+SAXSShell Complete Code and Workflow Outline
 ===========================================
 src/saxshell/
     __init__.py
@@ -134,7 +134,7 @@ to start from extracted XYZ state (frames)
 ------------------------------------------------------------------------------------------
 Project Purpose
 ---------------
-SAXShell is a software framework for extracting chemically meaningful
+SAXSShell is a software framework for extracting chemically meaningful
 solute-centered cluster ensembles from molecular dynamics trajectories
 and using those extracted cluster families as interpretable building
 blocks for small-angle X-ray scattering (SAXS) model construction,
@@ -143,7 +143,7 @@ initial deterministic fitting, and Bayesian refinement.
 Core Idea
 ---------
 Rather than modeling SAXS directly from an entire molecular dynamics box
-as one opaque object, SAXShell reduces the trajectory into a set of
+as one opaque object, SAXSShell reduces the trajectory into a set of
 interpretable local structural motifs.
 
 These motifs are:
@@ -182,7 +182,7 @@ High-Level Workflow
 
 Conceptual Layering
 -------------------
-SAXShell should be separated into four major layers:
+SAXSShell should be separated into four major layers:
 
 1. Structural Extraction Layer
    - trajectory loading
@@ -987,7 +987,7 @@ Recommended Stable Bridge Objects
 
 One-Sentence Summary
 --------------------
-SAXShell should convert molecular dynamics trajectories into chemically
+SAXSShell should convert molecular dynamics trajectories into chemically
 meaningful solute-centered cluster ensembles, organize those ensembles
 into interpretable cluster families, use those families to construct a
 multicomponent SAXS model, initialize the model with an lmfit prefit,

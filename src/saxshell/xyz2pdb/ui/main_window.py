@@ -106,7 +106,7 @@ class XYZToPDBMainWindow(QMainWindow):
         )
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("SAXShell (xyz2pdb)")
+        self.setWindowTitle("SAXSShell (xyz2pdb)")
         self.resize(1360, 820)
 
         central = QWidget()

@@ -114,7 +114,7 @@ class BondAnalysisMainWindow(QMainWindow):
             self._update_selection_summary()
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("SAXShell (bondanalysis)")
+        self.setWindowTitle("SAXSShell (bondanalysis)")
         self.resize(1320, 840)
 
         central = QWidget()
@@ -1265,7 +1265,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="bondanalysis-ui",
         description=(
-            "Launch the SAXShell bondanalysis UI for stoichiometry-level "
+            "Launch the SAXSShell bondanalysis UI for stoichiometry-level "
             "cluster folders."
         ),
     )
