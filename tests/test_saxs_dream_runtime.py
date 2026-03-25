@@ -10,7 +10,7 @@ from saxshell.saxs._model_templates import (
     list_template_specs,
     load_template_module,
 )
-from saxshell.saxs.dream import SAXSDreamWorkflow
+from saxshell.saxs.dream import SAXSDreamResultsLoader, SAXSDreamWorkflow
 from saxshell.saxs.prefit import (
     SAXSPrefitWorkflow,
     compute_cluster_geometry_metadata,
@@ -19,6 +19,8 @@ from saxshell.saxs.project_manager import (
     SAXSProjectManager,
     build_project_paths,
 )
+
+POLY_LMA_HS_MIX_TEMPLATE = "template_pydream_poly_lma_hs_mix_approx"
 
 
 def _write_component_file(path, q_values, intensities):
@@ -104,7 +106,11 @@ def _build_minimal_saxs_project(tmp_path):
     return project_dir, paths
 
 
-def _build_poly_lma_geometry_project(tmp_path):
+def _build_poly_lma_geometry_project(
+    tmp_path,
+    *,
+    template_name: str = POLY_LMA_HS_MIX_TEMPLATE,
+):
     manager = SAXSProjectManager()
     project_dir = tmp_path / "poly_lma_project"
     settings = manager.create_project(project_dir)
@@ -112,7 +118,6 @@ def _build_poly_lma_geometry_project(tmp_path):
 
     q_values = np.linspace(0.05, 0.3, 8)
     component = np.linspace(10.0, 17.0, 8)
-    template_name = "template_pydream_poly_lma_hs"
 
     clusters_dir = paths.project_dir / "clusters"
     structure_dir = clusters_dir / "A"
@@ -252,11 +257,16 @@ def test_saxs_templates_support_runtime_contract():
 
 
 def test_poly_lma_runtime_bundle_includes_cluster_geometry_inputs(tmp_path):
-    project_dir, _paths, effective_radius = _build_poly_lma_geometry_project(
+    project_dir, _paths, _effective_radius = _build_poly_lma_geometry_project(
         tmp_path
     )
     prefit = SAXSPrefitWorkflow(project_dir)
     prefit.compute_cluster_geometry_table()
+    prefit.set_cluster_geometry_active_radii_type("bond_length")
+    updated_rows = prefit.cluster_geometry_rows()
+    updated_rows[0].sf_approximation = "ellipsoid"
+    prefit.set_cluster_geometry_rows(updated_rows)
+    active_row = prefit.cluster_geometry_rows()[0]
     prefit.save_fit(prefit.parameter_entries)
 
     workflow = SAXSDreamWorkflow(project_dir)
@@ -264,11 +274,75 @@ def test_poly_lma_runtime_bundle_includes_cluster_geometry_inputs(tmp_path):
     bundle = workflow.create_runtime_bundle(entries=entries)
     metadata = json.loads(bundle.metadata_path.read_text(encoding="utf-8"))
 
-    assert metadata["template_name"] == "template_pydream_poly_lma_hs"
+    assert metadata["template_name"] == POLY_LMA_HS_MIX_TEMPLATE
     assert metadata["lmfit_extra_inputs"] == ["effective_radii"]
     assert metadata["template_runtime_inputs"]["effective_radii"] == (
-        pytest.approx([effective_radius])
+        pytest.approx([active_row.effective_radius])
     )
+    assert metadata["cluster_geometry_metadata"]["active_radii_type"] == (
+        "bond_length"
+    )
+    assert (
+        metadata["cluster_geometry_metadata"]["rows"][0]["sf_approximation"]
+        == "ellipsoid"
+    )
+
+    active_count = sum(1 for entry in entries if entry.vary)
+    np.save(
+        bundle.run_dir / "dream_sampled_params.npy",
+        np.zeros((2, 3, active_count), dtype=float),
+    )
+    np.save(
+        bundle.run_dir / "dream_log_ps.npy",
+        np.zeros((2, 3), dtype=float),
+    )
+    loader = SAXSDreamResultsLoader(bundle.run_dir, burnin_percent=0)
+    assert loader.cluster_geometry_table is not None
+    assert loader.cluster_geometry_table.active_radii_type == "bond_length"
+    assert loader.cluster_geometry_table.rows[0].sf_approximation == (
+        "ellipsoid"
+    )
+
+
+def test_runtime_bundles_created_back_to_back_use_unique_run_directories(
+    tmp_path,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    workflow = SAXSDreamWorkflow(project_dir)
+    entries = workflow.create_default_parameter_map()
+
+    first_bundle = workflow.create_runtime_bundle(entries=entries)
+    second_bundle = workflow.create_runtime_bundle(entries=entries)
+
+    assert first_bundle.run_dir != second_bundle.run_dir
+    assert first_bundle.run_dir.is_dir()
+    assert second_bundle.run_dir.is_dir()
+    assert first_bundle.settings_path.is_file()
+    assert second_bundle.settings_path.is_file()
+
+
+def test_runtime_bundle_uses_reduced_saved_q_range_without_rebuild(tmp_path):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.q_min = 0.12
+    settings.q_max = 0.19
+    manager.save_project(settings)
+
+    workflow = SAXSDreamWorkflow(project_dir)
+    bundle = workflow.create_runtime_bundle()
+    metadata = json.loads(bundle.metadata_path.read_text(encoding="utf-8"))
+
+    assert np.allclose(
+        np.asarray(metadata["q_values"], dtype=float),
+        [0.12142857142857144, 0.15714285714285714, 0.19285714285714284],
+    )
+    assert len(metadata["experimental_intensities"]) == 3
+    assert len(metadata["solvent_intensities"]) == 3
+    assert len(metadata["theoretical_intensities"]) == 1
+    assert len(metadata["theoretical_intensities"][0]) == 3
 
 
 def test_dream_runtime_bundle_smoke_executes_and_writes_outputs(tmp_path):

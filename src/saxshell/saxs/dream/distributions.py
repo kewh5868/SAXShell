@@ -22,6 +22,7 @@ class DreamParameterEntry:
     vary: bool
     distribution: str
     dist_params: dict[str, float]
+    smart_preset_status: str = "custom"
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -54,6 +55,10 @@ class DreamParameterEntry:
                 },
                 value,
             ),
+            smart_preset_status=str(
+                payload.get("smart_preset_status", "custom")
+            ).strip()
+            or "custom",
         )
 
 
@@ -102,6 +107,39 @@ def build_default_parameter_map(
             )
         )
     return entries
+
+
+def build_default_parameter_map_from_prefit_entries(
+    entries,
+) -> list[DreamParameterEntry]:
+    payload: dict[str, object] = {
+        "weights": [],
+        "fit_parameters": {},
+        "fit_parameter_meta": {},
+    }
+    for entry in entries:
+        name = str(getattr(entry, "name", "")).strip()
+        if not name:
+            continue
+        meta = {
+            "vary": bool(getattr(entry, "vary", True)),
+            "min": float(getattr(entry, "minimum", 0.0)),
+            "max": float(getattr(entry, "maximum", 0.0)),
+        }
+        if str(getattr(entry, "category", "")).strip() == "weight":
+            payload["weights"].append(
+                {
+                    "structure": str(getattr(entry, "structure", "")),
+                    "motif": str(getattr(entry, "motif", "")),
+                    "name": name,
+                    "value": float(getattr(entry, "value", 0.0)),
+                    **meta,
+                }
+            )
+            continue
+        payload["fit_parameters"][name] = float(getattr(entry, "value", 0.0))
+        payload["fit_parameter_meta"][name] = meta
+    return build_default_parameter_map(payload)
 
 
 def load_parameter_map(path: str | Path) -> list[DreamParameterEntry]:
@@ -186,6 +224,7 @@ __all__ = [
     "BASE_DISTRIBUTIONS",
     "DreamParameterEntry",
     "build_default_parameter_map",
+    "build_default_parameter_map_from_prefit_entries",
     "load_parameter_map",
     "normalize_distribution_params",
     "save_parameter_map",

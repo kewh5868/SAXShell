@@ -476,6 +476,28 @@ class DebyeProfileBuilder:
         processed_files = 0
         last_progress_report = -1
         for cluster_bin in active_cluster_bins:
+            single_atom_component = (
+                self._try_build_assumed_single_atom_component(cluster_bin)
+            )
+            if single_atom_component is not None:
+                processed_files += len(cluster_bin.files)
+                if progress_callback is not None and _should_emit_progress(
+                    processed_files,
+                    total_files,
+                    last_progress_report,
+                ):
+                    last_progress_report = processed_files
+                    progress_callback(
+                        progress_offset + processed_files,
+                        max(progress_total or total_files or 1, 1),
+                        (
+                            "Building SAXS components: "
+                            f"{cluster_bin.structure}/{cluster_bin.motif}"
+                        ),
+                    )
+                components.append(single_atom_component)
+                continue
+
             filtered_structures: list[tuple[np.ndarray, list[str]]] = []
             unique_elements: list[str] = []
             for file_path in cluster_bin.files:
@@ -515,26 +537,13 @@ class DebyeProfileBuilder:
             mean_trace = stacked.mean(axis=0)
             std_trace = stacked.std(axis=0)
             se_trace = std_trace / np.sqrt(stacked.shape[0])
-            output_path = self._write_component_file(
-                cluster_bin.structure,
-                cluster_bin.motif,
-                mean_trace,
-                std_trace,
-                se_trace,
-                len(traces),
-            )
             components.append(
-                AveragedComponent(
-                    structure=cluster_bin.structure,
-                    motif=cluster_bin.motif,
-                    file_count=len(traces),
-                    representative=cluster_bin.representative,
-                    source_dir=cluster_bin.source_dir,
-                    q_values=self.q_values.copy(),
-                    mean_intensity=mean_trace,
-                    std_intensity=std_trace,
-                    se_intensity=se_trace,
-                    output_path=output_path,
+                self._build_component(
+                    cluster_bin,
+                    mean_trace=mean_trace,
+                    std_trace=std_trace,
+                    se_trace=se_trace,
+                    n_structures=len(traces),
                 )
             )
         if progress_callback is not None and progress_total is not None:
@@ -544,6 +553,39 @@ class DebyeProfileBuilder:
                 "SAXS component build complete.",
             )
         return components
+
+    def _try_build_assumed_single_atom_component(
+        self,
+        cluster_bin: ClusterBin,
+    ) -> AveragedComponent | None:
+        if not cluster_bin.files:
+            return None
+        filtered = self._load_filtered_structure(cluster_bin.files[0])
+        if filtered is None:
+            return None
+
+        filtered_coords, filtered_elements = filtered
+        if len(filtered_coords) != 1 or len(filtered_elements) != 1:
+            return None
+
+        f0_dictionary = build_f0_dictionary(filtered_elements, self.q_values)
+        trace = np.asarray(
+            compute_debye_intensity(
+                filtered_coords,
+                filtered_elements,
+                self.q_values,
+                f0_dictionary=f0_dictionary,
+            ),
+            dtype=float,
+        )
+        zeros = np.zeros_like(trace)
+        return self._build_component(
+            cluster_bin,
+            mean_trace=trace,
+            std_trace=zeros,
+            se_trace=zeros,
+            n_structures=len(cluster_bin.files),
+        )
 
     def _filter_atoms(
         self,
@@ -556,6 +598,13 @@ class DebyeProfileBuilder:
             include_elements=self.include_elements or None,
             exclude_elements=self.exclude_elements or None,
         )
+
+    def _load_filtered_structure(
+        self,
+        file_path: str | Path,
+    ) -> tuple[np.ndarray, list[str]] | None:
+        coords, elements = load_structure_file(file_path)
+        return self._filter_atoms(coords, elements)
 
     def _compute_cluster_traces(
         self,
@@ -597,6 +646,36 @@ class DebyeProfileBuilder:
                 return False
             atom_signatures.add(tuple(filtered_elements))
         return len(atom_signatures) == 1
+
+    def _build_component(
+        self,
+        cluster_bin: ClusterBin,
+        *,
+        mean_trace: np.ndarray,
+        std_trace: np.ndarray,
+        se_trace: np.ndarray,
+        n_structures: int,
+    ) -> AveragedComponent:
+        output_path = self._write_component_file(
+            cluster_bin.structure,
+            cluster_bin.motif,
+            mean_trace,
+            std_trace,
+            se_trace,
+            n_structures,
+        )
+        return AveragedComponent(
+            structure=cluster_bin.structure,
+            motif=cluster_bin.motif,
+            file_count=n_structures,
+            representative=cluster_bin.representative,
+            source_dir=cluster_bin.source_dir,
+            q_values=self.q_values.copy(),
+            mean_intensity=mean_trace,
+            std_intensity=std_trace,
+            se_intensity=se_trace,
+            output_path=output_path,
+        )
 
     def _write_component_file(
         self,

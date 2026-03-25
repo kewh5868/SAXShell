@@ -112,8 +112,9 @@ from scipy.stats import norm
 #       One effective interaction radius for each cluster profile.
 #
 # Practical notes:
-# - effective_radii are metadata, not fitted here
-# - equivalent-volume sphere radii are a reasonable first choice
+# - effective_radii are runtime metadata fallbacks and UI defaults
+# - generated geometry parameters override those metadata values when present
+# - this strict template is intended for sphere-only cluster geometry
 # - hard-sphere S(Q) is the default excluded-volume interaction model
 # - charged or attractive systems may need a different S(Q)
 #
@@ -212,6 +213,52 @@ def normalize_profile_fractions(raw_weights):
     return raw_weights / total
 
 
+def equivalent_volume_radius(semiaxes):
+    semiaxes = np.asarray(semiaxes, dtype=float)
+    if semiaxes.shape != (3,):
+        raise ValueError("semiaxes must contain exactly three values")
+    if np.any(semiaxes <= 0):
+        raise ValueError("semiaxes must be positive")
+    return float(np.cbrt(np.prod(semiaxes)))
+
+
+def _weight_keys_from_params(params):
+    return sorted(
+        (key for key in params if key.startswith("w") and key[1:].isdigit()),
+        key=lambda key: int(key.lstrip("w")),
+    )
+
+
+def _resolve_effective_radii(weight_keys, params, fallback_effective_radii):
+    fallback_radii = np.asarray(fallback_effective_radii, dtype=float)
+    resolved_radii: list[float] = []
+    for index, weight_key in enumerate(weight_keys):
+        sphere_name = f"r_eff_{weight_key}"
+        if sphere_name in params:
+            resolved_radii.append(float(params[sphere_name]))
+            continue
+        if index >= len(fallback_radii):
+            raise ValueError(
+                "Missing geometry parameters and fallback effective_radii "
+                f"for component {weight_key}."
+            )
+        resolved_radii.append(float(fallback_radii[index]))
+    return np.asarray(resolved_radii, dtype=float)
+
+
+def _full_params_to_param_dict(full_params):
+    try:
+        names = FULL_PARAMETER_NAMES
+    except NameError:
+        return None
+    if len(full_params) != len(names):
+        return None
+    return {
+        str(name): float(full_params[index])
+        for index, name in enumerate(names)
+    }
+
+
 def polydisperse_lma_hs_model(
     q_values,
     cluster_intensities,
@@ -264,11 +311,13 @@ def lmfit_model_profile(
     q, solvent_data, model_data, effective_radii, **params
 ):
     """Evaluate the polydisperse LMA hard-sphere model for lmfit."""
-    weight_keys = sorted(
-        (key for key in params if key.startswith("w")),
-        key=lambda key: int(key.lstrip("w")),
-    )
+    weight_keys = _weight_keys_from_params(params)
     raw_weights = np.asarray([params[key] for key in weight_keys], dtype=float)
+    resolved_effective_radii = _resolve_effective_radii(
+        weight_keys,
+        params,
+        effective_radii,
+    )
 
     phi_solute = params["phi_solute"]
     phi_int = params["phi_int"]
@@ -279,7 +328,7 @@ def lmfit_model_profile(
     return polydisperse_lma_hs_model(
         q_values=q,
         cluster_intensities=model_data,
-        effective_radii=effective_radii,
+        effective_radii=resolved_effective_radii,
         solvent_intensities=solvent_data,
         raw_weights=raw_weights,
         phi_solute=phi_solute,
@@ -297,19 +346,38 @@ def model_poly_lma_hs(params):
     global solvent_intensities
     global effective_radii
 
-    n_profiles = len(theoretical_intensities)
-
-    raw_weights = params[:n_profiles]
-    phi_solute = params[n_profiles]
-    phi_int = params[n_profiles + 1]
-    solvent_scale = params[n_profiles + 2]
-    scale = params[n_profiles + 3]
-    offset = params[n_profiles + 4]
+    params = np.asarray(params, dtype=float)
+    named_params = _full_params_to_param_dict(params)
+    if named_params is not None:
+        weight_keys = _weight_keys_from_params(named_params)
+        raw_weights = np.asarray(
+            [named_params[key] for key in weight_keys],
+            dtype=float,
+        )
+        resolved_effective_radii = _resolve_effective_radii(
+            weight_keys,
+            named_params,
+            effective_radii,
+        )
+        phi_solute = named_params["phi_solute"]
+        phi_int = named_params["phi_int"]
+        solvent_scale = named_params["solvent_scale"]
+        scale = named_params["scale"]
+        offset = named_params["offset"]
+    else:
+        n_profiles = len(theoretical_intensities)
+        raw_weights = params[:n_profiles]
+        resolved_effective_radii = np.asarray(effective_radii, dtype=float)
+        phi_solute = params[n_profiles]
+        phi_int = params[n_profiles + 1]
+        solvent_scale = params[n_profiles + 2]
+        scale = params[n_profiles + 3]
+        offset = params[n_profiles + 4]
 
     return polydisperse_lma_hs_model(
         q_values=q_values,
         cluster_intensities=theoretical_intensities,
-        effective_radii=effective_radii,
+        effective_radii=resolved_effective_radii,
         solvent_intensities=solvent_intensities,
         raw_weights=raw_weights,
         phi_solute=phi_solute,
@@ -324,8 +392,13 @@ def log_likelihood_poly_lma_hs(params):
     """Return the normalized Gaussian log-likelihood for pyDREAM."""
     global experimental_intensities
 
-    n_profiles = len(theoretical_intensities)
-    log_sigma = params[n_profiles + 5]
+    params = np.asarray(params, dtype=float)
+    named_params = _full_params_to_param_dict(params)
+    if named_params is not None:
+        log_sigma = named_params["log_sigma"]
+    else:
+        n_profiles = len(theoretical_intensities)
+        log_sigma = params[n_profiles + 5]
     sigma = np.exp(log_sigma)
 
     if sigma <= 0:

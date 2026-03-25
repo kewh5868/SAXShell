@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -118,6 +119,7 @@ class ScientificDoubleSpinBox(QDoubleSpinBox):
 
 class DreamTab(QWidget):
     ACTIVE_SETTINGS_LABEL = "Active project settings"
+    NO_SAVED_RUNS_LABEL = "No saved DREAM runs"
 
     edit_parameter_map_requested = Signal()
     save_settings_requested = Signal()
@@ -810,12 +812,21 @@ class DreamTab(QWidget):
             "saved parameter map."
         )
         self.run_button.clicked.connect(self.run_dream_requested.emit)
-        self.load_button = QPushButton("Load Results")
+        self.saved_runs_combo = QComboBox()
+        self.saved_runs_combo.setToolTip(
+            "Choose a completed DREAM run from the active project to "
+            "reload its saved settings, prior parameter map, and analysis "
+            "results for inspection."
+        )
+        self.saved_runs_combo.setEnabled(False)
+        self.load_button = QPushButton("Load Selected Run")
         self.load_button.setToolTip(
-            "Load the most recent DREAM run from the project runtime folder "
-            "and redraw the summary plots."
+            "Load the selected DREAM run from the active project runtime "
+            "folder and redraw the summary plots using that run's saved "
+            "settings and priors."
         )
         self.load_button.clicked.connect(self.load_results_requested.emit)
+        self.load_button.setEnabled(False)
         self.report_button = QPushButton("Save Statistics")
         self.report_button.setToolTip(
             "Save a text report of the currently loaded DREAM posterior summary."
@@ -837,13 +848,12 @@ class DreamTab(QWidget):
                 self.run_button,
             ],
         )
-        self.analysis_actions_group = self._build_action_group(
-            "DREAM Analysis",
-            [
-                self.load_button,
-                self.report_button,
-            ],
-        )
+        self.analysis_actions_group = QGroupBox("DREAM Analysis")
+        analysis_layout = QGridLayout(self.analysis_actions_group)
+        analysis_layout.addWidget(QLabel("Saved run"), 0, 0)
+        analysis_layout.addWidget(self.saved_runs_combo, 0, 1, 1, 2)
+        analysis_layout.addWidget(self.load_button, 1, 0)
+        analysis_layout.addWidget(self.report_button, 1, 1)
         action_sections_layout.addWidget(self.setup_actions_group)
         action_sections_layout.addWidget(self.analysis_actions_group)
         layout.addWidget(action_sections, row, 0, 1, 4)
@@ -1155,6 +1165,11 @@ class DreamTab(QWidget):
         group = QGroupBox("DREAM Output")
         layout = QVBoxLayout(group)
         self.progress_label = QLabel("Progress: idle")
+        self.progress_label.setWordWrap(True)
+        self.progress_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         layout.addWidget(self.progress_label)
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1)
@@ -1207,6 +1222,46 @@ class DreamTab(QWidget):
         if not text or text == self.ACTIVE_SETTINGS_LABEL:
             return None
         return text
+
+    def set_available_saved_runs(
+        self,
+        runs: list[tuple[str, str]],
+        selected_run_dir: str | None = None,
+    ) -> None:
+        selected_value = (
+            selected_run_dir
+            if selected_run_dir is not None
+            else self.selected_saved_run_dir()
+        )
+        self.saved_runs_combo.blockSignals(True)
+        self.saved_runs_combo.clear()
+        if not runs:
+            self.saved_runs_combo.addItem(self.NO_SAVED_RUNS_LABEL, None)
+            self.saved_runs_combo.setCurrentIndex(0)
+            self.saved_runs_combo.setEnabled(False)
+            self.load_button.setEnabled(False)
+            self.saved_runs_combo.blockSignals(False)
+            return
+        for label, run_dir in runs:
+            self.saved_runs_combo.addItem(label, run_dir)
+        if selected_value:
+            index = self.saved_runs_combo.findData(selected_value)
+            if index >= 0:
+                self.saved_runs_combo.setCurrentIndex(index)
+            else:
+                self.saved_runs_combo.setCurrentIndex(0)
+        else:
+            self.saved_runs_combo.setCurrentIndex(0)
+        self.saved_runs_combo.setEnabled(True)
+        self.load_button.setEnabled(True)
+        self.saved_runs_combo.blockSignals(False)
+
+    def selected_saved_run_dir(self) -> str | None:
+        value = self.saved_runs_combo.currentData()
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
     def set_settings(
         self,
@@ -1542,10 +1597,13 @@ class DreamTab(QWidget):
         self._current_model_plot_data = plot_data
         self._model_legend_line_map.clear()
         self._model_legend_handle_lookup.clear()
+        for axis in self.model_figure.axes:
+            axis.set_xscale("linear")
+            axis.set_yscale("linear")
         self.model_figure.clear()
         self._update_model_trace_toggle_state(plot_data)
-        axis = self.model_figure.add_subplot(111)
         if plot_data is None:
+            axis = self.model_figure.add_subplot(111)
             axis.text(
                 0.5,
                 0.5,
@@ -1557,9 +1615,15 @@ class DreamTab(QWidget):
             self.model_canvas.draw()
             return
 
+        grid = self.model_figure.add_gridspec(2, 1, height_ratios=[3, 1])
+        top_axis = self.model_figure.add_subplot(grid[0, 0])
+        bottom_axis = self.model_figure.add_subplot(
+            grid[1, 0], sharex=top_axis
+        )
+
         plotted_lines: list[object] = []
         if self.show_experimental_trace_checkbox.isChecked():
-            experimental_artist = axis.scatter(
+            experimental_artist = top_axis.scatter(
                 plot_data.q_values,
                 plot_data.experimental_intensities,
                 color="black",
@@ -1580,7 +1644,7 @@ class DreamTab(QWidget):
             if self.model_log_y_checkbox.isChecked():
                 solvent_mask &= solvent_values > 0.0
             if np.any(solvent_mask):
-                (solvent_line,) = axis.plot(
+                (solvent_line,) = top_axis.plot(
                     np.asarray(plot_data.q_values, dtype=float)[solvent_mask],
                     solvent_values[solvent_mask],
                     color="green",
@@ -1589,7 +1653,7 @@ class DreamTab(QWidget):
                 )
                 plotted_lines.append(solvent_line)
         if self.show_model_trace_checkbox.isChecked():
-            (model_line,) = axis.plot(
+            (model_line,) = top_axis.plot(
                 plot_data.q_values,
                 plot_data.model_intensities,
                 color="tab:red",
@@ -1597,25 +1661,24 @@ class DreamTab(QWidget):
                 label=f"Model ({plot_data.bestfit_method})",
             )
             plotted_lines.append(model_line)
-        axis.set_xscale(
+        top_axis.set_xscale(
             "log" if self.model_log_x_checkbox.isChecked() else "linear"
         )
-        axis.set_yscale(
+        top_axis.set_yscale(
             "log" if self.model_log_y_checkbox.isChecked() else "linear"
         )
-        axis.set_xlabel("q (Å⁻¹)")
-        axis.set_ylabel("Intensity (arb. units)")
-        axis.set_title(f"DREAM refinement: {plot_data.template_name}")
+        top_axis.set_ylabel("Intensity (arb. units)")
+        top_axis.set_title(f"DREAM refinement: {plot_data.template_name}")
         metric_lines = [
             f"RMSE: {plot_data.rmse:.4g}",
             f"Mean |res|: {plot_data.mean_abs_residual:.4g}",
             f"R²: {plot_data.r_squared:.4g}",
         ]
-        axis.text(
+        top_axis.text(
             0.02,
             0.02,
             "\n".join(metric_lines),
-            transform=axis.transAxes,
+            transform=top_axis.transAxes,
             ha="left",
             va="bottom",
             fontsize=9,
@@ -1626,8 +1689,23 @@ class DreamTab(QWidget):
                 "alpha": 0.85,
             },
         )
+        residuals = np.asarray(
+            plot_data.model_intensities - plot_data.experimental_intensities,
+            dtype=float,
+        )
+        bottom_axis.axhline(0.0, color="0.5", linewidth=1.0)
+        bottom_axis.plot(
+            plot_data.q_values,
+            residuals,
+            color="tab:blue",
+        )
+        bottom_axis.set_xscale(
+            "log" if self.model_log_x_checkbox.isChecked() else "linear"
+        )
+        bottom_axis.set_xlabel("q (Å⁻¹)")
+        bottom_axis.set_ylabel("Residual")
         if plotted_lines:
-            self._build_interactive_model_legend(axis, plotted_lines)
+            self._build_interactive_model_legend(top_axis, plotted_lines)
         self.model_figure.tight_layout()
         self.model_canvas.draw()
 
@@ -1980,11 +2058,11 @@ class DreamTab(QWidget):
         self.visualization_settings_changed.emit()
 
     def _update_violin_style_controls(self) -> None:
-        self.violin_custom_color_button.setEnabled(
-            self.selected_violin_palette() == "custom_solid"
-        )
+        self.violin_custom_color_button.setEnabled(True)
 
     def _choose_violin_custom_color(self) -> None:
+        self._set_combo_data(self.violin_palette_combo, "custom_solid")
+        self._update_violin_style_controls()
         self._choose_plot_color(
             self.violin_custom_color_button,
             title="Choose custom violin color",

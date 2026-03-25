@@ -193,3 +193,69 @@ def test_build_profiles_computes_single_atom_cluster_only_once(
     )
     np.testing.assert_allclose(component.se_intensity, np.zeros_like(q_values))
     assert component.file_count == 3
+
+
+def test_build_profiles_loads_only_one_single_atom_structure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clusters_dir = tmp_path / "clusters"
+    single_atom_dir = clusters_dir / "Cl1"
+    single_atom_dir.mkdir(parents=True)
+    for index in range(4):
+        (single_atom_dir / f"frame_{index:04d}.xyz").write_text(
+            "1\ncomment\nCl 0.0 0.0 0.0\n",
+            encoding="utf-8",
+        )
+
+    q_values = np.asarray([0.05, 0.15], dtype=float)
+    load_counter = {"count": 0}
+    debye_counter = {"count": 0}
+
+    def fake_load_structure_file(_file_path):
+        load_counter["count"] += 1
+        return np.asarray([[0.0, 0.0, 0.0]], dtype=float), ["Cl"]
+
+    def fake_build_f0_dictionary(elements, q_values):
+        del q_values
+        return {str(element): np.ones(2, dtype=float) for element in elements}
+
+    def fake_compute_debye_intensity(
+        coordinates,
+        elements,
+        q_values,
+        *,
+        exclude_elements=None,
+        f0_dictionary=None,
+    ):
+        del coordinates, elements, exclude_elements, f0_dictionary
+        debye_counter["count"] += 1
+        return np.asarray(q_values, dtype=float) + 2.0
+
+    monkeypatch.setattr(
+        profiles,
+        "load_structure_file",
+        fake_load_structure_file,
+    )
+    monkeypatch.setattr(
+        profiles,
+        "build_f0_dictionary",
+        fake_build_f0_dictionary,
+    )
+    monkeypatch.setattr(
+        profiles,
+        "compute_debye_intensity",
+        fake_compute_debye_intensity,
+    )
+
+    builder = DebyeProfileBuilder(
+        q_values=q_values,
+        output_dir=tmp_path / "components",
+    )
+
+    components = builder.build_profiles(clusters_dir)
+
+    assert load_counter["count"] == 1
+    assert debye_counter["count"] == 1
+    assert len(components) == 1
+    assert components[0].file_count == 4

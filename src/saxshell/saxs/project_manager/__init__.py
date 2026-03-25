@@ -18,6 +18,7 @@ from .project import (
     build_project_paths,
     guess_experimental_header_rows,
     infer_experimental_columns,
+    load_built_component_q_range,
     load_experimental_data_file,
     read_experimental_column_names,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "build_project_paths",
     "guess_experimental_header_rows",
     "infer_experimental_columns",
+    "load_built_component_q_range",
     "load_experimental_data_file",
     "read_experimental_column_names",
     "build_prior_histogram_export_payload",

@@ -73,6 +73,29 @@ class SolutionPropertiesSettings:
         )
 
 
+def solution_properties_mode_hint_text(mode: str) -> str:
+    normalized = _normalized_mode(mode)
+    common = (
+        "Common inputs: solution density, solute/solvent stoichiometry, and "
+        "both molar masses are always required."
+    )
+    if normalized == "mass":
+        return (
+            f"{common} Mass mode uses the directly entered solute and solvent "
+            "masses."
+        )
+    if normalized == "mass_percent":
+        return (
+            f"{common} Mass-percent mode uses the entered solute mass percent "
+            "and total measured solution mass."
+        )
+    return (
+        f"{common} Molarity mode assumes 1 L of solution. The solution "
+        "density is still required so that liter can be converted into total "
+        "solution mass, and the solvent mass is then inferred by subtraction."
+    )
+
+
 @dataclass(slots=True)
 class SolutionPropertiesResult:
     mode: str
@@ -750,4 +773,5 @@ __all__ = [
     "calculate_solution_properties",
     "load_solution_properties_metadata",
     "save_solution_properties_metadata",
+    "solution_properties_mode_hint_text",
 ]

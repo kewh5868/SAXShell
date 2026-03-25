@@ -12,9 +12,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+
 from saxshell.saxs.dream.distributions import (
     DreamParameterEntry,
-    build_default_parameter_map,
+    build_default_parameter_map_from_prefit_entries,
     load_parameter_map,
     save_parameter_map,
 )
@@ -124,12 +126,13 @@ class SAXSDreamWorkflow:
             self.parameter_map_path.read_text(encoding="utf-8")
         )
         entries = load_parameter_map(self.parameter_map_path)
+        normalized_entries = self._normalize_parameter_map_entries(entries)
         normalized_payload = {
-            "entries": [entry.to_dict() for entry in entries]
+            "entries": [entry.to_dict() for entry in normalized_entries]
         }
         if payload != normalized_payload:
-            save_parameter_map(self.parameter_map_path, entries)
-        return entries
+            save_parameter_map(self.parameter_map_path, normalized_entries)
+        return normalized_entries
 
     def save_parameter_map(
         self,
@@ -142,14 +145,10 @@ class SAXSDreamWorkflow:
         *,
         persist: bool = True,
     ) -> list[DreamParameterEntry]:
-        prefit_path = self.paths.prefit_dir / "pd_prefit_params.json"
-        if not prefit_path.is_file():
-            raise FileNotFoundError(
-                "No prefit parameters were saved. Complete and save a SAXS "
-                "prefit before setting up DREAM."
-            )
-        payload = json.loads(prefit_path.read_text(encoding="utf-8"))
-        entries = build_default_parameter_map(payload)
+        self._reload_prefit_workflow()
+        entries = build_default_parameter_map_from_prefit_entries(
+            self.prefit_workflow.parameter_entries
+        )
         if persist:
             self.save_parameter_map(entries)
         return entries
@@ -160,18 +159,19 @@ class SAXSDreamWorkflow:
         settings: DreamRunSettings | None = None,
         entries: list[DreamParameterEntry] | None = None,
     ) -> DreamRunBundle:
+        self._reload_prefit_workflow()
         parameter_entries = entries or self.load_parameter_map()
         active_settings = self._prepare_runtime_settings(
             settings or self.load_settings(),
             parameter_entries,
         )
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         run_name = (
             f"dream_{self._sanitize_runtime_name(self.paths.project_dir.name)}"
             f"_{timestamp}"
         )
         run_dir = self.paths.dream_runtime_dir / run_name
-        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.mkdir(parents=True, exist_ok=False)
 
         runtime_script_path = run_dir / f"{run_name}.py"
         metadata_path = run_dir / "dream_runtime_metadata.json"
@@ -360,6 +360,43 @@ class SAXSDreamWorkflow:
             active_settings.history_file = history_file or None
         return active_settings
 
+    def _reload_prefit_workflow(self) -> None:
+        self.prefit_workflow = SAXSPrefitWorkflow(
+            self.paths.project_dir,
+            template_dir=self.template_dir,
+        )
+
+    def _normalize_parameter_map_entries(
+        self,
+        entries: list[DreamParameterEntry],
+    ) -> list[DreamParameterEntry]:
+        default_entries = build_default_parameter_map_from_prefit_entries(
+            self.prefit_workflow.parameter_entries
+        )
+        existing_lookup = {entry.param: entry for entry in entries}
+        if list(existing_lookup) == [entry.param for entry in default_entries]:
+            return [existing_lookup[entry.param] for entry in default_entries]
+
+        normalized_entries: list[DreamParameterEntry] = []
+        for default_entry in default_entries:
+            existing_entry = existing_lookup.get(default_entry.param)
+            if existing_entry is None:
+                normalized_entries.append(default_entry)
+                continue
+            normalized_entries.append(
+                DreamParameterEntry(
+                    structure=default_entry.structure,
+                    motif=default_entry.motif,
+                    param_type=existing_entry.param_type,
+                    param=default_entry.param,
+                    value=existing_entry.value,
+                    vary=existing_entry.vary,
+                    distribution=existing_entry.distribution,
+                    dist_params=existing_entry.dist_params,
+                )
+            )
+        return normalized_entries
+
     @staticmethod
     def _sanitize_preset_name(preset_name: str) -> str:
         cleaned = re.sub(r'[<>:"/\\\\|?*]+', "_", preset_name.strip())
@@ -412,11 +449,18 @@ class SAXSDreamWorkflow:
                 evaluation.experimental_intensities.tolist()
             ),
             "theoretical_intensities": [
-                component.intensities.tolist()
-                for component in self.prefit_workflow.components
+                intensities.tolist()
+                for intensities in self.prefit_workflow._model_data_for_q_values(
+                    evaluation.q_values
+                )
             ],
             "solvent_intensities": (
-                self.prefit_workflow.solvent_data.tolist()
+                np.asarray(
+                    self.prefit_workflow._solvent_trace_for_q_values(
+                        evaluation.q_values
+                    ),
+                    dtype=float,
+                ).tolist()
                 if self.prefit_workflow.solvent_data is not None
                 else [0.0] * len(evaluation.q_values)
             ),

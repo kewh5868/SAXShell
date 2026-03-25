@@ -1612,13 +1612,27 @@ def test_rmcsetup_solution_properties_mode_switch_changes_active_page(
     project_dir, _paths = _build_sample_saxs_project(tmp_path)
     window = RMCSetupMainWindow(initial_project_dir=project_dir)
 
+    assert (
+        "Mass mode uses the directly entered solute and solvent masses."
+        in (window.solution_mode_hint_label.text())
+    )
+
     window.solution_mode_combo.setCurrentIndex(1)
     assert window.solution_mode_combo.currentData() == "mass_percent"
     assert window.solution_mode_stack.currentIndex() == 1
+    assert "Mass-percent mode uses the entered solute mass percent" in (
+        window.solution_mode_hint_label.text()
+    )
 
     window.solution_mode_combo.setCurrentIndex(2)
     assert window.solution_mode_combo.currentData() == "molarity_per_liter"
     assert window.solution_mode_stack.currentIndex() == 2
+    assert "Molarity mode assumes 1 L of solution." in (
+        window.solution_mode_hint_label.text()
+    )
+    assert "solution density is still required" in (
+        window.solution_mode_hint_label.text().lower()
+    )
 
 
 def test_rmcsetup_solution_presets_load_bundled_values(
@@ -1650,6 +1664,12 @@ def test_rmcsetup_solution_presets_load_bundled_values(
     assert window.solution_preset_combo.currentData() == (
         "PbI2 - DMSO - 0.405 M"
     )
+    assert window._solution_presets[
+        "PbI2 - DMSO - 0.405 M"
+    ].solvent_density_g_per_ml == pytest.approx(1.10)
+    assert window._solution_presets[
+        "PbI2 - DMF - 0.49 M"
+    ].solvent_density_g_per_ml == pytest.approx(0.944)
     assert window.solution_mode_combo.currentData() == "molarity_per_liter"
     assert window.solution_density_spin.value() == pytest.approx(1.273)
     assert window.solute_stoich_edit.text() == "PbI2"
