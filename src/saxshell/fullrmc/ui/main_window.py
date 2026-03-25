@@ -83,6 +83,7 @@ from saxshell.fullrmc.solution_properties import (
     SolutionPropertiesSettings,
     calculate_solution_properties,
     save_solution_properties_metadata,
+    solution_properties_mode_hint_text,
 )
 from saxshell.fullrmc.solution_property_presets import (
     SolutionPropertiesPreset,
@@ -816,6 +817,12 @@ class RMCSetupMainWindow(QMainWindow):
             self.molar_mass_solvent_spin,
         )
         solution_layout.addLayout(solution_form)
+        self.solution_mode_hint_label = QLabel()
+        self.solution_mode_hint_label.setWordWrap(True)
+        self.solution_mode_hint_label.setText(
+            solution_properties_mode_hint_text("mass")
+        )
+        solution_layout.addWidget(self.solution_mode_hint_label)
 
         self.solution_mode_stack = QStackedWidget()
 
@@ -3744,13 +3751,17 @@ class RMCSetupMainWindow(QMainWindow):
         self._update_solution_mode_widgets()
 
     def _update_solution_mode_widgets(self) -> None:
+        selected_mode = self._selected_solution_mode()
         mode_to_index = {
             "mass": 0,
             "mass_percent": 1,
             "molarity_per_liter": 2,
         }
         self.solution_mode_stack.setCurrentIndex(
-            mode_to_index.get(self._selected_solution_mode(), 0)
+            mode_to_index.get(selected_mode, 0)
+        )
+        self.solution_mode_hint_label.setText(
+            solution_properties_mode_hint_text(selected_mode)
         )
 
     def _calculate_solution_properties(self) -> None:

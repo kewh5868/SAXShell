@@ -5,6 +5,7 @@ import multiprocessing as mp
 import os
 import pickle
 import time
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,15 +19,20 @@ from PySide6.QtGui import QColor, QTextOption
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QApplication,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QHeaderView,
     QInputDialog,
+    QLabel,
     QMessageBox,
+    QScrollArea,
+    QSizePolicy,
 )
 
 import saxshell.saxs.project_manager.project as project_module
 from saxshell.saxs._model_templates import (
+    list_template_specs,
     load_template_module,
     load_template_spec,
 )
@@ -35,6 +41,7 @@ from saxshell.saxs.dream import (
     DreamRunSettings,
     SAXSDreamResultsLoader,
     SAXSDreamWorkflow,
+    load_dream_settings,
 )
 from saxshell.saxs.prefit import (
     SAXSPrefitWorkflow,
@@ -48,14 +55,36 @@ from saxshell.saxs.project_manager import (
     build_project_paths,
     load_experimental_data_file,
 )
+from saxshell.saxs.template_installation import install_template_candidate
 from saxshell.saxs.ui.distribution_window import DistributionSetupWindow
 from saxshell.saxs.ui.experimental_data_loader import (
     ExperimentalDataHeaderDialog,
 )
-from saxshell.saxs.ui.main_window import RuntimeBundleOpener, SAXSMainWindow
+from saxshell.saxs.ui.main_window import (
+    InstallModelDialog,
+    RuntimeBundleOpener,
+    SAXSMainWindow,
+    TemplateInstallRequest,
+)
+from saxshell.saxs.ui.prefit_tab import TableCellComboBox
 from saxshell.saxs.ui.prior_histogram_window import PriorHistogramWindow
 from saxshell.saxs.ui.project_setup_tab import ProjectSetupTab
+from saxshell.saxs.ui.solute_volume_fraction_widget import (
+    SOLUTE_VOLUME_FRACTION_CITATION_URL,
+    SoluteVolumeFractionWidget,
+)
 from saxshell.version import __version__
+
+POLY_LMA_HS_TEMPLATE = "template_pydream_poly_lma_hs"
+POLY_LMA_HS_MIX_TEMPLATE = "template_pydream_poly_lma_hs_mix_approx"
+
+
+def _table_column_index(table, label: str) -> int:
+    for index in range(table.columnCount()):
+        header_item = table.horizontalHeaderItem(index)
+        if header_item is not None and header_item.text() == label:
+            return index
+    raise AssertionError(f"Column {label!r} was not found.")
 
 
 def _write_component_file(path, q_values, intensities):
@@ -141,7 +170,12 @@ def _build_minimal_saxs_project(tmp_path):
     return project_dir, paths
 
 
-def _build_poly_lma_geometry_project(tmp_path):
+def _build_poly_lma_geometry_project(
+    tmp_path,
+    *,
+    template_name: str = POLY_LMA_HS_MIX_TEMPLATE,
+    single_atom: bool = False,
+):
     manager = SAXSProjectManager()
     project_dir = tmp_path / "poly_lma_project"
     settings = manager.create_project(project_dir)
@@ -149,21 +183,28 @@ def _build_poly_lma_geometry_project(tmp_path):
 
     q_values = np.linspace(0.05, 0.3, 8)
     component = np.linspace(10.0, 17.0, 8)
-    template_name = "template_pydream_poly_lma_hs"
 
     clusters_dir = paths.project_dir / "clusters"
     structure_dir = clusters_dir / "A"
     structure_dir.mkdir(parents=True, exist_ok=True)
-    (structure_dir / "frame_0001.xyz").write_text(
-        "4\nframe 1\nPb 0.0 0.0 0.0\nI 2.0 0.0 0.0\n"
-        "I 0.0 2.0 0.0\nI 0.0 0.0 2.0\n",
-        encoding="utf-8",
-    )
-    (structure_dir / "frame_0002.xyz").write_text(
-        "4\nframe 2\nPb 0.0 0.0 0.0\nI 2.2 0.0 0.0\n"
-        "I 0.0 1.8 0.0\nI 0.0 0.0 2.1\n",
-        encoding="utf-8",
-    )
+    if single_atom:
+        (structure_dir / "frame_0001.xyz").write_text(
+            "1\nframe 1\nI 0.0 0.0 0.0\n",
+            encoding="utf-8",
+        )
+        cluster_count = 1
+    else:
+        (structure_dir / "frame_0001.xyz").write_text(
+            "4\nframe 1\nPb 0.0 0.0 0.0\nI 2.0 0.0 0.0\n"
+            "I 0.0 2.0 0.0\nI 0.0 0.0 2.0\n",
+            encoding="utf-8",
+        )
+        (structure_dir / "frame_0002.xyz").write_text(
+            "4\nframe 2\nPb 0.0 0.0 0.0\nI 2.2 0.0 0.0\n"
+            "I 0.0 1.8 0.0\nI 0.0 0.0 2.1\n",
+            encoding="utf-8",
+        )
+        cluster_count = 2
     geometry_table = compute_cluster_geometry_metadata(
         clusters_dir,
         template_name=template_name,
@@ -196,11 +237,11 @@ def _build_poly_lma_geometry_project(tmp_path):
         json.dumps(
             {
                 "origin": "clusters",
-                "total_files": 2,
+                "total_files": cluster_count,
                 "structures": {
                     "A": {
                         "no_motif": {
-                            "count": 2,
+                            "count": cluster_count,
                             "weight": 1.0,
                             "representative": "frame_0001.xyz",
                             "profile_file": "A_no_motif.txt",
@@ -230,15 +271,23 @@ def _build_poly_lma_geometry_project(tmp_path):
     return project_dir, paths
 
 
-def _write_minimal_dream_results(project_dir):
+def _write_minimal_dream_results(
+    project_dir,
+    *,
+    settings: DreamRunSettings | None = None,
+    entries: list[DreamParameterEntry] | None = None,
+):
     prefit = SAXSPrefitWorkflow(project_dir)
     prefit.save_fit(prefit.parameter_entries)
     workflow = SAXSDreamWorkflow(project_dir)
-    entries = workflow.create_default_parameter_map()
-    bundle = workflow.create_runtime_bundle(entries=entries)
+    parameter_entries = entries or workflow.create_default_parameter_map()
+    bundle = workflow.create_runtime_bundle(
+        settings=settings,
+        entries=parameter_entries,
+    )
 
     active_values = np.asarray(
-        [entry.value for entry in entries if entry.vary],
+        [entry.value for entry in parameter_entries if entry.vary],
         dtype=float,
     )
     sampled_params = []
@@ -427,11 +476,23 @@ def test_saxs_main_window_loads_project_prefit_and_dream_tabs(qapp, tmp_path):
     assert "Refine scale before the other model parameters" in (
         window.prefit_tab.prefit_help_button.toolTip()
     )
+    assert window.prefit_tab.show_experimental_trace_checkbox.isChecked()
+    assert window.prefit_tab.show_model_trace_checkbox.isChecked()
+    assert not window.prefit_tab.show_solvent_trace_checkbox.isChecked()
     assert window.prefit_tab.log_x_checkbox.isChecked()
     assert window.prefit_tab.log_y_checkbox.isChecked()
     assert window.prefit_tab.plot_toolbar is not None
     assert not window.prefit_tab.autosave_checkbox.isChecked()
     assert window.prefit_tab.recommended_scale_button is not None
+    assert isinstance(window.prefit_tab._left_scroll_area, QScrollArea)
+    assert (
+        window.prefit_tab._left_scroll_area.widget()
+        is window.prefit_tab._left_panel
+    )
+    assert (
+        window.prefit_tab._pane_splitter.widget(0)
+        is window.prefit_tab._left_scroll_area
+    )
     assert window.prefit_tab.set_best_button is not None
     assert window.prefit_tab.reset_best_button is not None
     assert window.prefit_tab.restore_state_button is not None
@@ -449,6 +510,197 @@ def test_saxs_main_window_loads_project_prefit_and_dream_tabs(qapp, tmp_path):
         in window.prefit_tab.summary_box.toPlainText()
     )
     assert "Prefit Console" in window.prefit_tab.summary_box.toPlainText()
+
+
+def test_prefit_ionic_radius_help_button_shows_citation(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.prefit_tab.QMessageBox.information",
+        lambda _parent, title, message: messages.append((title, message)),
+    )
+
+    assert (
+        window.prefit_tab.cluster_geometry_ionic_radius_help_button is not None
+    )
+    window.prefit_tab.cluster_geometry_ionic_radius_help_button.click()
+
+    assert messages
+    assert messages[-1][0] == "Ionic Radius Estimate Help"
+    assert "Shannon, R. D. (1976)" in messages[-1][1]
+    assert "https://doi.org/10.1107/S0567739476001551" in messages[-1][1]
+    assert "+0.14 A offset" in messages[-1][1]
+    window.close()
+
+
+def test_prefit_solute_volume_fraction_help_button_shows_citation(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.prefit_tab.QMessageBox.information",
+        lambda _parent, title, message: messages.append((title, message)),
+    )
+
+    window.prefit_tab.solute_volume_fraction_help_button.click()
+
+    assert messages
+    assert messages[-1][0] == "Solute Volume Fraction Estimate Help"
+    assert "phi_solute ~= c_solute * vbar_solute" in messages[-1][1]
+    assert SOLUTE_VOLUME_FRACTION_CITATION_URL in messages[-1][1]
+    window.close()
+
+
+def test_prefit_solute_volume_fraction_estimator_is_template_aware_and_applies(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    base_project_dir, _base_paths = _build_minimal_saxs_project(
+        tmp_path / "basic"
+    )
+    base_window = SAXSMainWindow(initial_project_dir=base_project_dir)
+
+    assert base_window.prefit_tab._solute_volume_fraction_group.isHidden()
+
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(
+        tmp_path / "poly"
+    )
+    poly_window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+
+    assert not poly_window.prefit_tab._solute_volume_fraction_group.isHidden()
+    assert "phi_solute" in (
+        poly_window.prefit_tab.solute_volume_fraction_status_label.text()
+    )
+    assert poly_window.prefit_tab.solute_volume_fraction_is_collapsed()
+
+    poly_window.prefit_tab.solute_volume_fraction_collapse_button.click()
+    widget = poly_window.prefit_tab.solute_volume_fraction_widget
+    assert not poly_window.prefit_tab.solute_volume_fraction_is_collapsed()
+    assert widget.output_is_collapsed()
+    widget.solution_density_spin.setValue(1.0)
+    widget.solute_stoich_edit.setText("Cs1Pb1I3")
+    widget.solvent_stoich_edit.setText("H2O")
+    widget.molar_mass_solute_spin.setValue(620.0)
+    widget.molar_mass_solvent_spin.setValue(18.015)
+    widget.mass_solute_spin.setValue(1.0)
+    widget.mass_solvent_spin.setValue(9.0)
+    widget.solute_density_spin.setValue(2.0)
+    widget.solvent_density_spin.setValue(1.0)
+
+    widget.calculate_button.click()
+
+    phi_row = poly_window.prefit_tab.find_parameter_row("phi_solute")
+    assert phi_row >= 0
+    assert float(
+        poly_window.prefit_tab.parameter_table.item(phi_row, 3).text()
+    ) == pytest.approx(0.5 / 10.0, rel=1e-3)
+    assert "Applied estimate to phi_solute" in widget.output_box.toPlainText()
+    assert (
+        "Estimated solute volume: 0.500 cm^3"
+        in widget.output_box.toPlainText()
+    )
+    assert (
+        "Estimated solvent volume: 9.000 cm^3"
+        in widget.output_box.toPlainText()
+    )
+    assert (
+        "Applied estimate to phi_solute = 0.050000."
+        in widget.output_box.toPlainText()
+    )
+    assert not widget.output_is_collapsed()
+    widget.output_toggle_button.click()
+    assert widget.output_is_collapsed()
+    widget.output_toggle_button.click()
+    assert not widget.output_is_collapsed()
+
+    base_window.close()
+    poly_window.close()
+
+
+def test_prefit_solute_volume_fraction_widget_hides_solute_density_in_molarity_mode(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    window.prefit_tab.solute_volume_fraction_collapse_button.click()
+    widget = window.prefit_tab.solute_volume_fraction_widget
+    molarity_index = widget.solution_mode_combo.findData("molarity_per_liter")
+    assert molarity_index >= 0
+    widget.solution_mode_combo.setCurrentIndex(molarity_index)
+
+    assert not widget.solution_density_spin.isHidden()
+    assert widget.solute_density_label.isHidden()
+    assert widget.solute_density_spin.isHidden()
+    assert not widget.solvent_density_label.isHidden()
+    assert not widget.solvent_density_spin.isHidden()
+    assert widget.current_estimator_settings().solute_density_g_per_ml is None
+    assert (
+        widget.current_estimator_settings().solvent_density_g_per_ml
+        == pytest.approx(widget.solvent_density_spin.value())
+    )
+    assert "solute density is hidden in molarity mode" in (
+        widget.solution_mode_hint_label.text().lower()
+    )
+    window.close()
+
+
+def test_solute_volume_fraction_widget_loads_builtin_solvent_density_presets(
+    qapp,
+):
+    del qapp
+    widget = SoluteVolumeFractionWidget()
+
+    dmf_index = widget.solution_preset_combo.findData("PbI2 - DMF - 0.49 M")
+    assert dmf_index >= 0
+    widget.solution_preset_combo.setCurrentIndex(dmf_index)
+    widget._load_selected_solution_preset()
+    assert widget.solvent_density_spin.value() == pytest.approx(0.944)
+
+    dmso_index = widget.solution_preset_combo.findData("PbI2 - DMSO - 0.405 M")
+    assert dmso_index >= 0
+    widget.solution_preset_combo.setCurrentIndex(dmso_index)
+    widget._load_selected_solution_preset()
+    assert widget.solvent_density_spin.value() == pytest.approx(1.10)
+
+
+def test_prefit_fallback_preserves_selected_template_when_workflow_not_ready(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, paths = _build_poly_lma_geometry_project(tmp_path)
+    (paths.project_dir / "md_prior_weights.json").unlink()
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert window.prefit_workflow is None
+    assert (
+        window.prefit_tab.selected_template_name() == POLY_LMA_HS_MIX_TEMPLATE
+    )
+    assert not window.prefit_tab._solute_volume_fraction_group.isHidden()
+    assert not window.prefit_tab._cluster_geometry_group.isHidden()
+    assert window.prefit_tab.parameter_table.rowCount() == 0
+    assert "Prefit workflow is not ready yet." in (
+        window.prefit_tab.output_box.toPlainText()
+    )
+    window.close()
 
 
 def test_prefit_cluster_geometry_section_is_template_aware(qapp, tmp_path):
@@ -474,6 +726,14 @@ def test_prefit_cluster_geometry_section_is_template_aware(qapp, tmp_path):
     assert "Compute cluster geometry metadata" in (
         poly_window.prefit_tab.cluster_geometry_status_label.text()
     )
+    assert (
+        poly_window.prefit_tab.cluster_geometry_radii_type_combo.currentData()
+        == "ionic"
+    )
+    assert (
+        poly_window.prefit_tab.cluster_geometry_ionic_radius_type_combo.currentData()
+        == "effective"
+    )
     assert poly_window.prefit_tab.cluster_geometry_table.rowCount() == 0
     assert "waiting on template metadata" in (
         poly_window.prefit_tab._summary_text.lower()
@@ -485,11 +745,33 @@ def test_prefit_cluster_geometry_section_is_template_aware(qapp, tmp_path):
     poly_window.compute_prefit_cluster_geometry()
 
     assert poly_window.prefit_tab.cluster_geometry_table.rowCount() == 1
+    assert poly_window.prefit_tab._current_evaluation is not None
+    assert (
+        poly_window.prefit_tab.cluster_geometry_progress_label.text()
+        == "Cluster geometry metadata ready."
+    )
+    assert (
+        poly_window.prefit_tab.cluster_geometry_progress_bar.value()
+        == poly_window.prefit_tab.cluster_geometry_progress_bar.maximum()
+    )
+    assert poly_window._progress_dialog is not None
+    assert not poly_window._progress_dialog.isVisible()
+    table = poly_window.prefit_tab.cluster_geometry_table
+    sf_column = _table_column_index(table, "S.F. Approx.")
+    map_to_column = _table_column_index(table, "Map To")
     mapping_combo = poly_window.prefit_tab.cluster_geometry_table.cellWidget(
-        0, 6
+        0,
+        map_to_column,
     )
     assert mapping_combo is not None
     assert str(mapping_combo.currentData()) == "w0"
+    sf_combo = poly_window.prefit_tab.cluster_geometry_table.cellWidget(
+        0,
+        sf_column,
+    )
+    assert sf_combo is not None
+    assert isinstance(sf_combo, TableCellComboBox)
+    assert str(sf_combo.currentData()) in {"sphere", "ellipsoid"}
     assert "effective_radii" in (
         poly_window.prefit_tab.cluster_geometry_status_label.text()
     )
@@ -516,6 +798,706 @@ def test_prefit_cluster_geometry_section_is_template_aware(qapp, tmp_path):
     assert poly_window.dream_tab.run_button.toolTip()
     assert "DREAM Summary" in poly_window.dream_tab.output_box.toPlainText()
     assert "DREAM Console" in poly_window.dream_tab.output_box.toPlainText()
+    base_window.close()
+    poly_window.close()
+
+
+def test_strict_poly_lma_hs_ui_only_offers_sphere_cluster_geometry_shape(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_poly_lma_geometry_project(
+        tmp_path,
+        template_name=POLY_LMA_HS_TEMPLATE,
+    )
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    window.compute_prefit_cluster_geometry()
+
+    table = window.prefit_tab.cluster_geometry_table
+    sf_column = _table_column_index(table, "S.F. Approx.")
+    sf_combo = table.cellWidget(0, sf_column)
+
+    assert sf_combo is not None
+    assert sf_combo.count() == 1
+    assert str(sf_combo.currentData()) == "sphere"
+    assert sf_combo.findData("ellipsoid") < 0
+    window.close()
+
+
+def test_prefit_cluster_geometry_invalid_radii_alert_and_revert(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    window.compute_prefit_cluster_geometry()
+
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_show_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    updated_rows = window.prefit_workflow.cluster_geometry_rows()
+    updated_rows[0].bond_length_sphere_effective_radius = 0.0
+    updated_rows[0].bond_length_ellipsoid_semiaxis_a = 0.0
+    updated_rows[0].bond_length_ellipsoid_semiaxis_b = 0.0
+    updated_rows[0].bond_length_ellipsoid_semiaxis_c = 0.0
+    window.prefit_workflow.set_cluster_geometry_rows(updated_rows)
+    window._refresh_prefit_cluster_geometry_section()
+
+    window.prefit_tab.toggle_cluster_geometry_radii_button.click()
+
+    assert errors
+    assert errors[-1][0] == "Invalid cluster geometry radii"
+    assert "positive active radii" in errors[-1][1]
+    assert (
+        window.prefit_tab.cluster_geometry_radii_type_combo.currentData()
+        == ("ionic")
+    )
+    assert window.prefit_workflow.cluster_geometry_active_radii_type() == (
+        "ionic"
+    )
+    assert window.prefit_tab._current_evaluation is not None
+    window.close()
+
+
+def test_prefit_cluster_geometry_manual_radius_updates_refresh_model(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    window.compute_prefit_cluster_geometry()
+
+    table = window.prefit_tab.cluster_geometry_table
+    radius_column = _table_column_index(table, "Effective Radius")
+    semiaxis_x_column = _table_column_index(table, "Semiaxis X")
+    semiaxis_y_column = _table_column_index(table, "Semiaxis Y")
+    semiaxis_z_column = _table_column_index(table, "Semiaxis Z")
+    sf_column = _table_column_index(table, "S.F. Approx.")
+    sf_combo = table.cellWidget(0, sf_column)
+    assert sf_combo is not None
+
+    sphere_index = sf_combo.findData("sphere")
+    assert sphere_index >= 0
+    sf_combo.setCurrentIndex(sphere_index)
+
+    original_model = np.asarray(
+        window.prefit_tab.current_evaluation().model_intensities,
+        dtype=float,
+    ).copy()
+    table.item(0, radius_column).setText("3.5")
+    window.prefit_tab.update_cluster_geometry_button.click()
+
+    updated_row = window.prefit_workflow.cluster_geometry_rows()[0]
+    assert updated_row.radii_type_used == "ionic"
+    assert updated_row.sf_approximation == "sphere"
+    assert updated_row.ionic_sphere_effective_radius == pytest.approx(3.5)
+    assert updated_row.effective_radius == pytest.approx(3.5)
+    radius_param_row = window.prefit_tab.find_parameter_row("r_eff_w0")
+    assert radius_param_row >= 0
+    assert float(
+        window.prefit_tab.parameter_table.item(radius_param_row, 3).text()
+    ) == pytest.approx(3.5)
+    updated_model = np.asarray(
+        window.prefit_tab.current_evaluation().model_intensities,
+        dtype=float,
+    )
+    assert not np.allclose(updated_model, original_model)
+
+    window.prefit_tab.toggle_cluster_geometry_radii_button.click()
+    bond_length_radius = float(table.item(0, radius_column).text())
+    window.prefit_tab.toggle_cluster_geometry_radii_button.click()
+    assert bond_length_radius != pytest.approx(3.5)
+    assert float(table.item(0, radius_column).text()) == pytest.approx(
+        3.5,
+        rel=1e-3,
+    )
+
+    ellipsoid_index = sf_combo.findData("ellipsoid")
+    assert ellipsoid_index >= 0
+    sf_combo.setCurrentIndex(ellipsoid_index)
+    ellipsoid_model = np.asarray(
+        window.prefit_tab.current_evaluation().model_intensities,
+        dtype=float,
+    ).copy()
+    table.item(0, semiaxis_x_column).setText("4.0")
+    table.item(0, semiaxis_y_column).setText("3.0")
+    table.item(0, semiaxis_z_column).setText("2.0")
+    window.prefit_tab.update_cluster_geometry_button.click()
+
+    updated_row = window.prefit_workflow.cluster_geometry_rows()[0]
+    expected_effective_radius = float(np.cbrt(4.0 * 3.0 * 2.0))
+    assert updated_row.sf_approximation == "ellipsoid"
+    assert updated_row.active_semiaxis_a == pytest.approx(4.0)
+    assert updated_row.active_semiaxis_b == pytest.approx(3.0)
+    assert updated_row.active_semiaxis_c == pytest.approx(2.0)
+    assert updated_row.effective_radius == pytest.approx(
+        expected_effective_radius
+    )
+    for parameter_name, expected_value in (
+        ("a_eff_w0", 4.0),
+        ("b_eff_w0", 3.0),
+        ("c_eff_w0", 2.0),
+    ):
+        parameter_row = window.prefit_tab.find_parameter_row(parameter_name)
+        assert parameter_row >= 0
+        assert float(
+            window.prefit_tab.parameter_table.item(parameter_row, 3).text()
+        ) == pytest.approx(expected_value)
+    refreshed_model = np.asarray(
+        window.prefit_tab.current_evaluation().model_intensities,
+        dtype=float,
+    )
+    assert not np.allclose(refreshed_model, ellipsoid_model)
+    window.close()
+
+
+def test_update_model_uses_regenerated_mixed_geometry_parameters(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    window.compute_prefit_cluster_geometry()
+
+    table = window.prefit_tab.cluster_geometry_table
+    semiaxis_x_column = _table_column_index(table, "Semiaxis X")
+    semiaxis_y_column = _table_column_index(table, "Semiaxis Y")
+    semiaxis_z_column = _table_column_index(table, "Semiaxis Z")
+    sf_column = _table_column_index(table, "S.F. Approx.")
+    sf_combo = table.cellWidget(0, sf_column)
+    assert sf_combo is not None
+    assert str(sf_combo.currentData()) == "ellipsoid"
+
+    original_model = np.asarray(
+        window.prefit_tab.current_evaluation().model_intensities,
+        dtype=float,
+    ).copy()
+
+    table.item(0, semiaxis_x_column).setText("8.0")
+    table.item(0, semiaxis_y_column).setText("2.0")
+    table.item(0, semiaxis_z_column).setText("1.0")
+    window.update_prefit_model()
+
+    updated_model = np.asarray(
+        window.prefit_tab.current_evaluation().model_intensities,
+        dtype=float,
+    )
+    assert not np.allclose(updated_model, original_model)
+    for parameter_name, expected_value in (
+        ("a_eff_w0", 8.0),
+        ("b_eff_w0", 2.0),
+        ("c_eff_w0", 1.0),
+    ):
+        parameter_row = window.prefit_tab.find_parameter_row(parameter_name)
+        assert parameter_row >= 0
+        assert float(
+            window.prefit_tab.parameter_table.item(parameter_row, 3).text()
+        ) == pytest.approx(expected_value)
+
+    sphere_index = sf_combo.findData("sphere")
+    assert sphere_index >= 0
+    sf_combo.setCurrentIndex(sphere_index)
+    radius_column = _table_column_index(table, "Effective Radius")
+    table.item(0, radius_column).setText("4.5")
+    ellipsoid_model = updated_model.copy()
+    window.update_prefit_model()
+
+    sphere_model = np.asarray(
+        window.prefit_tab.current_evaluation().model_intensities,
+        dtype=float,
+    )
+    assert not np.allclose(sphere_model, ellipsoid_model)
+    radius_param_row = window.prefit_tab.find_parameter_row("r_eff_w0")
+    assert radius_param_row >= 0
+    assert float(
+        window.prefit_tab.parameter_table.item(radius_param_row, 3).text()
+    ) == pytest.approx(4.5)
+    assert window.prefit_tab.find_parameter_row("a_eff_w0") < 0
+    window.close()
+
+
+def test_prefit_mixed_shape_switch_logs_when_equivalent_sphere_curve_is_unchanged(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    window.compute_prefit_cluster_geometry()
+
+    table = window.prefit_tab.cluster_geometry_table
+    sf_column = _table_column_index(table, "S.F. Approx.")
+    sf_combo = table.cellWidget(0, sf_column)
+    assert sf_combo is not None
+    assert str(sf_combo.currentData()) == "ellipsoid"
+
+    previous_model = np.asarray(
+        window.prefit_tab.current_evaluation().model_intensities,
+        dtype=float,
+    ).copy()
+
+    sphere_index = sf_combo.findData("sphere")
+    assert sphere_index >= 0
+    sf_combo.setCurrentIndex(sphere_index)
+    window.update_prefit_model()
+
+    current_model = np.asarray(
+        window.prefit_tab.current_evaluation().model_intensities,
+        dtype=float,
+    )
+    assert np.allclose(previous_model, current_model, rtol=1e-5, atol=1e-8)
+    assert "equivalent-sphere approximation" in (
+        window.prefit_tab.output_box.toPlainText().lower()
+    )
+    assert "changed approximation: ellipsoid -> sphere" in (
+        window.prefit_tab.output_box.toPlainText().lower()
+    )
+    window.close()
+
+
+def test_prefit_cluster_geometry_notes_are_collapsed_with_expand_and_tooltip(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    window.compute_prefit_cluster_geometry()
+
+    table = window.prefit_tab.cluster_geometry_table
+    notes_column = _table_column_index(table, "Notes")
+    notes_item = table.item(0, notes_column)
+    assert notes_item is not None
+    expected_collapsed_height = max(
+        table.verticalHeader().defaultSectionSize(),
+        30,
+    )
+    collapsed_height = table.rowHeight(0)
+
+    assert "\n" not in notes_item.text()
+    assert collapsed_height == expected_collapsed_height
+    assert (
+        "Active sphere radius" in notes_item.toolTip()
+        or "Active ellipsoid semiaxes" in notes_item.toolTip()
+    )
+
+    window.prefit_tab._on_cluster_geometry_cell_double_clicked(0, notes_column)
+    expanded_item = table.item(0, notes_column)
+    assert expanded_item is not None
+    expanded_height = table.rowHeight(0)
+    assert "\n" in expanded_item.text()
+    assert expanded_height >= collapsed_height
+
+    window.prefit_tab._on_cluster_geometry_cell_double_clicked(0, notes_column)
+    recollapsed_item = table.item(0, notes_column)
+    assert recollapsed_item is not None
+    assert "\n" not in recollapsed_item.text()
+    assert table.rowHeight(0) == expected_collapsed_height
+    assert table.rowHeight(0) <= expanded_height
+    window.close()
+
+
+def test_prefit_cluster_geometry_notes_reload_collapsed(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    window.compute_prefit_cluster_geometry()
+
+    table = window.prefit_tab.cluster_geometry_table
+    notes_column = _table_column_index(table, "Notes")
+    window.prefit_tab._on_cluster_geometry_cell_double_clicked(0, notes_column)
+    assert "\n" in table.item(0, notes_column).text()
+    window.close()
+
+    reloaded_window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    reloaded_table = reloaded_window.prefit_tab.cluster_geometry_table
+    reloaded_notes_item = reloaded_table.item(0, notes_column)
+    assert reloaded_notes_item is not None
+    assert "\n" not in reloaded_notes_item.text()
+    assert reloaded_table.rowHeight(0) == max(
+        reloaded_table.verticalHeader().defaultSectionSize(),
+        30,
+    )
+    reloaded_window.close()
+
+
+def test_prefit_cluster_geometry_paths_are_collapsed_with_expand_and_tooltip(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    window.compute_prefit_cluster_geometry()
+
+    table = window.prefit_tab.cluster_geometry_table
+    path_column = _table_column_index(table, "Path")
+    path_item = table.item(0, path_column)
+    assert path_item is not None
+    expected_collapsed_height = max(
+        table.verticalHeader().defaultSectionSize(),
+        30,
+    )
+    collapsed_height = table.rowHeight(0)
+
+    assert "..." in path_item.text()
+    assert path_item.toolTip().endswith("/clusters/A")
+    assert collapsed_height == expected_collapsed_height
+
+    window.prefit_tab._on_cluster_geometry_cell_double_clicked(0, path_column)
+    expanded_item = table.item(0, path_column)
+    assert expanded_item is not None
+    assert "..." not in expanded_item.text()
+    assert expanded_item.text() == expanded_item.toolTip()
+    assert table.rowHeight(0) >= collapsed_height
+
+    window.prefit_tab._on_cluster_geometry_cell_double_clicked(0, path_column)
+    recollapsed_item = table.item(0, path_column)
+    assert recollapsed_item is not None
+    assert "..." in recollapsed_item.text()
+    assert table.rowHeight(0) == expected_collapsed_height
+    window.close()
+
+
+def test_prefit_cluster_geometry_paths_reload_collapsed(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    window.compute_prefit_cluster_geometry()
+
+    table = window.prefit_tab.cluster_geometry_table
+    path_column = _table_column_index(table, "Path")
+    window.prefit_tab._on_cluster_geometry_cell_double_clicked(0, path_column)
+    assert "..." not in table.item(0, path_column).text()
+    window.close()
+
+    reloaded_window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    reloaded_table = reloaded_window.prefit_tab.cluster_geometry_table
+    reloaded_path_item = reloaded_table.item(0, path_column)
+    assert reloaded_path_item is not None
+    assert "..." in reloaded_path_item.text()
+    assert reloaded_table.rowHeight(0) == max(
+        reloaded_table.verticalHeader().defaultSectionSize(),
+        30,
+    )
+    reloaded_window.close()
+
+
+def test_prefit_cluster_geometry_ionic_radius_type_switch_updates_display(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    window.compute_prefit_cluster_geometry()
+
+    table = window.prefit_tab.cluster_geometry_table
+    radius_column = _table_column_index(table, "Effective Radius")
+    radii_type_column = _table_column_index(table, "Radii Type")
+    ionic_combo = window.prefit_tab.cluster_geometry_ionic_radius_type_combo
+
+    assert ionic_combo.currentData() == "effective"
+    effective_radius = float(table.item(0, radius_column).text())
+    assert table.item(0, radii_type_column).text() == "Ionic (effective)"
+
+    crystal_index = ionic_combo.findData("crystal")
+    assert crystal_index >= 0
+    ionic_combo.setCurrentIndex(crystal_index)
+
+    updated_row = window.prefit_workflow.cluster_geometry_rows()[0]
+    crystal_radius = float(table.item(0, radius_column).text())
+
+    assert ionic_combo.currentData() == "crystal"
+    assert (
+        window.prefit_workflow.cluster_geometry_active_ionic_radius_type()
+        == ("crystal")
+    )
+    assert updated_row.ionic_radius_type_used == "crystal"
+    assert table.item(0, radii_type_column).text() == "Ionic (crystal)"
+    assert crystal_radius == pytest.approx(
+        updated_row.crystal_ionic_sphere_effective_radius,
+        rel=1e-3,
+    )
+    assert crystal_radius > effective_radius
+    if updated_row.sf_approximation == "sphere":
+        radius_param_row = window.prefit_tab.find_parameter_row("r_eff_w0")
+        assert radius_param_row >= 0
+        assert float(
+            window.prefit_tab.parameter_table.item(radius_param_row, 3).text()
+        ) == pytest.approx(updated_row.crystal_ionic_sphere_effective_radius)
+    else:
+        for parameter_name, expected_value in (
+            ("a_eff_w0", updated_row.crystal_ionic_ellipsoid_semiaxis_a),
+            ("b_eff_w0", updated_row.crystal_ionic_ellipsoid_semiaxis_b),
+            ("c_eff_w0", updated_row.crystal_ionic_ellipsoid_semiaxis_c),
+        ):
+            parameter_row = window.prefit_tab.find_parameter_row(
+                parameter_name
+            )
+            assert parameter_row >= 0
+            assert float(
+                window.prefit_tab.parameter_table.item(
+                    parameter_row,
+                    3,
+                ).text()
+            ) == pytest.approx(expected_value)
+
+    window.prefit_tab.toggle_cluster_geometry_radii_button.click()
+    assert not ionic_combo.isEnabled()
+    window.prefit_tab.toggle_cluster_geometry_radii_button.click()
+    assert ionic_combo.isEnabled()
+    assert ionic_combo.currentData() == "crystal"
+    window.close()
+
+
+def test_update_model_reports_all_nonpositive_cluster_geometry_radii(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    window.compute_prefit_cluster_geometry()
+
+    table = window.prefit_tab.cluster_geometry_table
+    semiaxis_x_column = _table_column_index(table, "Semiaxis X")
+    semiaxis_y_column = _table_column_index(table, "Semiaxis Y")
+    sf_column = _table_column_index(table, "S.F. Approx.")
+    sf_combo = table.cellWidget(0, sf_column)
+    assert sf_combo is not None
+    ellipsoid_index = sf_combo.findData("ellipsoid")
+    assert ellipsoid_index >= 0
+    sf_combo.setCurrentIndex(ellipsoid_index)
+
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_show_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    table.item(0, semiaxis_x_column).setText("-1.0")
+    table.item(0, semiaxis_y_column).setText("0.0")
+    window.prefit_tab.update_button.click()
+
+    assert errors
+    assert errors[-1][0] == "Update model failed"
+    assert "Cluster geometry radii must be positive" in errors[-1][1]
+    assert "A Semiaxis X=-1" in errors[-1][1]
+    assert "A Semiaxis Y=0" in errors[-1][1]
+    assert window.prefit_tab.current_evaluation() is not None
+    window.close()
+
+
+def test_prefit_cluster_geometry_controls_switch_radii_mode_and_shape(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    window.compute_prefit_cluster_geometry()
+
+    table = window.prefit_tab.cluster_geometry_table
+    radius_column = _table_column_index(table, "Effective Radius")
+    radii_type_column = _table_column_index(table, "Radii Type")
+    semiaxis_x_column = _table_column_index(table, "Semiaxis X")
+    semiaxis_y_column = _table_column_index(table, "Semiaxis Y")
+    semiaxis_z_column = _table_column_index(table, "Semiaxis Z")
+    sf_column = _table_column_index(table, "S.F. Approx.")
+    initial_sf_combo = table.cellWidget(0, sf_column)
+    parameter_names = [
+        window.prefit_tab.parameter_table.item(row, 2).text()
+        for row in range(window.prefit_tab.parameter_table.rowCount())
+    ]
+
+    initial_radius_text = table.item(0, radius_column).text()
+    assert (
+        window.prefit_tab.cluster_geometry_radii_type_combo.currentData()
+        == ("ionic")
+    )
+    assert (
+        window.prefit_tab.cluster_geometry_ionic_radius_type_combo.currentData()
+        == "effective"
+    )
+    assert table.item(0, radii_type_column).text() == "Ionic (effective)"
+    assert initial_sf_combo is not None
+    if str(initial_sf_combo.currentData()) == "sphere":
+        assert "r_eff_w0" in parameter_names
+        assert "a_eff_w0" not in parameter_names
+    else:
+        assert "r_eff_w0" not in parameter_names
+        assert "a_eff_w0" in parameter_names
+        assert "b_eff_w0" in parameter_names
+        assert "c_eff_w0" in parameter_names
+
+    window.prefit_tab.toggle_cluster_geometry_radii_button.click()
+
+    assert (
+        window.prefit_tab.cluster_geometry_radii_type_combo.currentData()
+        == ("bond_length")
+    )
+    assert table.item(0, radii_type_column).text() == "Bond length"
+    sf_combo = table.cellWidget(0, sf_column)
+    assert sf_combo is not None
+    sphere_index = sf_combo.findData("sphere")
+    assert sphere_index >= 0
+    sf_combo.setCurrentIndex(sphere_index)
+    sphere_parameter_names = [
+        window.prefit_tab.parameter_table.item(row, 2).text()
+        for row in range(window.prefit_tab.parameter_table.rowCount())
+    ]
+
+    assert table.item(0, radius_column).text() != initial_radius_text
+    assert (
+        table.item(0, radius_column).foreground().color().name().lower()
+        == window.prefit_tab.ACTIVE_CLUSTER_GEOMETRY_COLOR.name().lower()
+    )
+    assert "r_eff_w0" in sphere_parameter_names
+    assert "a_eff_w0" not in sphere_parameter_names
+    assert "b_eff_w0" not in sphere_parameter_names
+    assert "c_eff_w0" not in sphere_parameter_names
+
+    ellipsoid_index = sf_combo.findData("ellipsoid")
+    assert ellipsoid_index >= 0
+    sf_combo.setCurrentIndex(ellipsoid_index)
+    ellipsoid_parameter_names = [
+        window.prefit_tab.parameter_table.item(row, 2).text()
+        for row in range(window.prefit_tab.parameter_table.rowCount())
+    ]
+
+    updated_row = window.prefit_workflow.cluster_geometry_rows()[0]
+    assert updated_row.sf_approximation == "ellipsoid"
+    assert updated_row.radii_type_used == "bond_length"
+    assert float(table.item(0, radius_column).text()) == pytest.approx(
+        updated_row.effective_radius,
+        rel=1e-3,
+    )
+    assert float(table.item(0, semiaxis_x_column).text()) == pytest.approx(
+        updated_row.active_semiaxis_a,
+        rel=1e-3,
+    )
+    assert float(table.item(0, semiaxis_y_column).text()) == pytest.approx(
+        updated_row.active_semiaxis_b,
+        rel=1e-3,
+    )
+    assert float(table.item(0, semiaxis_z_column).text()) == pytest.approx(
+        updated_row.active_semiaxis_c,
+        rel=1e-3,
+    )
+    assert (
+        table.item(0, radius_column).foreground().color().name().lower()
+        == window.prefit_tab.INACTIVE_CLUSTER_GEOMETRY_COLOR.name().lower()
+    )
+    for column in (
+        semiaxis_x_column,
+        semiaxis_y_column,
+        semiaxis_z_column,
+    ):
+        assert (
+            table.item(0, column).foreground().color().name().lower()
+            == window.prefit_tab.ACTIVE_CLUSTER_GEOMETRY_COLOR.name().lower()
+        )
+    assert "r_eff_w0" not in ellipsoid_parameter_names
+    assert "a_eff_w0" in ellipsoid_parameter_names
+    assert "b_eff_w0" in ellipsoid_parameter_names
+    assert "c_eff_w0" in ellipsoid_parameter_names
+    window.close()
+
+
+def test_prefit_cluster_geometry_single_atom_can_switch_to_bond_length_mode(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(
+        tmp_path,
+        template_name=POLY_LMA_HS_TEMPLATE,
+        single_atom=True,
+    )
+    window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    window.compute_prefit_cluster_geometry()
+
+    table = window.prefit_tab.cluster_geometry_table
+    radius_column = _table_column_index(table, "Effective Radius")
+    errors: list[tuple[str, str]] = []
+    window._show_error = lambda title, message: errors.append((title, message))
+
+    ionic_radius = float(table.item(0, radius_column).text())
+    window.prefit_tab.toggle_cluster_geometry_radii_button.click()
+
+    assert not errors
+    assert (
+        window.prefit_tab.cluster_geometry_radii_type_combo.currentData()
+        == ("bond_length")
+    )
+    assert window.prefit_workflow.cluster_geometry_active_radii_type() == (
+        "bond_length"
+    )
+    bond_length_radius = float(table.item(0, radius_column).text())
+    assert bond_length_radius == pytest.approx(1.39, rel=1e-3)
+    assert 0.0 < bond_length_radius < ionic_radius
+    assert window.prefit_tab.current_evaluation() is not None
+    window.close()
+
+
+def test_poly_lma_dream_parameter_map_tracks_cluster_geometry_shape(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    window.compute_prefit_cluster_geometry()
+
+    sf_column = _table_column_index(
+        window.prefit_tab.cluster_geometry_table,
+        "S.F. Approx.",
+    )
+    sf_combo = window.prefit_tab.cluster_geometry_table.cellWidget(
+        0, sf_column
+    )
+    assert sf_combo is not None
+
+    sphere_index = sf_combo.findData("sphere")
+    assert sphere_index >= 0
+    sf_combo.setCurrentIndex(sphere_index)
+    workflow = window._load_dream_workflow()
+    sphere_entries = workflow.create_default_parameter_map(persist=False)
+    sphere_names = [entry.param for entry in sphere_entries]
+    assert "r_eff_w0" in sphere_names
+    assert "a_eff_w0" not in sphere_names
+
+    ellipsoid_index = sf_combo.findData("ellipsoid")
+    assert ellipsoid_index >= 0
+    sf_combo.setCurrentIndex(ellipsoid_index)
+    workflow = window._load_dream_workflow()
+    ellipsoid_entries = workflow.create_default_parameter_map(persist=False)
+    ellipsoid_names = [entry.param for entry in ellipsoid_entries]
+    assert "r_eff_w0" not in ellipsoid_names
+    assert "a_eff_w0" in ellipsoid_names
+    assert "b_eff_w0" in ellipsoid_names
+    assert "c_eff_w0" in ellipsoid_names
+
+    window.close()
 
 
 def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
@@ -537,6 +1519,9 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert window.xyz2pdb_action.text() == "Open xyz2pdb Conversion"
     assert window.bondanalysis_action.text() == "Open Bond Analysis"
     assert window.fullrmc_action.text() == "Open fullrmc Setup"
+    assert (
+        window.volume_fraction_action.text() == "Open Volume Fraction Estimate"
+    )
 
     assert window.settings_menu.title() == "Settings"
     assert (
@@ -555,6 +1540,41 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert "GitHub repository:" in version_text
     assert "Developer contact:" in version_text
     assert "keith.white@colorado.edu" in version_text
+
+
+def test_volume_fraction_tool_window_opens_with_citation_and_target(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    window._open_solute_volume_fraction_tool()
+
+    tool_window = window._solute_volume_fraction_tool_window
+    assert tool_window is not None
+    assert tool_window.windowTitle() == "Volume Fraction Estimate"
+    labels = [label.text() for label in tool_window.findChildren(QLabel)]
+    assert any(SOLUTE_VOLUME_FRACTION_CITATION_URL in text for text in labels)
+    assert "phi_solute" in tool_window.estimator_widget.target_label.text()
+    molarity_index = tool_window.estimator_widget.solution_mode_combo.findData(
+        "molarity_per_liter"
+    )
+    assert molarity_index >= 0
+    tool_window.estimator_widget.solution_mode_combo.setCurrentIndex(
+        molarity_index
+    )
+    assert tool_window.estimator_widget.solute_density_label.isHidden()
+    assert tool_window.estimator_widget.solute_density_spin.isHidden()
+    assert not tool_window.estimator_widget.solvent_density_label.isHidden()
+    assert not tool_window.estimator_widget.solvent_density_spin.isHidden()
+    assert "solvent-density closure" in (
+        tool_window.estimator_widget.solution_mode_hint_label.text().lower()
+    )
+
+    tool_window.close()
+    window.close()
 
 
 def test_contact_action_opens_developer_contact_window(qapp, monkeypatch):
@@ -739,10 +1759,42 @@ def test_dream_layout_uses_combined_output_and_two_plot_panels(qapp):
         window.dream_tab.output_box.horizontalScrollBarPolicy()
         == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
     )
+    assert window.dream_tab.progress_label.wordWrap()
+    assert (
+        window.dream_tab.progress_label.sizePolicy().horizontalPolicy()
+        == QSizePolicy.Policy.Ignored
+    )
     assert window.dream_tab._main_splitter is window.dream_tab._top_splitter
     assert window.dream_tab._main_splitter.count() == 2
     assert window.dream_tab.verbose_checkbox.isChecked()
     assert window.dream_tab.verbose_interval_spin.value() == pytest.approx(1.0)
+
+
+def test_dream_progress_label_wrap_does_not_resize_left_pane(qapp):
+    del qapp
+    window = SAXSMainWindow()
+    window.show()
+    QApplication.processEvents()
+
+    before_sizes = window.dream_tab._main_splitter.sizes()
+    message = (
+        "DREAM runtime output path is writing a very long progress message "
+        "that should wrap inside the left pane instead of expanding the "
+        "splitter width to accommodate the text length. " * 4
+    ).strip()
+
+    window.dream_tab.start_progress(message)
+    QApplication.processEvents()
+
+    after_sizes = window.dream_tab._main_splitter.sizes()
+
+    assert window.dream_tab.progress_label.wordWrap()
+    assert (
+        window.dream_tab.progress_label.sizePolicy().horizontalPolicy()
+        == QSizePolicy.Policy.Ignored
+    )
+    assert abs(after_sizes[0] - before_sizes[0]) <= 2
+    window.close()
     assert window.dream_tab.verbose_interval_spin.isEnabled()
     assert window.dream_tab.selected_search_filter_preset() == "medium"
     assert window.dream_tab.chains_spin.value() == 4
@@ -808,7 +1860,7 @@ def test_dream_layout_uses_combined_output_and_two_plot_panels(qapp):
     assert window.dream_tab.violin_outline_width_spin.value() == pytest.approx(
         0.8
     )
-    assert not window.dream_tab.violin_custom_color_button.isEnabled()
+    assert window.dream_tab.violin_custom_color_button.isEnabled()
     assert window.dream_tab.violin_point_color_button.isEnabled()
     assert (
         "automatic post-run filter assessment"
@@ -1076,6 +2128,393 @@ def test_distribution_window_can_toggle_all_vary_flags(qapp):
     assert all(entry.vary for entry in window.current_entries())
 
 
+def test_distribution_window_recommended_vary_selection_keeps_radius_params_off(
+    qapp,
+):
+    del qapp
+    window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="PbI2",
+                motif="motif_A",
+                param_type="Both",
+                param="w0",
+                value=0.6,
+                vary=False,
+                distribution="lognorm",
+                dist_params={"loc": 0.0, "scale": 0.6, "s": 0.1},
+            ),
+            DreamParameterEntry(
+                structure="",
+                motif="",
+                param_type="SAXS",
+                param="scale",
+                value=1.0,
+                vary=False,
+                distribution="norm",
+                dist_params={"loc": 1.0, "scale": 0.2},
+            ),
+            DreamParameterEntry(
+                structure="PbI2",
+                motif="motif_A",
+                param_type="SAXS",
+                param="r_eff_w0",
+                value=4.0,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 4.0, "scale": 0.2},
+            ),
+        ]
+    )
+
+    window.select_recommended_vary_button.click()
+    entries = window.current_entries()
+
+    assert entries[0].vary is True
+    assert entries[1].vary is True
+    assert entries[2].vary is False
+
+
+def test_distribution_window_smart_prior_preset_tightens_and_relaxes_spreads(
+    qapp,
+):
+    del qapp
+    window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="PbI2",
+                motif="motif_A",
+                param_type="Both",
+                param="w0",
+                value=0.6,
+                vary=True,
+                distribution="lognorm",
+                dist_params={"loc": 0.0, "scale": 0.6, "s": 0.2},
+            ),
+            DreamParameterEntry(
+                structure="",
+                motif="",
+                param_type="SAXS",
+                param="scale",
+                value=1.0,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 1.0, "scale": 0.3},
+            ),
+        ]
+    )
+
+    window.smart_prior_preset_combo.setCurrentText("Strict")
+    window.apply_smart_prior_preset_button.click()
+    strict_entries = window.current_entries()
+    assert strict_entries[0].dist_params["s"] == pytest.approx(0.13)
+    assert strict_entries[1].dist_params["scale"] == pytest.approx(0.195)
+
+    window.smart_prior_preset_combo.setCurrentText("Lenient")
+    window.apply_smart_prior_preset_button.click()
+    lenient_entries = window.current_entries()
+    assert lenient_entries[0].dist_params["s"] == pytest.approx(0.195)
+    assert lenient_entries[1].dist_params["scale"] == pytest.approx(0.2925)
+
+
+def test_distribution_window_smart_prior_preset_can_target_selected_structures(
+    qapp,
+):
+    del qapp
+    window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="Small",
+                motif="m1",
+                param_type="Both",
+                param="w0",
+                value=0.3,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 0.3, "scale": 0.1},
+            ),
+            DreamParameterEntry(
+                structure="Small",
+                motif="m1",
+                param_type="SAXS",
+                param="r_eff_w0",
+                value=3.0,
+                vary=False,
+                distribution="norm",
+                dist_params={"loc": 3.0, "scale": 0.2},
+            ),
+            DreamParameterEntry(
+                structure="Large",
+                motif="m2",
+                param_type="Both",
+                param="w1",
+                value=0.7,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 0.7, "scale": 0.1},
+            ),
+        ]
+    )
+
+    scope_index = window.smart_prior_apply_scope_combo.findData("selected")
+    assert scope_index >= 0
+    window.smart_prior_apply_scope_combo.setCurrentIndex(scope_index)
+    window.table.selectRow(0)
+    window.smart_prior_preset_combo.setCurrentText("Strict")
+    window.apply_smart_prior_preset_button.click()
+    entries = window.current_entries()
+
+    assert entries[0].dist_params["scale"] == pytest.approx(0.065)
+    assert entries[1].dist_params["scale"] == pytest.approx(0.13)
+    assert entries[2].dist_params["scale"] == pytest.approx(0.1)
+    assert window.table.cellWidget(0, 8).currentText() == "Strict"
+    assert window.table.cellWidget(1, 8).currentText() == "Strict"
+    assert window.table.cellWidget(2, 8).currentText() == "Custom / Manual"
+
+
+def test_distribution_window_size_aware_prior_preset_uses_effective_radii(
+    qapp,
+):
+    del qapp
+    window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="Small",
+                motif="m1",
+                param_type="Both",
+                param="w0",
+                value=0.3,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 0.3, "scale": 0.1},
+            ),
+            DreamParameterEntry(
+                structure="Large",
+                motif="m2",
+                param_type="Both",
+                param="w1",
+                value=0.7,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 0.7, "scale": 0.1},
+            ),
+            DreamParameterEntry(
+                structure="Small",
+                motif="m1",
+                param_type="SAXS",
+                param="r_eff_w0",
+                value=3.0,
+                vary=False,
+                distribution="norm",
+                dist_params={"loc": 3.0, "scale": 0.2},
+            ),
+            DreamParameterEntry(
+                structure="Large",
+                motif="m2",
+                param_type="SAXS",
+                param="r_eff_w1",
+                value=8.0,
+                vary=False,
+                distribution="norm",
+                dist_params={"loc": 8.0, "scale": 0.2},
+            ),
+        ]
+    )
+
+    window.smart_prior_preset_combo.setCurrentText(
+        "Strict Small / Lenient Large"
+    )
+    window.apply_smart_prior_preset_button.click()
+    entries = window.current_entries()
+
+    assert entries[0].dist_params["scale"] == pytest.approx(0.065)
+    assert entries[1].dist_params["scale"] == pytest.approx(0.15)
+    assert entries[2].dist_params["scale"] == pytest.approx(0.13)
+    assert entries[3].dist_params["scale"] == pytest.approx(0.3)
+
+
+def test_distribution_window_size_aware_preset_sets_row_statuses_for_all_structures(
+    qapp,
+):
+    del qapp
+    window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="Small",
+                motif="m1",
+                param_type="Both",
+                param="w0",
+                value=0.3,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 0.3, "scale": 0.1},
+            ),
+            DreamParameterEntry(
+                structure="Large",
+                motif="m2",
+                param_type="Both",
+                param="w1",
+                value=0.7,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 0.7, "scale": 0.1},
+            ),
+            DreamParameterEntry(
+                structure="Small",
+                motif="m1",
+                param_type="SAXS",
+                param="r_eff_w0",
+                value=3.0,
+                vary=False,
+                distribution="norm",
+                dist_params={"loc": 3.0, "scale": 0.2},
+            ),
+            DreamParameterEntry(
+                structure="Large",
+                motif="m2",
+                param_type="SAXS",
+                param="r_eff_w1",
+                value=8.0,
+                vary=False,
+                distribution="norm",
+                dist_params={"loc": 8.0, "scale": 0.2},
+            ),
+            DreamParameterEntry(
+                structure="",
+                motif="",
+                param_type="SAXS",
+                param="scale",
+                value=1.0,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 1.0, "scale": 0.3},
+            ),
+        ]
+    )
+
+    scope_index = window.smart_prior_apply_scope_combo.findData("selected")
+    assert scope_index >= 0
+    window.smart_prior_apply_scope_combo.setCurrentIndex(scope_index)
+    window.table.selectRow(0)
+    window.smart_prior_preset_combo.setCurrentText(
+        "Strict Small / Lenient Large"
+    )
+    window.apply_smart_prior_preset_button.click()
+
+    assert window.table.cellWidget(0, 8).currentText() == "Strict"
+    assert window.table.cellWidget(1, 8).currentText() == "Lenient"
+    assert window.table.cellWidget(2, 8).currentText() == "Strict"
+    assert window.table.cellWidget(3, 8).currentText() == "Lenient"
+    assert window.table.cellWidget(4, 8).currentText() == "Proportional"
+
+
+def test_distribution_window_row_status_can_override_single_structure_preset(
+    qapp,
+):
+    del qapp
+    window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="Small",
+                motif="m1",
+                param_type="Both",
+                param="w0",
+                value=0.3,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 0.3, "scale": 0.1},
+            ),
+            DreamParameterEntry(
+                structure="Large",
+                motif="m2",
+                param_type="Both",
+                param="w1",
+                value=0.7,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 0.7, "scale": 0.1},
+            ),
+            DreamParameterEntry(
+                structure="Small",
+                motif="m1",
+                param_type="SAXS",
+                param="r_eff_w0",
+                value=3.0,
+                vary=False,
+                distribution="norm",
+                dist_params={"loc": 3.0, "scale": 0.2},
+            ),
+            DreamParameterEntry(
+                structure="Large",
+                motif="m2",
+                param_type="SAXS",
+                param="r_eff_w1",
+                value=8.0,
+                vary=False,
+                distribution="norm",
+                dist_params={"loc": 8.0, "scale": 0.2},
+            ),
+        ]
+    )
+
+    window.smart_prior_preset_combo.setCurrentText(
+        "Strict Small / Lenient Large"
+    )
+    window.apply_smart_prior_preset_button.click()
+
+    small_status_combo = window.table.cellWidget(0, 8)
+    very_lenient_index = small_status_combo.findData("very_lenient")
+    assert very_lenient_index >= 0
+    small_status_combo.setCurrentIndex(very_lenient_index)
+    entries = window.current_entries()
+
+    assert entries[0].dist_params["scale"] == pytest.approx(0.14625)
+    assert entries[2].dist_params["scale"] == pytest.approx(0.2925)
+    assert entries[1].dist_params["scale"] == pytest.approx(0.15)
+    assert entries[3].dist_params["scale"] == pytest.approx(0.3)
+    assert window.table.cellWidget(0, 8).currentText() == "Very Lenient"
+    assert window.table.cellWidget(2, 8).currentText() == "Very Lenient"
+    assert window.table.cellWidget(1, 8).currentText() == "Lenient"
+
+
+def test_distribution_window_warns_when_effective_radius_is_set_to_vary(
+    qapp,
+    monkeypatch,
+):
+    del qapp
+    window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="PbI2",
+                motif="motif_A",
+                param_type="SAXS",
+                param="r_eff_w0",
+                value=4.0,
+                vary=False,
+                distribution="norm",
+                dist_params={"loc": 4.0, "scale": 0.2},
+            )
+        ]
+    )
+
+    warnings: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.distribution_window.QMessageBox.warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+
+    vary_box = window.table.cellWidget(0, 5)
+    assert isinstance(vary_box, QCheckBox)
+    vary_box.setChecked(True)
+
+    assert warnings
+    assert warnings[-1][0] == "Effective radius variation warning"
+    assert "r_eff_w0" in warnings[-1][1]
+    assert "not recommended to vary effective-radius parameters" in (
+        warnings[-1][1]
+    )
+
+
 def test_distribution_window_previews_all_weight_priors_in_shared_plot(qapp):
     del qapp
     window = DistributionSetupWindow(
@@ -1141,6 +2580,231 @@ def test_template_dropdowns_use_display_names_and_tooltips(qapp):
         == basic_spec.description
     )
     assert tab.selected_template_name() == basic_spec.name
+
+
+def test_template_dropdowns_hide_deprecated_by_default_but_load_selected_deprecated(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    project_template_names = {
+        str(window.project_setup_tab.template_combo.itemData(index) or "")
+        for index in range(window.project_setup_tab.template_combo.count())
+    }
+    prefit_template_names = {
+        str(window.prefit_tab.template_combo.itemData(index) or "")
+        for index in range(window.prefit_tab.template_combo.count())
+    }
+
+    assert not window.project_setup_tab.show_deprecated_templates()
+    assert not window.prefit_tab.show_deprecated_templates()
+    assert window.project_setup_tab.selected_template_name() == (
+        "template_pd_likelihood_monosq_decoupled"
+    )
+    assert window.prefit_tab.selected_template_name() == (
+        "template_pd_likelihood_monosq_decoupled"
+    )
+    assert "template_pd_likelihood_monosq_decoupled" in project_template_names
+    assert "template_pd_likelihood_monosq_decoupled" in prefit_template_names
+    assert "template_likelihood_monosq" not in project_template_names
+    assert "template_likelihood_monosq" not in prefit_template_names
+    assert "template_pydream_poly_lma_hs_legacy" not in project_template_names
+    assert "template_pydream_poly_lma_hs_legacy" not in prefit_template_names
+    window.close()
+
+
+def test_template_dropdowns_can_show_deprecated_and_stay_synced(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    window.project_setup_tab.show_deprecated_templates_checkbox.setChecked(
+        True
+    )
+
+    project_template_names = {
+        str(window.project_setup_tab.template_combo.itemData(index) or "")
+        for index in range(window.project_setup_tab.template_combo.count())
+    }
+    prefit_template_names = {
+        str(window.prefit_tab.template_combo.itemData(index) or "")
+        for index in range(window.prefit_tab.template_combo.count())
+    }
+
+    assert window.project_setup_tab.show_deprecated_templates()
+    assert window.prefit_tab.show_deprecated_templates()
+    assert "template_likelihood_monosq" in project_template_names
+    assert "template_likelihood_monosq" in prefit_template_names
+    assert "template_pydream_poly_lma_hs_legacy" in project_template_names
+    assert "template_pydream_poly_lma_hs_legacy" in prefit_template_names
+
+    window.prefit_tab.show_deprecated_templates_checkbox.setChecked(False)
+
+    project_template_names = {
+        str(window.project_setup_tab.template_combo.itemData(index) or "")
+        for index in range(window.project_setup_tab.template_combo.count())
+    }
+    prefit_template_names = {
+        str(window.prefit_tab.template_combo.itemData(index) or "")
+        for index in range(window.prefit_tab.template_combo.count())
+    }
+
+    assert not window.project_setup_tab.show_deprecated_templates()
+    assert not window.prefit_tab.show_deprecated_templates()
+    assert window.project_setup_tab.selected_template_name() == (
+        "template_pd_likelihood_monosq_decoupled"
+    )
+    assert window.prefit_tab.selected_template_name() == (
+        "template_pd_likelihood_monosq_decoupled"
+    )
+    assert "template_likelihood_monosq" not in project_template_names
+    assert "template_likelihood_monosq" not in prefit_template_names
+    assert "template_pd_likelihood_monosq_decoupled" in project_template_names
+    assert "template_pd_likelihood_monosq_decoupled" in prefit_template_names
+    window.close()
+
+
+def test_install_model_dialog_collects_model_inputs(qapp, tmp_path):
+    del qapp
+    candidate_template = tmp_path / "candidate_install_model.py"
+    candidate_template.write_text(
+        "import numpy as np\n"
+        "# model_lmfit: lmfit_model_profile\n"
+        "# model_pydream: log_likelihood_candidate\n"
+        "# inputs_lmfit: q, solvent_data, model_data, params\n"
+        "# inputs_pydream: q_values, experimental_intensities, "
+        "solvent_intensities, theoretical_intensities, params\n"
+        "# param_columns: Structure, Motif, Param, Value, Vary, Min, Max\n"
+        "# param: scale,1.0,True,0.0,10.0\n"
+        "def lmfit_model_profile(q, solvent_data, model_data, **params):\n"
+        "    del q, solvent_data\n"
+        "    return params['scale'] * np.asarray(model_data[0], dtype=float)\n"
+        "def log_likelihood_candidate(params):\n"
+        "    del params\n"
+        "    return -1.0\n",
+        encoding="utf-8",
+    )
+    dialog = InstallModelDialog()
+    dialog.model_name_edit.setText("Dialog Candidate Model")
+    dialog.template_path_edit.setText(str(candidate_template))
+    dialog.description_edit.setPlainText("Dialog-installed candidate.")
+
+    request = dialog.selected_request()
+
+    assert request == TemplateInstallRequest(
+        model_name="Dialog Candidate Model",
+        template_path=candidate_template.resolve(),
+        model_description="Dialog-installed candidate.",
+    )
+
+
+def test_install_model_template_installs_and_refreshes_template_lists(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    install_dir = tmp_path / "installed_templates"
+    request = TemplateInstallRequest(
+        model_name="Installed Candidate Model",
+        template_path=(
+            Path(
+                "tests/template_candidates/valid_installable_model.py"
+            ).resolve()
+        ),
+        model_description="Installed from the Project Setup dialog.",
+    )
+    info_messages: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        window,
+        "_prompt_template_install_request",
+        lambda: request,
+    )
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.main_window.install_template_candidate",
+        lambda template_path, **kwargs: install_template_candidate(
+            template_path,
+            destination_dir=install_dir,
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.main_window.list_template_specs",
+        lambda **kwargs: list_template_specs(install_dir, **kwargs),
+    )
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.main_window.QMessageBox.information",
+        lambda _parent, title, message: info_messages.append((title, message)),
+    )
+
+    window.project_setup_tab.install_model_button.click()
+
+    assert (install_dir / "template_installed_candidate_model.py").is_file()
+    assert (install_dir / "template_installed_candidate_model.json").is_file()
+    assert any(
+        window.project_setup_tab.template_combo.itemText(index)
+        == "Installed Candidate Model"
+        for index in range(window.project_setup_tab.template_combo.count())
+    )
+    assert any(
+        window.prefit_tab.template_combo.itemText(index)
+        == "Installed Candidate Model"
+        for index in range(window.prefit_tab.template_combo.count())
+    )
+    assert info_messages
+    assert info_messages[0][0] == "Model installed"
+    assert "Installed Candidate Model" in info_messages[0][1]
+
+
+def test_install_model_template_surfaces_validation_failures(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    install_dir = tmp_path / "installed_templates"
+    request = TemplateInstallRequest(
+        model_name="Broken Dream Callable Model",
+        template_path=(
+            Path(
+                "tests/template_candidates/fail_missing_dream_callable_model.py"
+            ).resolve()
+        ),
+        model_description="Expected to fail in the validation step.",
+    )
+    errors: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        window,
+        "_prompt_template_install_request",
+        lambda: request,
+    )
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.main_window.install_template_candidate",
+        lambda template_path, **kwargs: install_template_candidate(
+            template_path,
+            destination_dir=install_dir,
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(
+        window,
+        "_show_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    window.project_setup_tab.install_model_button.click()
+
+    assert errors
+    assert errors[0][0] == "Install model failed"
+    assert "Missing callable log_likelihood_candidate" in errors[0][1]
 
 
 def test_project_setup_empty_preview_message_is_wrapped(qapp):
@@ -1817,6 +3481,103 @@ def test_load_latest_dream_results_updates_both_plot_panels(qapp, tmp_path):
     assert "w0 (A)" in tick_labels
 
 
+def test_dream_analysis_saved_run_dropdown_loads_selected_run_state(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    workflow = SAXSDreamWorkflow(project_dir)
+
+    older_entries = workflow.create_default_parameter_map()
+    older_entries[0] = DreamParameterEntry(
+        structure=older_entries[0].structure,
+        motif=older_entries[0].motif,
+        param_type=older_entries[0].param_type,
+        param=older_entries[0].param,
+        value=0.11,
+        vary=older_entries[0].vary,
+        distribution=older_entries[0].distribution,
+        dist_params=dict(older_entries[0].dist_params),
+        smart_preset_status=older_entries[0].smart_preset_status,
+    )
+    older_settings = DreamRunSettings(
+        nchains=3,
+        niterations=1234,
+        burnin_percent=7,
+        model_name="older_model",
+        run_label="older",
+    )
+    older_bundle = _write_minimal_dream_results(
+        project_dir,
+        settings=older_settings,
+        entries=older_entries,
+    )
+
+    newer_entries = workflow.create_default_parameter_map()
+    newer_entries[0] = DreamParameterEntry(
+        structure=newer_entries[0].structure,
+        motif=newer_entries[0].motif,
+        param_type=newer_entries[0].param_type,
+        param=newer_entries[0].param,
+        value=0.77,
+        vary=newer_entries[0].vary,
+        distribution=newer_entries[0].distribution,
+        dist_params=dict(newer_entries[0].dist_params),
+        smart_preset_status=newer_entries[0].smart_preset_status,
+    )
+    newer_settings = DreamRunSettings(
+        nchains=8,
+        niterations=4321,
+        burnin_percent=22,
+        model_name="newer_model",
+        run_label="newer",
+    )
+    newer_bundle = _write_minimal_dream_results(
+        project_dir,
+        settings=newer_settings,
+        entries=newer_entries,
+    )
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert window.dream_tab.saved_runs_combo.count() == 2
+    assert (
+        Path(window.dream_tab.saved_runs_combo.currentData()).resolve()
+        == newer_bundle.run_dir.resolve()
+    )
+
+    older_index = window.dream_tab.saved_runs_combo.findData(
+        str(older_bundle.run_dir)
+    )
+    assert older_index >= 0
+    window.dream_tab.saved_runs_combo.setCurrentIndex(older_index)
+    QApplication.processEvents()
+
+    window.load_selected_results()
+
+    loaded_settings = load_dream_settings(older_bundle.settings_path)
+    assert window._last_results_loader is not None
+    assert (
+        window._last_results_loader.run_dir == older_bundle.run_dir.resolve()
+    )
+    assert window.dream_tab.chains_spin.value() == loaded_settings.nchains
+    assert (
+        window.dream_tab.iterations_spin.value() == loaded_settings.niterations
+    )
+    assert (
+        window.dream_tab.burnin_spin.value() == loaded_settings.burnin_percent
+    )
+    assert float(
+        window.dream_tab.parameter_map_table.item(0, 4).text()
+    ) == pytest.approx(older_entries[0].value)
+    assert (
+        str(older_bundle.run_dir) in window.dream_tab.output_box.toPlainText()
+    )
+
+
 def test_dream_model_metrics_box_updates_with_bestfit_method(qapp, tmp_path):
     del qapp
     project_dir, _paths = _build_minimal_saxs_project(tmp_path)
@@ -1837,6 +3598,86 @@ def test_dream_model_metrics_box_updates_with_bestfit_method(qapp, tmp_path):
     assert "Mean |res|:" in second_metrics
     assert "R²:" in second_metrics
     assert first_metrics != second_metrics
+
+
+def test_dream_model_plot_includes_residual_subplot(qapp, tmp_path):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    _write_minimal_dream_results(project_dir)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    window.load_latest_results()
+
+    assert len(window.dream_tab.model_figure.axes) == 2
+    top_axis = window.dream_tab.model_figure.axes[0]
+    residual_axis = window.dream_tab.model_figure.axes[1]
+    assert top_axis.get_title().startswith("DREAM refinement:")
+    assert residual_axis.get_ylabel() == "Residual"
+    assert residual_axis.get_xlabel() == "q (Å⁻¹)"
+    assert residual_axis.get_xscale() == top_axis.get_xscale()
+
+    residual_line = residual_axis.get_lines()[-1]
+    plot_data = window.dream_tab._current_model_plot_data
+    assert plot_data is not None
+    expected = np.asarray(
+        plot_data.model_intensities - plot_data.experimental_intensities,
+        dtype=float,
+    )
+    assert np.allclose(
+        np.asarray(residual_line.get_ydata(), dtype=float),
+        expected,
+    )
+    window.close()
+
+
+def test_dream_model_plot_redraw_on_log_x_avoids_nonpositive_xlim_warning(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    _write_minimal_dream_results(project_dir)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        window.load_latest_results()
+        window.dream_tab.model_log_x_checkbox.setChecked(True)
+        QApplication.processEvents()
+        window.dream_tab.bestfit_method_combo.setCurrentIndex(1)
+        QApplication.processEvents()
+
+    warning_messages = [str(item.message) for item in caught]
+    assert not any(
+        "Attempt to set non-positive xlim on a log-scaled axis" in message
+        for message in warning_messages
+    )
+    window.close()
+
+
+def test_prefit_model_metrics_box_updates_with_model_changes(qapp, tmp_path):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    axis = window.prefit_tab.figure.axes[0]
+    first_metrics = "\n".join(text.get_text() for text in axis.texts)
+
+    assert "RMSE:" in first_metrics
+    assert "Mean |res|:" in first_metrics
+    assert "R²:" in first_metrics
+
+    window.prefit_tab.set_parameter_row("scale", value=1e-3)
+    window.update_prefit_model()
+
+    axis = window.prefit_tab.figure.axes[0]
+    second_metrics = "\n".join(text.get_text() for text in axis.texts)
+
+    assert "RMSE:" in second_metrics
+    assert "Mean |res|:" in second_metrics
+    assert "R²:" in second_metrics
+    assert first_metrics != second_metrics
+    window.close()
 
 
 def test_dream_violin_scale_modes_and_palette_controls(qapp, tmp_path):
@@ -1954,6 +3795,40 @@ def test_dream_violin_custom_color_controls_apply_to_plot(
     ]
     assert "#654321" in line_colors
     assert "#abcdef" in line_colors
+
+
+def test_dream_violin_custom_color_picker_switches_palette_and_updates_plot(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    _write_minimal_dream_results(project_dir)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.dream_tab.QColorDialog.getColor",
+        lambda *args, **kwargs: QColor("#224466"),
+    )
+
+    window.load_latest_results()
+    assert window.dream_tab.violin_palette_combo.currentData() == "Blues"
+
+    window.dream_tab.violin_custom_color_button.click()
+    QApplication.processEvents()
+
+    assert (
+        window.dream_tab.violin_palette_combo.currentData() == "custom_solid"
+    )
+    assert window.dream_tab.selected_violin_custom_color() == "#224466"
+    axis = window.dream_tab.violin_figure.axes[0]
+    body = next(
+        collection
+        for collection in axis.collections
+        if isinstance(collection, PolyCollection)
+    )
+    assert to_hex(body.get_facecolor()[0], keep_alpha=False) == "#224466"
 
 
 def test_dream_default_violin_palette_starts_with_higher_contrast_color(
@@ -2614,9 +4489,37 @@ def test_prefit_recommended_scale_button_updates_scale_bounds(qapp, tmp_path):
     assert scale_entry.value == pytest.approx(5e-4)
     assert scale_entry.minimum == pytest.approx(5e-5)
     assert scale_entry.maximum == pytest.approx(5e-3)
-    assert "Applied recommended scale settings." in (
+    assert "Applied autoscale settings." in (
         window.prefit_tab.output_box.toPlainText()
     )
+
+
+def test_run_prefit_keeps_manual_weight_value_outside_previous_bounds(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    weight_row = window.prefit_tab.find_parameter_row("w0")
+    assert weight_row >= 0
+    assert (
+        float(window.prefit_tab.parameter_table.item(weight_row, 6).text())
+        < 0.9
+    )
+    window.prefit_tab.parameter_table.item(weight_row, 3).setText("0.9")
+
+    window.run_prefit()
+
+    assert float(
+        window.prefit_tab.parameter_table.item(weight_row, 3).text()
+    ) == pytest.approx(0.9)
+    assert (
+        float(window.prefit_tab.parameter_table.item(weight_row, 6).text())
+        >= 0.9
+    )
+    window.close()
 
 
 def test_best_prefit_preset_saves_resets_and_reloads(qapp, tmp_path):
@@ -2718,6 +4621,48 @@ def test_restore_prefit_state_recovers_saved_parameters_and_run_config(
         entry.name: entry for entry in window.prefit_tab.parameter_entries()
     }
     assert best_entries["scale"].value == pytest.approx(7e-4)
+
+
+def test_restore_prefit_state_restores_cluster_geometry_mode_and_shape(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    window.compute_prefit_cluster_geometry()
+
+    table = window.prefit_tab.cluster_geometry_table
+    sf_column = _table_column_index(table, "S.F. Approx.")
+    sf_combo = table.cellWidget(0, sf_column)
+    assert sf_combo is not None
+
+    window.prefit_tab.toggle_cluster_geometry_radii_button.click()
+    ellipsoid_index = sf_combo.findData("ellipsoid")
+    assert ellipsoid_index >= 0
+    sf_combo.setCurrentIndex(ellipsoid_index)
+    window.save_prefit()
+
+    window.prefit_tab.toggle_cluster_geometry_radii_button.click()
+    sphere_index = sf_combo.findData("sphere")
+    assert sphere_index >= 0
+    sf_combo.setCurrentIndex(sphere_index)
+
+    window.restore_prefit_state()
+
+    restored_table = window.prefit_tab.cluster_geometry_table
+    restored_sf_combo = restored_table.cellWidget(0, sf_column)
+    assert restored_sf_combo is not None
+    assert (
+        window.prefit_tab.cluster_geometry_radii_type_combo.currentData()
+        == "bond_length"
+    )
+    assert str(restored_sf_combo.currentData()) == "ellipsoid"
+    restored_row = window.prefit_workflow.cluster_geometry_rows()[0]
+    assert restored_row.radii_type_used == "bond_length"
+    assert restored_row.sf_approximation == "ellipsoid"
+
+    window.close()
 
 
 def test_generate_prior_weights_does_not_force_prefit_without_components(
@@ -3261,6 +5206,93 @@ def test_project_setup_preview_updates_with_experimental_q_range(
     assert preview_axis.get_yscale() == "log"
 
 
+def test_save_project_state_reloads_prefit_and_dream_for_reduced_q_range(
+    qapp, tmp_path
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    window.project_setup_tab.qmin_edit.setText("0.12")
+    window.project_setup_tab.qmax_edit.setText("0.19")
+    window.save_project_state()
+
+    assert window.prefit_workflow is not None
+    assert np.allclose(
+        window.prefit_workflow.evaluate().q_values,
+        [0.12142857142857144, 0.15714285714285714, 0.19285714285714284],
+    )
+    assert window.dream_workflow is not None
+    assert np.allclose(
+        window.dream_workflow.prefit_workflow.evaluate().q_values,
+        [0.12142857142857144, 0.15714285714285714, 0.19285714285714284],
+    )
+    window.close()
+
+
+def test_save_project_state_warns_when_q_range_expands_beyond_components(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(
+        window,
+        "_show_error",
+        lambda title, message: captured.update(
+            {
+                "title": title,
+                "message": message,
+            }
+        ),
+    )
+
+    window.project_setup_tab.qmin_edit.setText("0.04")
+    window.project_setup_tab.qmax_edit.setText("0.31")
+    window.save_project_state()
+
+    assert (
+        captured["title"]
+        == "Expanded q-range requires rebuilding SAXS components"
+    )
+    assert "Recompute the SAXS model components" in captured["message"]
+    window.close()
+
+
+def test_save_project_state_ignores_tiny_q_range_edge_mismatch(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(
+        window,
+        "_show_error",
+        lambda title, message: captured.update(
+            {
+                "title": title,
+                "message": message,
+            }
+        ),
+    )
+
+    window.project_setup_tab.qmin_edit.setText("0.04995")
+    window.project_setup_tab.qmax_edit.setText("0.30005")
+    window.save_project_state()
+
+    assert captured == {}
+    assert window.prefit_workflow is not None
+    assert np.allclose(
+        window.prefit_workflow.evaluate().q_values,
+        np.linspace(0.05, 0.3, 8),
+    )
+    window.close()
+
+
 def test_project_setup_preview_plots_solvent_data_in_green(qapp, tmp_path):
     del qapp
     experimental_path = tmp_path / "exp_preview.txt"
@@ -3693,6 +5725,7 @@ def test_prefit_plot_shows_solvent_contribution_and_legend_pick_toggles_model(
 
     evaluation = window.prefit_workflow.evaluate(entries)
     window.prefit_tab.plot_evaluation(evaluation)
+    window.prefit_tab.show_solvent_trace_checkbox.setChecked(True)
 
     top_axis = window.prefit_tab.figure.axes[0]
     labels = [line.get_label() for line in top_axis.get_lines()]
@@ -3806,6 +5839,55 @@ def test_dream_plot_trace_toggles_control_visible_series(qapp, tmp_path):
     top_axis = window.dream_tab.model_figure.axes[0]
     line_labels = [line.get_label() for line in top_axis.get_lines()]
     assert not any(str(label).startswith("Model (") for label in line_labels)
+
+
+def test_prefit_plot_trace_toggles_control_visible_series(qapp, tmp_path):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    solvent_q = np.linspace(0.05, 0.3, 8)
+    solvent_intensity = np.linspace(1.5, 2.2, 8)
+    solvent_path = tmp_path / "prefit_toggle_solvent_trace.dat"
+    np.savetxt(solvent_path, np.column_stack([solvent_q, solvent_intensity]))
+
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.solvent_data_path = str(solvent_path)
+    settings.copied_solvent_data_file = None
+    manager.save_project(settings)
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    entries = window.prefit_workflow.load_parameter_entries()
+    for entry in entries:
+        if entry.name == "solv_w":
+            entry.value = 0.5
+        if entry.name == "scale":
+            entry.value = 2e-3
+
+    evaluation = window.prefit_workflow.evaluate(entries)
+    window.prefit_tab.plot_evaluation(evaluation)
+
+    assert window.prefit_tab.show_experimental_trace_checkbox.isEnabled()
+    assert window.prefit_tab.show_model_trace_checkbox.isEnabled()
+    assert window.prefit_tab.show_solvent_trace_checkbox.isEnabled()
+
+    top_axis = window.prefit_tab.figure.axes[0]
+    labels = [line.get_label() for line in top_axis.get_lines()]
+    assert "Solvent contribution" not in labels
+
+    window.prefit_tab.show_solvent_trace_checkbox.setChecked(True)
+    top_axis = window.prefit_tab.figure.axes[0]
+    labels = [line.get_label() for line in top_axis.get_lines()]
+    assert "Solvent contribution" in labels
+
+    window.prefit_tab.show_experimental_trace_checkbox.setChecked(False)
+    top_axis = window.prefit_tab.figure.axes[0]
+    line_labels = [line.get_label() for line in top_axis.get_lines()]
+    assert "Experimental" not in line_labels
+
+    window.prefit_tab.show_model_trace_checkbox.setChecked(False)
+    top_axis = window.prefit_tab.figure.axes[0]
+    line_labels = [line.get_label() for line in top_axis.get_lines()]
+    assert "Model" not in line_labels
 
 
 def test_save_prefit_plot_data_exports_csv_with_metadata(

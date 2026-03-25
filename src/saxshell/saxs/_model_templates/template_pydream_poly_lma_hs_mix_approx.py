@@ -1,7 +1,6 @@
 import numpy as np
 from scipy.stats import norm
 
-# =============================================================
 # model_lmfit: lmfit_model_profile
 # model_pydream: log_likelihood_poly_lma_hs
 # inputs_lmfit: q, solvent_data, model_data, effective_radii, params
@@ -9,14 +8,14 @@ from scipy.stats import norm
 # param_columns: Structure, Motif, Param, Value, Vary, Min, Max
 # cluster_geometry_metadata: true
 #
-# Recommended parameter order:
-#   w0, w1, ..., wN-1,
-#   phi_solute,
-#   phi_int,
-#   solvent_scale,
-#   scale,
-#   offset,
-#   log_sigma
+# Approximate mixed-shape template:
+# - hard-sphere Percus-Yevick is still evaluated on sphere radii
+# - sphere rows use r_eff_<weight>
+# - ellipsoid rows use a_eff/b_eff/c_eff and are collapsed to an
+#   equivalent-volume sphere radius before S(Q) is evaluated
+# - this is an approximate mixed hard-body route inspired by Hansen's
+#   nonspherical-body-to-polydisperse-sphere literature, not an exact
+#   hard-ellipsoid PY closure
 #
 # param: phi_solute,0.02,True,0.0,0.5
 # param: phi_int,0.02,True,0.0,0.4
@@ -24,118 +23,9 @@ from scipy.stats import norm
 # param: scale,1.0,True,1e-8,1e8
 # param: offset,0.0,True,-1e6,1e6
 # param: log_sigma,-9.21,True,-20.0,5.0
-#
-# Canonical pyDREAM template:
-# - normalized Gaussian log-likelihood
-# - explicit n_profiles parameter slicing
-# - decoupled forward model helper
-# - discrete local-monodisperse style cluster sum
-# - per-cluster hard-sphere S(Q) using effective radii
-# - explicit solvent template, global scale, and offset
-#
-# Model equation:
-#   I_model(q) = scale * [
-#       phi_solute * sum_i x_i I_i(q) S_HS(q; R_eff_i, phi_int)
-#       + solvent_scale * (1 - phi_solute) * I_solv(q)
-#   ] + offset
-#
-# Internal abundance normalization:
-#   x_i = f_i / sum_j f_j
-#   f_i >= 0 for all i
-#   sum_i x_i = 1 after normalization
-#
-# Parameter definitions:
-#
-# w0 ... wN-1
-#   Generated cluster-abundance coefficients for the cluster library.
-#   SAXSShell creates one weight parameter per averaged cluster profile
-#   in md_saxs_map.json and keeps those rows aligned with the component
-#   order used in Prefit and DREAM. These are normalized internally
-#   into x_i so the fitted values act as relative solute-cluster
-#   abundances instead of redundant global scale factors.
-#
-# phi_solute
-#   Physical solute volume fraction in the measured solution. This term
-#   scales the cluster contribution relative to the solvent template.
-#   Good prior information can come from solution density, composition,
-#   and solute/solvent molar masses. Keep this fixed or tightly bounded
-#   unless the data are on a credible absolute scale.
-#
-# phi_int
-#   Effective structural volume fraction used only inside the hard-
-#   sphere Percus-Yevick structure factor. This is the packing term that
-#   controls the strength and position of intercluster interference.
-#   It is intentionally distinct from phi_solute because the effective
-#   interaction packing seen by S(Q) need not equal the literal solute
-#   loading for irregular or anisotropic clusters.
-#
-# solvent_scale
-#   Multiplicative coefficient applied to the experimental solvent SAXS
-#   template before the global scale and offset. This absorbs mismatch
-#   from transmission, thickness, normalization, or imperfect solvent
-#   subtraction.
-#
-# scale
-#   Global multiplicative intensity factor applied to the full model.
-#   Keep this free when the measured SAXS data are not on absolute
-#   intensity scale or when the cluster I(Q) library is only known up to
-#   an arbitrary normalization.
-#
-# offset
-#   Constant additive background term. Use this to absorb fluorescence
-#   or other approximately q-independent residual background. Replace
-#   with a sloped or polynomial baseline only if the residuals show a
-#   clear q dependence that a constant cannot capture.
-#
-# log_sigma
-#   Natural logarithm of the Gaussian noise standard deviation used in
-#   the pyDREAM likelihood, with sigma = exp(log_sigma). Fitting the log
-#   of sigma enforces positivity and is usually numerically cleaner than
-#   fitting sigma directly.
-#
-# Likelihood convention:
-#   The log-likelihood is divided by the number of q points. This keeps
-#   the average log-likelihood magnitude more comparable when you change
-#   the fitted q-range, interpolation density, or total number of data
-#   points between runs.
-#
-# Required pyDREAM globals:
-#   q_values
-#       1D experimental q grid.
-#   experimental_intensities
-#       Experimental SAXS intensities sampled on q_values.
-#   solvent_intensities
-#       Experimental solvent SAXS template sampled on q_values.
-#   theoretical_intensities
-#       List or array of cluster I(Q) profiles sampled on q_values.
-#   effective_radii
-#       One effective interaction radius for each cluster profile.
-#
-# Practical notes:
-# - effective_radii are runtime metadata fallbacks and UI defaults
-# - generated geometry parameters override those metadata values when present
-# - this strict template is intended for sphere-only cluster geometry
-# - hard-sphere S(Q) is the default excluded-volume interaction model
-# - charged or attractive systems may need a different S(Q)
-#
-# Relevant resources:
-# Pedersen review on SAS modeling and local monodisperse ideas:
-# https://neutrons.ornl.gov/sites/default/files/Pedersen97.pdf
-#
-# SasView structure-factor overview and beta(Q) discussion:
-# https://www.sasview.org/docs/user/qtgui/Perspectives/Fitting/
-# fitting_sq.html
-#
-# SasView hard-sphere Percus-Yevick model documentation:
-# https://www.sasview.org/docs/user/models/hardsphere.html
-#
-# SasView Hayter-Penfold RMSA model for charged systems:
-# https://www.sasview.org/docs/user/models/hayter_msa.html
-# =============================================================
 
 
 def calc_hardsphere_sq(radius, volfraction, q_values):
-    """Return the hard-sphere Percus-Yevick structure factor."""
     q_values = np.asarray(q_values, dtype=float)
     radius = float(radius)
     volfraction = float(volfraction)
@@ -200,7 +90,6 @@ def calc_hardsphere_sq(radius, volfraction, q_values):
 
 
 def normalize_profile_fractions(raw_weights):
-    """Normalize non-negative raw cluster weights into fractions."""
     raw_weights = np.asarray(raw_weights, dtype=float)
 
     if np.any(raw_weights < 0):
@@ -234,8 +123,20 @@ def _resolve_effective_radii(weight_keys, params, fallback_effective_radii):
     resolved_radii: list[float] = []
     for index, weight_key in enumerate(weight_keys):
         sphere_name = f"r_eff_{weight_key}"
+        ellipsoid_names = [
+            f"a_eff_{weight_key}",
+            f"b_eff_{weight_key}",
+            f"c_eff_{weight_key}",
+        ]
         if sphere_name in params:
             resolved_radii.append(float(params[sphere_name]))
+            continue
+        if all(name in params for name in ellipsoid_names):
+            resolved_radii.append(
+                equivalent_volume_radius(
+                    [params[name] for name in ellipsoid_names]
+                )
+            )
             continue
         if index >= len(fallback_radii):
             raise ValueError(
@@ -271,7 +172,6 @@ def polydisperse_lma_hs_model(
     scale,
     offset,
 ):
-    """Return the discrete polydisperse LMA hard-sphere SAXS model."""
     q_values = np.asarray(q_values, dtype=float)
     solvent_intensities = np.asarray(solvent_intensities, dtype=float)
     effective_radii = np.asarray(effective_radii, dtype=float)
@@ -285,7 +185,7 @@ def polydisperse_lma_hs_model(
 
     if len(cluster_intensities) != len(raw_weights):
         raise ValueError(
-            "cluster_intensities and raw_weights must have the same " "length"
+            "cluster_intensities and raw_weights must have the same length"
         )
 
     if phi_solute < 0 or phi_solute > 1:
@@ -310,7 +210,6 @@ def polydisperse_lma_hs_model(
 def lmfit_model_profile(
     q, solvent_data, model_data, effective_radii, **params
 ):
-    """Evaluate the polydisperse LMA hard-sphere model for lmfit."""
     weight_keys = _weight_keys_from_params(params)
     raw_weights = np.asarray([params[key] for key in weight_keys], dtype=float)
     resolved_effective_radii = _resolve_effective_radii(
@@ -319,28 +218,21 @@ def lmfit_model_profile(
         effective_radii,
     )
 
-    phi_solute = params["phi_solute"]
-    phi_int = params["phi_int"]
-    solvent_scale = params["solvent_scale"]
-    scale = params["scale"]
-    offset = params["offset"]
-
     return polydisperse_lma_hs_model(
         q_values=q,
         cluster_intensities=model_data,
         effective_radii=resolved_effective_radii,
         solvent_intensities=solvent_data,
         raw_weights=raw_weights,
-        phi_solute=phi_solute,
-        phi_int=phi_int,
-        solvent_scale=solvent_scale,
-        scale=scale,
-        offset=offset,
+        phi_solute=params["phi_solute"],
+        phi_int=params["phi_int"],
+        solvent_scale=params["solvent_scale"],
+        scale=params["scale"],
+        offset=params["offset"],
     )
 
 
 def model_poly_lma_hs(params):
-    """Return the forward model intensity for pyDREAM."""
     global q_values
     global theoretical_intensities
     global solvent_intensities
@@ -389,7 +281,6 @@ def model_poly_lma_hs(params):
 
 
 def log_likelihood_poly_lma_hs(params):
-    """Return the normalized Gaussian log-likelihood for pyDREAM."""
     global experimental_intensities
 
     params = np.asarray(params, dtype=float)

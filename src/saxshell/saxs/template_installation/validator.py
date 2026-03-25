@@ -107,6 +107,12 @@ def validate_template_candidate(
                 candidate_dir, spec, module
             )
             _run_prefit_validation(result, project_dir, spec, candidate_dir)
+            _run_cluster_geometry_constraint_validation(
+                result,
+                project_dir,
+                spec,
+                candidate_dir,
+            )
             _run_dream_validation(result, project_dir, candidate_dir)
         finally:
             clear_template_caches()
@@ -450,6 +456,19 @@ def _build_validation_project(
                             anisotropy_metric=1.0,
                             notes="Validation geometry seed.",
                             mapped_parameter="w0",
+                            sf_approximation="sphere",
+                            radii_type_used="ionic",
+                            ionic_sphere_effective_radius=9.0,
+                            bond_length_sphere_effective_radius=9.0,
+                            ionic_ellipsoid_semiaxis_a=9.0,
+                            ionic_ellipsoid_semiaxis_b=9.0,
+                            ionic_ellipsoid_semiaxis_c=9.0,
+                            bond_length_ellipsoid_semiaxis_a=9.0,
+                            bond_length_ellipsoid_semiaxis_b=9.0,
+                            bond_length_ellipsoid_semiaxis_c=9.0,
+                            active_semiaxis_a=9.0,
+                            active_semiaxis_b=9.0,
+                            active_semiaxis_c=9.0,
                             mean_semiaxis_a=9.0,
                             mean_semiaxis_b=9.0,
                             mean_semiaxis_c=9.0,
@@ -531,6 +550,119 @@ def _run_prefit_validation(
         "prefit-workflow",
         True,
         "Validated template through SAXSPrefitWorkflow evaluate/run_fit.",
+    )
+
+
+def _run_cluster_geometry_constraint_validation(
+    result: TemplateValidationResult,
+    project_dir: Path,
+    spec: TemplateSpec,
+    template_dir: Path,
+) -> None:
+    if not spec.cluster_geometry_support.supported:
+        return
+
+    allowed = spec.cluster_geometry_support.allowed_sf_approximations
+    disallowed = tuple(
+        option for option in ("sphere", "ellipsoid") if option not in allowed
+    )
+
+    try:
+        workflow = SAXSPrefitWorkflow(
+            project_dir,
+            template_name=spec.name,
+            template_dir=template_dir,
+        )
+        rows = workflow.cluster_geometry_rows()
+        if not rows:
+            raise ValueError(
+                "Cluster geometry metadata was not loaded for validation."
+            )
+        if any(row.sf_approximation not in allowed for row in rows):
+            raise ValueError(
+                "Loaded cluster geometry rows contain disallowed "
+                "sf_approximation values."
+            )
+        if any(
+            row.structure_factor_recommendation not in allowed for row in rows
+        ):
+            raise ValueError(
+                "Loaded cluster geometry rows contain disallowed "
+                "structure_factor_recommendation values."
+            )
+
+        weight_name = (
+            workflow.components[0].param_name if workflow.components else "w0"
+        )
+        for approximation in allowed:
+            updated_rows = workflow.cluster_geometry_rows()
+            updated_rows[0].sf_approximation = approximation
+            workflow.set_cluster_geometry_rows(updated_rows)
+            refreshed_row = workflow.cluster_geometry_rows()[0]
+            if refreshed_row.sf_approximation != approximation:
+                raise ValueError(
+                    "Cluster geometry constraint sync failed to preserve "
+                    f"allowed approximation {approximation!r}."
+                )
+            evaluation = workflow.evaluate()
+            if not np.all(np.isfinite(evaluation.model_intensities)):
+                raise ValueError(
+                    "Prefit evaluation returned non-finite values after "
+                    f"switching to {approximation!r} geometry."
+                )
+            if spec.cluster_geometry_support.dynamic_parameters:
+                geometry_entries = [
+                    entry
+                    for entry in workflow.parameter_entries
+                    if entry.category == "geometry"
+                ]
+                geometry_names = {entry.name for entry in geometry_entries}
+                if approximation == "sphere":
+                    expected_names = {
+                        f"{spec.cluster_geometry_support.sphere_parameter_prefix}_{weight_name}"
+                    }
+                else:
+                    expected_names = {
+                        f"{prefix}_{weight_name}"
+                        for prefix in (
+                            spec.cluster_geometry_support.ellipsoid_parameter_prefixes
+                        )
+                    }
+                if geometry_names != expected_names:
+                    raise ValueError(
+                        "Dynamic geometry parameters did not match the "
+                        f"allowed {approximation!r} approximation."
+                    )
+                if any(entry.vary for entry in geometry_entries):
+                    raise ValueError(
+                        "Generated geometry parameters must default to vary off."
+                    )
+
+        if disallowed:
+            updated_rows = workflow.cluster_geometry_rows()
+            updated_rows[0].sf_approximation = disallowed[0]
+            workflow.set_cluster_geometry_rows(updated_rows)
+            normalized_row = workflow.cluster_geometry_rows()[0]
+            if normalized_row.sf_approximation not in allowed:
+                raise ValueError(
+                    "Disallowed cluster geometry approximation was not "
+                    "normalized to an allowed value."
+                )
+    except Exception as exc:
+        _append_check(
+            result,
+            "cluster-geometry-constraints",
+            False,
+            "Cluster geometry constraint validation failed: " f"{exc}",
+        )
+        return
+
+    _append_check(
+        result,
+        "cluster-geometry-constraints",
+        True,
+        "Validated allowed cluster geometry approximations and dynamic "
+        "parameter triggering for the installed template.",
     )
 
 

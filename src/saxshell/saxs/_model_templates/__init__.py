@@ -29,6 +29,17 @@ class TemplateClusterGeometrySupport:
     mapping_target: str = "component_weights"
     metadata_fields: tuple[str, ...] = ()
     runtime_bindings: tuple[TemplateRuntimeMetadataBinding, ...] = ()
+    allowed_sf_approximations: tuple[str, ...] = (
+        "sphere",
+        "ellipsoid",
+    )
+    dynamic_parameters: bool = False
+    sphere_parameter_prefix: str = "r_eff"
+    ellipsoid_parameter_prefixes: tuple[str, str, str] = (
+        "a_eff",
+        "b_eff",
+        "c_eff",
+    )
 
     @property
     def runtime_input_names(self) -> tuple[str, ...]:
@@ -40,6 +51,7 @@ class TemplateSpec:
     name: str
     module_path: Path
     metadata_path: Path | None
+    deprecated: bool
     display_name: str
     description: str
     lmfit_model_name: str
@@ -71,15 +83,73 @@ def _normalize_template_dir(template_dir: str | Path | None) -> Path:
     return Path(template_dir).expanduser().resolve()
 
 
+def _deprecated_template_dir(template_dir: Path) -> Path:
+    return template_dir / "_deprecated"
+
+
+def _template_search_paths(
+    template_dir: Path,
+    *,
+    include_deprecated: bool,
+) -> list[Path]:
+    search_paths = [template_dir]
+    deprecated_dir = _deprecated_template_dir(template_dir)
+    if include_deprecated and deprecated_dir.is_dir():
+        search_paths.append(deprecated_dir)
+    return search_paths
+
+
+def _iter_template_module_paths(
+    template_dir: Path,
+    *,
+    include_deprecated: bool,
+) -> list[Path]:
+    paths: list[Path] = []
+    for search_dir in _template_search_paths(
+        template_dir,
+        include_deprecated=include_deprecated,
+    ):
+        paths.extend(
+            sorted(
+                path
+                for path in search_dir.glob("*.py")
+                if path.name != "__init__.py"
+            )
+        )
+    return paths
+
+
+def _resolve_template_module_path(
+    template_name: str,
+    template_dir: Path,
+) -> Path | None:
+    candidate_paths = [
+        template_dir / f"{template_name}.py",
+        _deprecated_template_dir(template_dir) / f"{template_name}.py",
+    ]
+    for candidate in candidate_paths:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def list_template_specs(
     template_dir: str | Path | None = None,
+    *,
+    include_deprecated: bool = False,
 ) -> list[TemplateSpec]:
     resolved_dir = _normalize_template_dir(template_dir)
-    return [
-        load_template_spec(path.stem, resolved_dir)
-        for path in sorted(resolved_dir.glob("*.py"))
-        if path.name != "__init__.py"
-    ]
+    seen_names: set[str] = set()
+    specs: list[TemplateSpec] = []
+    for path in _iter_template_module_paths(
+        resolved_dir,
+        include_deprecated=include_deprecated,
+    ):
+        if path.stem in seen_names:
+            continue
+        specs.append(load_template_spec(path.stem, resolved_dir))
+        seen_names.add(path.stem)
+    return specs
 
 
 @lru_cache(maxsize=None)
@@ -88,13 +158,13 @@ def load_template_spec(
     template_dir: str | Path | None = None,
 ) -> TemplateSpec:
     resolved_dir = _normalize_template_dir(template_dir)
-    module_path = resolved_dir / f"{template_name}.py"
-    if not module_path.is_file():
+    module_path = _resolve_template_module_path(template_name, resolved_dir)
+    if module_path is None:
         raise FileNotFoundError(
             f"Unknown SAXS model template: {template_name}"
         )
     directives = _parse_directives(module_path)
-    metadata_path = resolved_dir / f"{template_name}.json"
+    metadata_path = module_path.with_suffix(".json")
     metadata = _load_template_metadata(
         metadata_path,
         template_name,
@@ -104,6 +174,7 @@ def load_template_spec(
         name=template_name,
         module_path=module_path,
         metadata_path=metadata_path if metadata_path.is_file() else None,
+        deprecated=module_path.parent.name == "_deprecated",
         display_name=str(metadata["display_name"]),
         description=str(metadata["description"]),
         lmfit_model_name=directives["model_lmfit"],
@@ -125,11 +196,11 @@ def load_template_module(
 ) -> ModuleType:
     resolved_dir = _normalize_template_dir(template_dir)
     spec = load_template_spec(template_name, resolved_dir)
+    relative_parts = (
+        spec.module_path.relative_to(resolved_dir).with_suffix("").parts
+    )
     import_spec = importlib.util.spec_from_file_location(
-        (
-            "saxshell.saxs._model_templates."
-            f"{resolved_dir.name}.{template_name}"
-        ),
+        ("saxshell.saxs._model_templates." + ".".join(relative_parts)),
         spec.module_path,
     )
     if import_spec is None or import_spec.loader is None:
@@ -391,11 +462,73 @@ def _parse_cluster_geometry_support(
             "cluster geometry metadata fields in runtime_bindings: "
             + ", ".join(sorted(set(invalid_fields)))
         )
+
+    allowed_sf_payload = raw_support.get(
+        "allowed_sf_approximations",
+        ["sphere", "ellipsoid"],
+    )
+    if isinstance(allowed_sf_payload, str):
+        allowed_sf_payload = [allowed_sf_payload]
+    allowed_sf_approximations = tuple(
+        str(option).strip().lower()
+        for option in allowed_sf_payload
+        if str(option).strip()
+    )
+    if not allowed_sf_approximations:
+        raise ValueError(
+            f"Template metadata file {metadata_path.name} must declare at "
+            "least one allowed_sf_approximations entry when cluster "
+            "geometry support is enabled."
+        )
+    invalid_approximations = [
+        option
+        for option in allowed_sf_approximations
+        if option not in {"sphere", "ellipsoid"}
+    ]
+    if invalid_approximations:
+        raise ValueError(
+            f"Template metadata file {metadata_path.name} declares "
+            "unsupported allowed_sf_approximations values: "
+            + ", ".join(sorted(set(invalid_approximations)))
+        )
+    allowed_sf_approximations = tuple(dict.fromkeys(allowed_sf_approximations))
+
+    dynamic_parameters = bool(raw_support.get("dynamic_parameters", False))
+    sphere_parameter_prefix = (
+        str(raw_support.get("sphere_parameter_prefix", "r_eff")).strip()
+        or "r_eff"
+    )
+    ellipsoid_prefixes_payload = raw_support.get(
+        "ellipsoid_parameter_prefixes",
+        ["a_eff", "b_eff", "c_eff"],
+    )
+    if isinstance(ellipsoid_prefixes_payload, str):
+        ellipsoid_prefixes_payload = [ellipsoid_prefixes_payload]
+    ellipsoid_parameter_prefixes = tuple(
+        str(prefix).strip()
+        for prefix in ellipsoid_prefixes_payload
+        if str(prefix).strip()
+    )
+    if dynamic_parameters and len(ellipsoid_parameter_prefixes) != 3:
+        raise ValueError(
+            f"Template metadata file {metadata_path.name} must declare "
+            "exactly three ellipsoid_parameter_prefixes when "
+            "dynamic_parameters is enabled."
+        )
+
     return TemplateClusterGeometrySupport(
         supported=True,
         mapping_target=mapping_target,
         metadata_fields=metadata_fields,
         runtime_bindings=runtime_bindings,
+        allowed_sf_approximations=allowed_sf_approximations,
+        dynamic_parameters=dynamic_parameters,
+        sphere_parameter_prefix=sphere_parameter_prefix,
+        ellipsoid_parameter_prefixes=(
+            ellipsoid_parameter_prefixes
+            if ellipsoid_parameter_prefixes
+            else ("a_eff", "b_eff", "c_eff")
+        ),
     )
 
 

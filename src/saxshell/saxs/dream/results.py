@@ -10,6 +10,7 @@ from saxshell.saxs._model_templates import (
     load_template_module,
     load_template_spec,
 )
+from saxshell.saxs.prefit import ClusterGeometryMetadataTable
 from saxshell.saxs.stoichiometry import stoich_sort_key
 
 
@@ -154,6 +155,16 @@ class SAXSDreamResultsLoader:
         }
         self.lmfit_extra_inputs = list(
             self.metadata.get("lmfit_extra_inputs", [])
+        )
+        raw_cluster_geometry_metadata = self.metadata.get(
+            "cluster_geometry_metadata"
+        )
+        self.cluster_geometry_table = (
+            ClusterGeometryMetadataTable.from_dict(
+                raw_cluster_geometry_metadata
+            )
+            if isinstance(raw_cluster_geometry_metadata, dict)
+            else None
         )
         self._expanded_samples_flat: np.ndarray | None = None
         self._posterior_view_cache: dict[

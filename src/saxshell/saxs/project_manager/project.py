@@ -60,6 +60,39 @@ def build_project_paths(project_dir: str | Path) -> ProjectPaths:
     )
 
 
+def load_built_component_q_range(
+    project_dir: str | Path,
+) -> tuple[float, float] | None:
+    paths = build_project_paths(project_dir)
+    component_files = sorted(paths.scattering_components_dir.glob("*.txt"))
+    if not component_files:
+        return None
+
+    lower_bounds: list[float] = []
+    upper_bounds: list[float] = []
+    for component_file in component_files:
+        raw_data = np.loadtxt(component_file, comments="#")
+        if raw_data.size == 0:
+            continue
+        if raw_data.ndim == 1:
+            raw_data = raw_data.reshape(1, -1)
+        q_values = np.asarray(raw_data[:, 0], dtype=float)
+        if q_values.size == 0:
+            continue
+        lower_bounds.append(float(np.min(q_values)))
+        upper_bounds.append(float(np.max(q_values)))
+    if not lower_bounds or not upper_bounds:
+        return None
+
+    supported_min = max(lower_bounds)
+    supported_max = min(upper_bounds)
+    if supported_min > supported_max:
+        raise ValueError(
+            "The built SAXS component files do not share an overlapping q-range."
+        )
+    return (float(supported_min), float(supported_max))
+
+
 @dataclass(slots=True)
 class ExperimentalDataSummary:
     path: Path

@@ -1,0 +1,24 @@
+{
+  "display_name": "pyDREAM Poly LMA Hard-Sphere (deprecated)",
+  "description": "pyDREAM Poly LMA Hard-Sphere (deprecated)\n\nThis legacy template preserves the earlier mixed sphere/ellipsoid-equivalent-sphere behavior for backwards compatibility with older projects.\n\nFor new work, prefer one of the newer split templates:\n- pyDREAM Poly LMA Hard-Sphere for the strict sphere-only hard-sphere workflow\n- pyDREAM Poly LMA Hard-Sphere/Ellipsoid Mix (Approx.) for the mixed-shape approximate workflow\n\nLike the mixed approximate template, ellipsoid rows are reduced to an equivalent-sphere interaction radius before the hard-sphere Percus-Yevick structure factor is evaluated.\n",
+  "capabilities": {
+    "cluster_geometry_metadata": {
+      "supported": true,
+      "mapping_target": "component_weights",
+      "dynamic_parameters": true,
+      "allowed_sf_approximations": ["sphere", "ellipsoid"],
+      "sphere_parameter_prefix": "r_eff",
+      "ellipsoid_parameter_prefixes": ["a_eff", "b_eff", "c_eff"],
+      "metadata_fields": [
+        "effective_radius",
+        "structure_factor_recommendation",
+        "avg_size_metric",
+        "anisotropy_metric",
+        "notes"
+      ],
+      "runtime_bindings": {
+        "effective_radii": "effective_radius"
+      }
+    }
+  }
+}

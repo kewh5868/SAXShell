@@ -79,10 +79,12 @@ class ProjectSetupTab(QWidget):
     scan_clusters_requested = Signal()
     build_components_requested = Signal()
     build_prior_weights_requested = Signal()
+    install_model_requested = Signal()
     generate_prior_plot_requested = Signal()
     save_prior_png_requested = Signal()
     save_component_plot_data_requested = Signal()
     save_prior_plot_data_requested = Signal()
+    show_deprecated_templates_changed = Signal(bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -337,6 +339,15 @@ class ProjectSetupTab(QWidget):
         self.template_help_button.clicked.connect(
             lambda: show_template_help(self)
         )
+        self.show_deprecated_templates_checkbox = QCheckBox("Show deprecated")
+        self.show_deprecated_templates_checkbox.setChecked(False)
+        self.show_deprecated_templates_checkbox.setToolTip(
+            "Include deprecated and archived SAXS templates in the "
+            "template dropdown."
+        )
+        self.show_deprecated_templates_checkbox.toggled.connect(
+            self.show_deprecated_templates_changed.emit
+        )
         controls_layout.addRow(
             "Selected template",
             self._template_row(),
@@ -354,8 +365,13 @@ class ProjectSetupTab(QWidget):
         self.build_prior_weights_button.clicked.connect(
             self.build_prior_weights_requested.emit
         )
+        self.install_model_button = QPushButton("Install Model")
+        self.install_model_button.clicked.connect(
+            self.install_model_requested.emit
+        )
         controls_layout.addRow("", self.build_prior_weights_button)
         controls_layout.addRow("", self.build_components_button)
+        controls_layout.addRow("", self.install_model_button)
         layout.addWidget(controls_widget, stretch=4)
 
         clusters_group = QGroupBox("Recognized Clusters")
@@ -418,6 +434,7 @@ class ProjectSetupTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.template_combo, stretch=1)
         layout.addWidget(self.template_help_button)
+        layout.addWidget(self.show_deprecated_templates_checkbox)
         return row
 
     def _build_activity_group(self) -> QGroupBox:
@@ -838,6 +855,14 @@ class ProjectSetupTab(QWidget):
         if self.template_combo.count() == 0:
             return None
         return str(self.template_combo.currentData() or "").strip() or None
+
+    def show_deprecated_templates(self) -> bool:
+        return self.show_deprecated_templates_checkbox.isChecked()
+
+    def set_show_deprecated_templates(self, enabled: bool) -> None:
+        self.show_deprecated_templates_checkbox.blockSignals(True)
+        self.show_deprecated_templates_checkbox.setChecked(bool(enabled))
+        self.show_deprecated_templates_checkbox.blockSignals(False)
 
     def project_dir(self) -> Path | None:
         parent_dir = self.project_directory()

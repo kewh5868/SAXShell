@@ -17,6 +17,8 @@ class SolutionPropertiesPreset:
     name: str
     settings: SolutionPropertiesSettings
     solute_molecule_count: int = 1
+    solute_density_g_per_ml: float | None = None
+    solvent_density_g_per_ml: float | None = None
     notes: str = ""
     builtin: bool = False
 
@@ -25,6 +27,14 @@ class SolutionPropertiesPreset:
             "settings": self.settings.to_dict(),
             "solute_molecule_count": self.solute_molecule_count,
         }
+        if self.solute_density_g_per_ml is not None:
+            payload["solute_density_g_per_ml"] = float(
+                self.solute_density_g_per_ml
+            )
+        if self.solvent_density_g_per_ml is not None:
+            payload["solvent_density_g_per_ml"] = float(
+                self.solvent_density_g_per_ml
+            )
         if self.notes:
             payload["notes"] = self.notes
         return payload
@@ -53,9 +63,27 @@ class SolutionPropertiesPreset:
             name=name,
             settings=settings,
             solute_molecule_count=solute_molecule_count,
+            solute_density_g_per_ml=_optional_positive_float(
+                payload.get("solute_density_g_per_ml")
+            ),
+            solvent_density_g_per_ml=_optional_positive_float(
+                payload.get("solvent_density_g_per_ml")
+            ),
             notes=str(payload.get("notes", "") or "").strip(),
             builtin=builtin,
         )
+
+
+def _optional_positive_float(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0.0:
+        return None
+    return parsed
 
 
 def solution_property_presets_dir() -> Path:

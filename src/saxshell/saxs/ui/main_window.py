@@ -31,23 +31,39 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QHBoxLayout,
     QInputDialog,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QSplitter,
     QTabWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from saxshell.saxs._model_templates import list_template_specs
+from saxshell.saxs._model_templates import (
+    list_template_specs,
+    load_template_spec,
+)
 from saxshell.saxs.dream import (
+    DreamParameterEntry,
     DreamRunBundle,
     DreamRunSettings,
     SAXSDreamResultsLoader,
     SAXSDreamWorkflow,
+    load_dream_settings,
+    load_parameter_map,
 )
 from saxshell.saxs.prefit import PrefitScaleRecommendation, SAXSPrefitWorkflow
+from saxshell.saxs.prefit.workflow import (
+    SOLUTE_VOLUME_FRACTION_PARAMETER_NAMES,
+    SOLVENT_VOLUME_FRACTION_PARAMETER_NAMES,
+    normalize_requested_q_range_to_supported,
+    q_range_boundary_tolerance,
+)
 from saxshell.saxs.project_manager import (
     ClusterImportResult,
     ProjectSettings,
@@ -55,6 +71,15 @@ from saxshell.saxs.project_manager import (
     build_project_paths,
     export_prior_histogram_npy,
     export_prior_histogram_table,
+    load_built_component_q_range,
+)
+from saxshell.saxs.solute_volume_fraction import (
+    DISPLAY_FRACTION_DECIMALS,
+    SoluteVolumeFractionEstimate,
+)
+from saxshell.saxs.template_installation import (
+    format_validation_report,
+    install_template_candidate,
 )
 from saxshell.saxs.ui.distribution_window import DistributionSetupWindow
 from saxshell.saxs.ui.dream_tab import DreamTab
@@ -63,6 +88,9 @@ from saxshell.saxs.ui.prefit_tab import PrefitTab
 from saxshell.saxs.ui.prior_histogram_window import PriorHistogramWindow
 from saxshell.saxs.ui.progress_dialog import SAXSProgressDialog
 from saxshell.saxs.ui.project_setup_tab import ProjectSetupTab
+from saxshell.saxs.ui.solute_volume_fraction_widget import (
+    SoluteVolumeFractionToolWindow,
+)
 from saxshell.version import __version__
 
 GITHUB_REPOSITORY_URL = "https://github.com/kewh5868/SAXShell"
@@ -70,6 +98,10 @@ CONTACT_EMAIL = "keith.white@colorado.edu"
 RECENT_PROJECTS_KEY = "recent_project_dirs"
 MAX_RECENT_PROJECTS = 10
 REPO_ROOT = Path(__file__).resolve().parents[4]
+EQUIVALENT_SPHERE_MIX_TEMPLATE_NAMES = {
+    "template_pydream_poly_lma_hs_mix_approx",
+    "template_pydream_poly_lma_hs_legacy",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,12 +120,102 @@ class FitQualityMetrics:
 
 
 @dataclass(frozen=True, slots=True)
+class DreamSavedRunRecord:
+    run_dir: Path
+    display_label: str
+
+
+@dataclass(frozen=True, slots=True)
 class DreamFitConstraintComparison:
     prefit_metrics: FitQualityMetrics
     dream_metrics: FitQualityMetrics
     fixed_parameters: tuple[str, ...]
     fixed_non_weight_parameters: tuple[str, ...]
     fixed_weight_parameters: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TemplateInstallRequest:
+    model_name: str
+    template_path: Path
+    model_description: str
+
+
+class InstallModelDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Install Model")
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        form_layout = QFormLayout()
+
+        self.model_name_edit = QLineEdit()
+        self.model_name_edit.setPlaceholderText("Example: Custom Poly LMA")
+        form_layout.addRow("Model name", self.model_name_edit)
+
+        self.template_path_edit = QLineEdit()
+        self.template_path_edit.setPlaceholderText(
+            "Select a Python template file"
+        )
+        browse_button = QPushButton("Browse…")
+        browse_button.clicked.connect(self._choose_template_file)
+        path_row = QWidget()
+        path_layout = QHBoxLayout(path_row)
+        path_layout.setContentsMargins(0, 0, 0, 0)
+        path_layout.addWidget(self.template_path_edit, stretch=1)
+        path_layout.addWidget(browse_button)
+        form_layout.addRow("Template .py", path_row)
+
+        self.description_edit = QTextEdit()
+        self.description_edit.setMinimumHeight(140)
+        self.description_edit.setPlaceholderText(
+            "Describe the model shown in the template selector tooltip."
+        )
+        form_layout.addRow("Description", self.description_edit)
+
+        layout.addLayout(form_layout)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _choose_template_file(self) -> None:
+        selected, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Select template Python file",
+            str(Path.home()),
+            "Python files (*.py)",
+        )
+        if selected:
+            self.template_path_edit.setText(selected)
+
+    def selected_request(self) -> TemplateInstallRequest:
+        model_name = self.model_name_edit.text().strip()
+        if not model_name:
+            raise ValueError("Enter a model name before installing.")
+        template_path_text = self.template_path_edit.text().strip()
+        if not template_path_text:
+            raise ValueError("Select a template Python file to install.")
+        template_path = Path(template_path_text).expanduser().resolve()
+        if not template_path.is_file():
+            raise FileNotFoundError(
+                f"Template file not found: {template_path}"
+            )
+        model_description = self.description_edit.toPlainText().strip()
+        if not model_description:
+            raise ValueError("Enter a model description before installing.")
+        return TemplateInstallRequest(
+            model_name=model_name,
+            template_path=template_path,
+            model_description=model_description,
+        )
 
 
 class SAXSProjectTaskWorker(QObject):
@@ -199,19 +321,26 @@ class SAXSMainWindow(QMainWindow):
         self._dream_task_worker: SAXSDreamRunWorker | None = None
         self._dream_progress_dialog: SAXSProgressDialog | None = None
         self._active_dream_run_settings: DreamRunSettings | None = None
+        self._loaded_dream_run_dir: Path | None = None
         self._warn_on_prefit_template_change = True
         self._restoring_prefit_template = False
+        self._updating_deprecated_template_visibility = False
+        self._show_deprecated_templates = False
         self._ui_scale = 1.0
         self._base_font_point_size = self._resolve_base_font_point_size()
         self._scale_shortcuts: list[QShortcut] = []
         self._child_tool_windows: list[QWidget] = []
+        self._solute_volume_fraction_tool_window: (
+            SoluteVolumeFractionToolWindow | None
+        ) = None
+        self._pending_prefit_sf_approximation_change: (
+            tuple[str, str] | None
+        ) = None
         self._build_ui()
         self._capture_scale_baselines(self)
         self._register_scale_shortcuts()
         self._apply_ui_scale(announce=False)
-        template_specs = list_template_specs()
-        self.project_setup_tab.set_available_templates(template_specs, None)
-        self.prefit_tab.set_templates(template_specs, None)
+        self._refresh_template_selectors()
         self.dream_tab.set_available_settings_presets([], None)
         if initial_project_dir is not None:
             self.load_project(initial_project_dir)
@@ -258,6 +387,12 @@ class SAXSMainWindow(QMainWindow):
         self.project_setup_tab.build_prior_weights_requested.connect(
             self.build_prior_weights
         )
+        self.project_setup_tab.install_model_requested.connect(
+            self.install_model_template
+        )
+        self.project_setup_tab.show_deprecated_templates_changed.connect(
+            self._on_show_deprecated_templates_changed
+        )
         self.project_setup_tab.prior_mode_combo.currentTextChanged.connect(
             lambda _text: self._refresh_prior_plot()
         )
@@ -276,6 +411,9 @@ class SAXSMainWindow(QMainWindow):
 
         self.prefit_tab.template_changed.connect(
             self._on_prefit_template_changed
+        )
+        self.prefit_tab.show_deprecated_templates_changed.connect(
+            self._on_show_deprecated_templates_changed
         )
         self.prefit_tab.autosave_toggled.connect(self._on_autosave_changed)
         self.prefit_tab.update_model_requested.connect(
@@ -302,8 +440,23 @@ class SAXSMainWindow(QMainWindow):
         self.prefit_tab.compute_cluster_geometry_requested.connect(
             self.compute_prefit_cluster_geometry
         )
+        self.prefit_tab.update_cluster_geometry_requested.connect(
+            self.update_prefit_cluster_geometry
+        )
         self.prefit_tab.cluster_geometry_mapping_changed.connect(
-            self._sync_prefit_cluster_geometry_rows
+            self._on_prefit_cluster_geometry_changed
+        )
+        self.prefit_tab.cluster_geometry_sf_approximation_changed.connect(
+            self._on_prefit_cluster_geometry_sf_approximation_changed
+        )
+        self.prefit_tab.cluster_geometry_radii_type_changed.connect(
+            self._on_prefit_cluster_geometry_radii_type_changed
+        )
+        self.prefit_tab.cluster_geometry_ionic_radius_type_changed.connect(
+            self._on_prefit_cluster_geometry_ionic_radius_type_changed
+        )
+        self.prefit_tab.solute_volume_fraction_widget.estimate_calculated.connect(
+            self._on_solute_volume_fraction_estimate_calculated
         )
 
         self.dream_tab.edit_parameter_map_requested.connect(
@@ -317,7 +470,9 @@ class SAXSMainWindow(QMainWindow):
             self.preview_dream_runtime_bundle
         )
         self.dream_tab.run_dream_requested.connect(self.run_dream_bundle)
-        self.dream_tab.load_results_requested.connect(self.load_latest_results)
+        self.dream_tab.load_results_requested.connect(
+            self.load_selected_results
+        )
         self.dream_tab.save_report_requested.connect(self.save_dream_report)
         self.dream_tab.save_model_fit_requested.connect(
             self.save_dream_model_fit
@@ -391,15 +546,18 @@ class SAXSMainWindow(QMainWindow):
         self.tools_menu.addAction(self.fullrmc_action)
 
         self.tools_menu.addSeparator()
+        self.volume_fraction_action = QAction(
+            "Open Volume Fraction Estimate", self
+        )
+        self.volume_fraction_action.triggered.connect(
+            self._open_solute_volume_fraction_tool
+        )
+        self.tools_menu.addAction(self.volume_fraction_action)
         placeholder_specs = [
             ("PDF Calculation (Coming Soon)", "PDF Calculation"),
             (
                 "Number Density Estimate (Coming Soon)",
                 "Number Density Estimate",
-            ),
-            (
-                "Volume Fraction Estimate (Coming Soon)",
-                "Volume Fraction Estimate",
             ),
             (
                 "Bond Association/Dissociation Analysis (Coming Soon)",
@@ -697,14 +855,171 @@ class SAXSMainWindow(QMainWindow):
         except Exception as exc:
             self._show_error("Generate prior weights failed", str(exc))
 
+    def install_model_template(self) -> None:
+        try:
+            request = self._prompt_template_install_request()
+            if request is None:
+                return
+            try:
+                installed = install_template_candidate(
+                    request.template_path,
+                    model_name=request.model_name,
+                    model_description=request.model_description,
+                )
+            except FileExistsError:
+                response = QMessageBox.warning(
+                    self,
+                    "Template already exists",
+                    (
+                        "A template with this installed model name already "
+                        "exists. Do you want to overwrite it?"
+                    ),
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if response != QMessageBox.StandardButton.Yes:
+                    self.statusBar().showMessage(
+                        "Template installation canceled"
+                    )
+                    return
+                installed = install_template_candidate(
+                    request.template_path,
+                    model_name=request.model_name,
+                    model_description=request.model_description,
+                    overwrite=True,
+                )
+            report = format_validation_report(installed.validation_result)
+            self._refresh_template_selectors(
+                selected_name=self.project_setup_tab.selected_template_name()
+            )
+            self.project_setup_tab.append_summary(
+                "Installed model template "
+                f"{request.model_name} from {request.template_path}"
+            )
+            QMessageBox.information(
+                self,
+                "Model installed",
+                report
+                + "\n\nInstalled template:\n"
+                + str(installed.installed_template_path),
+            )
+            self.statusBar().showMessage("Model installed")
+        except Exception as exc:
+            self._show_error("Install model failed", str(exc))
+
+    def _prompt_template_install_request(
+        self,
+    ) -> TemplateInstallRequest | None:
+        dialog = InstallModelDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.selected_request()
+
+    def _refresh_template_selectors(
+        self,
+        *,
+        selected_name: str | None = None,
+        include_deprecated: bool | None = None,
+    ) -> None:
+        include_deprecated = (
+            self._show_deprecated_templates
+            if include_deprecated is None
+            else bool(include_deprecated)
+        )
+        selected_names = [
+            name
+            for name in [
+                selected_name,
+                self.project_setup_tab.selected_template_name(),
+                self.prefit_tab.selected_template_name(),
+            ]
+            if name
+        ]
+        template_specs = self._template_specs_for_dropdown(
+            include_deprecated=include_deprecated,
+            selected_names=selected_names,
+        )
+        self._set_show_deprecated_templates(include_deprecated)
+        project_selected_name = (
+            selected_name or self.project_setup_tab.selected_template_name()
+        )
+        self.project_setup_tab.set_available_templates(
+            template_specs,
+            project_selected_name,
+        )
+        prefit_selected_name = (
+            selected_name or self.prefit_tab.selected_template_name()
+        )
+        self.prefit_tab.set_templates(
+            template_specs,
+            prefit_selected_name,
+        )
+
+    def _template_specs_for_dropdown(
+        self,
+        *,
+        include_deprecated: bool,
+        selected_names: list[str] | tuple[str, ...],
+    ) -> list:
+        template_specs = list_template_specs(
+            include_deprecated=include_deprecated
+        )
+        specs_by_name = {spec.name: spec for spec in template_specs}
+        if not include_deprecated:
+            for template_name in selected_names:
+                normalized_name = str(template_name).strip()
+                if not normalized_name or normalized_name in specs_by_name:
+                    continue
+                try:
+                    spec = load_template_spec(normalized_name)
+                except Exception:
+                    continue
+                specs_by_name[spec.name] = spec
+                template_specs.append(spec)
+        return sorted(
+            specs_by_name.values(),
+            key=lambda spec: (
+                bool(spec.deprecated),
+                spec.display_name.lower(),
+                spec.name.lower(),
+            ),
+        )
+
+    def _set_show_deprecated_templates(self, enabled: bool) -> None:
+        self._show_deprecated_templates = bool(enabled)
+        self._updating_deprecated_template_visibility = True
+        try:
+            self.project_setup_tab.set_show_deprecated_templates(enabled)
+            self.prefit_tab.set_show_deprecated_templates(enabled)
+        finally:
+            self._updating_deprecated_template_visibility = False
+
+    @Slot(bool)
+    def _on_show_deprecated_templates_changed(self, enabled: bool) -> None:
+        if self._updating_deprecated_template_visibility:
+            return
+        self._refresh_template_selectors(include_deprecated=enabled)
+
     def save_project_state(self) -> None:
         try:
             settings = self._settings_from_project_tab()
             saved_path = self._save_settings(settings)
+            self._apply_project_settings(settings)
             self.project_setup_tab.append_summary(
                 f"Saved project state to {saved_path}"
             )
-            self.statusBar().showMessage("Project state saved")
+            rebuild_message = self._component_q_range_rebuild_message(settings)
+            if rebuild_message is not None:
+                self._show_error(
+                    "Expanded q-range requires rebuilding SAXS components",
+                    rebuild_message,
+                )
+                self.statusBar().showMessage(
+                    "Project state saved; rebuild SAXS components to apply the expanded q-range"
+                )
+            else:
+                self.statusBar().showMessage("Project state saved")
         except Exception as exc:
             self._show_error("Save project state failed", str(exc))
 
@@ -735,6 +1050,49 @@ class SAXSMainWindow(QMainWindow):
             self.statusBar().showMessage(status_message)
         self._update_file_menu_state()
         return saved_path
+
+    def _component_q_range_rebuild_message(
+        self,
+        settings: ProjectSettings,
+    ) -> str | None:
+        supported_range = load_built_component_q_range(settings.project_dir)
+        if supported_range is None:
+            return None
+        supported_min, supported_max = supported_range
+        requested_min = (
+            float(settings.q_min)
+            if settings.q_min is not None
+            else float(supported_min)
+        )
+        requested_max = (
+            float(settings.q_max)
+            if settings.q_max is not None
+            else float(supported_max)
+        )
+        requested_min, requested_max = (
+            normalize_requested_q_range_to_supported(
+                requested_min,
+                requested_max,
+                supported_min,
+                supported_max,
+            )
+        )
+        tolerance = q_range_boundary_tolerance(
+            supported_min,
+            supported_max,
+        )
+        if requested_min >= (supported_min - tolerance) and requested_max <= (
+            supported_max + tolerance
+        ):
+            return None
+        return (
+            "The requested q-range "
+            f"{requested_min:.6g} to {requested_max:.6g} extends beyond the "
+            "q-range currently covered by the built SAXS model components "
+            f"({supported_min:.6g} to {supported_max:.6g}). Recompute the "
+            "SAXS model components in Project Setup for the updated q-range "
+            "to be applied in Prefit and DREAM."
+        )
 
     def save_project_as(self) -> None:
         if self.current_settings is None:
@@ -886,11 +1244,16 @@ class SAXSMainWindow(QMainWindow):
                 self.statusBar().showMessage("Cluster import complete")
         elif task_name == "build_components":
             settings, build_result = result
-            settings.cluster_inventory_rows = build_result.cluster_rows
-            self.current_settings = settings
-            self._apply_project_settings(settings)
+            reloaded_settings = self.project_manager.load_project(
+                settings.project_dir
+            )
+            reloaded_settings.cluster_inventory_rows = (
+                build_result.cluster_rows
+            )
+            self.current_settings = reloaded_settings
+            self._apply_project_settings(reloaded_settings)
             self.project_setup_tab.apply_cluster_import_data(
-                settings.available_elements,
+                reloaded_settings.available_elements,
                 build_result.cluster_rows,
             )
             self.project_setup_tab.append_summary(
@@ -911,11 +1274,16 @@ class SAXSMainWindow(QMainWindow):
             self.statusBar().showMessage("Project components built")
         elif task_name == "build_prior_weights":
             settings, build_result = result
-            settings.cluster_inventory_rows = build_result.cluster_rows
-            self.current_settings = settings
-            self._apply_project_settings(settings)
+            reloaded_settings = self.project_manager.load_project(
+                settings.project_dir
+            )
+            reloaded_settings.cluster_inventory_rows = (
+                build_result.cluster_rows
+            )
+            self.current_settings = reloaded_settings
+            self._apply_project_settings(reloaded_settings)
             self.project_setup_tab.apply_cluster_import_data(
-                settings.available_elements,
+                reloaded_settings.available_elements,
                 build_result.cluster_rows,
             )
             self.project_setup_tab.append_summary(
@@ -953,13 +1321,42 @@ class SAXSMainWindow(QMainWindow):
             self._progress_dialog = SAXSProgressDialog(self)
         return self._progress_dialog
 
-    def _show_progress_dialog(self, total: int, message: str) -> None:
+    def _show_progress_dialog(
+        self,
+        total: int,
+        message: str,
+        *,
+        unit_label: str = "items",
+        title: str | None = None,
+    ) -> None:
         dialog = self._ensure_progress_dialog()
-        dialog.begin(total, message)
+        dialog.begin(total, message, unit_label=unit_label, title=title)
 
     def _close_progress_dialog(self) -> None:
         if self._progress_dialog is not None:
             self._progress_dialog.close()
+
+    def _update_prefit_cluster_geometry_progress(
+        self,
+        processed: int,
+        total: int,
+        message: str,
+    ) -> None:
+        self.prefit_tab.update_cluster_geometry_progress(
+            processed,
+            total,
+            message,
+            unit_label="files",
+        )
+        if self._progress_dialog is not None:
+            self._progress_dialog.update_progress(
+                processed,
+                total,
+                message,
+                unit_label="files",
+            )
+        self.statusBar().showMessage(message)
+        QApplication.processEvents()
 
     def _ensure_dream_progress_dialog(self) -> SAXSProgressDialog:
         if self._dream_progress_dialog is None:
@@ -1040,6 +1437,7 @@ class SAXSMainWindow(QMainWindow):
             run_dir,
             burnin_percent=settings.burnin_percent,
         )
+        self._loaded_dream_run_dir = Path(run_dir).resolve()
         assessment_message: str | None = None
         assessment_error: str | None = None
         self._last_dream_filter_assessments = []
@@ -1055,6 +1453,7 @@ class SAXSMainWindow(QMainWindow):
             self.dream_tab.set_settings(settings, preset_name=None)
         except Exception as exc:  # pragma: no cover - defensive UI logging
             assessment_error = str(exc)
+        self._refresh_saved_dream_runs(selected_run_dir=run_dir)
         self._refresh_loaded_dream_results()
         auto_export_paths: list[Path] = []
         auto_export_error: str | None = None
@@ -1141,6 +1540,38 @@ class SAXSMainWindow(QMainWindow):
             self._dream_task_thread = None
         self._active_dream_run_settings = None
 
+    def closeEvent(self, event) -> None:
+        self._shutdown_background_threads()
+        super().closeEvent(event)
+
+    def _shutdown_background_threads(self) -> None:
+        self._close_progress_dialog()
+        self._close_dream_progress_dialog()
+        self._shutdown_thread(
+            thread=self._task_thread,
+            cleanup_callback=self._cleanup_task_thread,
+        )
+        self._shutdown_thread(
+            thread=self._dream_task_thread,
+            cleanup_callback=self._cleanup_dream_task_thread,
+        )
+
+    @staticmethod
+    def _shutdown_thread(
+        *,
+        thread,
+        cleanup_callback,
+    ) -> None:
+        if thread is None:
+            cleanup_callback()
+            return
+        if thread.isRunning():
+            thread.quit()
+            if not thread.wait(1500):
+                thread.terminate()
+                thread.wait(1500)
+        cleanup_callback()
+
     def _refresh_prefit_cluster_geometry_section(self) -> None:
         if self.prefit_workflow is None:
             self.prefit_tab.set_cluster_geometry_visible(False)
@@ -1149,15 +1580,146 @@ class SAXSMainWindow(QMainWindow):
         self.prefit_tab.set_cluster_geometry_visible(visible)
         if not visible:
             return
+        self.prefit_tab.set_cluster_geometry_active_radii_type(
+            self.prefit_workflow.cluster_geometry_active_radii_type(),
+            emit_signal=False,
+        )
+        self.prefit_tab.set_cluster_geometry_active_ionic_radius_type(
+            self.prefit_workflow.cluster_geometry_active_ionic_radius_type(),
+            emit_signal=False,
+        )
         self.prefit_tab.populate_cluster_geometry_table(
             self.prefit_workflow.cluster_geometry_rows(),
             mapping_options=(
                 self.prefit_workflow.cluster_geometry_mapping_options()
             ),
+            active_radii_type=(
+                self.prefit_workflow.cluster_geometry_active_radii_type()
+            ),
+            active_ionic_radius_type=(
+                self.prefit_workflow.cluster_geometry_active_ionic_radius_type()
+            ),
+            allowed_sf_approximations=(
+                self.prefit_workflow.allowed_cluster_geometry_approximations()
+            ),
         )
         self.prefit_tab.set_cluster_geometry_status_text(
             self.prefit_workflow.cluster_geometry_status_text()
         )
+
+    def _refresh_prefit_volume_fraction_section(self) -> None:
+        target = self._current_volume_fraction_target()
+        visible = target is not None
+        self.prefit_tab.set_solute_volume_fraction_visible(visible)
+        if target is None:
+            self.prefit_tab.set_solute_volume_fraction_target(None, None)
+        else:
+            parameter_name, fraction_kind = target
+            self.prefit_tab.set_solute_volume_fraction_target(
+                parameter_name,
+                fraction_kind,
+            )
+        self._sync_volume_fraction_tool_target()
+
+    def _current_volume_fraction_target(self) -> tuple[str, str] | None:
+        if self.prefit_workflow is None:
+            return None
+        return self.prefit_workflow.volume_fraction_estimator_target()
+
+    def _sync_volume_fraction_tool_target(self) -> None:
+        target = self._current_volume_fraction_target()
+        if target is None:
+            parameter_name = None
+            fraction_kind = None
+        else:
+            parameter_name, fraction_kind = target
+        if self._solute_volume_fraction_tool_window is not None:
+            self._solute_volume_fraction_tool_window.estimator_widget.set_target_parameter(
+                parameter_name,
+                fraction_kind,
+            )
+
+    @Slot(object)
+    def _on_solute_volume_fraction_estimate_calculated(
+        self,
+        estimate_payload: object,
+    ) -> None:
+        if not isinstance(estimate_payload, SoluteVolumeFractionEstimate):
+            return
+        target = self._current_volume_fraction_target()
+        widget = self.sender()
+        if target is None:
+            if hasattr(widget, "append_application_note"):
+                widget.append_application_note(
+                    "No active Prefit solute/solvent fraction parameter is "
+                    "currently available, so this estimate was not applied "
+                    "to the model."
+                )
+            self.statusBar().showMessage("Volume fraction estimate calculated")
+            return
+        parameter_name, fraction_kind = target
+        parameter_value = (
+            float(estimate_payload.solute_volume_fraction)
+            if fraction_kind == "solute"
+            else float(estimate_payload.solvent_volume_fraction)
+        )
+        if self.prefit_workflow is None:
+            return
+        try:
+            current_entry = next(
+                (
+                    entry
+                    for entry in self.prefit_tab.parameter_entries()
+                    if entry.name == parameter_name
+                ),
+                None,
+            )
+            minimum = 0.0
+            maximum = max(parameter_value, 1.0)
+            if current_entry is not None:
+                minimum = min(float(current_entry.minimum), 0.0)
+                maximum = max(
+                    float(current_entry.maximum),
+                    parameter_value,
+                    1.0,
+                )
+            self.prefit_tab.set_parameter_row(
+                parameter_name,
+                value=parameter_value,
+                minimum=minimum,
+                maximum=maximum,
+            )
+            if hasattr(widget, "append_application_note"):
+                widget.append_application_note(
+                    "Applied estimate to "
+                    f"{parameter_name} = "
+                    f"{parameter_value:.{DISPLAY_FRACTION_DECIMALS}f}."
+                )
+            self.prefit_tab.append_log(
+                "Applied solution-based volume fraction estimate.\n"
+                f"Parameter: {parameter_name}\n"
+                f"Kind: {fraction_kind}\n"
+                f"Value: {parameter_value:.{DISPLAY_FRACTION_DECIMALS}f}\n"
+                f"Solute volume fraction: "
+                f"{estimate_payload.solute_volume_fraction:.{DISPLAY_FRACTION_DECIMALS}f}\n"
+                f"Solvent volume fraction: "
+                f"{estimate_payload.solvent_volume_fraction:.{DISPLAY_FRACTION_DECIMALS}f}"
+            )
+            self.prefit_workflow.parameter_entries = (
+                self.prefit_tab.parameter_entries()
+            )
+            evaluation = self._load_prefit_preview()
+            if evaluation is None:
+                self.statusBar().showMessage(
+                    "Volume fraction estimate applied; preview is waiting "
+                    "on the remaining template metadata"
+                )
+            else:
+                self.statusBar().showMessage(
+                    "Volume fraction estimate applied"
+                )
+        except Exception as exc:
+            self._show_error("Apply volume fraction failed", str(exc))
 
     def _sync_prefit_cluster_geometry_rows(self) -> None:
         if (
@@ -1165,12 +1727,165 @@ class SAXSMainWindow(QMainWindow):
             or not self.prefit_workflow.supports_cluster_geometry_metadata()
         ):
             return
+        self.prefit_workflow.parameter_entries = (
+            self.prefit_tab.parameter_entries()
+        )
+        self.prefit_workflow.set_cluster_geometry_active_radii_type(
+            self.prefit_tab.cluster_geometry_active_radii_type()
+        )
+        self.prefit_workflow.set_cluster_geometry_active_ionic_radius_type(
+            self.prefit_tab.cluster_geometry_active_ionic_radius_type()
+        )
         self.prefit_workflow.set_cluster_geometry_rows(
             self.prefit_tab.cluster_geometry_rows()
         )
         self.prefit_tab.set_cluster_geometry_status_text(
             self.prefit_workflow.cluster_geometry_status_text()
         )
+
+    def _restore_prefit_cluster_geometry_view_from_workflow(self) -> None:
+        if (
+            self.prefit_workflow is None
+            or not self.prefit_workflow.supports_cluster_geometry_metadata()
+        ):
+            return
+        self._pending_prefit_sf_approximation_change = None
+        self._refresh_prefit_cluster_geometry_section()
+        self.prefit_tab.populate_parameter_table(
+            self.prefit_workflow.parameter_entries
+        )
+
+    @Slot(str, str)
+    def _on_prefit_cluster_geometry_sf_approximation_changed(
+        self,
+        previous_approximation: str,
+        current_approximation: str,
+    ) -> None:
+        previous_value = str(previous_approximation).strip()
+        current_value = str(current_approximation).strip()
+        if (
+            not previous_value
+            or not current_value
+            or previous_value == current_value
+        ):
+            self._pending_prefit_sf_approximation_change = None
+            return
+        self._pending_prefit_sf_approximation_change = (
+            previous_value,
+            current_value,
+        )
+
+    def _on_prefit_cluster_geometry_changed(self) -> None:
+        previous_evaluation = self.prefit_tab.current_evaluation()
+        try:
+            self._sync_prefit_cluster_geometry_rows()
+            self.prefit_tab.populate_parameter_table(
+                self.prefit_workflow.parameter_entries
+            )
+            self._invalidate_dream_workflow_cache()
+            evaluation = self._load_prefit_preview()
+            self._maybe_note_equivalent_sphere_shape_switch(
+                previous_evaluation,
+                evaluation,
+            )
+        except Exception as exc:
+            self._restore_prefit_cluster_geometry_view_from_workflow()
+            self._load_prefit_preview()
+            self._show_error("Invalid cluster geometry radii", str(exc))
+
+    def _on_prefit_cluster_geometry_radii_type_changed(
+        self,
+        radii_type: str,
+    ) -> None:
+        if (
+            self.prefit_workflow is None
+            or not self.prefit_workflow.supports_cluster_geometry_metadata()
+        ):
+            return
+        try:
+            self.prefit_workflow.parameter_entries = (
+                self.prefit_tab.parameter_entries()
+            )
+            self.prefit_workflow.set_cluster_geometry_active_radii_type(
+                radii_type
+            )
+            self.prefit_workflow.set_cluster_geometry_rows(
+                self.prefit_tab.cluster_geometry_rows()
+            )
+            self.prefit_tab.populate_cluster_geometry_table(
+                self.prefit_workflow.cluster_geometry_rows(),
+                mapping_options=(
+                    self.prefit_workflow.cluster_geometry_mapping_options()
+                ),
+                active_radii_type=(
+                    self.prefit_workflow.cluster_geometry_active_radii_type()
+                ),
+                active_ionic_radius_type=(
+                    self.prefit_workflow.cluster_geometry_active_ionic_radius_type()
+                ),
+                allowed_sf_approximations=(
+                    self.prefit_workflow.allowed_cluster_geometry_approximations()
+                ),
+            )
+            self.prefit_tab.populate_parameter_table(
+                self.prefit_workflow.parameter_entries
+            )
+            self.prefit_tab.set_cluster_geometry_status_text(
+                self.prefit_workflow.cluster_geometry_status_text()
+            )
+            self._invalidate_dream_workflow_cache()
+            self._load_prefit_preview()
+        except Exception as exc:
+            self._restore_prefit_cluster_geometry_view_from_workflow()
+            self._load_prefit_preview()
+            self._show_error("Invalid cluster geometry radii", str(exc))
+
+    def _on_prefit_cluster_geometry_ionic_radius_type_changed(
+        self,
+        ionic_radius_type: str,
+    ) -> None:
+        if (
+            self.prefit_workflow is None
+            or not self.prefit_workflow.supports_cluster_geometry_metadata()
+        ):
+            return
+        try:
+            self.prefit_workflow.parameter_entries = (
+                self.prefit_tab.parameter_entries()
+            )
+            self.prefit_workflow.set_cluster_geometry_active_ionic_radius_type(
+                ionic_radius_type
+            )
+            self.prefit_workflow.set_cluster_geometry_rows(
+                self.prefit_tab.cluster_geometry_rows()
+            )
+            self.prefit_tab.populate_cluster_geometry_table(
+                self.prefit_workflow.cluster_geometry_rows(),
+                mapping_options=(
+                    self.prefit_workflow.cluster_geometry_mapping_options()
+                ),
+                active_radii_type=(
+                    self.prefit_workflow.cluster_geometry_active_radii_type()
+                ),
+                active_ionic_radius_type=(
+                    self.prefit_workflow.cluster_geometry_active_ionic_radius_type()
+                ),
+                allowed_sf_approximations=(
+                    self.prefit_workflow.allowed_cluster_geometry_approximations()
+                ),
+            )
+            self.prefit_tab.populate_parameter_table(
+                self.prefit_workflow.parameter_entries
+            )
+            self.prefit_tab.set_cluster_geometry_status_text(
+                self.prefit_workflow.cluster_geometry_status_text()
+            )
+            self._invalidate_dream_workflow_cache()
+            self._load_prefit_preview()
+        except Exception as exc:
+            self._restore_prefit_cluster_geometry_view_from_workflow()
+            self._load_prefit_preview()
+            self._show_error("Invalid cluster geometry radii", str(exc))
 
     def _load_prefit_preview(
         self,
@@ -1213,13 +1928,45 @@ class SAXSMainWindow(QMainWindow):
                 "Build a project and load its SAXS components first.",
             )
             return
+        start_message = "Computing cluster geometry metadata..."
+        self.prefit_tab.start_cluster_geometry_progress(start_message)
+        self._show_progress_dialog(
+            1,
+            start_message,
+            unit_label="files",
+            title="SAXS Cluster Geometry Progress",
+        )
+        QApplication.processEvents()
         try:
-            table = self.prefit_workflow.compute_cluster_geometry_table()
+            self.prefit_workflow.parameter_entries = (
+                self.prefit_tab.parameter_entries()
+            )
+            self.prefit_workflow.set_cluster_geometry_active_radii_type(
+                self.prefit_tab.cluster_geometry_active_radii_type()
+            )
+            self.prefit_workflow.set_cluster_geometry_active_ionic_radius_type(
+                self.prefit_tab.cluster_geometry_active_ionic_radius_type()
+            )
+            table = self.prefit_workflow.compute_cluster_geometry_table_with_progress(
+                progress_callback=self._update_prefit_cluster_geometry_progress
+            )
             self.prefit_tab.populate_cluster_geometry_table(
-                table.rows,
+                self.prefit_workflow.cluster_geometry_rows(),
                 mapping_options=(
                     self.prefit_workflow.cluster_geometry_mapping_options()
                 ),
+                active_radii_type=(
+                    self.prefit_workflow.cluster_geometry_active_radii_type()
+                ),
+                active_ionic_radius_type=(
+                    self.prefit_workflow.cluster_geometry_active_ionic_radius_type()
+                ),
+                allowed_sf_approximations=(
+                    self.prefit_workflow.allowed_cluster_geometry_approximations()
+                ),
+            )
+            self.prefit_tab.populate_parameter_table(
+                self.prefit_workflow.parameter_entries
             )
             self.prefit_tab.set_cluster_geometry_status_text(
                 self.prefit_workflow.cluster_geometry_status_text()
@@ -1227,15 +1974,70 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_tab.append_log(
                 "Computed cluster geometry metadata.\n"
                 f"Template: {self.prefit_workflow.template_spec.name}\n"
-                f"Clusters: {len(table.rows)}"
+                f"Clusters: {len(table.rows)}\n"
+                "Active radii mode: "
+                f"{self.prefit_workflow.cluster_geometry_active_radii_type()}"
             )
+            self.prefit_tab.finish_cluster_geometry_progress(
+                "Cluster geometry metadata ready."
+            )
+            self._invalidate_dream_workflow_cache()
             self._load_prefit_preview()
             self.statusBar().showMessage("Cluster geometry metadata computed")
         except Exception as exc:
+            self.prefit_tab.finish_cluster_geometry_progress(
+                "Cluster geometry metadata failed."
+            )
             self._show_error(
                 "Compute cluster geometry failed",
                 str(exc),
             )
+        finally:
+            self._close_progress_dialog()
+
+    def update_prefit_cluster_geometry(self) -> None:
+        if self.prefit_workflow is None:
+            self._show_error(
+                "Prefit unavailable",
+                "Build a project and load its SAXS components first.",
+            )
+            return
+        try:
+            self._sync_prefit_cluster_geometry_rows()
+            self.prefit_tab.populate_cluster_geometry_table(
+                self.prefit_workflow.cluster_geometry_rows(),
+                mapping_options=(
+                    self.prefit_workflow.cluster_geometry_mapping_options()
+                ),
+                active_radii_type=(
+                    self.prefit_workflow.cluster_geometry_active_radii_type()
+                ),
+                active_ionic_radius_type=(
+                    self.prefit_workflow.cluster_geometry_active_ionic_radius_type()
+                ),
+                allowed_sf_approximations=(
+                    self.prefit_workflow.allowed_cluster_geometry_approximations()
+                ),
+            )
+            self.prefit_tab.populate_parameter_table(
+                self.prefit_workflow.parameter_entries
+            )
+            self.prefit_tab.set_cluster_geometry_status_text(
+                self.prefit_workflow.cluster_geometry_status_text()
+            )
+            self.prefit_tab.append_log(
+                "Updated cluster geometry metadata.\n"
+                f"Template: {self.prefit_workflow.template_spec.name}\n"
+                f"Active radii mode: "
+                f"{self.prefit_workflow.cluster_geometry_active_radii_type()}"
+            )
+            self._invalidate_dream_workflow_cache()
+            self._load_prefit_preview()
+            self.statusBar().showMessage("Cluster geometry metadata updated")
+        except Exception as exc:
+            self._restore_prefit_cluster_geometry_view_from_workflow()
+            self._load_prefit_preview()
+            self._show_error("Update cluster geometry failed", str(exc))
 
     def update_prefit_model(self) -> None:
         if self.prefit_workflow is None:
@@ -1245,8 +2047,12 @@ class SAXSMainWindow(QMainWindow):
             )
             return
         try:
+            previous_evaluation = self.prefit_tab.current_evaluation()
             self._sync_prefit_cluster_geometry_rows()
-            entries = self.prefit_tab.parameter_entries()
+            entries = [
+                entry for entry in self.prefit_workflow.parameter_entries
+            ]
+            self.prefit_tab.populate_parameter_table(entries)
             evaluation = self.prefit_workflow.evaluate(entries)
             self.prefit_tab.plot_evaluation(evaluation)
             run_config = self.prefit_tab.run_config()
@@ -1260,8 +2066,62 @@ class SAXSMainWindow(QMainWindow):
                 self._format_prefit_summary(evaluation)
             )
             self._maybe_append_scale_recommendation(entries)
+            self._maybe_note_equivalent_sphere_shape_switch(
+                previous_evaluation,
+                evaluation,
+            )
         except Exception as exc:
             self._show_error("Update model failed", str(exc))
+
+    def _maybe_note_equivalent_sphere_shape_switch(
+        self,
+        previous_evaluation,
+        current_evaluation,
+    ) -> None:
+        pending_change = self._pending_prefit_sf_approximation_change
+        self._pending_prefit_sf_approximation_change = None
+        if pending_change is None or self.prefit_workflow is None:
+            return
+        if (
+            self.prefit_workflow.template_spec.name
+            not in EQUIVALENT_SPHERE_MIX_TEMPLATE_NAMES
+        ):
+            return
+        if previous_evaluation is None or current_evaluation is None:
+            return
+        previous_model = np.asarray(
+            previous_evaluation.model_intensities,
+            dtype=float,
+        )
+        current_model = np.asarray(
+            current_evaluation.model_intensities,
+            dtype=float,
+        )
+        if previous_model.shape != current_model.shape:
+            return
+        if not np.allclose(
+            previous_model,
+            current_model,
+            rtol=1e-5,
+            atol=1e-8,
+        ):
+            return
+        previous_shape, current_shape = pending_change
+        self.prefit_tab.append_log(
+            "Cluster-geometry shape switch left the Prefit model unchanged "
+            "to plotting precision.\n"
+            f"Changed approximation: {previous_shape} -> {current_shape}\n"
+            "Reason: the active mixed hard-sphere/ellipsoid template is an "
+            "equivalent-sphere approximation. Ellipsoid semiaxes are reduced "
+            "to an equivalent-volume sphere radius before S(Q) is evaluated, "
+            "so changing only the S.F. Approx. dropdown may leave the model "
+            "curve unchanged when the effective interaction radius does not "
+            "change."
+        )
+        self.statusBar().showMessage(
+            "Shape switch preserved the equivalent-sphere interaction radius; "
+            "the model curve stayed the same to plotting precision"
+        )
 
     def run_prefit(self) -> None:
         if self.prefit_workflow is None:
@@ -1273,6 +2133,10 @@ class SAXSMainWindow(QMainWindow):
         try:
             self._sync_prefit_cluster_geometry_rows()
             config = self.prefit_tab.run_config()
+            entries = [
+                entry for entry in self.prefit_workflow.parameter_entries
+            ]
+            self.prefit_tab.populate_parameter_table(entries)
             self.prefit_tab.append_log(
                 "Running prefit.\n"
                 f"Template: {self.prefit_workflow.template_spec.name}\n"
@@ -1286,7 +2150,7 @@ class SAXSMainWindow(QMainWindow):
                 )
             )
             result = self.prefit_workflow.run_fit(
-                self.prefit_tab.parameter_entries(),
+                entries,
                 method=config.method,
                 max_nfev=config.max_nfev,
             )
@@ -1535,12 +2399,16 @@ class SAXSMainWindow(QMainWindow):
                     "Switch to the matching template before restoring this "
                     "snapshot so the Best Prefit preset remains untouched."
                 )
+            self.prefit_workflow.restore_cluster_geometry_table(
+                saved_state.cluster_geometry_table
+            )
             self.prefit_workflow.parameter_entries = (
                 saved_state.parameter_entries
             )
             self.prefit_tab.populate_parameter_table(
                 saved_state.parameter_entries
             )
+            self._refresh_prefit_cluster_geometry_section()
             if saved_state.method and saved_state.max_nfev is not None:
                 self.prefit_tab.set_run_config(
                     method=saved_state.method,
@@ -1564,6 +2432,7 @@ class SAXSMainWindow(QMainWindow):
                 f"{saved_state.max_nfev or self.prefit_tab.run_config().max_nfev}\n"
                 "Best Prefit preset was not modified."
             )
+            self._invalidate_dream_workflow_cache()
             self.update_prefit_model()
             self.statusBar().showMessage("Prefit state restored")
         except Exception as exc:
@@ -1938,37 +2807,89 @@ class SAXSMainWindow(QMainWindow):
 
     def load_latest_results(self) -> None:
         try:
-            workflow = self._load_dream_workflow()
-            run_dirs = sorted(
-                workflow.paths.dream_runtime_dir.glob("dream_*"),
-                key=lambda path: path.name,
-            )
-            latest_dir = next(
-                reversed(
-                    [
-                        path
-                        for path in run_dirs
-                        if (path / "dream_sampled_params.npy").is_file()
-                        and (path / "dream_log_ps.npy").is_file()
-                    ]
-                )
-            )
-            self._last_results_loader = SAXSDreamResultsLoader(
-                latest_dir,
-                burnin_percent=self.dream_tab.settings_payload().burnin_percent,
-            )
-            self._refresh_loaded_dream_results()
-            self.dream_tab.append_log(
-                f"Loaded DREAM results from {latest_dir}"
-            )
-            self.statusBar().showMessage("DREAM results loaded")
+            self._load_dream_workflow()
+            saved_runs = self._list_saved_dream_runs()
+            latest_dir = saved_runs[0].run_dir
+            self._load_dream_results_from_run_dir(latest_dir)
         except StopIteration:
             self._show_error(
                 "Load results failed",
                 "No DREAM sample files were found in the runtime bundle folder.",
             )
+        except IndexError:
+            self._show_error(
+                "Load results failed",
+                "No completed DREAM runs were found for the active project.",
+            )
         except Exception as exc:
             self._show_error("Load results failed", str(exc))
+
+    def load_selected_results(self) -> None:
+        try:
+            self._load_dream_workflow()
+            selected_run_dir = self.dream_tab.selected_saved_run_dir()
+            if selected_run_dir is None:
+                raise FileNotFoundError(
+                    "No completed DREAM runs were found for the active project."
+                )
+            self._load_dream_results_from_run_dir(selected_run_dir)
+        except Exception as exc:
+            self._show_error("Load results failed", str(exc))
+
+    def _load_dream_results_from_run_dir(
+        self,
+        run_dir: str | Path,
+    ) -> None:
+        selected_run_dir = Path(run_dir).expanduser().resolve()
+        settings_path = selected_run_dir / "pd_settings.json"
+        parameter_map_path = selected_run_dir / "pd_param_map.json"
+        if settings_path.is_file():
+            run_settings = load_dream_settings(settings_path)
+        else:
+            metadata_path = selected_run_dir / "dream_runtime_metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            run_settings = DreamRunSettings.from_dict(
+                dict(metadata.get("settings", {}))
+            )
+        display_settings = self._merge_dream_analysis_settings(
+            run_settings,
+            self.dream_tab.settings_payload(),
+        )
+        try:
+            parameter_map_entries = load_parameter_map(parameter_map_path)
+        except Exception:
+            parameter_map_entries = []
+        self._last_results_loader = None
+        self.dream_tab.set_settings(display_settings, preset_name=None)
+        self._last_results_loader = SAXSDreamResultsLoader(
+            selected_run_dir,
+            burnin_percent=display_settings.burnin_percent,
+        )
+        if not parameter_map_entries:
+            parameter_map_entries = [
+                DreamParameterEntry.from_dict(dict(entry))
+                for entry in self._last_results_loader.parameter_map_entries
+                if isinstance(entry, dict)
+            ]
+        self.dream_tab.set_parameter_map_entries(parameter_map_entries)
+        self._loaded_dream_run_dir = selected_run_dir
+        self._refresh_saved_dream_runs(selected_run_dir=selected_run_dir)
+        self._refresh_loaded_dream_results()
+        self.dream_tab.append_log(
+            "Loaded DREAM results for inspection.\n"
+            f"Run directory: {selected_run_dir}\n"
+            f"Saved settings: {settings_path if settings_path.is_file() else 'metadata fallback'}\n"
+            "Saved prior parameter map: "
+            + (
+                str(parameter_map_path)
+                if parameter_map_path.is_file()
+                else "not found in run folder"
+            )
+            + "\n"
+            "These settings and priors are shown for inspection only until "
+            "you explicitly save them back to the active project."
+        )
+        self.statusBar().showMessage("DREAM results loaded")
 
     def _resolve_runtime_script_preview_path(self) -> Path:
         if (
@@ -3033,8 +3954,12 @@ class SAXSMainWindow(QMainWindow):
         }
 
     def _apply_project_settings(self, settings: ProjectSettings) -> None:
-        template_specs = list_template_specs()
+        template_specs = self._template_specs_for_dropdown(
+            include_deprecated=self._show_deprecated_templates,
+            selected_names=[settings.selected_model_template or ""],
+        )
         self._last_results_loader = None
+        self._loaded_dream_run_dir = None
         self._dream_workflow_project_dir = None
         self._dream_parameter_map_saved_in_session = False
         self._active_dream_settings_snapshot = None
@@ -3048,7 +3973,7 @@ class SAXSMainWindow(QMainWindow):
             self._load_prefit_workflow()
         except Exception as exc:
             self.prefit_workflow = None
-            self.prefit_tab.set_templates(template_specs, None)
+            self._apply_prefit_template_fallback(settings, template_specs)
             self.prefit_tab.plot_evaluation(None)
             self.prefit_tab.set_log_text(
                 "Prefit workflow is not ready yet.\n" f"{exc}"
@@ -3056,10 +3981,12 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_tab.set_summary_text(
                 "Prefit summary is not available yet.\n" f"{exc}"
             )
+            self.prefit_tab.set_saved_states([], None)
         try:
             self._load_dream_workflow()
         except Exception as exc:
             self.dream_workflow = None
+            self.dream_tab.set_available_saved_runs([])
             self.dream_tab.set_log_text(
                 "DREAM workflow is not ready yet.\n" f"{exc}"
             )
@@ -3157,10 +4084,14 @@ class SAXSMainWindow(QMainWindow):
         if self.current_settings is None:
             raise ValueError("No project is currently loaded.")
         self.prefit_workflow = SAXSPrefitWorkflow(
-            self.current_settings.project_dir
+            self.current_settings.project_dir,
+            template_name=self.current_settings.selected_model_template,
         )
         self.current_settings = self.prefit_workflow.settings
-        template_specs = list_template_specs()
+        template_specs = self._template_specs_for_dropdown(
+            include_deprecated=self._show_deprecated_templates,
+            selected_names=[self.prefit_workflow.template_spec.name],
+        )
         self.prefit_tab.set_templates(
             template_specs,
             self.prefit_workflow.template_spec.name,
@@ -3176,6 +4107,7 @@ class SAXSMainWindow(QMainWindow):
         self.prefit_tab.populate_parameter_table(
             self.prefit_workflow.parameter_entries
         )
+        self._refresh_prefit_volume_fraction_section()
         self._refresh_prefit_cluster_geometry_section()
         self._load_prefit_preview()
         self.prefit_tab.set_log_text(self._format_prefit_console_intro())
@@ -3185,6 +4117,77 @@ class SAXSMainWindow(QMainWindow):
             )
         self._refresh_saved_prefit_states()
         return self.prefit_workflow
+
+    def _apply_prefit_template_fallback(
+        self,
+        settings: ProjectSettings,
+        template_specs: list,
+    ) -> None:
+        selected_template = (
+            str(settings.selected_model_template or "").strip() or None
+        )
+        self.prefit_tab.set_templates(template_specs, selected_template)
+        self.prefit_tab.set_autosave(settings.autosave_prefits)
+        if selected_template:
+            self._restoring_prefit_template = True
+            try:
+                self.prefit_tab.set_selected_template(selected_template)
+            finally:
+                self._restoring_prefit_template = False
+        self.prefit_tab.populate_parameter_table([])
+        template_spec = None
+        if selected_template:
+            try:
+                template_spec = load_template_spec(selected_template)
+            except Exception:
+                template_spec = None
+        target = self._volume_fraction_target_for_template_spec(template_spec)
+        self.prefit_tab.set_solute_volume_fraction_visible(target is not None)
+        if target is None:
+            self.prefit_tab.set_solute_volume_fraction_target(None, None)
+        else:
+            self.prefit_tab.set_solute_volume_fraction_target(*target)
+        supports_cluster_geometry = bool(
+            template_spec is not None
+            and template_spec.cluster_geometry_support.supported
+        )
+        self.prefit_tab.set_cluster_geometry_visible(supports_cluster_geometry)
+        if supports_cluster_geometry and template_spec is not None:
+            self.prefit_tab.populate_cluster_geometry_table(
+                [],
+                mapping_options=[],
+                allowed_sf_approximations=(
+                    template_spec.cluster_geometry_support.allowed_sf_approximations
+                ),
+            )
+            self.prefit_tab.set_cluster_geometry_status_text(
+                "The active template expects per-cluster geometry metadata. "
+                "Build prior weights and load the Prefit workflow to map "
+                "component rows, then compute cluster geometry metadata."
+            )
+        else:
+            self.prefit_tab.set_cluster_geometry_status_text(
+                "This template does not use per-cluster geometry metadata."
+            )
+
+    @staticmethod
+    def _volume_fraction_target_for_template_spec(
+        template_spec,
+    ) -> tuple[str, str] | None:
+        if template_spec is None:
+            return None
+        parameter_names = {
+            str(parameter.name).strip()
+            for parameter in template_spec.parameters
+            if str(parameter.name).strip()
+        }
+        for candidate in SOLUTE_VOLUME_FRACTION_PARAMETER_NAMES:
+            if candidate in parameter_names:
+                return candidate, "solute"
+        for candidate in SOLVENT_VOLUME_FRACTION_PARAMETER_NAMES:
+            if candidate in parameter_names:
+                return candidate, "solvent"
+        return None
 
     def _load_dream_workflow(self) -> SAXSDreamWorkflow:
         if self.current_settings is None:
@@ -3229,7 +4232,69 @@ class SAXSMainWindow(QMainWindow):
             )
             self.dream_tab.reset_progress()
             self.dream_tab.clear_plots()
+        self._refresh_saved_dream_runs()
         return self.dream_workflow
+
+    def _list_saved_dream_runs(self) -> list[DreamSavedRunRecord]:
+        if self.current_settings is None:
+            return []
+        runtime_dir = build_project_paths(
+            self.current_settings.project_dir
+        ).dream_runtime_dir
+        if not runtime_dir.is_dir():
+            return []
+        records: list[DreamSavedRunRecord] = []
+        run_dirs = sorted(
+            runtime_dir.glob("dream_*"), key=lambda path: path.name
+        )
+        for run_dir in reversed(run_dirs):
+            if not (
+                (run_dir / "dream_sampled_params.npy").is_file()
+                and (run_dir / "dream_log_ps.npy").is_file()
+            ):
+                continue
+            settings_path = run_dir / "pd_settings.json"
+            try:
+                settings = load_dream_settings(settings_path)
+            except Exception:
+                settings = DreamRunSettings()
+            label_parts = [run_dir.name]
+            if (
+                settings.run_label.strip()
+                and settings.run_label.strip() != "dream"
+            ):
+                label_parts.append(settings.run_label.strip())
+            if settings.model_name:
+                label_parts.append(settings.model_name)
+            label_parts.append(
+                f"{settings.nchains} chains x {settings.niterations} iter"
+            )
+            records.append(
+                DreamSavedRunRecord(
+                    run_dir=run_dir,
+                    display_label=" | ".join(label_parts),
+                )
+            )
+        return records
+
+    def _refresh_saved_dream_runs(
+        self,
+        *,
+        selected_run_dir: str | Path | None = None,
+    ) -> None:
+        records = self._list_saved_dream_runs()
+        selected_value: str | None = None
+        if selected_run_dir is not None:
+            selected_value = str(Path(selected_run_dir).resolve())
+        elif self._loaded_dream_run_dir is not None:
+            selected_value = str(self._loaded_dream_run_dir.resolve())
+        self.dream_tab.set_available_saved_runs(
+            [
+                (record.display_label, str(record.run_dir))
+                for record in records
+            ],
+            selected_run_dir=selected_value,
+        )
 
     def _refresh_prior_plot(self) -> None:
         if self.current_settings is None:
@@ -3301,13 +4366,11 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_workflow.set_template(template_name)
             if self.current_settings is not None:
                 self.current_settings = self.prefit_workflow.settings
-            self.project_setup_tab.set_available_templates(
-                list_template_specs(),
-                template_name,
-            )
+            self._refresh_template_selectors(selected_name=template_name)
             self.prefit_tab.populate_parameter_table(
                 self.prefit_workflow.parameter_entries
             )
+            self._refresh_prefit_volume_fraction_section()
             self._refresh_prefit_cluster_geometry_section()
             evaluation = self._load_prefit_preview(append_blocked_log=True)
             self.prefit_tab.append_log(
@@ -3345,7 +4408,11 @@ class SAXSMainWindow(QMainWindow):
         try:
             preset_name = self.dream_tab.selected_settings_preset_name()
             previous_preset_name = self._current_dream_preset_name
-            if previous_preset_name is None and preset_name is not None:
+            if (
+                previous_preset_name is None
+                and preset_name is not None
+                and self._loaded_dream_run_dir is None
+            ):
                 self._active_dream_settings_snapshot = (
                     self._copy_dream_settings(
                         self.dream_tab.settings_payload()
@@ -3567,6 +4634,25 @@ class SAXSMainWindow(QMainWindow):
             )
         else:
             self.statusBar().showMessage("Opened fullrmc setup")
+
+    def _open_solute_volume_fraction_tool(self) -> None:
+        window = SoluteVolumeFractionToolWindow()
+        window.estimator_widget.estimate_calculated.connect(
+            self._on_solute_volume_fraction_estimate_calculated
+        )
+        self._solute_volume_fraction_tool_window = window
+        self._sync_volume_fraction_tool_target()
+        window.destroyed.connect(
+            lambda *_args: setattr(
+                self,
+                "_solute_volume_fraction_tool_window",
+                None,
+            )
+        )
+        window.show()
+        window.raise_()
+        self._child_tool_windows.append(window)
+        self.statusBar().showMessage("Opened volume fraction estimate")
 
     def _show_placeholder_tool_message(self, tool_name: str) -> None:
         QMessageBox.information(
@@ -4214,6 +5300,33 @@ class SAXSMainWindow(QMainWindow):
             )
         return "all_post_burnin"
 
+    @staticmethod
+    def _merge_dream_analysis_settings(
+        run_settings: DreamRunSettings,
+        current_settings: DreamRunSettings,
+    ) -> DreamRunSettings:
+        merged = DreamRunSettings.from_dict(run_settings.to_dict())
+        merged.bestfit_method = current_settings.bestfit_method
+        merged.posterior_filter_mode = current_settings.posterior_filter_mode
+        merged.posterior_top_percent = current_settings.posterior_top_percent
+        merged.posterior_top_n = current_settings.posterior_top_n
+        merged.credible_interval_low = current_settings.credible_interval_low
+        merged.credible_interval_high = current_settings.credible_interval_high
+        merged.violin_parameter_mode = current_settings.violin_parameter_mode
+        merged.violin_sample_source = current_settings.violin_sample_source
+        merged.violin_weight_order = current_settings.violin_weight_order
+        merged.violin_value_scale_mode = (
+            current_settings.violin_value_scale_mode
+        )
+        merged.violin_palette = current_settings.violin_palette
+        merged.violin_custom_color = current_settings.violin_custom_color
+        merged.violin_point_color = current_settings.violin_point_color
+        merged.violin_interval_color = current_settings.violin_interval_color
+        merged.violin_median_color = current_settings.violin_median_color
+        merged.violin_outline_color = current_settings.violin_outline_color
+        merged.violin_outline_width = current_settings.violin_outline_width
+        return merged
+
     def _append_dream_vary_recommendation(self, entries: list) -> None:
         fixed = [entry.param for entry in entries if not entry.vary]
         if not fixed:
@@ -4229,6 +5342,11 @@ class SAXSMainWindow(QMainWindow):
 
     def _invalidate_written_dream_bundle(self) -> None:
         self._last_written_dream_bundle = None
+
+    def _invalidate_dream_workflow_cache(self) -> None:
+        self.dream_workflow = None
+        self._invalidate_written_dream_bundle()
+        self._last_dream_constraint_warning_signature = None
 
     def _format_prefit_console_intro(self) -> str:
         if self.prefit_workflow is None:
@@ -4391,7 +5509,7 @@ class SAXSMainWindow(QMainWindow):
                 vary=True,
             )
             self.prefit_tab.append_log(
-                "Applied recommended scale settings.\n"
+                "Applied autoscale settings.\n"
                 f"Current scale: {recommendation.current_scale:.6g}\n"
                 f"Recommended scale: {recommendation.recommended_scale:.6g}\n"
                 f"Scale min: {recommendation.recommended_minimum:.6g}\n"
@@ -4400,7 +5518,7 @@ class SAXSMainWindow(QMainWindow):
                 f"Points used: {recommendation.points_used}"
             )
             self.update_prefit_model()
-            self.statusBar().showMessage("Recommended scale settings applied")
+            self.statusBar().showMessage("Autoscale applied")
         except Exception as exc:
             self._show_error("Scale recommendation failed", str(exc))
 
