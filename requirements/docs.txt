@@ -1,1 +1,4 @@
-# No docs-only packages are currently installed in saxshell-py312.
+# Pin MkDocs to 1.x because Material for MkDocs 9.x is not compatible with
+# MkDocs 2.0 as of February 2026.
+mkdocs==1.6.1
+mkdocs-material==9.7.5
