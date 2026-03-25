@@ -77,3 +77,7 @@ When you add or change user-facing behavior:
 
 TODO: expand this page with any future contributor conventions around release
 notes or benchmark workflows if they become formalized.
+
+TODO: document the remaining migration steps as SAXSShell is renamed from
+SAXShell, including which internal package paths and compatibility shims are
+still intentionally using the legacy name.

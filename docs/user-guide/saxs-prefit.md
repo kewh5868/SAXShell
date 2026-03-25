@@ -98,7 +98,7 @@ scatterer-solvent contrast term `Δρ` and notes that, on absolute-scale data,
 `scale` should match the volume fraction only when the fit is physically
 consistent; otherwise an extra rescaling factor is still needed.
 
-That same practical issue becomes even more important when SAXShell is fitting
+That same practical issue becomes even more important when SAXSShell is fitting
 simulated or cluster-derived component profiles. In those workflows, the
 effective contrast between the cluster, the surrounding medium, and any
 solvation or hydration layer is often not known exactly. Published SAXS work on
@@ -113,7 +113,7 @@ So the scientifically careful statement is:
 - but **do not assume absolute scaling removes the need for a fitted scale
   factor**
 
-In SAXShell, `scale` is therefore kept in most templates as a practical way to
+In SAXSShell, `scale` is therefore kept in most templates as a practical way to
 absorb uncertainty in:
 
 - effective contrast between solute and medium

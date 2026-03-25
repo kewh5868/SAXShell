@@ -1,15 +1,15 @@
 # pyDREAM Workflow
 
-The **SAXS DREAM Fit** tab is the posterior-sampling side of SAXShell. It uses
+The **SAXS DREAM Fit** tab is the posterior-sampling side of SAXSShell. It uses
 the current project, Prefit parameter table, and active template runtime inputs
 to generate a pyDREAM bundle and launch a Bayesian refinement.
 
-SAXShell uses **pyDREAM**, a Python implementation of the
+SAXSShell uses **pyDREAM**, a Python implementation of the
 **MT-DREAM(ZS)** sampler. In plain language, pyDREAM runs several Markov chains
 at once, explores parameter space, and then uses the accepted samples to
 estimate both a best-fit model and the uncertainty around that fit.
 
-## What DREAM Is Doing In SAXShell
+## What DREAM Is Doing In SAXSShell
 
 Use DREAM when you want more than one optimized answer.
 
@@ -66,7 +66,7 @@ candidate parameter values. Running multiple chains helps pyDREAM explore more
 robustly and reduces the chance that one unlucky starting point dominates the
 result.
 
-In SAXShell:
+In SAXSShell:
 
 - more chains usually means better exploration
 - more chains also usually means more runtime
@@ -78,7 +78,7 @@ In SAXShell:
 **Burn-in** is the early part of a chain that you throw away because the
 sampler is still settling into the high-probability region of parameter space.
 
-In SAXShell, burn-in is implemented as:
+In SAXSShell, burn-in is implemented as:
 
 1. compute the number of iterations in each chain
 2. remove the earliest `burnin_percent` from every chain
@@ -92,7 +92,7 @@ and posterior filtering.
 **MAP** stands for **Maximum a Posteriori**.
 
 In Bayesian fitting, this means the parameter set with the highest posterior
-probability among the samples being considered. In SAXShell, that is
+probability among the samples being considered. In SAXSShell, that is
 implemented as:
 
 1. apply burn-in
@@ -130,7 +130,7 @@ If you change any of the linked controls manually, the preset switches to
 
 ## DREAM Settings Explained
 
-This section explains the main pyDREAM controls in the current SAXShell UI in
+This section explains the main pyDREAM controls in the current SAXSShell UI in
 plain language.
 
 ## Edit Priors And Smart Prior Presets
@@ -149,7 +149,7 @@ current table is the baseline and the preset multiplies that baseline width.
 
 ### Width Rescaling Rule
 
-Let `f` be the smart-preset spread factor. SAXShell applies:
+Let `f` be the smart-preset spread factor. SAXSShell applies:
 
 - **Very Strict**: `f = 0.40`
 - **Strict**: `f = 0.65`
@@ -175,7 +175,7 @@ scale' = scale
 s' = f * s
 ```
 
-For a uniform prior, SAXShell preserves the current center and rescales the
+For a uniform prior, SAXSShell preserves the current center and rescales the
 width:
 
 ```text
@@ -189,7 +189,7 @@ So the preset changes spread, not the intended center of the prior.
 ### Apply To: All Structures vs Selected Structures
 
 For the single-mode presets above, the **Apply to** control determines whether
-SAXShell adjusts:
+SAXSShell adjusts:
 
 - all structure groups in the table
 - or only the currently selected structure rows
@@ -199,7 +199,7 @@ In the current implementation, a "structure group" means:
 - all rows sharing the same `(structure, motif)` pair, if those fields are set
 - otherwise only the specific row itself
 
-That means if you apply `Strict` to one selected cluster structure, SAXShell
+That means if you apply `Strict` to one selected cluster structure, SAXSShell
 updates the whole structure/motif group together so its associated weight and
 related rows stay synchronized.
 
@@ -210,11 +210,11 @@ The two mixed presets are:
 - **Strict Small / Lenient Large**
 - **Lenient Small / Strict Large**
 
-These always apply across **all** structures because SAXShell must rank the
+These always apply across **all** structures because SAXSShell must rank the
 structures against each other before deciding which ones are "small" or
 "large".
 
-First, SAXShell builds one effective radius per weight parameter:
+First, SAXSShell builds one effective radius per weight parameter:
 
 - if a sphere radius row exists, it uses `r_eff_wN`
 - if an ellipsoid is represented by semiaxes, it converts that to an
@@ -228,7 +228,7 @@ r_eq = (a * b * c)^(1/3)
 
 where `a`, `b`, and `c` are the active semiaxes for that component.
 
-Next, SAXShell computes the median radius across all weight-linked structures:
+Next, SAXSShell computes the median radius across all weight-linked structures:
 
 ```text
 r_med = median({r_i})
@@ -310,7 +310,7 @@ How many DREAM chains to run.
 
 - Higher values usually improve exploration.
 - Higher values also increase runtime and output size.
-- SAXShell may raise this automatically so there is at least one chain per
+- SAXSShell may raise this automatically so there is at least one chain per
   varying parameter.
 
 ### Iterations
@@ -346,7 +346,7 @@ Practical meaning:
 - too small can make early proposal adaptation weaker
 - larger values can help stabilize the sampler in harder problems
 
-SAXShell will raise this automatically if needed so it is at least `2 x Chains`.
+SAXSShell will raise this automatically if needed so it is at least `2 x Chains`.
 
 ### Crossover Burn-in
 
@@ -412,7 +412,7 @@ comparing runs.
 
 ## Best-Fit Methods
 
-The **Best-fit method** control changes how SAXShell reduces the retained
+The **Best-fit method** control changes how SAXSShell reduces the retained
 posterior to a single representative parameter set for the model plot and
 summary.
 
@@ -420,14 +420,14 @@ summary.
 
 **Maximum a Posteriori**.
 
-SAXShell picks the retained sample with the highest log-posterior value after
+SAXSShell picks the retained sample with the highest log-posterior value after
 burn-in and posterior filtering.
 
 Use this when you want the single most probable retained sampled state.
 
 ### Chain Mean MAP
 
-SAXShell finds the best retained sample **within each chain** and then averages
+SAXSShell finds the best retained sample **within each chain** and then averages
 those per-chain MAP parameter vectors.
 
 Use this when you want a slightly more chain-balanced representative estimate
@@ -435,7 +435,7 @@ instead of a single winning sample.
 
 ### Median
 
-SAXShell computes the parameter-wise median across the retained posterior
+SAXSShell computes the parameter-wise median across the retained posterior
 samples.
 
 Use this when you want a robust central estimate that is less sensitive to one
@@ -447,7 +447,7 @@ Posterior filtering controls **which retained post-burn-in samples are allowed
 to contribute** to the summary statistics, best-fit selection, and violin plot
 data source.
 
-In SAXShell, filtering is performed in this order:
+In SAXSShell, filtering is performed in this order:
 
 1. apply burn-in to every chain
 2. flatten the remaining samples across all chains
@@ -472,7 +472,7 @@ Use this when:
 Sort all post-burn-in samples by log-posterior from highest to lowest, then
 keep only the top percentage.
 
-SAXShell keeps:
+SAXSShell keeps:
 
 - `ceil(total_post_burnin_samples * top_percent / 100)`
 - with a minimum of 1 retained sample
@@ -485,7 +485,7 @@ hard-coding an exact sample count.
 Sort all post-burn-in samples by log-posterior from highest to lowest, then
 keep only the best `N` samples.
 
-SAXShell clamps this to:
+SAXSShell clamps this to:
 
 - at least 1 sample
 - no more than the total number of post-burn-in samples
@@ -494,7 +494,7 @@ Use this when you want a fixed-size retained subset across runs.
 
 ## Automatic Posterior Filter Assessment
 
-If **Auto-select best filter after run** is enabled, SAXShell evaluates all
+If **Auto-select best filter after run** is enabled, SAXSShell evaluates all
 three filter modes after the run finishes:
 
 - `all_post_burnin`
@@ -507,7 +507,7 @@ It evaluates them using:
 - the current default `Top %`
 - the current default `Top N`
 
-SAXShell then recommends the filter with the best fit quality using this tie
+SAXSShell then recommends the filter with the best fit quality using this tie
 break order:
 
 1. lowest RMSE

@@ -1,6 +1,6 @@
 # GUI Overview
 
-SAXShell is not a single-window application. The repository contains multiple
+SAXSShell is not a single-window application. The repository contains multiple
 Qt workflows, each with its own UI and CLI entry point.
 
 ## Main applications

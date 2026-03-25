@@ -1,6 +1,6 @@
-# SAXShell
+# SAXSShell
 
-SAXShell is a workflow-oriented toolkit for turning molecular simulation output
+SAXSShell is a workflow-oriented toolkit for turning molecular simulation output
 into structural analysis and SAXS fitting workflows. The repository combines:
 
 - Qt desktop applications for interactive use
@@ -73,3 +73,10 @@ The SAXS workflow in this repository is active and evolving. The documentation
 focuses on features that are already represented in the current codebase. When
 exact behavior is still evolving, the docs call that out explicitly instead of
 guessing.
+
+> Note
+>
+> SAXSShell is in the process of being renamed from `SAXShell`. During this
+> transition, some internal package paths, CLI names, saved-settings namespaces,
+> or compatibility references may still use `saxshell` or `SAXShell` even though
+> the front-facing documentation and UI are being updated to `SAXSShell`.

@@ -107,7 +107,7 @@ class MDTrajectoryMainWindow(QMainWindow):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("SAXShell (mdtrajectory)")
+        self.setWindowTitle("SAXSShell (mdtrajectory)")
         self.resize(1280, 780)
 
         central = QWidget()

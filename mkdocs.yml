@@ -1,10 +1,10 @@
-site_name: SAXShell
+site_name: SAXSShell
 site_description: >-
-  Workflow-oriented documentation for SAXShell, from trajectory processing and
+  Workflow-oriented documentation for SAXSShell, from trajectory processing and
   cluster extraction to SAXS project setup, prefit modeling, and pyDREAM runs.
-site_url: https://kewh5868.github.io/SAXShell/
-repo_url: https://github.com/kewh5868/SAXShell
-repo_name: kewh5868/SAXShell
+site_url: https://kewh5868.github.io/SAXSShell/
+repo_url: https://github.com/kewh5868/SAXSShell
+repo_name: kewh5868/SAXSShell
 
 theme:
   name: material

@@ -12,7 +12,7 @@ def main(argv: list[str] | None = None) -> int:
             "Python package for analysis of small-angle scattering data "
             "from molecular dynamics derived liquid structures.\n\n"
             "For more information, visit: "
-            "https://github.com/kewh5868/saxshell/"
+            "https://github.com/kewh5868/SAXSShell/"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

@@ -93,7 +93,7 @@ from saxshell.saxs.ui.solute_volume_fraction_widget import (
 )
 from saxshell.version import __version__
 
-GITHUB_REPOSITORY_URL = "https://github.com/kewh5868/SAXShell"
+GITHUB_REPOSITORY_URL = "https://github.com/kewh5868/SAXSShell"
 CONTACT_EMAIL = "keith.white@colorado.edu"
 RECENT_PROJECTS_KEY = "recent_project_dirs"
 MAX_RECENT_PROJECTS = 10
@@ -352,7 +352,7 @@ class SAXSMainWindow(QMainWindow):
             self.dream_tab.clear_plots()
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("SAXShell (saxs)")
+        self.setWindowTitle("SAXSShell (saxs)")
         self.resize(self._default_window_size())
 
         self._build_menu_bar()
@@ -4660,7 +4660,7 @@ class SAXSMainWindow(QMainWindow):
             "Coming soon",
             (
                 f"{tool_name} is listed in the Tools menu as a placeholder "
-                "for future SAXShell integration."
+                "for future SAXSShell integration."
             ),
         )
         self.statusBar().showMessage(f"{tool_name} is not available yet", 5000)
@@ -4750,7 +4750,7 @@ class SAXSMainWindow(QMainWindow):
             self._git_output("remote", "get-url", "upstream") or ""
         )
         lines = [
-            "SAXShell Version Information",
+            "SAXSShell Version Information",
             "",
             f"Package version: {__version__}",
             f"Git branch: {branch or 'unavailable'}",
@@ -4776,14 +4776,14 @@ class SAXSMainWindow(QMainWindow):
             or GITHUB_REPOSITORY_URL
         )
         QDesktopServices.openUrl(QUrl(repository_url))
-        self.statusBar().showMessage("Opened SAXShell GitHub repository")
+        self.statusBar().showMessage("Opened SAXSShell GitHub repository")
 
     def _show_contact_information(self) -> None:
         QMessageBox.information(
             self,
             "Developer Contact",
             (
-                "For SAXShell questions, template requests, or bug reports, "
+                "For SAXSShell questions, template requests, or bug reports, "
                 "contact the developer at:\n\n"
                 f"{CONTACT_EMAIL}"
             ),

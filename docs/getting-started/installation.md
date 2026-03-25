@@ -24,8 +24,8 @@ saxshell --help
 Clone the repository and install it in editable mode:
 
 ```bash
-git clone https://github.com/kewh5868/SAXShell.git
-cd SAXShell
+git clone https://github.com/kewh5868/SAXSShell.git
+cd SAXSShell
 python -m pip install -e .
 ```
 

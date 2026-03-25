@@ -33,9 +33,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/kewh5868/SAXShell/"
-Documentation = "https://kewh5868.github.io/SAXShell/"
-Issues = "https://github.com/kewh5868/SAXShell/issues/"
+Homepage = "https://github.com/kewh5868/SAXSShell/"
+Documentation = "https://kewh5868.github.io/SAXSShell/"
+Issues = "https://github.com/kewh5868/SAXSShell/issues/"
 
 [project.scripts]
 bondanalysis = "saxshell.bondanalysis.cli:main"

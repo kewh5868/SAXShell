@@ -1,6 +1,6 @@
 # Results and Export
 
-SAXShell stores more than one kind of output. Some files are meant for people,
+SAXSShell stores more than one kind of output. Some files are meant for people,
 and some are meant for the workflow itself.
 
 ## Prefit outputs

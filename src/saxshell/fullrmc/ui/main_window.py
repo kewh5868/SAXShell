@@ -376,7 +376,7 @@ class RMCSetupMainWindow(QMainWindow):
         initial_project_dir: str | Path | None = None,
     ) -> None:
         super().__init__()
-        self.setWindowTitle("SAXShell (rmcsetup)")
+        self.setWindowTitle("SAXSShell (rmcsetup)")
         self.resize(1080, 860)
 
         self.project_manager = SAXSProjectManager()
@@ -4756,7 +4756,7 @@ def main(argv: list[str] | None = None) -> int:
     """Entry point for launching the Qt6 rmcsetup UI."""
     parser = argparse.ArgumentParser(
         prog="rmcsetup-ui",
-        description="Launch the SAXShell rmcsetup UI scaffold.",
+        description="Launch the SAXSShell rmcsetup UI scaffold.",
     )
     parser.add_argument(
         "project_dir",
