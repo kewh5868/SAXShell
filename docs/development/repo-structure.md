@@ -8,6 +8,7 @@ This page is a short orientation guide for contributors.
 src/saxshell/
   bondanalysis/
   cluster/
+  clusterdynamics/
   fullrmc/
   mdtrajectory/
   saxs/
@@ -31,6 +32,11 @@ Residue-aware XYZ-to-PDB conversion, reference-library helpers, and UI code.
 ### `src/saxshell/cluster`
 
 Cluster extraction workflows and UI.
+
+### `src/saxshell/clusterdynamics`
+
+Time-binned cluster-distribution analysis, lifetime/rate summaries, dataset
+save/load helpers, and the matching UI.
 
 ### `src/saxshell/bondanalysis`
 

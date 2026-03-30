@@ -55,6 +55,11 @@ from saxshell.bondanalysis.results import (
     load_result_index,
 )
 from saxshell.bondanalysis.ui.plot_window import BondAnalysisPlotWindow
+from saxshell.saxs.ui.branding import (
+    configure_saxshell_application,
+    load_saxshell_icon,
+    prepare_saxshell_application_identity,
+)
 
 _OPEN_WINDOWS: list["BondAnalysisMainWindow"] = []
 
@@ -115,6 +120,7 @@ class BondAnalysisMainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell (bondanalysis)")
+        self.setWindowIcon(load_saxshell_icon())
         self.resize(1320, 840)
 
         central = QWidget()
@@ -1250,7 +1256,9 @@ def launch_bondanalysis_ui(
     app = QApplication.instance()
     owns_app = app is None
     if app is None:
+        prepare_saxshell_application_identity()
         app = QApplication(sys.argv)
+    configure_saxshell_application(app)
 
     window = BondAnalysisMainWindow(initial_clusters_dir=clusters_dir)
     _OPEN_WINDOWS.append(window)

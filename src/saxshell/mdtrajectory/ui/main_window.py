@@ -23,6 +23,11 @@ from saxshell.mdtrajectory.ui.export_panel import ExportPanel
 from saxshell.mdtrajectory.ui.state import MDTrajectoryAppState
 from saxshell.mdtrajectory.ui.trajectory_panel import TrajectoryPanel
 from saxshell.mdtrajectory.workflow import suggest_output_dir
+from saxshell.saxs.ui.branding import (
+    configure_saxshell_application,
+    load_saxshell_icon,
+    prepare_saxshell_application_identity,
+)
 
 
 @dataclass(slots=True)
@@ -108,6 +113,7 @@ class MDTrajectoryMainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell (mdtrajectory)")
+        self.setWindowIcon(load_saxshell_icon())
         self.resize(1280, 780)
 
         central = QWidget()
@@ -640,6 +646,11 @@ class MDTrajectoryMainWindow(QMainWindow):
 
 
 def launch_mdtrajectory_app() -> MDTrajectoryMainWindow:
+    app = QApplication.instance()
+    if app is None:
+        prepare_saxshell_application_identity()
+        app = QApplication([])
+    configure_saxshell_application(app)
     window = MDTrajectoryMainWindow()
     window.show()
     return window

@@ -34,6 +34,11 @@ from saxshell.cluster import (
 from saxshell.cluster.ui.definitions_panel import ClusterDefinitionsPanel
 from saxshell.cluster.ui.export_panel import ClusterExportPanel
 from saxshell.cluster.ui.trajectory_panel import ClusterTrajectoryPanel
+from saxshell.saxs.ui.branding import (
+    configure_saxshell_application,
+    load_saxshell_icon,
+    prepare_saxshell_application_identity,
+)
 from saxshell.structure import AtomTypeDefinitions
 
 
@@ -378,6 +383,7 @@ class ClusterMainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell (cluster)")
+        self.setWindowIcon(load_saxshell_icon())
         self.resize(1360, 860)
 
         central = QWidget()
@@ -1153,7 +1159,9 @@ def launch_cluster_ui(
     app = QApplication.instance()
     owns_app = app is None
     if app is None:
+        prepare_saxshell_application_identity()
         app = QApplication(sys.argv)
+    configure_saxshell_application(app)
 
     window = ClusterMainWindow(
         initial_frames_dir=Path(frames_dir) if frames_dir is not None else None

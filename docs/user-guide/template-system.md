@@ -134,6 +134,9 @@ The repository currently includes bundled templates such as:
 - poly-LMA hard-sphere workflows
 - approximate mixed sphere/ellipsoid workflows
 
+For the bundled model equations, variable definitions, and literature links,
+see [Pre-loaded SAXS Models](preloaded-saxs-models.md).
+
 Some older templates now live in a `_deprecated` subfolder. They are hidden by
 default in template dropdowns, but older projects can still load them.
 
@@ -326,6 +329,18 @@ solute, its solvation layer, and the surrounding medium is not known exactly.
 This is especially relevant for structure-derived scattering workflows, where
 published SAXS studies show that uncertainties in hydration-layer contrast can
 materially change the calculated profile.
+
+For the current poly-LMA solvent-subtraction workflows, the repository also
+distinguishes between:
+
+- a physical bulk-density solute-associated volume fraction reported for reference
+- a SAXS-effective interaction ratio used for the model-facing `phi_solute` /
+  `phi_solvent` default
+
+That distinction matters because the solvent-background subtraction is carried
+by both the solute/solvent split and the explicit solvent term. The model-facing
+split therefore follows the contrast-weighted SAXS interaction estimate, while
+the attenuation term stays in `solvent_scale`.
 
 Likewise, `offset` is included because a flat residual background is common in
 real SAXS data reduction. In practice this can represent imperfect background

@@ -518,8 +518,98 @@ class ClusterDefinitionsPanel(QGroupBox):
         value = self.default_cutoff_spin.value()
         return None if value <= 0.0 else value
 
+    def load_atom_type_definitions(
+        self,
+        definitions: AtomTypeDefinitions,
+        *,
+        emit_signal: bool = True,
+    ) -> None:
+        self.atom_table.setRowCount(0)
+        ordered_atom_types = ["node", "linker", "shell"]
+        seen_atom_types: set[str] = set()
+        for atom_type in ordered_atom_types + sorted(definitions):
+            if atom_type in seen_atom_types:
+                continue
+            seen_atom_types.add(atom_type)
+            for element, residue in definitions.get(atom_type, []):
+                row = self.atom_table.rowCount()
+                self.atom_table.insertRow(row)
+                type_combo = QComboBox()
+                type_combo.addItems(["node", "linker", "shell"])
+                if atom_type not in {"node", "linker", "shell"}:
+                    type_combo.addItem(atom_type)
+                type_combo.setCurrentText(atom_type)
+                type_combo.setToolTip("Cluster role assigned to this element.")
+                type_combo.currentTextChanged.connect(
+                    lambda _text: self.settings_changed.emit()
+                )
+                self.atom_table.setCellWidget(row, 0, type_combo)
+                self.atom_table.setItem(
+                    row,
+                    1,
+                    QTableWidgetItem("" if element is None else str(element)),
+                )
+                self.atom_table.setItem(
+                    row,
+                    2,
+                    QTableWidgetItem("" if residue is None else str(residue)),
+                )
+        self._sync_pair_element_choices()
+        if emit_signal:
+            self.settings_changed.emit()
+
+    def load_pair_cutoff_definitions(
+        self,
+        definitions: PairCutoffDefinitions,
+        *,
+        emit_signal: bool = True,
+    ) -> None:
+        self.pair_table.setRowCount(0)
+        self._sync_pair_element_choices()
+        for atom1, atom2 in sorted(definitions):
+            row = self.pair_table.rowCount()
+            self.pair_table.insertRow(row)
+            atom1_combo = self._make_pair_combo()
+            atom2_combo = self._make_pair_combo()
+            self.pair_table.setCellWidget(row, 0, atom1_combo)
+            self.pair_table.setCellWidget(row, 1, atom2_combo)
+            self._sync_pair_element_choices()
+            atom1_combo.setCurrentText(atom1)
+            atom2_combo.setCurrentText(atom2)
+            shell_cutoffs = definitions[(atom1, atom2)]
+            for level, column in enumerate((2, 3, 4)):
+                cutoff = shell_cutoffs.get(level)
+                self.pair_table.setItem(
+                    row,
+                    column,
+                    QTableWidgetItem("" if cutoff is None else str(cutoff)),
+                )
+        if emit_signal:
+            self.settings_changed.emit()
+
+    def set_default_cutoff(
+        self,
+        value: float | None,
+        *,
+        emit_signal: bool = True,
+    ) -> None:
+        self.default_cutoff_spin.blockSignals(True)
+        self.default_cutoff_spin.setValue(
+            0.0 if value is None else float(value)
+        )
+        self.default_cutoff_spin.blockSignals(False)
+        if emit_signal:
+            self.settings_changed.emit()
+
     def use_pbc(self) -> bool:
         return self.use_pbc_box.isChecked()
+
+    def set_use_pbc(self, value: bool, *, emit_signal: bool = True) -> None:
+        self.use_pbc_box.blockSignals(True)
+        self.use_pbc_box.setChecked(bool(value))
+        self.use_pbc_box.blockSignals(False)
+        if emit_signal:
+            self.settings_changed.emit()
 
     def search_mode(self) -> str:
         data = self.search_mode_combo.currentData()
@@ -527,8 +617,30 @@ class ClusterDefinitionsPanel(QGroupBox):
             return SEARCH_MODE_KDTREE
         return str(data)
 
+    def set_search_mode(self, value: str, *, emit_signal: bool = True) -> None:
+        for index in range(self.search_mode_combo.count()):
+            if self.search_mode_combo.itemData(index) == value:
+                self.search_mode_combo.blockSignals(True)
+                self.search_mode_combo.setCurrentIndex(index)
+                self.search_mode_combo.blockSignals(False)
+                break
+        if emit_signal:
+            self.settings_changed.emit()
+
     def save_state_frequency(self) -> int:
         return int(self.save_state_frequency_spin.value())
+
+    def set_save_state_frequency(
+        self,
+        value: int,
+        *,
+        emit_signal: bool = True,
+    ) -> None:
+        self.save_state_frequency_spin.blockSignals(True)
+        self.save_state_frequency_spin.setValue(int(value))
+        self.save_state_frequency_spin.blockSignals(False)
+        if emit_signal:
+            self.settings_changed.emit()
 
     def include_shell_levels(self) -> tuple[int, ...]:
         levels = [0]
@@ -543,11 +655,51 @@ class ClusterDefinitionsPanel(QGroupBox):
             level for level in self.include_shell_levels() if level > 0
         )
 
+    def set_shell_growth_levels(
+        self,
+        levels: tuple[int, ...] | list[int],
+        *,
+        emit_signal: bool = True,
+    ) -> None:
+        normalized = {int(level) for level in levels}
+        self.shell1_box.blockSignals(True)
+        self.shell2_box.blockSignals(True)
+        self.shell1_box.setChecked(1 in normalized)
+        self.shell2_box.setChecked(2 in normalized)
+        self.shell1_box.blockSignals(False)
+        self.shell2_box.blockSignals(False)
+        if emit_signal:
+            self.settings_changed.emit()
+
     def shared_shells(self) -> bool:
         return self.shared_shells_box.isChecked()
 
+    def set_shared_shells(
+        self,
+        value: bool,
+        *,
+        emit_signal: bool = True,
+    ) -> None:
+        self.shared_shells_box.blockSignals(True)
+        self.shared_shells_box.setChecked(bool(value))
+        self.shared_shells_box.blockSignals(False)
+        if emit_signal:
+            self.settings_changed.emit()
+
     def include_shell_atoms_in_stoichiometry(self) -> bool:
         return self.include_shell_stoichiometry_box.isChecked()
+
+    def set_include_shell_atoms_in_stoichiometry(
+        self,
+        value: bool,
+        *,
+        emit_signal: bool = True,
+    ) -> None:
+        self.include_shell_stoichiometry_box.blockSignals(True)
+        self.include_shell_stoichiometry_box.setChecked(bool(value))
+        self.include_shell_stoichiometry_box.blockSignals(False)
+        if emit_signal:
+            self.settings_changed.emit()
 
     def rule_counts(self) -> tuple[int, int]:
         atom_rules = sum(

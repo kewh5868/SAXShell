@@ -34,10 +34,11 @@ The current repo supports an end-to-end path that usually looks like this:
 1. Inspect and split trajectories with `mdtrajectory`.
 2. Optionally convert XYZ frames to residue-aware PDB files with `xyz2pdb`.
 3. Extract clusters with `clusters`.
-4. Measure bond and angle distributions with `bondanalysis`.
-5. Build a SAXS project with `saxs`.
-6. Refine the project in **SAXS Prefit** and, if needed, run **pyDREAM**.
-7. Use the resulting distributions and selected structures in downstream tools
+4. Analyze time-dependent cluster populations with `clusterdynamics`.
+5. Measure bond and angle distributions with `bondanalysis`.
+6. Build a SAXS project with `saxs`.
+7. Refine the project in **SAXS Prefit** and, if needed, run **pyDREAM**.
+8. Use the resulting distributions and selected structures in downstream tools
    such as `fullrmc`.
 
 ## Documentation map

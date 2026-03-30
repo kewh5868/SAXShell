@@ -1,5 +1,7 @@
 """Fullrmc setup scaffolding and launch helpers."""
 
+from typing import TYPE_CHECKING
+
 from .constraint_generation import (
     ConstraintGenerationEntry,
     ConstraintGenerationMetadata,
@@ -84,8 +86,10 @@ from .solvent_handling import (
     load_solvent_handling_metadata,
     save_solvent_handling_metadata,
 )
-from .ui.main_window import RMCSetupMainWindow, launch_rmcsetup_ui
-from .ui.representative_preview_window import RepresentativePreviewWindow
+
+if TYPE_CHECKING:
+    from .ui.main_window import RMCSetupMainWindow, launch_rmcsetup_ui
+    from .ui.representative_preview_window import RepresentativePreviewWindow
 
 __all__ = [
     "ClusterSourceValidationResult",
@@ -158,3 +162,21 @@ __all__ = [
     "solution_property_presets_path",
     "validate_cluster_source",
 ]
+
+
+def __getattr__(name: str):
+    if name in {"RMCSetupMainWindow", "launch_rmcsetup_ui"}:
+        from .ui.main_window import RMCSetupMainWindow, launch_rmcsetup_ui
+
+        exports = {
+            "RMCSetupMainWindow": RMCSetupMainWindow,
+            "launch_rmcsetup_ui": launch_rmcsetup_ui,
+        }
+        return exports[name]
+    if name == "RepresentativePreviewWindow":
+        from .ui.representative_preview_window import (
+            RepresentativePreviewWindow,
+        )
+
+        return RepresentativePreviewWindow
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

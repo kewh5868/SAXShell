@@ -184,11 +184,14 @@ def _add_common_conversion_arguments(
 def _handle_ui(args: argparse.Namespace) -> int:
     from PySide6.QtWidgets import QApplication
 
+    from saxshell.saxs.ui.branding import prepare_saxshell_application_identity
+
     from .ui.main_window import launch_xyz2pdb_ui
 
     app = QApplication.instance()
     created_app = app is None
     if app is None:
+        prepare_saxshell_application_identity()
         app = QApplication(sys.argv)
     launch_xyz2pdb_ui(
         input_path=getattr(args, "input_path", None),

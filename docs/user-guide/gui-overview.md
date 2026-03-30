@@ -19,6 +19,12 @@ PDB conversion before clustering.
 
 Use this when you need to build cluster-network exports from extracted frames.
 
+### `clusterdynamics`
+
+Use this when you need time-binned cluster-distribution heatmaps, optional
+energy overlays, and lifetime / association / dissociation summaries from an
+extracted XYZ or PDB frame folder.
+
 ### `bondanalysis`
 
 Use this when you need bond-pair and angle-distribution measurements on the
@@ -73,3 +79,7 @@ Several newer SAXS UI surfaces follow the same patterns:
 
 TODO: add screenshots once the docs site has a stable asset pipeline and the
 UI labels settle after the current SAXS workflow changes.
+
+??? note "Artwork Attribution"
+The SAXSShell application icon used in the SAXS UI is based on artwork
+generated with ChatGPT (OpenAI).

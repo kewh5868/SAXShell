@@ -186,20 +186,20 @@ loc' = c - scale' / 2
 
 So the preset changes spread, not the intended center of the prior.
 
-### Apply To: All Structures vs Selected Structures
+### Apply To: All Parameters vs Selected Parameters
 
 For the single-mode presets above, the **Apply to** control determines whether
 SAXSShell adjusts:
 
-- all structure groups in the table
-- or only the currently selected structure rows
+- all parameter rows in the table
+- or only the currently selected parameter rows
 
 In the current implementation, a "structure group" means:
 
 - all rows sharing the same `(structure, motif)` pair, if those fields are set
 - otherwise only the specific row itself
 
-That means if you apply `Strict` to one selected cluster structure, SAXSShell
+That means if you apply `Strict` to one selected cluster parameter row, SAXSShell
 updates the whole structure/motif group together so its associated weight and
 related rows stay synchronized.
 
@@ -210,7 +210,7 @@ The two mixed presets are:
 - **Strict Small / Lenient Large**
 - **Lenient Small / Strict Large**
 
-These always apply across **all** structures because SAXSShell must rank the
+These always apply across **all** parameters because SAXSShell must rank the
 structures against each other before deciding which ones are "small" or
 "large".
 

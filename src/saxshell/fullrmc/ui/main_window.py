@@ -120,6 +120,11 @@ from saxshell.saxs.stoichiometry import (
     format_stoich_for_axis,
     sort_stoich_labels,
 )
+from saxshell.saxs.ui.branding import (
+    configure_saxshell_application,
+    load_saxshell_icon,
+    prepare_saxshell_application_identity,
+)
 
 _OPEN_WINDOWS: list["RMCSetupMainWindow"] = []
 
@@ -377,6 +382,7 @@ class RMCSetupMainWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self.setWindowTitle("SAXSShell (rmcsetup)")
+        self.setWindowIcon(load_saxshell_icon())
         self.resize(1080, 860)
 
         self.project_manager = SAXSProjectManager()
@@ -4742,7 +4748,9 @@ def launch_rmcsetup_ui(
     app = QApplication.instance()
     owns_app = app is None
     if app is None:
+        prepare_saxshell_application_identity()
         app = QApplication(sys.argv)
+    configure_saxshell_application(app)
 
     window = RMCSetupMainWindow(initial_project_dir=project_dir)
     _OPEN_WINDOWS.append(window)
