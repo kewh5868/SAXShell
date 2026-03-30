@@ -18,9 +18,9 @@ from scipy.stats import norm
 #   offset,
 #   log_sigma
 #
-# param: phi_solute,0.02,True,0.0,0.5
+# param: phi_solute,0.02,False,0.0,0.5
 # param: phi_int,0.02,True,0.0,0.4
-# param: solvent_scale,1.0,True,0.0,5.0
+# param: solvent_scale,1.0,False,0.0,1.0
 # param: scale,1.0,True,1e-8,1e8
 # param: offset,0.0,True,-1e6,1e6
 # param: log_sigma,-9.21,True,-20.0,5.0
@@ -31,13 +31,13 @@ from scipy.stats import norm
 # - decoupled forward model helper
 # - discrete local-monodisperse style cluster sum
 # - per-cluster hard-sphere S(Q) using effective radii
-# - explicit solvent template, global scale, and offset
+# - explicit solvent template, bounded solvent weight, and offset
 #
 # Model equation:
-#   I_model(q) = scale * [
-#       phi_solute * sum_i x_i I_i(q) S_HS(q; R_eff_i, phi_int)
+#   I_model(q) =
+#       scale * phi_solute * sum_i x_i I_i(q) S_HS(q; R_eff_i, phi_int)
 #       + solvent_scale * (1 - phi_solute) * I_solv(q)
-#   ] + offset
+#       + offset
 #
 # Internal abundance normalization:
 #   x_i = f_i / sum_j f_j
@@ -55,11 +55,13 @@ from scipy.stats import norm
 #   abundances instead of redundant global scale factors.
 #
 # phi_solute
-#   Physical solute volume fraction in the measured solution. This term
-#   scales the cluster contribution relative to the solvent template.
-#   Good prior information can come from solution density, composition,
-#   and solute/solvent molar masses. Keep this fixed or tightly bounded
-#   unless the data are on a credible absolute scale.
+#   SAXS-effective solute interaction ratio in the measured solution.
+#   This is the contrast-weighted model-facing solute fraction, not the
+#   raw bulk-density volume fraction. Good prior information can come
+#   from the solution-scattering estimator, which reports both the
+#   physical occupancy fraction and the energy-dependent SAXS-effective
+#   interaction ratio. Keep this fixed or tightly bounded because the
+#   solvent subtraction already depends on (1 - phi_solute).
 #
 # phi_int
 #   Effective structural volume fraction used only inside the hard-
@@ -70,16 +72,20 @@ from scipy.stats import norm
 #   loading for irregular or anisotropic clusters.
 #
 # solvent_scale
-#   Multiplicative coefficient applied to the experimental solvent SAXS
-#   template before the global scale and offset. This absorbs mismatch
-#   from transmission, thickness, normalization, or imperfect solvent
-#   subtraction.
+#   Bounded 0..1 attenuation/subtraction weight applied to the
+#   experimental solvent SAXS template contribution. In the split-
+#   fraction poly templates the solvent complement remains in
+#   (1 - phi_solute), so solvent_scale carries the attenuation and
+#   normalization part of the solvent-background correction without
+#   duplicating the contrast-weighted interaction ratio. Keep this fixed
+#   by default so it does not become redundant with phi_solute during
+#   fitting.
 #
 # scale
-#   Global multiplicative intensity factor applied to the full model.
-#   Keep this free when the measured SAXS data are not on absolute
-#   intensity scale or when the cluster I(Q) library is only known up to
-#   an arbitrary normalization.
+#   Global multiplicative intensity factor applied only to the solute
+#   scattering contribution. Keep this free when the measured SAXS data
+#   are not on absolute intensity scale or when the cluster I(Q)
+#   library is only known up to an arbitrary normalization.
 #
 # offset
 #   Constant additive background term. Use this to absorb fluorescence
@@ -259,6 +265,44 @@ def _full_params_to_param_dict(full_params):
     }
 
 
+def _bounded_solvent_weight(value):
+    return float(np.clip(float(value), 0.0, 1.0))
+
+
+def _effective_structure_factor_profile(
+    q_values,
+    cluster_intensities,
+    effective_radii,
+    raw_weights,
+    phi_int,
+):
+    """Return the mixture-equivalent S(q) that modulates the form
+    factor."""
+    q_values = np.asarray(q_values, dtype=float)
+    effective_radii = np.asarray(effective_radii, dtype=float)
+    raw_weights = np.asarray(raw_weights, dtype=float)
+    fractions = normalize_profile_fractions(raw_weights)
+    numerator = np.zeros_like(q_values, dtype=float)
+    denominator = np.zeros_like(q_values, dtype=float)
+    fallback = np.zeros_like(q_values, dtype=float)
+
+    for frac, iq_cluster, radius in zip(
+        fractions, cluster_intensities, effective_radii
+    ):
+        iq_cluster = np.asarray(iq_cluster, dtype=float)
+        sq = calc_hardsphere_sq(radius, phi_int, q_values)
+        numerator += frac * iq_cluster * sq
+        denominator += frac * iq_cluster
+        fallback += frac * sq
+
+    structure_factor = fallback.copy()
+    valid_mask = np.abs(denominator) > 1e-12
+    structure_factor[valid_mask] = (
+        numerator[valid_mask] / denominator[valid_mask]
+    )
+    return structure_factor
+
+
 def polydisperse_lma_hs_model(
     q_values,
     cluster_intensities,
@@ -301,10 +345,15 @@ def polydisperse_lma_hs_model(
         sq = calc_hardsphere_sq(radius, phi_int, q_values)
         solute_sum += frac * iq_cluster * sq
 
-    model = phi_solute * solute_sum
-    model += solvent_scale * (1.0 - phi_solute) * solvent_intensities
+    solvent_weight = _bounded_solvent_weight(solvent_scale)
+    solute_contribution = scale * phi_solute * solute_sum
+    solvent_contribution = (
+        solvent_weight
+        * (1.0 - phi_solute)
+        * np.asarray(solvent_intensities, dtype=float)
+    )
 
-    return scale * model + offset
+    return solute_contribution + solvent_contribution + offset
 
 
 def lmfit_model_profile(
@@ -321,7 +370,7 @@ def lmfit_model_profile(
 
     phi_solute = params["phi_solute"]
     phi_int = params["phi_int"]
-    solvent_scale = params["solvent_scale"]
+    solvent_scale = _bounded_solvent_weight(params["solvent_scale"])
     scale = params["scale"]
     offset = params["offset"]
 
@@ -336,6 +385,27 @@ def lmfit_model_profile(
         solvent_scale=solvent_scale,
         scale=scale,
         offset=offset,
+    )
+
+
+def structure_factor_profile(
+    q, solvent_data, model_data, effective_radii, **params
+):
+    """Return the mixture-equivalent structure-factor trace S(q)."""
+    del solvent_data
+    weight_keys = _weight_keys_from_params(params)
+    raw_weights = np.asarray([params[key] for key in weight_keys], dtype=float)
+    resolved_effective_radii = _resolve_effective_radii(
+        weight_keys,
+        params,
+        effective_radii,
+    )
+    return _effective_structure_factor_profile(
+        q,
+        model_data,
+        resolved_effective_radii,
+        raw_weights,
+        params["phi_int"],
     )
 
 
@@ -361,7 +431,7 @@ def model_poly_lma_hs(params):
         )
         phi_solute = named_params["phi_solute"]
         phi_int = named_params["phi_int"]
-        solvent_scale = named_params["solvent_scale"]
+        solvent_scale = _bounded_solvent_weight(named_params["solvent_scale"])
         scale = named_params["scale"]
         offset = named_params["offset"]
     else:
@@ -370,7 +440,7 @@ def model_poly_lma_hs(params):
         resolved_effective_radii = np.asarray(effective_radii, dtype=float)
         phi_solute = params[n_profiles]
         phi_int = params[n_profiles + 1]
-        solvent_scale = params[n_profiles + 2]
+        solvent_scale = _bounded_solvent_weight(params[n_profiles + 2])
         scale = params[n_profiles + 3]
         offset = params[n_profiles + 4]
 

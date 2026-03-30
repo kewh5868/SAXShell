@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from re import sub
@@ -13,6 +14,8 @@ from saxshell.mdtrajectory.frame.manager import (
     FrameSelectionPreview,
     TrajectoryManager,
 )
+
+EXPORT_METADATA_FILENAME = "mdtrajectory_export.json"
 
 
 def suggest_output_dir(
@@ -66,7 +69,7 @@ def _base_output_dir_name(
         return base_name
 
     cutoff_text = format_cutoff_for_dir(cutoff_fs)
-    return f"{base_name}_t{cutoff_text}fs"
+    return f"{base_name}_f{cutoff_text}fs"
 
 
 @dataclass(slots=True)
@@ -103,12 +106,16 @@ class MDTrajectoryExportResult:
     output_dir: Path
     written_files: list[Path]
     selection: MDTrajectorySelectionResult
+    metadata_file: Path | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
             "output_dir": str(self.output_dir),
             "written_files": [str(path) for path in self.written_files],
             "written_count": len(self.written_files),
+            "metadata_file": (
+                None if self.metadata_file is None else str(self.metadata_file)
+            ),
             "selection": self.selection.to_dict(),
         }
 
@@ -259,6 +266,13 @@ class MDTrajectoryWorkflow:
         if selection.preview.selected_frames == 0:
             raise ValueError("No frames match the current selection settings.")
 
+        selected_frames = self.manager.get_selected_frames(
+            start=start,
+            stop=stop,
+            stride=stride,
+            min_time_fs=selection.applied_cutoff_fs,
+            post_cutoff_stride=post_cutoff_stride,
+        )
         written_files = self.manager.export_frames(
             output_dir=selection.output_dir,
             start=start,
@@ -267,8 +281,53 @@ class MDTrajectoryWorkflow:
             min_time_fs=selection.applied_cutoff_fs,
             post_cutoff_stride=post_cutoff_stride,
         )
+        metadata_file = self._write_export_metadata(
+            selection=selection,
+            written_files=written_files,
+            selected_frames=selected_frames,
+        )
         return MDTrajectoryExportResult(
             output_dir=selection.output_dir,
             written_files=written_files,
             selection=selection,
+            metadata_file=metadata_file,
         )
+
+    def _write_export_metadata(
+        self,
+        *,
+        selection: MDTrajectorySelectionResult,
+        written_files: list[Path],
+        selected_frames,
+    ) -> Path:
+        metadata_path = selection.output_dir / EXPORT_METADATA_FILENAME
+        payload = {
+            "version": 1,
+            "trajectory_file": str(self.trajectory_file),
+            "topology_file": (
+                None if self.topology_file is None else str(self.topology_file)
+            ),
+            "energy_file": (
+                None if self.energy_file is None else str(self.energy_file)
+            ),
+            "selection": selection.to_dict(),
+            "written_frames": [
+                {
+                    "filename": path.name,
+                    "frame_index": int(frame.frame_index),
+                    "time_fs": (
+                        None if frame.time_fs is None else float(frame.time_fs)
+                    ),
+                }
+                for frame, path in zip(
+                    selected_frames,
+                    written_files,
+                    strict=False,
+                )
+            ],
+        }
+        metadata_path.write_text(
+            json.dumps(payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return metadata_path

@@ -56,6 +56,30 @@ def main(argv: list[str] | None = None) -> int:
         nargs=argparse.REMAINDER,
         help="Arguments passed through to the bondanalysis command.",
     )
+    clusterdynamics_parser = subparsers.add_parser(
+        "clusterdynamics",
+        help=(
+            "Analyze time-binned cluster distributions and lifetimes, or "
+            "launch the cluster-dynamics UI."
+        ),
+    )
+    clusterdynamics_parser.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="Arguments passed through to the clusterdynamics command.",
+    )
+    clusterdynamicsml_parser = subparsers.add_parser(
+        "clusterdynamicsml",
+        help=(
+            "Predict larger-cluster surrogate structures, stoichiometries, "
+            "and cluster-only SAXS traces."
+        ),
+    )
+    clusterdynamicsml_parser.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="Arguments passed through to the clusterdynamicsml command.",
+    )
     xyz2pdb_parser = subparsers.add_parser(
         "xyz2pdb",
         help=(
@@ -118,6 +142,24 @@ def main(argv: list[str] | None = None) -> int:
         if forwarded_args[:1] == ["--"]:
             forwarded_args = forwarded_args[1:]
         return bondanalysis_main(forwarded_args)
+
+    if args.command == "clusterdynamics":
+        from saxshell.clusterdynamics.cli import main as clusterdynamics_main
+
+        forwarded_args = list(args.args)
+        if forwarded_args[:1] == ["--"]:
+            forwarded_args = forwarded_args[1:]
+        return clusterdynamics_main(forwarded_args)
+
+    if args.command == "clusterdynamicsml":
+        from saxshell.clusterdynamicsml.cli import (
+            main as clusterdynamicsml_main,
+        )
+
+        forwarded_args = list(args.args)
+        if forwarded_args[:1] == ["--"]:
+            forwarded_args = forwarded_args[1:]
+        return clusterdynamicsml_main(forwarded_args)
 
     if args.command == "xyz2pdb":
         from saxshell.xyz2pdb.cli import main as xyz2pdb_main

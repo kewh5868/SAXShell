@@ -41,6 +41,8 @@ markdown_extensions:
   - def_list
   - footnotes
   - tables
+  - pymdownx.arithmatex:
+      generic: true
   - toc:
       permalink: true
   - pymdownx.details
@@ -50,6 +52,10 @@ markdown_extensions:
   - pymdownx.superfences
   - pymdownx.tabbed:
       alternate_style: true
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
 
 nav:
   - Home: index.md
@@ -61,7 +67,9 @@ nav:
       - GUI Overview: user-guide/gui-overview.md
       - Project Configuration: user-guide/project-configuration.md
       - Cluster Extraction: user-guide/cluster-extraction.md
+      - Cluster Dynamics: user-guide/cluster-dynamics.md
       - SAXS Prefit: user-guide/saxs-prefit.md
+      - Pre-loaded SAXS Models: user-guide/preloaded-saxs-models.md
       - LMFit Workflow: user-guide/lmfit-workflow.md
       - pyDREAM Workflow: user-guide/pydream-workflow.md
       - Results and Export: user-guide/results-and-export.md

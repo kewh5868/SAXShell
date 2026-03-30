@@ -14,6 +14,10 @@ classes that are most likely to be imported directly.
 
 - `saxshell.cluster.workflow.ClusterWorkflow`
 
+### Cluster dynamics
+
+- `saxshell.clusterdynamics.workflow.ClusterDynamicsWorkflow`
+
 ### Bond analysis
 
 - `saxshell.bondanalysis.workflow.BondAnalysisWorkflow`

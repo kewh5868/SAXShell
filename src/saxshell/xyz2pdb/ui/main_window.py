@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
+    QApplication,
     QMainWindow,
     QMessageBox,
     QScrollArea,
@@ -13,6 +15,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from saxshell.saxs.ui.branding import (
+    configure_saxshell_application,
+    load_saxshell_icon,
+    prepare_saxshell_application_identity,
+)
 from saxshell.xyz2pdb import (
     XYZToPDBExportResult,
     XYZToPDBInspectionResult,
@@ -107,6 +114,7 @@ class XYZToPDBMainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell (xyz2pdb)")
+        self.setWindowIcon(load_saxshell_icon())
         self.resize(1360, 820)
 
         central = QWidget()
@@ -438,6 +446,11 @@ def launch_xyz2pdb_ui(
     reference_library_dir: str | Path | None = None,
 ) -> XYZToPDBMainWindow:
     """Create, show, and return the xyz2pdb main window."""
+    app = QApplication.instance()
+    if app is None:
+        prepare_saxshell_application_identity()
+        app = QApplication(sys.argv)
+    configure_saxshell_application(app)
     window = XYZToPDBMainWindow(
         input_path=None if input_path is None else Path(input_path),
         config_file=None if config_file is None else Path(config_file),

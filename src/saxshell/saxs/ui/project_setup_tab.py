@@ -12,8 +12,8 @@ from matplotlib.backends.backend_qtagg import (
 )
 from matplotlib.colors import to_hex
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -85,9 +85,12 @@ class ProjectSetupTab(QWidget):
     save_component_plot_data_requested = Signal()
     save_prior_plot_data_requested = Signal()
     show_deprecated_templates_changed = Signal(bool)
+    model_only_mode_changed = Signal(bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._console_autoscroll_enabled = True
+        self._summary_text = ""
         self._experimental_header_rows = 0
         self._experimental_q_column: int | None = None
         self._experimental_intensity_column: int | None = None
@@ -232,6 +235,17 @@ class ProjectSetupTab(QWidget):
         )
         layout.addRow("Clusters folder", self._clusters_row())
 
+        self.model_only_mode_checkbox = QCheckBox("Model Only Mode")
+        self.model_only_mode_checkbox.setChecked(False)
+        self.model_only_mode_checkbox.setToolTip(
+            "Disable experimental-data-dependent fitting and use the project "
+            "as a forward-model-only SAXS simulator."
+        )
+        self.model_only_mode_checkbox.toggled.connect(
+            self._on_model_only_mode_toggled
+        )
+        layout.addRow("", self.model_only_mode_checkbox)
+
         self.experimental_data_edit = QLineEdit()
         self.experimental_data_edit.setReadOnly(True)
         layout.addRow("Experimental data", self._experimental_data_row())
@@ -325,11 +339,13 @@ class ProjectSetupTab(QWidget):
 
     def _build_model_group(self) -> QGroupBox:
         group = QGroupBox("Model and Build")
-        layout = QHBoxLayout(group)
+        layout = QVBoxLayout(group)
 
-        controls_widget = QWidget()
-        controls_layout = QFormLayout(controls_widget)
+        header_widget = QWidget()
+        self._model_build_header_widget = header_widget
+        header_layout = QFormLayout(header_widget)
         self.template_combo = QComboBox()
+        self.template_combo.setMinimumWidth(420)
         self.template_combo.currentIndexChanged.connect(
             self._on_template_combo_changed
         )
@@ -348,15 +364,24 @@ class ProjectSetupTab(QWidget):
         self.show_deprecated_templates_checkbox.toggled.connect(
             self.show_deprecated_templates_changed.emit
         )
-        controls_layout.addRow(
+        header_layout.addRow(
             "Selected template",
             self._template_row(),
         )
 
         self.active_template_edit = QLineEdit()
         self.active_template_edit.setReadOnly(True)
-        controls_layout.addRow("Active template", self.active_template_edit)
+        self.active_template_edit.setMinimumWidth(420)
+        header_layout.addRow("Active template", self.active_template_edit)
+        layout.addWidget(header_widget)
 
+        lower_layout = QHBoxLayout()
+        self._model_build_lower_layout = lower_layout
+        button_widget = QWidget()
+        self._model_build_button_widget = button_widget
+        button_layout = QVBoxLayout(button_widget)
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        button_layout.setSpacing(8)
         self.build_components_button = QPushButton("Build SAXS Components")
         self.build_components_button.clicked.connect(
             self.build_components_requested.emit
@@ -369,12 +394,19 @@ class ProjectSetupTab(QWidget):
         self.install_model_button.clicked.connect(
             self.install_model_requested.emit
         )
-        controls_layout.addRow("", self.build_prior_weights_button)
-        controls_layout.addRow("", self.build_components_button)
-        controls_layout.addRow("", self.install_model_button)
-        layout.addWidget(controls_widget, stretch=4)
+        button_layout.addWidget(self.build_prior_weights_button)
+        button_layout.addWidget(self.build_components_button)
+        button_layout.addWidget(self.install_model_button)
+        button_layout.addStretch(1)
+        button_widget.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Preferred,
+        )
+        button_widget.setMinimumWidth(220)
+        lower_layout.addWidget(button_widget, stretch=0)
 
         clusters_group = QGroupBox("Recognized Clusters")
+        self._recognized_clusters_group = clusters_group
         clusters_layout = QVBoxLayout(clusters_group)
         self.recognized_clusters_table = QTableWidget(0, 8)
         self.recognized_clusters_table.setHorizontalHeaderLabels(
@@ -425,7 +457,8 @@ class ProjectSetupTab(QWidget):
         header.resizeSection(6, 72)
         header.resizeSection(7, 92)
         clusters_layout.addWidget(self.recognized_clusters_table)
-        layout.addWidget(clusters_group, stretch=6)
+        lower_layout.addWidget(clusters_group, stretch=1)
+        layout.addLayout(lower_layout, stretch=1)
         return group
 
     def _template_row(self) -> QWidget:
@@ -657,17 +690,10 @@ class ProjectSetupTab(QWidget):
         self.save_project_button.setEnabled(selected)
         self._update_prior_control_state()
         if not selected:
-            self.data_status_label.setText(
-                "Choose an experimental SAXS file or folder after opening a "
-                "project.\n"
-                "The selected file, columns, q-range, and import settings "
-                "will be summarized here."
-            )
-            self.solvent_status_label.setText(
-                "Optional solvent SAXS data can be loaded here and will be "
-                "carried into prefit and DREAM if the active model uses "
-                "solvent intensities."
-            )
+            self._experimental_summary = None
+            self._solvent_summary = None
+        self._refresh_data_status_labels()
+        self._apply_model_only_mode_state()
 
     def set_project_settings(
         self,
@@ -709,6 +735,7 @@ class ProjectSetupTab(QWidget):
         self._solvent_q_column = settings.solvent_q_column
         self._solvent_intensity_column = settings.solvent_intensity_column
         self._solvent_error_column = settings.solvent_error_column
+        self.set_model_only_mode(settings.model_only_mode)
         self.qmin_edit.setText(
             "" if settings.q_min is None else f"{settings.q_min:g}"
         )
@@ -808,6 +835,8 @@ class ProjectSetupTab(QWidget):
                 )
         else:
             self._solvent_summary = None
+        self._refresh_data_status_labels()
+        self._apply_model_only_mode_state()
         self._update_data_trace_control_state()
         self._redraw_saxs_preview()
 
@@ -879,6 +908,17 @@ class ProjectSetupTab(QWidget):
         text = self.project_name_edit.text().strip()
         return text or None
 
+    def model_only_mode(self) -> bool:
+        return bool(self.model_only_mode_checkbox.isChecked())
+
+    def set_model_only_mode(self, enabled: bool) -> None:
+        self.model_only_mode_checkbox.blockSignals(True)
+        self.model_only_mode_checkbox.setChecked(bool(enabled))
+        self.model_only_mode_checkbox.blockSignals(False)
+        if enabled and self.use_experimental_grid_checkbox.isChecked():
+            self.use_experimental_grid_checkbox.setChecked(False)
+        self._apply_model_only_mode_state()
+
     def open_project_dir(self) -> Path | None:
         text = self.open_project_dir_edit.text().strip()
         return Path(text).expanduser() if text else None
@@ -894,6 +934,70 @@ class ProjectSetupTab(QWidget):
     def solvent_data_path(self) -> Path | None:
         text = self.solvent_data_edit.text().strip()
         return Path(text).expanduser() if text else None
+
+    def _default_experimental_status_text(self) -> str:
+        return (
+            "Choose an experimental SAXS file or folder after opening a "
+            "project.\n"
+            "The selected file, columns, q-range, and import settings will "
+            "be summarized here."
+        )
+
+    def _default_solvent_status_text(self) -> str:
+        return (
+            "Optional solvent SAXS data can be loaded here and will be "
+            "carried into prefit and DREAM if the active model uses "
+            "solvent intensities."
+        )
+
+    def _refresh_data_status_labels(self) -> None:
+        if self.model_only_mode():
+            self.data_status_label.setText(
+                "Model Only Mode is enabled.\n"
+                "Experimental data input is locked and hidden from the "
+                "plots until Model Only Mode is turned off."
+            )
+            self.solvent_status_label.setText(
+                "Model Only Mode is enabled.\n"
+                "Solvent data input is locked and hidden from the plots "
+                "until Model Only Mode is turned off."
+            )
+            return
+        if self._experimental_summary is not None:
+            self.data_status_label.setText(
+                self._experimental_import_summary(self._experimental_summary)
+            )
+        else:
+            self.data_status_label.setText(
+                self._default_experimental_status_text()
+            )
+        if self._solvent_summary is not None:
+            self.solvent_status_label.setText(
+                self._experimental_import_summary(self._solvent_summary)
+            )
+        else:
+            self.solvent_status_label.setText(
+                self._default_solvent_status_text()
+            )
+
+    def _apply_model_only_mode_state(self) -> None:
+        locked = self.model_only_mode()
+        self.experimental_data_edit.setEnabled(not locked)
+        self.experimental_file_button.setEnabled(not locked)
+        self.experimental_folder_button.setEnabled(not locked)
+        self.experimental_columns_button.setEnabled(not locked)
+        self.experimental_clear_button.setEnabled(not locked)
+        self.solvent_data_edit.setEnabled(not locked)
+        self.solvent_file_button.setEnabled(not locked)
+        self.solvent_columns_button.setEnabled(not locked)
+        self.solvent_clear_button.setEnabled(not locked)
+        self.use_experimental_grid_checkbox.setEnabled(not locked)
+        if locked and self.use_experimental_grid_checkbox.isChecked():
+            self.use_experimental_grid_checkbox.setChecked(False)
+        self._update_resample_grid_state()
+        self._refresh_data_status_labels()
+        self._update_data_trace_control_state()
+        self._redraw_saxs_preview()
 
     def experimental_header_rows(self) -> int:
         return int(self._experimental_header_rows)
@@ -968,7 +1072,31 @@ class ProjectSetupTab(QWidget):
     def q_max(self) -> float | None:
         return self._optional_float(self.qmax_edit.text())
 
+    def default_experimental_q_range(self) -> tuple[float, float] | None:
+        if self.model_only_mode() or self._experimental_summary is None:
+            return None
+        q_values = np.asarray(self._experimental_summary.q_values, dtype=float)
+        if q_values.size == 0:
+            return None
+        return float(q_values.min()), float(q_values.max())
+
+    def q_range_matches_loaded_experimental_defaults(self) -> bool:
+        default_range = self.default_experimental_q_range()
+        if default_range is None:
+            return False
+        q_min = self.q_min()
+        q_max = self.q_max()
+        if q_min is None or q_max is None:
+            return False
+        default_q_min, default_q_max = default_range
+        return bool(
+            np.isclose(q_min, default_q_min, rtol=0.0, atol=1e-9)
+            and np.isclose(q_max, default_q_max, rtol=0.0, atol=1e-9)
+        )
+
     def use_experimental_grid(self) -> bool:
+        if self.model_only_mode():
+            return False
         return bool(self.use_experimental_grid_checkbox.isChecked())
 
     def q_points(self) -> int | None:
@@ -982,6 +1110,10 @@ class ProjectSetupTab(QWidget):
     def prior_secondary_element(self) -> str | None:
         if not self._prior_mode_uses_secondary_filter():
             return None
+        text = self.secondary_filter_combo.currentText().strip()
+        return text or None
+
+    def selected_prior_secondary_element(self) -> str | None:
         text = self.secondary_filter_combo.currentText().strip()
         return text or None
 
@@ -1020,7 +1152,14 @@ class ProjectSetupTab(QWidget):
         return colors or None
 
     def append_summary(self, message: str) -> None:
-        self.summary_box.append(message)
+        stripped = str(message).strip()
+        if not stripped:
+            return
+        if self._summary_text:
+            self._summary_text += "\n" + stripped
+        else:
+            self._summary_text = stripped
+        self._render_summary_text()
 
     def component_plot_export_payload(self) -> dict[str, object]:
         traces: list[dict[str, object]] = []
@@ -1102,7 +1241,48 @@ class ProjectSetupTab(QWidget):
         self._update_data_trace_control_state()
 
     def set_summary_text(self, text: str) -> None:
-        self.summary_box.setPlainText(text)
+        self._summary_text = str(text).strip()
+        self._render_summary_text()
+
+    def set_console_autoscroll_enabled(self, enabled: bool) -> None:
+        self._console_autoscroll_enabled = bool(enabled)
+        if self._console_autoscroll_enabled:
+            self._scroll_summary_to_end()
+
+    def _render_summary_text(self) -> None:
+        scrollbar = self.summary_box.verticalScrollBar()
+        previous_value = scrollbar.value()
+        previous_maximum = max(scrollbar.maximum(), 1)
+        self.summary_box.setPlainText(self._summary_text)
+        if self._console_autoscroll_enabled:
+            self._scroll_summary_to_end()
+            return
+        updated_scrollbar = self.summary_box.verticalScrollBar()
+        if updated_scrollbar.maximum() > 0:
+            position_fraction = previous_value / previous_maximum
+            updated_scrollbar.setValue(
+                int(round(position_fraction * updated_scrollbar.maximum()))
+            )
+
+    def _scroll_summary_to_end(self) -> None:
+        cursor = self.summary_box.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.summary_box.setTextCursor(cursor)
+        self.summary_box.ensureCursorVisible()
+        scrollbar = self.summary_box.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        QTimer.singleShot(
+            0,
+            self._scroll_summary_to_end_once,
+        )
+
+    def _scroll_summary_to_end_once(self) -> None:
+        cursor = self.summary_box.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.summary_box.setTextCursor(cursor)
+        self.summary_box.ensureCursorVisible()
+        scrollbar = self.summary_box.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def draw_component_plot(self, component_paths: list[Path] | None) -> None:
         self._component_paths = component_paths
@@ -1182,7 +1362,8 @@ class ProjectSetupTab(QWidget):
         self._component_legend_lookup.clear()
         self._component_line_lookup.clear()
         self._component_color_lookup.clear()
-        has_data_preview = (
+        show_data_preview = not self.model_only_mode()
+        has_data_preview = show_data_preview and (
             self._experimental_summary is not None
             or self._solvent_summary is not None
         )
@@ -1193,9 +1374,14 @@ class ProjectSetupTab(QWidget):
                 0.5,
                 0.5,
                 fill(
-                    "Select experimental data and build SAXS components "
-                    "to preview the experimental range and averaged "
-                    "cluster profiles.",
+                    (
+                        "Build SAXS components to preview averaged cluster "
+                        "profiles in Model Only Mode."
+                        if self.model_only_mode()
+                        else "Select experimental data and build SAXS "
+                        "components to preview the experimental range and "
+                        "averaged cluster profiles."
+                    ),
                     width=42,
                 ),
                 ha="center",
@@ -1221,7 +1407,7 @@ class ProjectSetupTab(QWidget):
             plotted_lines.extend(
                 self._draw_experimental_preview(
                     experimental_axis,
-                    self._experimental_summary,
+                    self._experimental_summary if show_data_preview else None,
                 )
             )
 
@@ -1484,22 +1670,31 @@ class ProjectSetupTab(QWidget):
 
     def _experimental_data_row(self) -> QWidget:
         row = QWidget()
+        self.experimental_data_row_widget = row
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.experimental_data_edit, stretch=1)
 
-        file_button = QPushButton("File…")
-        file_button.clicked.connect(self._choose_experimental_file)
-        folder_button = QPushButton("Folder…")
-        folder_button.clicked.connect(self._choose_experimental_folder)
-        columns_button = QPushButton("Columns…")
-        columns_button.clicked.connect(self._configure_experimental_columns)
-        clear_button = QPushButton("Clear")
-        clear_button.clicked.connect(self._clear_experimental_selection)
-        layout.addWidget(file_button)
-        layout.addWidget(folder_button)
-        layout.addWidget(columns_button)
-        layout.addWidget(clear_button)
+        self.experimental_file_button = QPushButton("File…")
+        self.experimental_file_button.clicked.connect(
+            self._choose_experimental_file
+        )
+        self.experimental_folder_button = QPushButton("Folder…")
+        self.experimental_folder_button.clicked.connect(
+            self._choose_experimental_folder
+        )
+        self.experimental_columns_button = QPushButton("Columns…")
+        self.experimental_columns_button.clicked.connect(
+            self._configure_experimental_columns
+        )
+        self.experimental_clear_button = QPushButton("Clear")
+        self.experimental_clear_button.clicked.connect(
+            self._clear_experimental_selection
+        )
+        layout.addWidget(self.experimental_file_button)
+        layout.addWidget(self.experimental_folder_button)
+        layout.addWidget(self.experimental_columns_button)
+        layout.addWidget(self.experimental_clear_button)
         self.experimental_trace_visible_checkbox = QCheckBox()
         self.experimental_trace_visible_checkbox.setChecked(True)
         self.experimental_trace_visible_checkbox.toggled.connect(
@@ -1522,19 +1717,24 @@ class ProjectSetupTab(QWidget):
 
     def _solvent_data_row(self) -> QWidget:
         row = QWidget()
+        self.solvent_data_row_widget = row
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.solvent_data_edit, stretch=1)
 
-        file_button = QPushButton("File…")
-        file_button.clicked.connect(self._choose_solvent_file)
-        columns_button = QPushButton("Columns…")
-        columns_button.clicked.connect(self._configure_solvent_columns)
-        clear_button = QPushButton("Clear")
-        clear_button.clicked.connect(self._clear_solvent_selection)
-        layout.addWidget(file_button)
-        layout.addWidget(columns_button)
-        layout.addWidget(clear_button)
+        self.solvent_file_button = QPushButton("File…")
+        self.solvent_file_button.clicked.connect(self._choose_solvent_file)
+        self.solvent_columns_button = QPushButton("Columns…")
+        self.solvent_columns_button.clicked.connect(
+            self._configure_solvent_columns
+        )
+        self.solvent_clear_button = QPushButton("Clear")
+        self.solvent_clear_button.clicked.connect(
+            self._clear_solvent_selection
+        )
+        layout.addWidget(self.solvent_file_button)
+        layout.addWidget(self.solvent_columns_button)
+        layout.addWidget(self.solvent_clear_button)
         self.solvent_trace_visible_checkbox = QCheckBox()
         self.solvent_trace_visible_checkbox.setChecked(True)
         self.solvent_trace_visible_checkbox.toggled.connect(
@@ -1581,7 +1781,7 @@ class ProjectSetupTab(QWidget):
         project_file = build_project_paths(project_dir).project_file
         if not project_file.is_file():
             self.open_project_dir_edit.clear()
-            self.summary_box.append(
+            self.append_summary(
                 "Select a complete SAXS project folder that contains "
                 "saxs_project.json, not a parent directory of multiple projects."
             )
@@ -1670,10 +1870,7 @@ class ProjectSetupTab(QWidget):
         self._experimental_intensity_column = None
         self._experimental_error_column = None
         self._experimental_summary = None
-        self.data_status_label.setText(
-            "No experimental data selected.\n"
-            "Choose an experimental SAXS file or folder to preview its range."
-        )
+        self._refresh_data_status_labels()
         self._update_data_trace_control_state()
         self._redraw_saxs_preview()
         self.autosave_project_requested.emit("cleared experimental data")
@@ -1715,11 +1912,7 @@ class ProjectSetupTab(QWidget):
         self._solvent_intensity_column = None
         self._solvent_error_column = None
         self._solvent_summary = None
-        self.solvent_status_label.setText(
-            "Optional solvent SAXS data can be loaded here and will be "
-            "carried into prefit and DREAM if the active model uses "
-            "solvent intensities."
-        )
+        self._refresh_data_status_labels()
         self._update_data_trace_control_state()
         self._redraw_saxs_preview()
         self.autosave_project_requested.emit("cleared solvent data")
@@ -1797,17 +1990,15 @@ class ProjectSetupTab(QWidget):
         self,
         summary: ExperimentalDataSummary,
     ) -> None:
-        self.data_status_label.setText(
-            self._experimental_import_summary(summary)
-        )
+        del summary
+        self._refresh_data_status_labels()
 
     def _set_solvent_status(
         self,
         summary: ExperimentalDataSummary,
     ) -> None:
-        self.solvent_status_label.setText(
-            self._experimental_import_summary(summary)
-        )
+        del summary
+        self._refresh_data_status_labels()
 
     def _load_experimental_summary_from_path(
         self,
@@ -1944,8 +2135,12 @@ class ProjectSetupTab(QWidget):
         self._apply_solvent_file(selected_path, accepted_summary)
 
     def _update_data_trace_control_state(self) -> None:
-        has_experimental = self._experimental_summary is not None
-        has_solvent = self._solvent_summary is not None
+        if self.model_only_mode():
+            has_experimental = False
+            has_solvent = False
+        else:
+            has_experimental = self._experimental_summary is not None
+            has_solvent = self._solvent_summary is not None
         self.experimental_trace_visible_checkbox.setEnabled(has_experimental)
         self.experimental_trace_color_button.setEnabled(has_experimental)
         self.solvent_trace_visible_checkbox.setEnabled(has_solvent)
@@ -1986,6 +2181,17 @@ class ProjectSetupTab(QWidget):
             self.autosave_project_requested.emit(
                 "cleared the clusters folder reference"
             )
+
+    def _on_model_only_mode_toggled(self, enabled: bool) -> None:
+        if enabled and self.use_experimental_grid_checkbox.isChecked():
+            self.use_experimental_grid_checkbox.setChecked(False)
+        self._apply_model_only_mode_state()
+        self.model_only_mode_changed.emit(bool(enabled))
+        self.autosave_project_requested.emit(
+            "enabled Model Only Mode"
+            if enabled
+            else "disabled Model Only Mode"
+        )
 
     def _update_resample_grid_state(self) -> None:
         self.resample_points_spin.setEnabled(

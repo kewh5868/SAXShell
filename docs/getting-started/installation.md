@@ -48,6 +48,7 @@ The current package exposes these top-level tools:
 - `saxshell`
 - `mdtrajectory`
 - `clusters`
+- `clusterdynamics`
 - `bondanalysis`
 - `xyz2pdb`
 - `saxs`

@@ -185,11 +185,14 @@ def _add_cutoff_resolution_arguments(
 def _handle_ui(_: argparse.Namespace) -> int:
     from PySide6.QtWidgets import QApplication
 
+    from saxshell.saxs.ui.branding import prepare_saxshell_application_identity
+
     from .ui.main_window import launch_mdtrajectory_app
 
     app = QApplication.instance()
     created_app = app is None
     if app is None:
+        prepare_saxshell_application_identity()
         app = QApplication(sys.argv)
     launch_mdtrajectory_app()
     if created_app:

@@ -29,6 +29,7 @@ from saxshell.saxs.prefit.cluster_geometry import (
     validate_positive_cluster_geometry_table,
 )
 from saxshell.saxs.project_manager import (
+    ProjectSettings,
     SAXSProjectManager,
     build_project_paths,
     load_built_component_q_range,
@@ -67,6 +68,13 @@ SOLVENT_VOLUME_FRACTION_PARAMETER_NAMES = (
     "solvent_fraction",
     "solvent_volume_fraction",
 )
+SOLVENT_WEIGHT_PARAMETER_NAMES = (
+    "solv_w",
+    "solvent_scale",
+)
+PREFIT_MODEL_POSITIVE_FLOOR_RELATIVE = 1e-9
+PREFIT_MODEL_NEGATIVE_PENALTY_MULTIPLIER = 25.0
+PREFIT_MODEL_NONFINITE_PENALTY_MULTIPLIER = 100.0
 
 
 def q_range_boundary_tolerance(
@@ -117,6 +125,8 @@ class PrefitParameterEntry:
     minimum: float
     maximum: float
     category: str
+    value_expression: str | None = None
+    initial_value_expression: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -128,6 +138,15 @@ class PrefitParameterEntry:
             motif=str(payload.get("motif", "")),
             name=str(payload.get("name", "")),
             value=float(payload.get("value", 0.0)),
+            value_expression=_optional_str(
+                payload.get("value_expression", payload.get("expression"))
+            ),
+            initial_value_expression=_optional_str(
+                payload.get(
+                    "initial_value_expression",
+                    payload.get("initial_expression"),
+                )
+            ),
             vary=bool(payload.get("vary", True)),
             minimum=float(payload.get("minimum", payload.get("min", 0.0))),
             maximum=float(payload.get("maximum", payload.get("max", 0.0))),
@@ -135,14 +154,253 @@ class PrefitParameterEntry:
         )
 
 
+def _parameter_value_expression(
+    entry: PrefitParameterEntry,
+) -> str | None:
+    return _optional_str(entry.value_expression)
+
+
+def _parameter_initial_value_expression(
+    entry: PrefitParameterEntry,
+) -> str | None:
+    return _optional_str(entry.initial_value_expression)
+
+
+def normalize_prefit_parameter_expression(expression: str) -> str:
+    normalized = str(expression).strip()
+    if not normalized:
+        raise ValueError("Linked parameter expressions cannot be empty.")
+    if normalized[0] in {"*", "/"}:
+        return f"1{normalized}"
+    if normalized[0] == "+":
+        return f"0{normalized}"
+    return normalized
+
+
+def build_prefit_lmfit_parameters(
+    entries: list[PrefitParameterEntry],
+) -> tuple[Parameters, list[PrefitParameterEntry]]:
+    working_entries = [
+        PrefitParameterEntry.from_dict(entry.to_dict()) for entry in entries
+    ]
+    seed_params = Parameters()
+    runtime_expression_entries: list[PrefitParameterEntry] = []
+    seed_expression_entries: list[PrefitParameterEntry] = []
+
+    for entry in working_entries:
+        value = float(entry.value)
+        seed_params.add(
+            entry.name,
+            value=value,
+            vary=False,
+            min=-np.inf,
+            max=np.inf,
+        )
+        if _parameter_value_expression(entry) is not None:
+            runtime_expression_entries.append(entry)
+        if _parameter_initial_value_expression(entry) is not None:
+            seed_expression_entries.append(entry)
+
+    for entry in runtime_expression_entries + seed_expression_entries:
+        raw_expression = _parameter_value_expression(
+            entry
+        ) or _parameter_initial_value_expression(entry)
+        if raw_expression is None:
+            continue
+        normalized_expression = normalize_prefit_parameter_expression(
+            raw_expression
+        )
+        try:
+            seed_params[entry.name].set(
+                expr=normalized_expression,
+                vary=False,
+                min=-np.inf,
+                max=np.inf,
+            )
+        except Exception as exc:
+            raise ValueError(
+                "Invalid linked parameter expression for "
+                f"{entry.name}: {raw_expression}"
+            ) from exc
+
+    for entry in runtime_expression_entries + seed_expression_entries:
+        raw_expression = _parameter_value_expression(
+            entry
+        ) or _parameter_initial_value_expression(entry)
+        if raw_expression is None:
+            continue
+        try:
+            entry.value = float(seed_params[entry.name].value)
+        except Exception as exc:
+            raise ValueError(
+                "Invalid linked parameter expression for "
+                f"{entry.name}: {raw_expression}"
+            ) from exc
+
+    lmfit_params = Parameters()
+    for entry in working_entries:
+        lower = float(entry.minimum)
+        upper = float(entry.maximum)
+        value = float(entry.value)
+        if lower > upper:
+            lower, upper = upper, lower
+        if value < lower:
+            lower = value
+        if value > upper:
+            upper = value
+        entry.minimum = lower
+        entry.maximum = upper
+        lmfit_params.add(
+            entry.name,
+            value=value,
+            vary=bool(entry.vary),
+            min=lower,
+            max=upper,
+        )
+
+    for entry in runtime_expression_entries:
+        raw_expression = _parameter_value_expression(entry)
+        if raw_expression is None:
+            continue
+        normalized_expression = normalize_prefit_parameter_expression(
+            raw_expression
+        )
+        try:
+            lmfit_params[entry.name].set(
+                expr=normalized_expression,
+                vary=False,
+                min=-np.inf,
+                max=np.inf,
+            )
+        except Exception as exc:
+            raise ValueError(
+                "Invalid linked parameter expression for "
+                f"{entry.name}: {raw_expression}"
+            ) from exc
+
+    for entry in runtime_expression_entries:
+        raw_expression = _parameter_value_expression(entry)
+        if raw_expression is None:
+            continue
+        try:
+            entry.value = float(lmfit_params[entry.name].value)
+        except Exception as exc:
+            raise ValueError(
+                "Invalid linked parameter expression for "
+                f"{entry.name}: {raw_expression}"
+            ) from exc
+        entry.vary = False
+
+    values = lmfit_params.valuesdict()
+    for entry in working_entries:
+        if _parameter_value_expression(entry) is not None:
+            entry.value = float(values[entry.name])
+            entry.vary = False
+            continue
+        parameter = lmfit_params[entry.name]
+        entry.value = float(parameter.value)
+        entry.vary = bool(parameter.vary)
+        entry.minimum = float(parameter.min)
+        entry.maximum = float(parameter.max)
+    return lmfit_params, working_entries
+
+
+def resolve_prefit_parameter_entries(
+    entries: list[PrefitParameterEntry],
+) -> list[PrefitParameterEntry]:
+    _params, resolved_entries = build_prefit_lmfit_parameters(entries)
+    return resolved_entries
+
+
+def constrained_prefit_residuals(
+    experimental: np.ndarray,
+    model: np.ndarray,
+) -> np.ndarray:
+    experimental_values = np.asarray(experimental, dtype=float)
+    model_values = np.asarray(model, dtype=float)
+    residuals = model_values - experimental_values
+    penalty = np.zeros_like(residuals, dtype=float)
+
+    finite_experimental = experimental_values[np.isfinite(experimental_values)]
+    finite_model = model_values[np.isfinite(model_values)]
+    penalty_scale_candidates = [1e-12]
+    if finite_experimental.size:
+        penalty_scale_candidates.append(
+            float(np.max(np.abs(finite_experimental)))
+        )
+    if finite_model.size:
+        penalty_scale_candidates.append(float(np.max(np.abs(finite_model))))
+    penalty_scale = max(penalty_scale_candidates)
+    positive_floor = max(
+        penalty_scale * PREFIT_MODEL_POSITIVE_FLOOR_RELATIVE,
+        1e-15,
+    )
+
+    invalid_mask = ~np.isfinite(model_values)
+    if np.any(invalid_mask):
+        penalty[invalid_mask] = (
+            PREFIT_MODEL_NONFINITE_PENALTY_MULTIPLIER * penalty_scale
+        )
+
+    non_positive_mask = np.isfinite(model_values) & (
+        model_values <= positive_floor
+    )
+    if np.any(non_positive_mask):
+        reference = np.maximum(
+            np.abs(experimental_values[non_positive_mask]),
+            positive_floor,
+        )
+        deficit = (
+            positive_floor - model_values[non_positive_mask]
+        ) / reference
+        penalty[non_positive_mask] = (
+            PREFIT_MODEL_NEGATIVE_PENALTY_MULTIPLIER
+            * penalty_scale
+            * (1.0 + deficit)
+        )
+
+    return np.concatenate([residuals, penalty])
+
+
+def validate_prefit_parameter_identifiability(
+    entries: list[PrefitParameterEntry],
+) -> None:
+    phi_solute_entry = next(
+        (entry for entry in entries if entry.name == "phi_solute"),
+        None,
+    )
+    solvent_entry = next(
+        (
+            entry
+            for entry in entries
+            if entry.name in SOLVENT_WEIGHT_PARAMETER_NAMES
+        ),
+        None,
+    )
+    if phi_solute_entry is None or solvent_entry is None:
+        return
+    if bool(phi_solute_entry.vary) and bool(solvent_entry.vary):
+        raise ValueError(
+            "phi_solute and "
+            f"{solvent_entry.name} cannot both vary during fitting. "
+            "Their product controls the solvent subtraction term, so they "
+            "must be fixed by prior estimates or only one may vary at a time."
+        )
+
+
 @dataclass(slots=True)
 class PrefitEvaluation:
     q_values: np.ndarray
-    experimental_intensities: np.ndarray
+    experimental_intensities: np.ndarray | None
     model_intensities: np.ndarray
-    residuals: np.ndarray
+    residuals: np.ndarray | None
     solvent_intensities: np.ndarray | None = None
     solvent_contribution: np.ndarray | None = None
+    structure_factor_trace: np.ndarray | None = None
+
+    @property
+    def is_model_only(self) -> bool:
+        return self.experimental_intensities is None
 
 
 @dataclass(slots=True)
@@ -166,6 +424,10 @@ class PrefitScaleRecommendation:
     recommended_maximum: float
     adjustment_factor: float
     points_used: int
+    current_offset: float | None = None
+    recommended_offset: float | None = None
+    recommended_offset_minimum: float | None = None
+    recommended_offset_maximum: float | None = None
 
 
 @dataclass(slots=True)
@@ -195,9 +457,7 @@ class SAXSPrefitWorkflow:
         self.project_manager = SAXSProjectManager()
         self.settings = self.project_manager.load_project(project_dir)
         self.paths = build_project_paths(self.settings.project_dir)
-        self.experimental_data = self.project_manager.load_experimental_data(
-            self.settings
-        )
+        self.experimental_data = self._load_experimental_trace()
         self.template_dir = (
             Path(template_dir).expanduser().resolve()
             if template_dir is not None
@@ -230,10 +490,58 @@ class SAXSPrefitWorkflow:
     ) -> list[TemplateSpec]:
         return list_template_specs(template_dir)
 
+    def has_experimental_data(self) -> bool:
+        return self.experimental_data is not None
+
+    def can_run_prefit(self) -> bool:
+        return (
+            self.has_experimental_data() and not self.settings.model_only_mode
+        )
+
+    def set_model_only_mode(self, enabled: bool) -> None:
+        self.settings.model_only_mode = bool(enabled)
+        if self.settings.model_only_mode:
+            self.settings.use_experimental_grid = False
+            if self.settings.q_points is None or self.settings.q_points <= 1:
+                self.settings.q_points = 500
+        self.project_manager.save_project(self.settings)
+        self.experimental_data = self._load_experimental_trace()
+        self.solvent_data = self._load_solvent_trace()
+
+    def apply_project_settings(
+        self,
+        settings: ProjectSettings,
+    ) -> None:
+        incoming_settings = ProjectSettings.from_dict(settings.to_dict())
+        if incoming_settings.resolved_project_dir != self.paths.project_dir:
+            raise ValueError(
+                "Cannot apply project settings from a different SAXS project."
+            )
+        selected_template = (
+            str(incoming_settings.selected_model_template or "").strip()
+            or self.template_spec.name
+        )
+        if selected_template != self.template_spec.name:
+            raise ValueError(
+                "The active Prefit template changed. Reload the project "
+                "workflows instead of applying settings in place."
+            )
+        self.settings = incoming_settings
+        self.paths = build_project_paths(self.settings.project_dir)
+        self.component_map_path = self.paths.project_dir / "md_saxs_map.json"
+        self.prior_weights_path = (
+            self.paths.project_dir / "md_prior_weights.json"
+        )
+        self.cluster_geometry_metadata_path = (
+            self.paths.cluster_geometry_metadata_file
+        )
+        self.experimental_data = self._load_experimental_trace()
+        self.solvent_data = self._load_solvent_trace()
+
     def load_parameter_entries(self) -> list[PrefitParameterEntry]:
         best_entries = self.load_best_prefit_entries()
         if best_entries is not None:
-            return best_entries
+            return self._apply_parameter_constraints(best_entries)
         state_path = self.paths.prefit_dir / "prefit_state.json"
         if state_path.is_file():
             payload = json.loads(state_path.read_text(encoding="utf-8"))
@@ -242,7 +550,7 @@ class SAXSPrefitWorkflow:
                 PrefitParameterEntry.from_dict(entry) for entry in entries
             ]
             if self._has_matching_entry_signature(parsed_entries):
-                return parsed_entries
+                return self._apply_parameter_constraints(parsed_entries)
             if parsed_entries:
                 return self._merge_parameter_entries(
                     parsed_entries,
@@ -257,12 +565,19 @@ class SAXSPrefitWorkflow:
         entries = parameter_entries or self.parameter_entries
         q_values = self._component_q_values()
         model_data = self._model_data_for_q_values(q_values)
-        experimental = np.interp(
-            q_values,
-            self.experimental_data.q_values,
-            self.experimental_data.intensities,
+        experimental = (
+            np.interp(
+                q_values,
+                self.experimental_data.q_values,
+                self.experimental_data.intensities,
+            )
+            if self.experimental_data is not None
+            else None
         )
-        params = {entry.name: float(entry.value) for entry in entries}
+        _lmfit_params, resolved_entries = build_prefit_lmfit_parameters(
+            entries
+        )
+        params = {entry.name: float(entry.value) for entry in resolved_entries}
         solvent_data = (
             self._solvent_trace_for_q_values(q_values)
             if self.solvent_data is not None
@@ -288,14 +603,30 @@ class SAXSPrefitWorkflow:
             params=params,
             extra_inputs=extra_inputs,
         )
-        residuals = model_intensities - experimental
+        structure_factor_trace = self._evaluate_structure_factor_trace(
+            q_values,
+            solvent_data=solvent_data,
+            model_data=model_data,
+            params=params,
+            extra_inputs=extra_inputs,
+        )
+        residuals = (
+            np.asarray(model_intensities, dtype=float) - experimental
+            if experimental is not None
+            else None
+        )
         return PrefitEvaluation(
             q_values=q_values,
             experimental_intensities=experimental,
             model_intensities=np.asarray(model_intensities, dtype=float),
-            residuals=np.asarray(residuals, dtype=float),
+            residuals=(
+                np.asarray(residuals, dtype=float)
+                if residuals is not None
+                else None
+            ),
             solvent_intensities=solvent_intensities,
             solvent_contribution=solvent_contribution,
+            structure_factor_trace=structure_factor_trace,
         )
 
     def run_fit(
@@ -305,11 +636,21 @@ class SAXSPrefitWorkflow:
         method: str = "leastsq",
         max_nfev: int = 10000,
     ) -> PrefitFitResult:
-        entries = [
-            PrefitParameterEntry.from_dict(entry.to_dict())
-            for entry in (parameter_entries or self.parameter_entries)
-        ]
-        self._ensure_entry_bounds_include_current_values(entries)
+        if self.settings.model_only_mode:
+            raise ValueError(
+                "Prefit is disabled in Model Only Mode. Disable Model Only "
+                "Mode and load experimental SAXS data to run a fit."
+            )
+        if self.experimental_data is None:
+            raise ValueError(
+                "Prefit requires experimental SAXS data before a fit can be run."
+            )
+        validate_prefit_parameter_identifiability(
+            parameter_entries or self.parameter_entries
+        )
+        lmfit_params, entries = build_prefit_lmfit_parameters(
+            parameter_entries or self.parameter_entries
+        )
         q_values = self._component_q_values()
         model_data = self._model_data_for_q_values(q_values)
         experimental = np.interp(
@@ -324,15 +665,6 @@ class SAXSPrefitWorkflow:
         )
         lmfit_model = self._lmfit_model_function()
         extra_inputs = self._lmfit_extra_inputs()
-        lmfit_params = Parameters()
-        for entry in entries:
-            lmfit_params.add(
-                entry.name,
-                value=float(entry.value),
-                vary=bool(entry.vary),
-                min=float(entry.minimum),
-                max=float(entry.maximum),
-            )
 
         def objective(active_params: Parameters) -> np.ndarray:
             params = active_params.valuesdict()
@@ -343,7 +675,10 @@ class SAXSPrefitWorkflow:
                 *extra_inputs,
                 **params,
             )
-            return np.asarray(model, dtype=float) - experimental
+            return constrained_prefit_residuals(
+                experimental,
+                np.asarray(model, dtype=float),
+            )
 
         result = minimize(
             objective,
@@ -355,11 +690,21 @@ class SAXSPrefitWorkflow:
         for entry in entries:
             fitted = result.params[entry.name]
             entry.value = float(fitted.value)
+            if _parameter_value_expression(entry) is not None:
+                entry.vary = False
+                continue
             entry.vary = bool(fitted.vary)
             entry.minimum = float(fitted.min)
             entry.maximum = float(fitted.max)
 
         evaluation = self.evaluate(entries)
+        if (
+            evaluation.residuals is None
+            or evaluation.experimental_intensities is None
+        ):
+            raise ValueError(
+                "Prefit fit statistics are unavailable without experimental SAXS data."
+            )
         chi_square = float(np.sum(evaluation.residuals**2))
         dof = max(
             len(evaluation.q_values)
@@ -472,6 +817,12 @@ class SAXSPrefitWorkflow:
                 "min": entry.minimum,
                 "max": entry.maximum,
             }
+            expression = _parameter_value_expression(entry)
+            if expression is not None:
+                meta["expression"] = expression
+            initial_expression = _parameter_initial_value_expression(entry)
+            if initial_expression is not None:
+                meta["initial_expression"] = initial_expression
             if entry.category == "weight":
                 weights_payload.append(
                     {
@@ -522,25 +873,38 @@ class SAXSPrefitWorkflow:
             )
 
         curve_path = self.paths.prefit_dir / "latest_prefit_curve.txt"
-        curve_data = np.column_stack(
-            [
-                evaluation.q_values,
-                evaluation.experimental_intensities,
-                evaluation.model_intensities,
-                evaluation.residuals,
-            ]
-        )
+        if (
+            evaluation.experimental_intensities is not None
+            and evaluation.residuals is not None
+        ):
+            curve_data = np.column_stack(
+                [
+                    evaluation.q_values,
+                    evaluation.experimental_intensities,
+                    evaluation.model_intensities,
+                    evaluation.residuals,
+                ]
+            )
+            curve_header = "q experimental_intensity model_intensity residual"
+        else:
+            curve_data = np.column_stack(
+                [
+                    evaluation.q_values,
+                    evaluation.model_intensities,
+                ]
+            )
+            curve_header = "q model_intensity"
         np.savetxt(
             curve_path,
             curve_data,
-            header="q experimental_intensity model_intensity residual",
+            header=curve_header,
             comments="",
         )
         snapshot_curve_path = snapshot_dir / "prefit_curve.txt"
         np.savetxt(
             snapshot_curve_path,
             curve_data,
-            header="q experimental_intensity model_intensity residual",
+            header=curve_header,
             comments="",
         )
 
@@ -582,16 +946,21 @@ class SAXSPrefitWorkflow:
             self.settings.template_reset_parameter_entries,
         )
         if stored_entries is not None:
-            return stored_entries
-        return self._copy_entries(self._template_default_entries)
+            return self._apply_parameter_constraints(stored_entries)
+        return self._apply_parameter_constraints(
+            self._copy_entries(self._template_default_entries)
+        )
 
     def load_best_prefit_entries(
         self,
     ) -> list[PrefitParameterEntry] | None:
-        return self._entries_from_project_payload(
+        entries = self._entries_from_project_payload(
             self.settings.best_prefit_template,
             self.settings.best_prefit_parameter_entries,
         )
+        if entries is None:
+            return None
+        return self._apply_parameter_constraints(entries)
 
     def save_best_prefit_entries(
         self,
@@ -650,7 +1019,12 @@ class SAXSPrefitWorkflow:
             path=state_dir,
             saved_at=str(payload.get("saved_at", state_dir.name)),
             template_name=str(payload.get("template_name", "")).strip(),
-            parameter_entries=parameter_entries,
+            parameter_entries=self._apply_parameter_constraints(
+                parameter_entries,
+                default_entries=self._build_default_parameter_entries(
+                    cluster_geometry_table=cluster_geometry_table,
+                ),
+            ),
             cluster_geometry_table=cluster_geometry_table,
             method=_optional_str(run_settings.get("method")),
             max_nfev=_optional_int(run_settings.get("max_nfev")),
@@ -667,6 +1041,14 @@ class SAXSPrefitWorkflow:
         *,
         span_factor: float = 10.0,
     ) -> PrefitScaleRecommendation:
+        if self.settings.model_only_mode:
+            raise ValueError(
+                "Scale recommendations are unavailable in Model Only Mode."
+            )
+        if self.experimental_data is None:
+            raise ValueError(
+                "Scale recommendations require experimental SAXS data."
+            )
         entries = parameter_entries or self.parameter_entries
         scale_entry = next(
             (entry for entry in entries if entry.name == "scale"),
@@ -676,27 +1058,57 @@ class SAXSPrefitWorkflow:
             raise ValueError(
                 "The current SAXS template does not define a scale parameter."
             )
-        evaluation = self.evaluate(entries)
+        if _parameter_value_expression(scale_entry) is not None:
+            raise ValueError(
+                "Scale recommendations are unavailable when scale is linked "
+                "to another parameter expression."
+            )
+        offset_entry = next(
+            (entry for entry in entries if entry.name == "offset"),
+            None,
+        )
+        if (
+            offset_entry is not None
+            and _parameter_value_expression(offset_entry) is not None
+        ):
+            raise ValueError(
+                "Scale recommendations are unavailable when offset is linked "
+                "to another parameter expression."
+            )
+        current_offset = (
+            float(offset_entry.value) if offset_entry is not None else None
+        )
+        recommended_entries = self._copy_entries(entries)
+        for entry in recommended_entries:
+            if entry.name == "scale":
+                entry.value = 1.0
+            elif entry.name == "offset":
+                entry.value = 0.0
+        evaluation = self.evaluate(recommended_entries)
         offset_value = next(
             (
                 float(entry.value)
-                for entry in entries
+                for entry in recommended_entries
                 if entry.name == "offset"
             ),
             0.0,
         )
+        solvent_contribution = (
+            np.asarray(evaluation.solvent_contribution, dtype=float)
+            if evaluation.solvent_contribution is not None
+            else np.zeros_like(evaluation.model_intensities, dtype=float)
+        )
         target = np.asarray(
-            evaluation.experimental_intensities - offset_value,
+            evaluation.experimental_intensities
+            - offset_value
+            - solvent_contribution,
             dtype=float,
         )
         model = np.asarray(
-            evaluation.model_intensities - offset_value,
+            evaluation.model_intensities - offset_value - solvent_contribution,
             dtype=float,
         )
-        mask = np.isfinite(target) & np.isfinite(model) & (np.abs(model) > 0.0)
-        positive_mask = mask & (target > 0.0) & (model > 0.0)
-        if np.count_nonzero(positive_mask) >= 3:
-            mask = positive_mask
+        mask = np.isfinite(target) & np.isfinite(model)
         if not np.any(mask):
             raise ValueError(
                 "A scale recommendation is not available because the current "
@@ -705,49 +1117,112 @@ class SAXSPrefitWorkflow:
             )
         masked_target = np.asarray(target[mask], dtype=float)
         masked_model = np.asarray(model[mask], dtype=float)
-        centered_target = masked_target - float(np.nanmin(masked_target))
-        centered_model = masked_model - float(np.nanmin(masked_model))
-        numerator = float(np.dot(centered_model, centered_target))
-        denominator = float(np.dot(centered_model, centered_model))
-        adjustment_factor = (
-            numerator / denominator if denominator > 0.0 else float("nan")
-        )
-        if not np.isfinite(adjustment_factor) or adjustment_factor <= 0.0:
-            adjustment_factor = float(
-                np.median(
-                    np.abs(centered_target)
-                    / np.maximum(np.abs(centered_model), 1e-30)
+        if np.count_nonzero(np.isfinite(masked_model)) < 2:
+            raise ValueError(
+                "A scale recommendation requires at least two finite SAXS "
+                "model points."
+            )
+        centered_model = masked_model - float(np.nanmean(masked_model))
+        centered_target = masked_target - float(np.nanmean(masked_target))
+        recommended_offset: float | None = None
+        if offset_entry is not None:
+            design_matrix = np.column_stack(
+                [
+                    masked_model,
+                    np.ones_like(masked_model, dtype=float),
+                ]
+            )
+            coefficients, *_ = np.linalg.lstsq(
+                design_matrix,
+                masked_target,
+                rcond=None,
+            )
+            recommended_scale = float(coefficients[0])
+            recommended_offset = float(coefficients[1])
+        else:
+            numerator = float(np.dot(masked_model, masked_target))
+            denominator = float(np.dot(masked_model, masked_model))
+            recommended_scale = (
+                numerator / denominator if denominator > 0.0 else float("nan")
+            )
+        if not np.isfinite(recommended_scale) or recommended_scale <= 0.0:
+            numerator = float(np.dot(centered_model, centered_target))
+            denominator = float(np.dot(centered_model, centered_model))
+            adjustment_factor = (
+                numerator / denominator if denominator > 0.0 else float("nan")
+            )
+            if not np.isfinite(adjustment_factor) or adjustment_factor <= 0.0:
+                adjustment_factor = float(
+                    np.median(
+                        np.abs(masked_target)
+                        / np.maximum(np.abs(masked_model), 1e-30)
+                    )
                 )
-            )
-        if not np.isfinite(adjustment_factor) or adjustment_factor <= 0.0:
-            target_span = float(
-                np.nanmax(masked_target) - np.nanmin(masked_target)
-            )
-            model_span = float(
-                np.nanmax(masked_model) - np.nanmin(masked_model)
-            )
-            if model_span > 0.0 and target_span > 0.0:
-                adjustment_factor = target_span / model_span
-        if not np.isfinite(adjustment_factor) or adjustment_factor <= 0.0:
+            if not np.isfinite(adjustment_factor) or adjustment_factor <= 0.0:
+                target_span = float(
+                    np.nanmax(masked_target) - np.nanmin(masked_target)
+                )
+                model_span = float(
+                    np.nanmax(masked_model) - np.nanmin(masked_model)
+                )
+                if model_span > 0.0 and target_span > 0.0:
+                    adjustment_factor = target_span / model_span
+            recommended_scale = float(adjustment_factor)
+            if offset_entry is not None:
+                recommended_offset = float(
+                    np.nanmean(
+                        masked_target - recommended_scale * masked_model
+                    )
+                )
+        if not np.isfinite(recommended_scale) or recommended_scale <= 0.0:
             raise ValueError(
                 "A positive scale recommendation could not be estimated from "
                 "the current model and experimental traces."
             )
-        current_scale = float(scale_entry.value)
+        raw_current_scale = float(scale_entry.value)
+        current_scale = raw_current_scale
         if current_scale <= 0.0:
             current_scale = max(float(scale_entry.maximum), 1.0) / span_factor
-        recommended_scale = max(current_scale * adjustment_factor, 1e-12)
+        recommended_scale = max(float(recommended_scale), 1e-12)
+        adjustment_factor = (
+            recommended_scale / current_scale
+            if current_scale > 0.0
+            else float("nan")
+        )
         recommended_minimum = max(recommended_scale / span_factor, 1e-12)
         recommended_maximum = max(
             recommended_scale * span_factor,
             recommended_scale * 1.5,
             float(scale_entry.maximum),
         )
+        recommended_offset_minimum: float | None = None
+        recommended_offset_maximum: float | None = None
+        if offset_entry is not None and recommended_offset is not None:
+            target_span = float(
+                np.nanmax(masked_target) - np.nanmin(masked_target)
+            )
+            offset_padding = max(
+                target_span / span_factor,
+                abs(float(recommended_offset)) / span_factor,
+                1e-12,
+            )
+            recommended_offset_minimum = min(
+                float(offset_entry.minimum),
+                float(recommended_offset) - offset_padding,
+            )
+            recommended_offset_maximum = max(
+                float(offset_entry.maximum),
+                float(recommended_offset) + offset_padding,
+            )
         return PrefitScaleRecommendation(
-            current_scale=float(scale_entry.value),
+            current_scale=raw_current_scale,
             recommended_scale=recommended_scale,
             recommended_minimum=min(recommended_minimum, recommended_scale),
             recommended_maximum=max(recommended_maximum, recommended_scale),
+            current_offset=current_offset,
+            recommended_offset=recommended_offset,
+            recommended_offset_minimum=recommended_offset_minimum,
+            recommended_offset_maximum=recommended_offset_maximum,
             adjustment_factor=adjustment_factor,
             points_used=int(np.count_nonzero(mask)),
         )
@@ -768,6 +1243,17 @@ class SAXSPrefitWorkflow:
 
     def supports_volume_fraction_estimator(self) -> bool:
         return self.volume_fraction_estimator_target() is not None
+
+    def solvent_weight_estimator_target(self) -> str | None:
+        parameter_names = {
+            str(parameter.name).strip()
+            for parameter in self.template_spec.parameters
+            if str(parameter.name).strip()
+        }
+        for candidate in SOLVENT_WEIGHT_PARAMETER_NAMES:
+            if candidate in parameter_names:
+                return candidate
+        return None
 
     def supports_cluster_geometry_metadata(self) -> bool:
         return bool(self.template_spec.cluster_geometry_support.supported)
@@ -1213,9 +1699,24 @@ class SAXSPrefitWorkflow:
                     minimum=float(existing_entry.minimum),
                     maximum=float(existing_entry.maximum),
                     category=default_entry.category,
+                    value_expression=_parameter_value_expression(
+                        existing_entry
+                    ),
+                    initial_value_expression=(
+                        _parameter_initial_value_expression(existing_entry)
+                    ),
                 )
             )
-        return merged_entries
+        defaults_by_name = {
+            entry.name: entry for entry in default_entries if entry.name
+        }
+        return [
+            SAXSPrefitWorkflow._apply_parameter_entry_constraints(
+                entry,
+                defaults_by_name.get(entry.name),
+            )
+            for entry in merged_entries
+        ]
 
     def _ensure_project_parameter_presets(self) -> None:
         dirty = False
@@ -1255,7 +1756,51 @@ class SAXSPrefitWorkflow:
         entries = [PrefitParameterEntry.from_dict(entry) for entry in payload]
         if not self._has_matching_entry_signature(entries):
             return None
-        return entries
+        return self._apply_parameter_constraints(entries)
+
+    def _apply_parameter_constraints(
+        self,
+        entries: list[PrefitParameterEntry],
+        *,
+        default_entries: list[PrefitParameterEntry] | None = None,
+    ) -> list[PrefitParameterEntry]:
+        defaults = default_entries or self._template_default_entries
+        defaults_by_name = {
+            entry.name: entry for entry in defaults if entry.name
+        }
+        return [
+            self._apply_parameter_entry_constraints(
+                entry,
+                defaults_by_name.get(entry.name),
+            )
+            for entry in entries
+        ]
+
+    @staticmethod
+    def _apply_parameter_entry_constraints(
+        entry: PrefitParameterEntry,
+        default_entry: PrefitParameterEntry | None = None,
+    ) -> PrefitParameterEntry:
+        constrained = PrefitParameterEntry.from_dict(entry.to_dict())
+        if constrained.name not in SOLVENT_WEIGHT_PARAMETER_NAMES:
+            return constrained
+        minimum = 0.0
+        maximum = 1.0
+        if default_entry is not None:
+            minimum = max(minimum, float(default_entry.minimum))
+            maximum = min(maximum, float(default_entry.maximum))
+        bounded_minimum = max(float(constrained.minimum), minimum)
+        bounded_maximum = min(float(constrained.maximum), maximum)
+        if bounded_maximum < bounded_minimum:
+            bounded_minimum = minimum
+            bounded_maximum = maximum
+        constrained.minimum = bounded_minimum
+        constrained.maximum = bounded_maximum
+        constrained.value = min(
+            max(float(constrained.value), constrained.minimum),
+            constrained.maximum,
+        )
+        return constrained
 
     def _has_matching_entry_signature(
         self,
@@ -1336,7 +1881,17 @@ class SAXSPrefitWorkflow:
             )
         return components
 
+    def _load_experimental_trace(self):
+        if self.settings.model_only_mode:
+            return None
+        try:
+            return self.project_manager.load_experimental_data(self.settings)
+        except Exception:
+            return None
+
     def _load_solvent_trace(self) -> np.ndarray | None:
+        if self.settings.model_only_mode:
+            return None
         q_values = self._component_q_values_from_candidates()
         solvent_summary = self.project_manager.load_solvent_data(self.settings)
         if solvent_summary is not None:
@@ -1363,7 +1918,27 @@ class SAXSPrefitWorkflow:
     def _supported_component_q_range(self) -> tuple[float, float]:
         supported = load_built_component_q_range(self.paths.project_dir)
         if supported is None:
-            q_values = np.asarray(self.experimental_data.q_values, dtype=float)
+            components = getattr(self, "components", [])
+            if self.experimental_data is not None:
+                q_values = np.asarray(
+                    self.experimental_data.q_values, dtype=float
+                )
+            elif components:
+                q_values = np.asarray(components[0].q_values, dtype=float)
+            else:
+                source = np.asarray(
+                    [
+                        value
+                        for value in (self.settings.q_min, self.settings.q_max)
+                        if value is not None
+                    ],
+                    dtype=float,
+                )
+                if source.size == 0:
+                    raise ValueError(
+                        "No q-range is available for the current SAXS project."
+                    )
+                q_values = source
             return (float(np.min(q_values)), float(np.max(q_values)))
         return supported
 
@@ -1431,10 +2006,16 @@ class SAXSPrefitWorkflow:
                 self.paths.scattering_components_dir.glob("*.txt")
             )
             if not component_files:
-                source_q_values = np.asarray(
-                    self.experimental_data.q_values,
-                    dtype=float,
-                )
+                if self.experimental_data is not None:
+                    source_q_values = np.asarray(
+                        self.experimental_data.q_values,
+                        dtype=float,
+                    )
+                else:
+                    raise ValueError(
+                        "No SAXS component q-grid is available yet. Build the "
+                        "SAXS components in Project Setup before previewing the model."
+                    )
             else:
                 raw_data = np.loadtxt(component_files[0], comments="#")
                 source_q_values = np.asarray(raw_data[:, 0], dtype=float)
@@ -1605,6 +2186,39 @@ class SAXSPrefitWorkflow:
             **isolated_params,
         )
         return np.asarray(contribution, dtype=float)
+
+    def _evaluate_structure_factor_trace(
+        self,
+        q_values: np.ndarray,
+        *,
+        solvent_data: np.ndarray,
+        model_data: list[np.ndarray],
+        params: dict[str, float],
+        extra_inputs: list[np.ndarray],
+    ) -> np.ndarray | None:
+        structure_factor_function = getattr(
+            self.template_module,
+            "structure_factor_profile",
+            None,
+        )
+        if structure_factor_function is None:
+            return None
+        try:
+            structure_factor = structure_factor_function(
+                q_values,
+                np.asarray(solvent_data, dtype=float),
+                model_data,
+                *extra_inputs,
+                **params,
+            )
+        except Exception:
+            return None
+        structure_factor_array = np.asarray(structure_factor, dtype=float)
+        if structure_factor_array.shape != np.asarray(q_values).shape:
+            return None
+        if not np.all(np.isfinite(structure_factor_array)):
+            return None
+        return structure_factor_array
 
     def _lmfit_extra_inputs(self) -> list[np.ndarray]:
         runtime_inputs = self.template_runtime_inputs()
@@ -1801,6 +2415,17 @@ class SAXSPrefitWorkflow:
                 f"  q points: {len(evaluation.q_values)}",
             ]
         )
+        if fit_result is None and (
+            evaluation.experimental_intensities is None
+            or evaluation.residuals is None
+        ):
+            lines.extend(
+                [
+                    "  mode: model_only",
+                    "  experimental_data: unavailable",
+                    "  fit_metrics: unavailable",
+                ]
+            )
         if fit_result is not None:
             lines.extend(
                 [

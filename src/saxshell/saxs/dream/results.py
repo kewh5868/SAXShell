@@ -41,6 +41,7 @@ class DreamModelPlotData:
     experimental_intensities: np.ndarray
     model_intensities: np.ndarray
     solvent_contribution: np.ndarray | None
+    structure_factor_trace: np.ndarray | None
     bestfit_method: str
     template_name: str
     rmse: float
@@ -170,6 +171,13 @@ class SAXSDreamResultsLoader:
         self._posterior_view_cache: dict[
             tuple[object, ...], _PosteriorView
         ] = {}
+        self._summary_cache: dict[tuple[object, ...], DreamSummary] = {}
+        self._model_plot_cache: dict[
+            tuple[object, ...], DreamModelPlotData
+        ] = {}
+        self._violin_data_cache: dict[
+            tuple[object, ...], DreamViolinPlotData
+        ] = {}
         self._parameter_entry_lookup = self._build_parameter_entry_lookup()
         self._apply_burnin()
 
@@ -209,8 +217,19 @@ class SAXSDreamResultsLoader:
             credible_interval_low=credible_interval_low,
             credible_interval_high=credible_interval_high,
         )
+        cache_key = (
+            str(bestfit_method),
+            str(view.filter_mode),
+            round(float(view.top_percent), 6),
+            int(view.top_n),
+            round(float(view.credible_interval_low), 6),
+            round(float(view.credible_interval_high), 6),
+        )
+        cached = self._summary_cache.get(cache_key)
+        if cached is not None:
+            return cached
         best_active = self._select_best_params(bestfit_method, view)
-        return DreamSummary(
+        summary = DreamSummary(
             bestfit_method=bestfit_method,
             bestfit_params=self.expand_params(best_active),
             map_params=self.expand_params(view.map_params),
@@ -229,6 +248,8 @@ class SAXSDreamResultsLoader:
             credible_interval_high=float(view.credible_interval_high),
             run_dir=self.run_dir,
         )
+        self._summary_cache[cache_key] = summary
+        return summary
 
     def build_model_fit_data(
         self,
@@ -240,6 +261,15 @@ class SAXSDreamResultsLoader:
         credible_interval_low: float = 16.0,
         credible_interval_high: float = 84.0,
     ) -> DreamModelPlotData:
+        cache_key = (
+            str(bestfit_method),
+            str(posterior_filter_mode),
+            round(float(posterior_top_percent), 6),
+            int(posterior_top_n),
+        )
+        cached = self._model_plot_cache.get(cache_key)
+        if cached is not None:
+            return cached
         summary = self.get_summary(
             bestfit_method=bestfit_method,
             posterior_filter_mode=posterior_filter_mode,
@@ -274,6 +304,11 @@ class SAXSDreamResultsLoader:
             params=params,
             extra_inputs=extra_inputs,
         )
+        structure_factor_trace = self._evaluate_structure_factor_trace(
+            model_module,
+            params=params,
+            extra_inputs=extra_inputs,
+        )
         residuals = np.asarray(
             model_intensities - self.experimental_intensities,
             dtype=float,
@@ -290,17 +325,20 @@ class SAXSDreamResultsLoader:
             if total_sum_squares > 0.0
             else 1.0
         )
-        return DreamModelPlotData(
+        plot_data = DreamModelPlotData(
             q_values=self.q_values,
             experimental_intensities=self.experimental_intensities,
             model_intensities=model_intensities,
             solvent_contribution=solvent_contribution,
+            structure_factor_trace=structure_factor_trace,
             bestfit_method=bestfit_method,
             template_name=self.template_name,
             rmse=rmse,
             mean_abs_residual=mean_abs_residual,
             r_squared=r_squared,
         )
+        self._model_plot_cache[cache_key] = plot_data
+        return plot_data
 
     def build_violin_data(
         self,
@@ -314,6 +352,17 @@ class SAXSDreamResultsLoader:
         sample_source: str = "filtered_posterior",
         weight_order: str = "weight_index",
     ) -> DreamViolinPlotData:
+        cache_key = (
+            str(mode),
+            str(posterior_filter_mode),
+            round(float(posterior_top_percent), 6),
+            int(posterior_top_n),
+            str(sample_source),
+            str(weight_order),
+        )
+        cached = self._violin_data_cache.get(cache_key)
+        if cached is not None:
+            return cached
         view = self._posterior_view(
             filter_mode=posterior_filter_mode,
             top_percent=posterior_top_percent,
@@ -329,7 +378,11 @@ class SAXSDreamResultsLoader:
             samples = np.asarray(active_samples, dtype=float)
             names = list(self.active_parameter_names)
         else:
-            full_samples = self._expand_sample_matrix(active_samples)
+            full_samples = self._full_violin_samples(
+                view,
+                active_samples=active_samples,
+                sample_source=sample_source,
+            )
             if mode == "all_parameters":
                 samples = full_samples
                 names = list(self.full_parameter_names)
@@ -337,6 +390,19 @@ class SAXSDreamResultsLoader:
                 names, samples = self._select_columns(
                     full_samples,
                     include=lambda name: name.startswith("w"),
+                )
+            elif mode == "effective_radii_only":
+                names, samples = self._select_columns(
+                    full_samples,
+                    include=self._is_effective_radius_parameter,
+                )
+            elif mode == "additional_parameters_only":
+                names, samples = self._select_columns(
+                    full_samples,
+                    include=lambda name: (
+                        not name.startswith("w")
+                        and not self._is_effective_radius_parameter(name)
+                    ),
                 )
             elif mode == "fit_parameters":
                 names, samples = self._select_columns(
@@ -348,14 +414,15 @@ class SAXSDreamResultsLoader:
                     "Unknown DREAM violin mode: "
                     f"{mode}. Expected one of "
                     "'varying_parameters', 'all_parameters', "
-                    "'weights_only', or 'fit_parameters'."
+                    "'weights_only', 'effective_radii_only', "
+                    "'additional_parameters_only', or 'fit_parameters'."
                 )
         names, samples = self._ordered_violin_columns(
             names,
             samples,
             weight_order=weight_order,
         )
-        return DreamViolinPlotData(
+        violin_data = DreamViolinPlotData(
             parameter_names=names,
             display_names=[
                 self._parameter_display_name(name) for name in names
@@ -366,6 +433,8 @@ class SAXSDreamResultsLoader:
             sample_count=int(np.asarray(samples).shape[0]),
             weight_order=weight_order,
         )
+        self._violin_data_cache[cache_key] = violin_data
+        return violin_data
 
     def save_statistics_report(
         self,
@@ -461,6 +530,37 @@ class SAXSDreamResultsLoader:
             **isolated_params,
         )
         return np.asarray(contribution, dtype=float)
+
+    def _evaluate_structure_factor_trace(
+        self,
+        model_module,
+        *,
+        params: dict[str, float],
+        extra_inputs: list[np.ndarray],
+    ) -> np.ndarray | None:
+        structure_factor_function = getattr(
+            model_module,
+            "structure_factor_profile",
+            None,
+        )
+        if structure_factor_function is None:
+            return None
+        try:
+            structure_factor = structure_factor_function(
+                self.q_values,
+                self.solvent_intensities,
+                self.theoretical_intensities,
+                *extra_inputs,
+                **params,
+            )
+        except Exception:
+            return None
+        structure_factor_array = np.asarray(structure_factor, dtype=float)
+        if structure_factor_array.shape != self.q_values.shape:
+            return None
+        if not np.all(np.isfinite(structure_factor_array)):
+            return None
+        return structure_factor_array
 
     def _select_best_params(
         self,
@@ -621,6 +721,21 @@ class SAXSDreamResultsLoader:
             "'map_chain_only'."
         )
 
+    def _full_violin_samples(
+        self,
+        view: _PosteriorView,
+        *,
+        active_samples: np.ndarray,
+        sample_source: str,
+    ) -> np.ndarray:
+        if sample_source == "filtered_posterior":
+            flat_mask = np.asarray(view.sample_mask, dtype=bool).reshape(-1)
+            return np.asarray(
+                self._expanded_flat_samples()[flat_mask],
+                dtype=float,
+            )
+        return self._expand_sample_matrix(active_samples)
+
     def _posterior_mask(
         self,
         *,
@@ -761,6 +876,17 @@ class SAXSDreamResultsLoader:
             if name and name not in lookup:
                 lookup[name] = dict(entry)
         return lookup
+
+    @staticmethod
+    def _is_effective_radius_parameter(parameter_name: str) -> bool:
+        name = str(parameter_name).strip()
+        return bool(
+            name == "eff_r"
+            or name.startswith("r_eff_")
+            or name.startswith("a_eff_")
+            or name.startswith("b_eff_")
+            or name.startswith("c_eff_")
+        )
 
     @staticmethod
     def _normalize_sampled_params(

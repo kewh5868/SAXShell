@@ -39,6 +39,8 @@ Issues = "https://github.com/kewh5868/SAXSShell/issues/"
 
 [project.scripts]
 bondanalysis = "saxshell.bondanalysis.cli:main"
+clusterdynamics = "saxshell.clusterdynamics.cli:main"
+clusterdynamicsml = "saxshell.clusterdynamicsml.cli:main"
 clusters = "saxshell.cluster.cli:main"
 mdtrajectory = "saxshell.mdtrajectory.cli:main"
 saxshell = "saxshell.saxshell:main"
@@ -63,6 +65,7 @@ dependencies = { file = ["requirements/pip.txt"] }
 [tool.setuptools.package-data]
 "saxshell.xyz2pdb" = ["reference_library/*.pdb", "reference_library/*.txt"]
 "saxshell.fullrmc" = ["_solution_property_presets/*.json"]
+"saxshell.saxs" = ["_beam_geometry_presets/*.json", "_ui_assets/*.svg"]
 
 [tool.codespell]
 exclude-file = ".codespell/ignore_lines.txt"

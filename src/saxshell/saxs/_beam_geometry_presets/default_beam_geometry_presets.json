@@ -1,0 +1,31 @@
+{
+  "presets": {
+    "NSLS-II 28-ID-1 (default)": {
+      "incident_energy_kev": 74.0,
+      "capillary_size_mm": 1.0,
+      "capillary_geometry": "cylindrical",
+      "beam_profile": "uniform",
+      "beam_footprint_width_mm": 0.4,
+      "beam_footprint_height_mm": 0.4,
+      "notes": "Nominal beam size 0.4 mm x 0.4 mm."
+    },
+    "APS 5-IDD (default - focused)": {
+      "incident_energy_kev": 17.0,
+      "capillary_size_mm": 1.0,
+      "capillary_geometry": "cylindrical",
+      "beam_profile": "uniform",
+      "beam_footprint_width_mm": 0.05,
+      "beam_footprint_height_mm": 1.0,
+      "notes": "Nominal beam size 50 micron x 1000 micron."
+    },
+    "APS 5-IDD (default - unfocused)": {
+      "incident_energy_kev": 17.5,
+      "capillary_size_mm": 1.0,
+      "capillary_geometry": "cylindrical",
+      "beam_profile": "uniform",
+      "beam_footprint_width_mm": 1.0,
+      "beam_footprint_height_mm": 1.0,
+      "notes": "Nominal beam size 1 mm x 1 mm."
+    }
+  }
+}

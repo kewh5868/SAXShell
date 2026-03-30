@@ -372,7 +372,7 @@ def test_validate_template_candidate_rejects_cluster_geometry_binding_missing_fr
         # cluster_geometry_metadata: true
         # param: phi_solute,0.02,True,0.0,0.5
         # param: phi_int,0.02,True,0.0,0.4
-        # param: solvent_scale,1.0,True,0.0,5.0
+        # param: solvent_scale,1.0,True,0.0,1.0
         # param: scale,1.0,True,1e-8,1e8
         # param: offset,0.0,True,-1.0,1.0
         # param: log_sigma,-9.21,True,-20.0,5.0
