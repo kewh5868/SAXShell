@@ -53,7 +53,7 @@ class SoluteVolumeFractionEstimate:
 
     def summary_text(self) -> str:
         lines = [
-            "Volume fraction estimate",
+            "Physical solute-associated volume fraction estimate",
             f"Mode: {self.solution_result.mode}",
             (
                 "Solution volume from measured density: "
@@ -149,19 +149,28 @@ class SoluteVolumeFractionEstimate:
         lines.extend(
             [
                 (
-                    "Estimated solute volume fraction: "
+                    "Physical solute-associated volume fraction: "
                     f"{_format_fraction(self.solute_volume_fraction)}"
+                ),
+                (
+                    "Physical solvent-associated volume fraction: "
+                    f"{_format_fraction(self.solvent_volume_fraction)}"
                 ),
                 "",
                 "Interpretation:",
-                "This estimate follows the SAXS-style concentration x "
-                "specific-volume picture for solute occupancy in the measured "
-                "solution volume:",
+                "This is the physical occupancy estimate from the bulk "
+                "density/composition model. SAXSShell keeps reporting it for "
+                "reference, but the poly-LMA model-facing phi_solute / "
+                "phi_solvent defaults now come from the SAXS-effective "
+                "contrast-weighted interaction ratio when that estimate is "
+                "available.",
+                "",
+                "Bulk-density relation:",
                 (
-                    "phi_solute ~= c_solute * vbar_solute "
+                    "phi_phys ~= c_solute * vbar_solute "
                     "= (m_solute / V_solution) * (1 / rho_solute)."
                     if self.calculation_method == "solute_density"
-                    else "phi_solute ~= V_solute / V_solution, with "
+                    else "phi_phys ~= V_solute / V_solution, with "
                     "V_solute ~= V_solution - (m_solvent / rho_solvent)."
                 ),
             ]

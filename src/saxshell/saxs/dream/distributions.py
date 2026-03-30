@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -90,6 +91,7 @@ def build_default_parameter_map(
     for name, value in dict(prefit_payload.get("fit_parameters", {})).items():
         meta = dict(fit_parameter_meta.get(name, {}))
         float_value = float(value)
+        distribution = _default_distribution_for_fit_parameter(str(name))
         entries.append(
             DreamParameterEntry(
                 structure="",
@@ -98,12 +100,12 @@ def build_default_parameter_map(
                 param=str(name),
                 value=float_value,
                 vary=bool(meta.get("vary", True)),
-                distribution="norm",
+                distribution=distribution,
                 dist_params=_default_distribution_params(
                     float_value,
                     cv_default,
                     eps,
-                )["norm"],
+                )[distribution],
             )
         )
     return entries
@@ -218,6 +220,13 @@ def _default_distribution_params(
             "scale": uniform_scale,
         },
     }
+
+
+def _default_distribution_for_fit_parameter(name: str) -> str:
+    normalized_name = str(name).strip()
+    if re.fullmatch(r"r_eff_w\d+", normalized_name):
+        return "lognorm"
+    return "norm"
 
 
 __all__ = [

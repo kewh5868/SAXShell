@@ -10,33 +10,51 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 import numpy as np
+from matplotlib import colormaps
+from matplotlib.colors import to_hex
 from PySide6.QtCore import (
     QObject,
     QSettings,
     QSize,
     Qt,
     QThread,
+    QTimer,
     QUrl,
     Signal,
     Slot,
 )
-from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QDesktopServices,
+    QFont,
+    QKeySequence,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QColorDialog,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFontComboBox,
     QFormLayout,
+    QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QInputDialog,
+    QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTabWidget,
     QTextEdit,
@@ -57,29 +75,52 @@ from saxshell.saxs.dream import (
     load_dream_settings,
     load_parameter_map,
 )
-from saxshell.saxs.prefit import PrefitScaleRecommendation, SAXSPrefitWorkflow
+from saxshell.saxs.model_report import (
+    DreamFilterReportView,
+    DreamModelReportContext,
+    PriorHistogramRequest,
+    ReportComponentPlotData,
+    ReportComponentSeries,
+    export_dream_model_report_pptx,
+)
+from saxshell.saxs.prefit import (
+    PrefitParameterEntry,
+    PrefitScaleRecommendation,
+    SAXSPrefitWorkflow,
+)
 from saxshell.saxs.prefit.workflow import (
     SOLUTE_VOLUME_FRACTION_PARAMETER_NAMES,
     SOLVENT_VOLUME_FRACTION_PARAMETER_NAMES,
+    SOLVENT_WEIGHT_PARAMETER_NAMES,
     normalize_requested_q_range_to_supported,
     q_range_boundary_tolerance,
 )
 from saxshell.saxs.project_manager import (
     ClusterImportResult,
+    ExperimentalDataSummary,
+    PowerPointExportSettings,
     ProjectSettings,
     SAXSProjectManager,
     build_project_paths,
     export_prior_histogram_npy,
     export_prior_histogram_table,
     load_built_component_q_range,
+    load_experimental_data_file,
 )
-from saxshell.saxs.solute_volume_fraction import (
-    DISPLAY_FRACTION_DECIMALS,
-    SoluteVolumeFractionEstimate,
+from saxshell.saxs.solute_volume_fraction import DISPLAY_FRACTION_DECIMALS
+from saxshell.saxs.solution_scattering_estimator import (
+    SolutionScatteringEstimate,
 )
 from saxshell.saxs.template_installation import (
     format_validation_report,
     install_template_candidate,
+)
+from saxshell.saxs.ui.branding import (
+    build_saxshell_brand_widget,
+    configure_saxshell_application,
+    create_saxshell_startup_splash,
+    load_saxshell_icon,
+    prepare_saxshell_application_identity,
 )
 from saxshell.saxs.ui.distribution_window import DistributionSetupWindow
 from saxshell.saxs.ui.dream_tab import DreamTab
@@ -89,6 +130,9 @@ from saxshell.saxs.ui.prior_histogram_window import PriorHistogramWindow
 from saxshell.saxs.ui.progress_dialog import SAXSProgressDialog
 from saxshell.saxs.ui.project_setup_tab import ProjectSetupTab
 from saxshell.saxs.ui.solute_volume_fraction_widget import (
+    AttenuationEstimateToolWindow,
+    FluorescenceEstimateToolWindow,
+    NumberDensityEstimateToolWindow,
     SoluteVolumeFractionToolWindow,
 )
 from saxshell.version import __version__
@@ -96,12 +140,21 @@ from saxshell.version import __version__
 GITHUB_REPOSITORY_URL = "https://github.com/kewh5868/SAXSShell"
 CONTACT_EMAIL = "keith.white@colorado.edu"
 RECENT_PROJECTS_KEY = "recent_project_dirs"
+CONSOLE_AUTOSCROLL_KEY = "console_autoscroll_enabled"
 MAX_RECENT_PROJECTS = 10
 REPO_ROOT = Path(__file__).resolve().parents[4]
 EQUIVALENT_SPHERE_MIX_TEMPLATE_NAMES = {
     "template_pydream_poly_lma_hs_mix_approx",
     "template_pydream_poly_lma_hs_legacy",
 }
+POWERPOINT_COLOR_MAP_OPTIONS = (
+    "viridis",
+    "plasma",
+    "cividis",
+    "magma",
+    "inferno",
+    "turbo",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +192,464 @@ class TemplateInstallRequest:
     model_name: str
     template_path: Path
     model_description: str
+
+
+class MainUISettingsDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        dream_settings: DreamRunSettings,
+        powerpoint_settings: PowerPointExportSettings,
+        powerpoint_enabled: bool,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._powerpoint_enabled = bool(powerpoint_enabled)
+        self.setWindowTitle("Main UI Settings")
+        self.resize(760, 780)
+        layout = QVBoxLayout(self)
+
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        self._build_dream_output_tab(dream_settings)
+        self._build_powerpoint_tab(powerpoint_settings)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _build_dream_output_tab(self, settings: DreamRunSettings) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        form_layout = QFormLayout()
+
+        self.verbose_checkbox = QCheckBox("Verbose sampler output")
+        self.verbose_checkbox.setChecked(settings.verbose)
+        self.verbose_checkbox.setToolTip(
+            "Enable or disable verbose DREAM sampler progress output."
+        )
+        self.interval_spin = QDoubleSpinBox()
+        self.interval_spin.setRange(0.1, 30.0)
+        self.interval_spin.setDecimals(1)
+        self.interval_spin.setSingleStep(0.1)
+        self.interval_spin.setValue(settings.verbose_output_interval_seconds)
+        self.interval_spin.setToolTip(
+            "Minimum number of seconds between DREAM runtime output "
+            "updates shown in the UI while verbose output is enabled."
+        )
+        self.interval_spin.setEnabled(self.verbose_checkbox.isChecked())
+        self.verbose_checkbox.toggled.connect(self.interval_spin.setEnabled)
+        form_layout.addRow(self.verbose_checkbox)
+        form_layout.addRow("Output interval (s)", self.interval_spin)
+        layout.addLayout(form_layout)
+        layout.addStretch(1)
+        self.tabs.addTab(tab, "DREAM Output")
+
+    def _build_powerpoint_tab(
+        self,
+        settings: PowerPointExportSettings,
+    ) -> None:
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        tab_layout.addWidget(scroll_area)
+
+        container = QWidget()
+        scroll_area.setWidget(container)
+        layout = QVBoxLayout(container)
+
+        note_label = QLabel(
+            "Adjust the PowerPoint export styling, slide content, and "
+            "supplemental files generated with the report."
+        )
+        note_label.setWordWrap(True)
+        layout.addWidget(note_label)
+        self._powerpoint_disabled_label = QLabel(
+            "Load a project to edit PowerPoint export settings."
+        )
+        self._powerpoint_disabled_label.setWordWrap(True)
+        self._powerpoint_disabled_label.setVisible(
+            not self._powerpoint_enabled
+        )
+        layout.addWidget(self._powerpoint_disabled_label)
+
+        appearance_group = QGroupBox("Appearance")
+        appearance_layout = QFormLayout(appearance_group)
+        self.powerpoint_font_combo = QFontComboBox()
+        self.powerpoint_font_combo.setCurrentFont(QFont(settings.font_family))
+        appearance_layout.addRow("Font family", self.powerpoint_font_combo)
+
+        self.component_cmap_combo = QComboBox()
+        self._populate_color_map_combo(
+            self.component_cmap_combo,
+            settings.component_color_map,
+        )
+        appearance_layout.addRow(
+            "Component trace palette",
+            self.component_cmap_combo,
+        )
+
+        self.prior_cmap_combo = QComboBox()
+        self._populate_color_map_combo(
+            self.prior_cmap_combo,
+            settings.prior_histogram_color_map,
+        )
+        appearance_layout.addRow(
+            "Prior histogram palette",
+            self.prior_cmap_combo,
+        )
+
+        self.solvent_sort_prior_cmap_combo = QComboBox()
+        self._populate_color_map_combo(
+            self.solvent_sort_prior_cmap_combo,
+            settings.solvent_sort_histogram_color_map,
+        )
+        appearance_layout.addRow(
+            "Solvent-sort histogram palette",
+            self.solvent_sort_prior_cmap_combo,
+        )
+        layout.addWidget(appearance_group)
+
+        colors_group = QGroupBox("Colors")
+        colors_layout = QGridLayout(colors_group)
+        colors_layout.setColumnStretch(1, 1)
+        color_rows = [
+            ("Text", settings.text_color, "powerpoint_text_color_button"),
+            (
+                "Experimental trace",
+                settings.experimental_trace_color,
+                "powerpoint_experimental_color_button",
+            ),
+            (
+                "Model trace",
+                settings.model_trace_color,
+                "powerpoint_model_color_button",
+            ),
+            (
+                "Residual trace",
+                settings.residual_trace_color,
+                "powerpoint_residual_color_button",
+            ),
+            (
+                "Solvent trace",
+                settings.solvent_trace_color,
+                "powerpoint_solvent_color_button",
+            ),
+            (
+                "Structure factor trace",
+                settings.structure_factor_color,
+                "powerpoint_structure_factor_color_button",
+            ),
+            (
+                "Table header fill",
+                settings.table_header_fill,
+                "powerpoint_table_header_fill_button",
+            ),
+            (
+                "Table even row fill",
+                settings.table_even_row_fill,
+                "powerpoint_table_even_fill_button",
+            ),
+            (
+                "Table odd row fill",
+                settings.table_odd_row_fill,
+                "powerpoint_table_odd_fill_button",
+            ),
+            (
+                "Table header rule",
+                settings.table_rule_color,
+                "powerpoint_table_rule_color_button",
+            ),
+        ]
+        for row_index, (label, color, attribute_name) in enumerate(color_rows):
+            color_label = QLabel(label)
+            button = QPushButton()
+            self._configure_color_button(button, color=color, label=label)
+            button.clicked.connect(
+                lambda checked=False, btn=button, title=label: self._choose_color(
+                    btn,
+                    title,
+                )
+            )
+            setattr(self, attribute_name, button)
+            colors_layout.addWidget(color_label, row_index, 0)
+            colors_layout.addWidget(button, row_index, 1)
+        layout.addWidget(colors_group)
+
+        content_group = QGroupBox("Slides and Summary Content")
+        content_layout = QVBoxLayout(content_group)
+        self.include_prior_histograms_checkbox = QCheckBox(
+            "Include prior histogram slides"
+        )
+        self.include_prior_histograms_checkbox.setChecked(
+            settings.include_prior_histograms
+        )
+        content_layout.addWidget(self.include_prior_histograms_checkbox)
+
+        self.include_initial_traces_checkbox = QCheckBox(
+            "Include initial SAXS traces slide"
+        )
+        self.include_initial_traces_checkbox.setChecked(
+            settings.include_initial_traces
+        )
+        content_layout.addWidget(self.include_initial_traces_checkbox)
+
+        self.include_prefit_model_checkbox = QCheckBox(
+            "Include prefit model slide"
+        )
+        self.include_prefit_model_checkbox.setChecked(
+            settings.include_prefit_model
+        )
+        content_layout.addWidget(self.include_prefit_model_checkbox)
+
+        self.include_prefit_parameters_checkbox = QCheckBox(
+            "Include prefit parameter table slides"
+        )
+        self.include_prefit_parameters_checkbox.setChecked(
+            settings.include_prefit_parameters
+        )
+        content_layout.addWidget(self.include_prefit_parameters_checkbox)
+
+        self.include_geometry_table_checkbox = QCheckBox(
+            "Include computed geometry parameter slides"
+        )
+        self.include_geometry_table_checkbox.setChecked(
+            settings.include_geometry_table
+        )
+        content_layout.addWidget(self.include_geometry_table_checkbox)
+
+        self.include_estimator_metrics_checkbox = QCheckBox(
+            "Include estimator metrics slides"
+        )
+        self.include_estimator_metrics_checkbox.setChecked(
+            settings.include_estimator_metrics
+        )
+        content_layout.addWidget(self.include_estimator_metrics_checkbox)
+
+        self.include_dream_settings_checkbox = QCheckBox(
+            "Include DREAM settings and assessment slides"
+        )
+        self.include_dream_settings_checkbox.setChecked(
+            settings.include_dream_settings
+        )
+        content_layout.addWidget(self.include_dream_settings_checkbox)
+
+        self.include_dream_prior_table_checkbox = QCheckBox(
+            "Include DREAM prior distribution slides"
+        )
+        self.include_dream_prior_table_checkbox.setChecked(
+            settings.include_dream_prior_table
+        )
+        content_layout.addWidget(self.include_dream_prior_table_checkbox)
+
+        self.include_dream_output_model_checkbox = QCheckBox(
+            "Include DREAM output model slides"
+        )
+        self.include_dream_output_model_checkbox.setChecked(
+            settings.include_dream_output_model
+        )
+        content_layout.addWidget(self.include_dream_output_model_checkbox)
+
+        self.include_posterior_comparisons_checkbox = QCheckBox(
+            "Include posterior comparison plots"
+        )
+        self.include_posterior_comparisons_checkbox.setChecked(
+            settings.include_posterior_comparisons
+        )
+        content_layout.addWidget(self.include_posterior_comparisons_checkbox)
+
+        self.include_output_summary_checkbox = QCheckBox(
+            "Include output summary text"
+        )
+        self.include_output_summary_checkbox.setChecked(
+            settings.include_output_summary
+        )
+        content_layout.addWidget(self.include_output_summary_checkbox)
+
+        self.include_directory_summary_checkbox = QCheckBox(
+            "Include directory summary text"
+        )
+        self.include_directory_summary_checkbox.setChecked(
+            settings.include_directory_summary
+        )
+        content_layout.addWidget(self.include_directory_summary_checkbox)
+        layout.addWidget(content_group)
+
+        output_group = QGroupBox("Supplemental Output Data")
+        output_layout = QVBoxLayout(output_group)
+        self.generate_manifest_checkbox = QCheckBox(
+            "Generate report manifest JSON"
+        )
+        self.generate_manifest_checkbox.setChecked(settings.generate_manifest)
+        output_layout.addWidget(self.generate_manifest_checkbox)
+
+        self.export_figure_assets_checkbox = QCheckBox(
+            "Keep rendered figure PNG assets"
+        )
+        self.export_figure_assets_checkbox.setChecked(
+            settings.export_figure_assets
+        )
+        output_layout.addWidget(self.export_figure_assets_checkbox)
+        layout.addWidget(output_group)
+
+        self._powerpoint_groups = (
+            appearance_group,
+            colors_group,
+            content_group,
+            output_group,
+        )
+        for group in self._powerpoint_groups:
+            group.setEnabled(self._powerpoint_enabled)
+        layout.addStretch(1)
+        self.tabs.addTab(tab, "PowerPoint Export")
+
+    @staticmethod
+    def _populate_color_map_combo(
+        combo: QComboBox,
+        selected_name: str,
+    ) -> None:
+        for name in POWERPOINT_COLOR_MAP_OPTIONS:
+            combo.addItem(name, name)
+        current_name = str(selected_name).strip() or "viridis"
+        index = combo.findData(current_name)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+
+    @staticmethod
+    def _configure_color_button(
+        button: QPushButton,
+        *,
+        color: str,
+        label: str,
+    ) -> None:
+        normalized = str(color).strip() or "#000000"
+        qcolor = QColor(normalized)
+        foreground = "#ffffff"
+        if qcolor.isValid() and qcolor.lightness() > 128:
+            foreground = "#000000"
+        button.setText(normalized.upper())
+        button.setToolTip(f"{label}: {normalized.upper()}")
+        button.setMinimumWidth(120)
+        button.setStyleSheet(
+            "QPushButton {"
+            f"background-color: {normalized};"
+            f"color: {foreground};"
+            "border: 1px solid #666666;"
+            "padding: 4px 8px;"
+            "}"
+        )
+
+    def _choose_color(self, button: QPushButton, label: str) -> None:
+        chosen = QColorDialog.getColor(
+            QColor(button.text().strip()),
+            self,
+            f"Choose {label.lower()}",
+        )
+        if not chosen.isValid():
+            return
+        self._configure_color_button(
+            button,
+            color=chosen.name(),
+            label=label,
+        )
+
+    def dream_output_values(self) -> tuple[bool, float]:
+        return (
+            bool(self.verbose_checkbox.isChecked()),
+            float(self.interval_spin.value()),
+        )
+
+    def powerpoint_settings_value(self) -> PowerPointExportSettings:
+        return PowerPointExportSettings(
+            font_family=(
+                self.powerpoint_font_combo.currentFont().family().strip()
+                or "Arial"
+            ),
+            component_color_map=str(
+                self.component_cmap_combo.currentData() or "viridis"
+            ),
+            prior_histogram_color_map=str(
+                self.prior_cmap_combo.currentData() or "viridis"
+            ),
+            solvent_sort_histogram_color_map=str(
+                self.solvent_sort_prior_cmap_combo.currentData() or "summer"
+            ),
+            text_color=self.powerpoint_text_color_button.text().strip(),
+            experimental_trace_color=(
+                self.powerpoint_experimental_color_button.text().strip()
+            ),
+            model_trace_color=(
+                self.powerpoint_model_color_button.text().strip()
+            ),
+            residual_trace_color=(
+                self.powerpoint_residual_color_button.text().strip()
+            ),
+            solvent_trace_color=(
+                self.powerpoint_solvent_color_button.text().strip()
+            ),
+            structure_factor_color=(
+                self.powerpoint_structure_factor_color_button.text().strip()
+            ),
+            table_header_fill=(
+                self.powerpoint_table_header_fill_button.text().strip()
+            ),
+            table_even_row_fill=(
+                self.powerpoint_table_even_fill_button.text().strip()
+            ),
+            table_odd_row_fill=(
+                self.powerpoint_table_odd_fill_button.text().strip()
+            ),
+            table_rule_color=(
+                self.powerpoint_table_rule_color_button.text().strip()
+            ),
+            include_prior_histograms=bool(
+                self.include_prior_histograms_checkbox.isChecked()
+            ),
+            include_initial_traces=bool(
+                self.include_initial_traces_checkbox.isChecked()
+            ),
+            include_prefit_model=bool(
+                self.include_prefit_model_checkbox.isChecked()
+            ),
+            include_prefit_parameters=bool(
+                self.include_prefit_parameters_checkbox.isChecked()
+            ),
+            include_geometry_table=bool(
+                self.include_geometry_table_checkbox.isChecked()
+            ),
+            include_estimator_metrics=bool(
+                self.include_estimator_metrics_checkbox.isChecked()
+            ),
+            include_dream_settings=bool(
+                self.include_dream_settings_checkbox.isChecked()
+            ),
+            include_dream_prior_table=bool(
+                self.include_dream_prior_table_checkbox.isChecked()
+            ),
+            include_dream_output_model=bool(
+                self.include_dream_output_model_checkbox.isChecked()
+            ),
+            include_posterior_comparisons=bool(
+                self.include_posterior_comparisons_checkbox.isChecked()
+            ),
+            include_output_summary=bool(
+                self.include_output_summary_checkbox.isChecked()
+            ),
+            include_directory_summary=bool(
+                self.include_directory_summary_checkbox.isChecked()
+            ),
+            generate_manifest=bool(
+                self.generate_manifest_checkbox.isChecked()
+            ),
+            export_figure_assets=bool(
+                self.export_figure_assets_checkbox.isChecked()
+            ),
+        )
 
 
 class InstallModelDialog(QDialog):
@@ -290,6 +801,12 @@ class SAXSMainWindow(QMainWindow):
     """Main Qt window for SAXS project setup, prefit, and DREAM
     refinement."""
 
+    DREAM_REFRESH_DELAY_MS = 75
+    DREAM_REFRESH_STYLE = 1
+    DREAM_REFRESH_VIOLIN = 2
+    DREAM_REFRESH_SUMMARY = 3
+    DREAM_REFRESH_FULL = 4
+
     def __init__(
         self,
         initial_project_dir: str | Path | None = None,
@@ -324,8 +841,12 @@ class SAXSMainWindow(QMainWindow):
         self._loaded_dream_run_dir: Path | None = None
         self._warn_on_prefit_template_change = True
         self._restoring_prefit_template = False
+        self._prefit_missing_components_warning_shown = False
         self._updating_deprecated_template_visibility = False
         self._show_deprecated_templates = False
+        self._console_autoscroll_enabled = (
+            self._load_console_autoscroll_setting()
+        )
         self._ui_scale = 1.0
         self._base_font_point_size = self._resolve_base_font_point_size()
         self._scale_shortcuts: list[QShortcut] = []
@@ -333,9 +854,28 @@ class SAXSMainWindow(QMainWindow):
         self._solute_volume_fraction_tool_window: (
             SoluteVolumeFractionToolWindow | None
         ) = None
+        self._number_density_tool_window: (
+            NumberDensityEstimateToolWindow | None
+        ) = None
+        self._attenuation_tool_window: AttenuationEstimateToolWindow | None = (
+            None
+        )
+        self._fluorescence_tool_window: (
+            FluorescenceEstimateToolWindow | None
+        ) = None
+        self._last_solution_scattering_estimate: (
+            SolutionScatteringEstimate | None
+        ) = None
         self._pending_prefit_sf_approximation_change: (
             tuple[str, str] | None
         ) = None
+        self._pending_dream_refresh_scope = 0
+        self._dream_refresh_timer = QTimer(self)
+        self._dream_refresh_timer.setSingleShot(True)
+        self._dream_refresh_timer.setInterval(self.DREAM_REFRESH_DELAY_MS)
+        self._dream_refresh_timer.timeout.connect(
+            self._flush_pending_dream_refresh
+        )
         self._build_ui()
         self._capture_scale_baselines(self)
         self._register_scale_shortcuts()
@@ -352,14 +892,28 @@ class SAXSMainWindow(QMainWindow):
             self.dream_tab.clear_plots()
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("SAXSShell (saxs)")
+        self.setWindowTitle("SAXSShell")
+        self.setWindowIcon(load_saxshell_icon())
         self.resize(self._default_window_size())
 
         self._build_menu_bar()
         self.tabs = QTabWidget()
+        self.tabs.setCornerWidget(
+            build_saxshell_brand_widget(self.tabs),
+            Qt.Corner.TopLeftCorner,
+        )
         self.project_setup_tab = ProjectSetupTab()
         self.prefit_tab = PrefitTab()
         self.dream_tab = DreamTab()
+        self.project_setup_tab.set_console_autoscroll_enabled(
+            self._console_autoscroll_enabled
+        )
+        self.prefit_tab.set_console_autoscroll_enabled(
+            self._console_autoscroll_enabled
+        )
+        self.dream_tab.set_console_autoscroll_enabled(
+            self._console_autoscroll_enabled
+        )
         self.tabs.addTab(self.project_setup_tab, "Project Setup")
         self.tabs.addTab(self.prefit_tab, "SAXS Prefit")
         self.tabs.addTab(self.dream_tab, "SAXS DREAM Fit")
@@ -377,6 +931,9 @@ class SAXSMainWindow(QMainWindow):
         )
         self.project_setup_tab.autosave_project_requested.connect(
             self._autosave_project_from_tab
+        )
+        self.project_setup_tab.model_only_mode_changed.connect(
+            self._on_model_only_mode_changed
         )
         self.project_setup_tab.scan_clusters_requested.connect(
             self.scan_clusters_from_tab
@@ -415,6 +972,9 @@ class SAXSMainWindow(QMainWindow):
         self.prefit_tab.show_deprecated_templates_changed.connect(
             self._on_show_deprecated_templates_changed
         )
+        self.prefit_tab.field_interaction_requested.connect(
+            self._on_prefit_field_interaction_requested
+        )
         self.prefit_tab.autosave_toggled.connect(self._on_autosave_changed)
         self.prefit_tab.update_model_requested.connect(
             self.update_prefit_model
@@ -437,6 +997,9 @@ class SAXSMainWindow(QMainWindow):
             self.restore_prefit_state
         )
         self.prefit_tab.reset_requested.connect(self.reset_prefit_entries)
+        self.prefit_tab.parameter_reset_requested.connect(
+            self.reset_single_prefit_parameter
+        )
         self.prefit_tab.compute_cluster_geometry_requested.connect(
             self.compute_prefit_cluster_geometry
         )
@@ -456,7 +1019,7 @@ class SAXSMainWindow(QMainWindow):
             self._on_prefit_cluster_geometry_ionic_radius_type_changed
         )
         self.prefit_tab.solute_volume_fraction_widget.estimate_calculated.connect(
-            self._on_solute_volume_fraction_estimate_calculated
+            self._on_solution_scattering_estimate_calculated
         )
 
         self.dream_tab.edit_parameter_map_requested.connect(
@@ -474,6 +1037,12 @@ class SAXSMainWindow(QMainWindow):
             self.load_selected_results
         )
         self.dream_tab.save_report_requested.connect(self.save_dream_report)
+        self.dream_tab.recycle_output_requested.connect(
+            self.recycle_dream_output_to_prefit
+        )
+        self.dream_tab.export_model_report_requested.connect(
+            self.export_dream_model_report
+        )
         self.dream_tab.save_model_fit_requested.connect(
             self.save_dream_model_fit
         )
@@ -484,7 +1053,29 @@ class SAXSMainWindow(QMainWindow):
             self._on_dream_settings_preset_changed
         )
         self.dream_tab.visualization_settings_changed.connect(
-            self._refresh_loaded_dream_results
+            lambda: self._schedule_dream_results_refresh(
+                self.DREAM_REFRESH_STYLE
+            )
+        )
+        self.dream_tab.results_settings_changed.connect(
+            lambda: self._schedule_dream_results_refresh(
+                self.DREAM_REFRESH_FULL
+            )
+        )
+        self.dream_tab.summary_settings_changed.connect(
+            lambda: self._schedule_dream_results_refresh(
+                self.DREAM_REFRESH_SUMMARY
+            )
+        )
+        self.dream_tab.violin_data_settings_changed.connect(
+            lambda: self._schedule_dream_results_refresh(
+                self.DREAM_REFRESH_VIOLIN
+            )
+        )
+        self.dream_tab.violin_style_settings_changed.connect(
+            lambda: self._schedule_dream_results_refresh(
+                self.DREAM_REFRESH_STYLE
+            )
         )
         self._refresh_recent_projects_menu()
         self._update_file_menu_state()
@@ -541,6 +1132,24 @@ class SAXSMainWindow(QMainWindow):
         )
         self.tools_menu.addAction(self.bondanalysis_action)
 
+        self.clusterdynamics_action = QAction(
+            "Open Cluster Dynamics",
+            self,
+        )
+        self.clusterdynamics_action.triggered.connect(
+            self._open_clusterdynamics_tool
+        )
+        self.tools_menu.addAction(self.clusterdynamics_action)
+
+        self.clusterdynamicsml_action = QAction(
+            "Open Cluster Dynamics ML",
+            self,
+        )
+        self.clusterdynamicsml_action.triggered.connect(
+            self._open_clusterdynamicsml_tool
+        )
+        self.tools_menu.addAction(self.clusterdynamicsml_action)
+
         self.fullrmc_action = QAction("Open fullrmc Setup", self)
         self.fullrmc_action.triggered.connect(self._open_fullrmc_tool)
         self.tools_menu.addAction(self.fullrmc_action)
@@ -553,16 +1162,31 @@ class SAXSMainWindow(QMainWindow):
             self._open_solute_volume_fraction_tool
         )
         self.tools_menu.addAction(self.volume_fraction_action)
+        self.number_density_action = QAction(
+            "Open Number Density Estimate", self
+        )
+        self.number_density_action.triggered.connect(
+            self._open_number_density_tool
+        )
+        self.tools_menu.addAction(self.number_density_action)
+        self.attenuation_estimate_action = QAction(
+            "Open Attenuation Estimate",
+            self,
+        )
+        self.attenuation_estimate_action.triggered.connect(
+            self._open_attenuation_tool
+        )
+        self.tools_menu.addAction(self.attenuation_estimate_action)
+        self.fluorescence_estimate_action = QAction(
+            "Open Fluorescence Estimate",
+            self,
+        )
+        self.fluorescence_estimate_action.triggered.connect(
+            self._open_fluorescence_tool
+        )
+        self.tools_menu.addAction(self.fluorescence_estimate_action)
         placeholder_specs = [
             ("PDF Calculation (Coming Soon)", "PDF Calculation"),
-            (
-                "Number Density Estimate (Coming Soon)",
-                "Number Density Estimate",
-            ),
-            (
-                "Bond Association/Dissociation Analysis (Coming Soon)",
-                "Bond Association/Dissociation Analysis",
-            ),
         ]
         self._placeholder_tool_actions: list[QAction] = []
         for label, tool_name in placeholder_specs:
@@ -576,14 +1200,27 @@ class SAXSMainWindow(QMainWindow):
             self._placeholder_tool_actions.append(action)
 
         self.settings_menu = menu_bar.addMenu("Settings")
-        self.dream_output_settings_action = QAction(
-            "DREAM Output Settings...",
+        self.console_autoscroll_action = QAction(
+            "Autoscroll Console Output",
             self,
         )
-        self.dream_output_settings_action.triggered.connect(
-            self._open_dream_output_settings_dialog
+        self.console_autoscroll_action.setCheckable(True)
+        self.console_autoscroll_action.setChecked(
+            bool(self._console_autoscroll_enabled)
         )
-        self.settings_menu.addAction(self.dream_output_settings_action)
+        self.console_autoscroll_action.triggered.connect(
+            self._toggle_console_autoscroll
+        )
+        self.settings_menu.addAction(self.console_autoscroll_action)
+        self.main_ui_settings_action = QAction(
+            "Main UI Settings...",
+            self,
+        )
+        self.main_ui_settings_action.triggered.connect(
+            self._open_main_ui_settings_dialog
+        )
+        self.settings_menu.addAction(self.main_ui_settings_action)
+        self.dream_output_settings_action = self.main_ui_settings_action
 
         self.help_menu = menu_bar.addMenu("Help")
         self.version_info_action = QAction("Version Information", self)
@@ -782,6 +1419,7 @@ class SAXSMainWindow(QMainWindow):
 
     def load_project(self, project_dir: str | Path) -> None:
         settings = self.project_manager.load_project(project_dir)
+        self._last_solution_scattering_estimate = None
         self.current_settings = settings
         self._apply_project_settings(settings)
         self._remember_recent_project(settings.project_dir)
@@ -812,6 +1450,8 @@ class SAXSMainWindow(QMainWindow):
     def build_project_components(self) -> None:
         try:
             settings = self._settings_from_project_tab()
+            if not self._confirm_default_q_range_for_component_build():
+                return
             self._save_settings(
                 settings,
                 status_message="Project auto-saved before building SAXS components",
@@ -831,6 +1471,66 @@ class SAXSMainWindow(QMainWindow):
             )
         except Exception as exc:
             self._show_error("Build failed", str(exc))
+
+    def _current_project_has_built_components(self) -> bool:
+        project_dir: Path | None
+        if self.current_settings is not None:
+            project_dir = Path(self.current_settings.project_dir).expanduser()
+        else:
+            project_dir = self.project_setup_tab.project_dir()
+        if project_dir is None:
+            return False
+        paths = build_project_paths(project_dir)
+        return any(paths.scattering_components_dir.glob("*.txt"))
+
+    def _on_prefit_field_interaction_requested(self) -> None:
+        if self._current_project_has_built_components():
+            self._prefit_missing_components_warning_shown = False
+            return
+        message = (
+            "Build SAXS components in the Project Setup tab before editing "
+            "Prefit fields for this model."
+        )
+        if self._prefit_missing_components_warning_shown:
+            self.statusBar().showMessage(message, 5000)
+            return
+        self._prefit_missing_components_warning_shown = True
+        QMessageBox.warning(
+            self,
+            "Build SAXS components first",
+            message,
+        )
+        self.statusBar().showMessage(message, 5000)
+
+    def _confirm_default_q_range_for_component_build(self) -> bool:
+        if (
+            not self.project_setup_tab.q_range_matches_loaded_experimental_defaults()
+        ):
+            return True
+        default_range = self.project_setup_tab.default_experimental_q_range()
+        if default_range is None:
+            return True
+        q_min, q_max = default_range
+        response = QMessageBox.warning(
+            self,
+            "Build SAXS components with default q-range?",
+            (
+                "The q-range still matches the full experimental-data "
+                f"default ({q_min:.6g} to {q_max:.6g}). If you intended to "
+                "crop the SAXS range, adjust q min and q max before "
+                "building.\n\n"
+                "Continue building SAXS components with the default q-range?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if response == QMessageBox.StandardButton.Yes:
+            return True
+        self.statusBar().showMessage(
+            "SAXS component build canceled so the q-range can be adjusted.",
+            5000,
+        )
+        return False
 
     def build_prior_weights(self) -> None:
         try:
@@ -1005,7 +1705,7 @@ class SAXSMainWindow(QMainWindow):
         try:
             settings = self._settings_from_project_tab()
             saved_path = self._save_settings(settings)
-            self._apply_project_settings(settings)
+            self._sync_live_project_settings_after_save(settings)
             self.project_setup_tab.append_summary(
                 f"Saved project state to {saved_path}"
             )
@@ -1022,6 +1722,37 @@ class SAXSMainWindow(QMainWindow):
                 self.statusBar().showMessage("Project state saved")
         except Exception as exc:
             self._show_error("Save project state failed", str(exc))
+
+    def _sync_live_project_settings_after_save(
+        self,
+        settings: ProjectSettings,
+    ) -> None:
+        active_settings = ProjectSettings.from_dict(settings.to_dict())
+        self.current_settings = active_settings
+        self.project_setup_tab.set_project_selected(True)
+        self._refresh_component_plot()
+        self._refresh_prior_plot()
+
+        if self.prefit_workflow is not None:
+            self.prefit_workflow.parameter_entries = (
+                self.prefit_tab.parameter_entries()
+            )
+            self.prefit_workflow.apply_project_settings(active_settings)
+            self.current_settings = self.prefit_workflow.settings
+            self._load_prefit_preview()
+            self._refresh_saved_prefit_states()
+
+        if self.dream_workflow is not None:
+            self.dream_workflow.apply_project_settings(self.current_settings)
+            self._dream_workflow_project_dir = str(
+                Path(self.current_settings.project_dir).resolve()
+            )
+            self._invalidate_written_dream_bundle()
+            self._last_dream_constraint_warning_signature = None
+            self._refresh_saved_dream_runs()
+
+        self._refresh_model_only_mode_state()
+        self._update_file_menu_state()
 
     @Slot(str)
     def _autosave_project_from_tab(self, reason: str) -> None:
@@ -1363,9 +2094,24 @@ class SAXSMainWindow(QMainWindow):
             self._dream_progress_dialog = SAXSProgressDialog(self)
         return self._dream_progress_dialog
 
-    def _show_dream_progress_dialog(self, message: str) -> None:
+    def _show_dream_progress_dialog(
+        self,
+        message: str,
+        *,
+        total: int | None = None,
+        unit_label: str = "runs",
+        title: str = "SAXS DREAM Progress",
+    ) -> None:
         dialog = self._ensure_dream_progress_dialog()
-        dialog.begin_busy(message, title="SAXS DREAM Progress")
+        if total is None:
+            dialog.begin_busy(message, title=title)
+            return
+        dialog.begin(
+            total,
+            message,
+            unit_label=unit_label,
+            title=title,
+        )
 
     def _close_dream_progress_dialog(self) -> None:
         if self._dream_progress_dialog is not None:
@@ -1609,117 +2355,283 @@ class SAXSMainWindow(QMainWindow):
 
     def _refresh_prefit_volume_fraction_section(self) -> None:
         target = self._current_volume_fraction_target()
-        visible = target is not None
+        solvent_weight_target = self._current_solvent_weight_target()
+        visible = self.prefit_workflow is not None
         self.prefit_tab.set_solute_volume_fraction_visible(visible)
-        if target is None:
-            self.prefit_tab.set_solute_volume_fraction_target(None, None)
-        else:
+        parameter_name = None
+        fraction_kind = None
+        if target is not None:
             parameter_name, fraction_kind = target
-            self.prefit_tab.set_solute_volume_fraction_target(
-                parameter_name,
-                fraction_kind,
-            )
-        self._sync_volume_fraction_tool_target()
+        self.prefit_tab.set_solute_volume_fraction_target(
+            parameter_name,
+            fraction_kind,
+            solvent_weight_target,
+        )
+        self._sync_solution_scattering_tool_targets()
 
     def _current_volume_fraction_target(self) -> tuple[str, str] | None:
         if self.prefit_workflow is None:
             return None
         return self.prefit_workflow.volume_fraction_estimator_target()
 
-    def _sync_volume_fraction_tool_target(self) -> None:
+    def _current_solvent_weight_target(self) -> str | None:
+        if self.prefit_workflow is None:
+            return None
+        return self.prefit_workflow.solvent_weight_estimator_target()
+
+    def _sync_solution_scattering_tool_targets(self) -> None:
         target = self._current_volume_fraction_target()
         if target is None:
             parameter_name = None
             fraction_kind = None
         else:
             parameter_name, fraction_kind = target
-        if self._solute_volume_fraction_tool_window is not None:
-            self._solute_volume_fraction_tool_window.estimator_widget.set_target_parameter(
+        solvent_weight_parameter = self._current_solvent_weight_target()
+        for window in (
+            self._solute_volume_fraction_tool_window,
+            self._number_density_tool_window,
+            self._attenuation_tool_window,
+            self._fluorescence_tool_window,
+        ):
+            if window is None:
+                continue
+            window.estimator_widget.set_target_parameter(
                 parameter_name,
                 fraction_kind,
+                solvent_weight_parameter,
             )
 
+    def _apply_estimator_parameter_to_prefit(
+        self,
+        parameter_name: str,
+        parameter_value: float,
+    ) -> None:
+        current_entry = next(
+            (
+                entry
+                for entry in self.prefit_tab.parameter_entries()
+                if entry.name == parameter_name
+            ),
+            None,
+        )
+        minimum = 0.0
+        maximum = max(parameter_value, 1.0)
+        if current_entry is not None:
+            minimum = min(float(current_entry.minimum), 0.0)
+            maximum = max(
+                float(current_entry.maximum),
+                parameter_value,
+                1.0,
+            )
+        self.prefit_tab.set_parameter_row(
+            parameter_name,
+            value=parameter_value,
+            minimum=minimum,
+            maximum=maximum,
+            vary=False,
+        )
+
     @Slot(object)
-    def _on_solute_volume_fraction_estimate_calculated(
+    def _on_solution_scattering_estimate_calculated(
         self,
         estimate_payload: object,
     ) -> None:
-        if not isinstance(estimate_payload, SoluteVolumeFractionEstimate):
+        if not isinstance(estimate_payload, SolutionScatteringEstimate):
             return
-        target = self._current_volume_fraction_target()
+        self._last_solution_scattering_estimate = estimate_payload
         widget = self.sender()
-        if target is None:
-            if hasattr(widget, "append_application_note"):
-                widget.append_application_note(
-                    "No active Prefit solute/solvent fraction parameter is "
-                    "currently available, so this estimate was not applied "
-                    "to the model."
-                )
-            self.statusBar().showMessage("Volume fraction estimate calculated")
-            return
-        parameter_name, fraction_kind = target
-        parameter_value = (
-            float(estimate_payload.solute_volume_fraction)
-            if fraction_kind == "solute"
-            else float(estimate_payload.solvent_volume_fraction)
-        )
+        applied_notes: list[str] = []
+        log_lines = ["Applied solution-scattering estimates."]
         if self.prefit_workflow is None:
-            return
-        try:
-            current_entry = next(
-                (
-                    entry
-                    for entry in self.prefit_tab.parameter_entries()
-                    if entry.name == parameter_name
-                ),
-                None,
-            )
-            minimum = 0.0
-            maximum = max(parameter_value, 1.0)
-            if current_entry is not None:
-                minimum = min(float(current_entry.minimum), 0.0)
-                maximum = max(
-                    float(current_entry.maximum),
-                    parameter_value,
-                    1.0,
-                )
-            self.prefit_tab.set_parameter_row(
-                parameter_name,
-                value=parameter_value,
-                minimum=minimum,
-                maximum=maximum,
-            )
             if hasattr(widget, "append_application_note"):
-                widget.append_application_note(
-                    "Applied estimate to "
-                    f"{parameter_name} = "
-                    f"{parameter_value:.{DISPLAY_FRACTION_DECIMALS}f}."
+                cast(object, widget).append_application_note(
+                    "The calculations completed, but there is no active "
+                    "Prefit workflow to apply them to."
                 )
-            self.prefit_tab.append_log(
-                "Applied solution-based volume fraction estimate.\n"
-                f"Parameter: {parameter_name}\n"
-                f"Kind: {fraction_kind}\n"
-                f"Value: {parameter_value:.{DISPLAY_FRACTION_DECIMALS}f}\n"
-                f"Solute volume fraction: "
-                f"{estimate_payload.solute_volume_fraction:.{DISPLAY_FRACTION_DECIMALS}f}\n"
-                f"Solvent volume fraction: "
-                f"{estimate_payload.solvent_volume_fraction:.{DISPLAY_FRACTION_DECIMALS}f}"
+            self.statusBar().showMessage(
+                "Solution-scattering estimate calculated"
             )
+            return
+
+        preview_changed = False
+        try:
+            volume_target = self._current_volume_fraction_target()
+            interaction_estimate = (
+                estimate_payload.interaction_contrast_estimate
+            )
+            if interaction_estimate is not None and volume_target is not None:
+                parameter_name, fraction_kind = volume_target
+                parameter_value = (
+                    float(
+                        interaction_estimate.saxs_effective_solute_interaction_ratio
+                    )
+                    if fraction_kind == "solute"
+                    else float(
+                        interaction_estimate.saxs_effective_solvent_background_ratio
+                    )
+                )
+                self._apply_estimator_parameter_to_prefit(
+                    parameter_name,
+                    parameter_value,
+                )
+                applied_notes.append(
+                    f"Applied {parameter_name} = "
+                    f"{parameter_value:.{DISPLAY_FRACTION_DECIMALS}f} "
+                    "from the SAXS-effective interaction ratio."
+                )
+                log_lines.extend(
+                    [
+                        f"Volume-fraction target: {parameter_name}",
+                        f"Model fraction kind: {fraction_kind}",
+                        (
+                            "Physical solute-associated volume fraction: "
+                            f"{interaction_estimate.physical_solute_associated_volume_fraction:.{DISPLAY_FRACTION_DECIMALS}f}"
+                        ),
+                        (
+                            "Physical solvent-associated volume fraction: "
+                            f"{interaction_estimate.physical_solvent_associated_volume_fraction:.{DISPLAY_FRACTION_DECIMALS}f}"
+                        ),
+                        (
+                            "SAXS-effective solute interaction ratio: "
+                            f"{interaction_estimate.saxs_effective_solute_interaction_ratio:.{DISPLAY_FRACTION_DECIMALS}f}"
+                        ),
+                        (
+                            "SAXS-effective solvent background ratio: "
+                            f"{interaction_estimate.saxs_effective_solvent_background_ratio:.{DISPLAY_FRACTION_DECIMALS}f}"
+                        ),
+                        (
+                            "Contrast weight factor: "
+                            f"{interaction_estimate.contrast_weight_factor:.6g}"
+                        ),
+                    ]
+                )
+                preview_changed = True
+            elif (
+                estimate_payload.volume_fraction_estimate is not None
+                and hasattr(widget, "append_application_note")
+            ):
+                cast(object, widget).append_application_note(
+                    "Calculated the physical bulk fraction and the "
+                    "SAXS-effective interaction ratio, but the active "
+                    "template does not expose a model-facing solute/solvent "
+                    "interaction fraction parameter."
+                )
+
+            solvent_weight_target = self._current_solvent_weight_target()
+            if (
+                estimate_payload.attenuation_estimate is not None
+                and solvent_weight_target is not None
+            ):
+                attenuation_scale = float(
+                    estimate_payload.attenuation_estimate.solvent_scattering_scale_factor
+                )
+                uses_split_fraction_parameter = volume_target is not None
+                solvent_scale = attenuation_scale
+                if (
+                    not uses_split_fraction_parameter
+                    and interaction_estimate is not None
+                ):
+                    solvent_scale = (
+                        attenuation_scale
+                        * interaction_estimate.saxs_effective_solvent_background_ratio
+                    )
+                self._apply_estimator_parameter_to_prefit(
+                    solvent_weight_target,
+                    solvent_scale,
+                )
+                if (
+                    not uses_split_fraction_parameter
+                    and interaction_estimate is not None
+                ):
+                    applied_notes.append(
+                        f"Applied {solvent_weight_target} = "
+                        f"{solvent_scale:.{DISPLAY_FRACTION_DECIMALS}f} "
+                        "from attenuation x the SAXS-effective solvent "
+                        "background ratio."
+                    )
+                elif not uses_split_fraction_parameter:
+                    applied_notes.append(
+                        f"Applied {solvent_weight_target} = "
+                        f"{solvent_scale:.{DISPLAY_FRACTION_DECIMALS}f} "
+                        "from attenuation only because the SAXS-effective "
+                        "interaction ratio was not available."
+                    )
+                else:
+                    applied_notes.append(
+                        f"Applied {solvent_weight_target} = "
+                        f"{solvent_scale:.{DISPLAY_FRACTION_DECIMALS}f} "
+                        "as the attenuation solvent scale."
+                    )
+                log_lines.extend(
+                    [
+                        f"Solvent-weight target: {solvent_weight_target}",
+                        (
+                            "Attenuation solvent scale factor: "
+                            f"{attenuation_scale:.{DISPLAY_FRACTION_DECIMALS}f}"
+                        ),
+                        (
+                            "Sample transmission: "
+                            f"{estimate_payload.attenuation_estimate.sample_transmission:.{DISPLAY_FRACTION_DECIMALS}f}"
+                        ),
+                        (
+                            "Neat-solvent transmission: "
+                            f"{estimate_payload.attenuation_estimate.neat_solvent_transmission:.{DISPLAY_FRACTION_DECIMALS}f}"
+                        ),
+                    ]
+                )
+                if (
+                    not uses_split_fraction_parameter
+                    and interaction_estimate is not None
+                ):
+                    log_lines.append(
+                        "Combined solvent background multiplier: "
+                        f"{solvent_scale:.{DISPLAY_FRACTION_DECIMALS}f}"
+                    )
+                elif (
+                    uses_split_fraction_parameter
+                    and interaction_estimate is not None
+                ):
+                    log_lines.append(
+                        "SAXS-effective solvent background ratio is carried by "
+                        f"{volume_target[0]} = "
+                        f"{interaction_estimate.saxs_effective_solvent_background_ratio:.{DISPLAY_FRACTION_DECIMALS}f}"
+                    )
+                preview_changed = True
+            elif estimate_payload.attenuation_estimate is not None and hasattr(
+                widget, "append_application_note"
+            ):
+                cast(object, widget).append_application_note(
+                    "Calculated the attenuation-based solvent contribution, "
+                    "but the active template does not expose a solvent "
+                    "background parameter such as solv_w or solvent_scale."
+                )
+
+            if applied_notes and hasattr(widget, "append_application_note"):
+                cast(object, widget).append_application_note(
+                    "\n".join(applied_notes)
+                )
+
+            if not preview_changed:
+                if estimate_payload.fluorescence_estimate is not None:
+                    self.statusBar().showMessage(
+                        "Solution-scattering estimate calculated"
+                    )
+                return
+
             self.prefit_workflow.parameter_entries = (
                 self.prefit_tab.parameter_entries()
             )
+            self.prefit_tab.append_log("\n".join(log_lines))
             evaluation = self._load_prefit_preview()
             if evaluation is None:
                 self.statusBar().showMessage(
-                    "Volume fraction estimate applied; preview is waiting "
-                    "on the remaining template metadata"
+                    "Estimator values applied; preview is waiting on the "
+                    "remaining template metadata"
                 )
             else:
-                self.statusBar().showMessage(
-                    "Volume fraction estimate applied"
-                )
+                self.statusBar().showMessage("Estimator values applied")
         except Exception as exc:
-            self._show_error("Apply volume fraction failed", str(exc))
+            self._show_error("Apply estimator values failed", str(exc))
 
     def _sync_prefit_cluster_geometry_rows(self) -> None:
         if (
@@ -2049,10 +2961,8 @@ class SAXSMainWindow(QMainWindow):
         try:
             previous_evaluation = self.prefit_tab.current_evaluation()
             self._sync_prefit_cluster_geometry_rows()
-            entries = [
-                entry for entry in self.prefit_workflow.parameter_entries
-            ]
-            self.prefit_tab.populate_parameter_table(entries)
+            entries = self.prefit_tab.parameter_entries()
+            self.prefit_workflow.parameter_entries = entries
             evaluation = self.prefit_workflow.evaluate(entries)
             self.prefit_tab.plot_evaluation(evaluation)
             run_config = self.prefit_tab.run_config()
@@ -2130,13 +3040,17 @@ class SAXSMainWindow(QMainWindow):
                 "Build a project and load its SAXS components first.",
             )
             return
+        if not self.prefit_workflow.can_run_prefit():
+            self._show_error(
+                "Prefit unavailable",
+                "Disable Model Only Mode and load experimental SAXS data to run a prefit.",
+            )
+            return
         try:
             self._sync_prefit_cluster_geometry_rows()
             config = self.prefit_tab.run_config()
-            entries = [
-                entry for entry in self.prefit_workflow.parameter_entries
-            ]
-            self.prefit_tab.populate_parameter_table(entries)
+            entries = self.prefit_tab.parameter_entries()
+            self.prefit_workflow.parameter_entries = entries
             self.prefit_tab.append_log(
                 "Running prefit.\n"
                 f"Template: {self.prefit_workflow.template_spec.name}\n"
@@ -2188,6 +3102,12 @@ class SAXSMainWindow(QMainWindow):
             self._show_error(
                 "Prefit unavailable",
                 "Build a project and load its SAXS components first.",
+            )
+            return
+        if not self.prefit_workflow.can_run_prefit():
+            self._show_error(
+                "Save Prefit unavailable",
+                "Disable Model Only Mode and load experimental SAXS data before saving a prefit report.",
             )
             return
         try:
@@ -2257,23 +3177,28 @@ class SAXSMainWindow(QMainWindow):
             )
             if destination is None:
                 return
-            columns = [
-                "q",
-                "experimental_intensity",
-                "model_intensity",
-                "residual",
-                "solvent_intensity",
-                "solvent_contribution",
-            ]
-            matrix = np.column_stack(
-                [
-                    np.asarray(evaluation.q_values, dtype=float),
+            columns = ["q"]
+            matrix_columns = [np.asarray(evaluation.q_values, dtype=float)]
+            if evaluation.experimental_intensities is not None:
+                columns.append("experimental_intensity")
+                matrix_columns.append(
                     np.asarray(
                         evaluation.experimental_intensities,
                         dtype=float,
-                    ),
-                    np.asarray(evaluation.model_intensities, dtype=float),
-                    np.asarray(evaluation.residuals, dtype=float),
+                    )
+                )
+            columns.append("model_intensity")
+            matrix_columns.append(
+                np.asarray(evaluation.model_intensities, dtype=float)
+            )
+            if evaluation.residuals is not None:
+                columns.append("residual")
+                matrix_columns.append(
+                    np.asarray(evaluation.residuals, dtype=float)
+                )
+            columns.extend(["solvent_intensity", "solvent_contribution"])
+            matrix_columns.extend(
+                [
                     (
                         np.asarray(evaluation.solvent_intensities, dtype=float)
                         if evaluation.solvent_intensities is not None
@@ -2289,6 +3214,18 @@ class SAXSMainWindow(QMainWindow):
                     ),
                 ]
             )
+            columns.append("structure_factor")
+            matrix_columns.append(
+                (
+                    np.asarray(
+                        evaluation.structure_factor_trace,
+                        dtype=float,
+                    )
+                    if evaluation.structure_factor_trace is not None
+                    else np.full_like(evaluation.q_values, np.nan)
+                )
+            )
+            matrix = np.column_stack(matrix_columns)
             if destination.suffix.lower() == ".csv":
                 self._write_prefit_plot_csv(
                     destination,
@@ -2326,6 +3263,52 @@ class SAXSMainWindow(QMainWindow):
             "saved in the project."
         )
         self.update_prefit_model()
+
+    def reset_single_prefit_parameter(
+        self,
+        structure: str,
+        motif: str,
+        parameter_name: str,
+    ) -> None:
+        if self.prefit_workflow is None:
+            return
+        try:
+            default_entry = next(
+                (
+                    entry
+                    for entry in self.prefit_workflow.load_template_reset_entries()
+                    if (
+                        entry.structure == structure
+                        and entry.motif == motif
+                        and entry.name == parameter_name
+                    )
+                ),
+                None,
+            )
+            if default_entry is None:
+                raise ValueError(
+                    f"No template-default entry is available for {parameter_name}."
+                )
+            self.prefit_tab.set_parameter_row(
+                parameter_name,
+                structure=structure,
+                motif=motif,
+                value=default_entry.value,
+                minimum=default_entry.minimum,
+                maximum=default_entry.maximum,
+                vary=default_entry.vary,
+            )
+            self.prefit_workflow.parameter_entries = (
+                self.prefit_tab.parameter_entries()
+            )
+            self.prefit_tab.append_log(
+                "Reset individual parameter to the template-default prefit "
+                f"preset.\nParameter: {parameter_name}"
+            )
+            self.update_prefit_model()
+            self.statusBar().showMessage(f"Reset {parameter_name}")
+        except Exception as exc:
+            self._show_error("Reset parameter failed", str(exc))
 
     def set_best_prefit_parameters(self) -> None:
         if self.prefit_workflow is None:
@@ -2859,6 +3842,8 @@ class SAXSMainWindow(QMainWindow):
             parameter_map_entries = load_parameter_map(parameter_map_path)
         except Exception:
             parameter_map_entries = []
+        self._dream_refresh_timer.stop()
+        self._pending_dream_refresh_scope = 0
         self._last_results_loader = None
         self.dream_tab.set_settings(display_settings, preset_name=None)
         self._last_results_loader = SAXSDreamResultsLoader(
@@ -2947,6 +3932,231 @@ class SAXSMainWindow(QMainWindow):
             self.statusBar().showMessage("DREAM statistics saved")
         except Exception as exc:
             self._show_error("Save report failed", str(exc))
+
+    def recycle_dream_output_to_prefit(self) -> None:
+        if self._last_results_loader is None:
+            self._show_error(
+                "Recycle DREAM output failed",
+                "Load DREAM results first.",
+            )
+            return
+        if self.prefit_workflow is None:
+            self._show_error(
+                "Recycle DREAM output failed",
+                "Load or build a project first so the Prefit workflow is available.",
+            )
+            return
+        try:
+            settings = self.dream_tab.settings_payload()
+            summary = self._last_results_loader.get_summary(
+                bestfit_method=settings.bestfit_method,
+                posterior_filter_mode=settings.posterior_filter_mode,
+                posterior_top_percent=settings.posterior_top_percent,
+                posterior_top_n=settings.posterior_top_n,
+                credible_interval_low=settings.credible_interval_low,
+                credible_interval_high=settings.credible_interval_high,
+            )
+            current_entries = self.prefit_tab.parameter_entries()
+            updated_entries = []
+            summary_lookup = {
+                str(name): float(summary.bestfit_params[index])
+                for index, name in enumerate(summary.full_parameter_names)
+            }
+            matched_names: list[str] = []
+            unmatched_prefit_names: list[str] = []
+            for entry in current_entries:
+                copied_entry = PrefitParameterEntry.from_dict(entry.to_dict())
+                if copied_entry.name in summary_lookup:
+                    copied_entry.value = float(
+                        summary_lookup[copied_entry.name]
+                    )
+                    matched_names.append(copied_entry.name)
+                else:
+                    unmatched_prefit_names.append(copied_entry.name)
+                updated_entries.append(copied_entry)
+            if not matched_names:
+                raise ValueError(
+                    "The loaded DREAM result did not contain any parameters "
+                    "that match the active Prefit table."
+                )
+
+            self.prefit_tab.populate_parameter_table(updated_entries)
+            self.prefit_workflow.parameter_entries = list(updated_entries)
+            self._invalidate_dream_workflow_cache()
+            self.tabs.setCurrentWidget(self.prefit_tab)
+            self.prefit_tab.update_button.setFocus(
+                Qt.FocusReason.OtherFocusReason
+            )
+
+            unmatched_dream_names = [
+                str(name)
+                for name in summary.full_parameter_names
+                if str(name) not in {entry.name for entry in current_entries}
+            ]
+            log_lines = [
+                "Recycled DREAM output into Prefit.",
+                f"DREAM run: {summary.run_dir}",
+                (
+                    "Best-fit selection: "
+                    f"{settings.bestfit_method} with "
+                    f"{self._describe_posterior_filter(settings)}"
+                ),
+                (
+                    "Matched Prefit parameters: "
+                    f"{len(matched_names)} / {len(current_entries)}"
+                ),
+                (
+                    "Prefit preview refresh: deferred to keep recycle "
+                    "responsive. Click Update Model when you're ready to "
+                    "rerender the Prefit plot."
+                ),
+            ]
+            if (
+                self.prefit_workflow.template_spec.name
+                != self._last_results_loader.template_name
+            ):
+                log_lines.append(
+                    "Template mismatch note: active Prefit template is "
+                    f"{self.prefit_workflow.template_spec.name}, while the "
+                    f"loaded DREAM run used {self._last_results_loader.template_name}. "
+                    "Only overlapping parameter names were recycled."
+                )
+            if unmatched_prefit_names:
+                preview = ", ".join(unmatched_prefit_names[:8])
+                if len(unmatched_prefit_names) > 8:
+                    preview += ", ..."
+                log_lines.append(
+                    "Prefit-only parameters left unchanged: " + preview
+                )
+            if unmatched_dream_names:
+                preview = ", ".join(unmatched_dream_names[:8])
+                if len(unmatched_dream_names) > 8:
+                    preview += ", ..."
+                log_lines.append(
+                    "DREAM-only parameters not copied: " + preview
+                )
+            self.prefit_tab.append_log("\n".join(log_lines))
+            self.dream_tab.append_log(
+                "Recycled the current DREAM best fit into the Prefit tab.\n"
+                + "\n".join(log_lines[1:])
+            )
+            self.statusBar().showMessage(
+                "DREAM output copied into Prefit; preview refresh deferred"
+            )
+        except Exception as exc:
+            self._show_error("Recycle DREAM output failed", str(exc))
+
+    def export_dream_model_report(self) -> None:
+        if self._last_results_loader is None:
+            self._show_error(
+                "Export model report failed",
+                "Load DREAM results first.",
+            )
+            return
+        if self.current_settings is None:
+            self._show_error(
+                "Export model report failed",
+                "Load or build a project first.",
+            )
+            return
+        progress_started = False
+        progress_total = 1
+        wait_message = (
+            "Generating DREAM model report PowerPoint. Please wait..."
+        )
+        try:
+            settings = self.dream_tab.settings_payload()
+            paths = build_project_paths(self.current_settings.project_dir)
+            paths.reports_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_name = f"dream_model_report_{timestamp}"
+            output_path = paths.reports_dir / f"{base_name}.pptx"
+            asset_dir = paths.reports_dir / f"{base_name}_assets"
+            self.dream_tab.append_log(wait_message)
+            self.dream_tab.begin_progress(
+                progress_total,
+                wait_message,
+                unit_label="steps",
+            )
+            self._show_dream_progress_dialog(
+                wait_message,
+                total=progress_total,
+                unit_label="steps",
+                title="DREAM Report Export",
+            )
+            self.statusBar().showMessage(wait_message)
+            QApplication.processEvents()
+            progress_started = True
+            context = self._build_dream_model_report_context(
+                settings=settings,
+                output_path=output_path,
+                asset_dir=asset_dir,
+            )
+
+            def _on_export_progress(
+                processed: int,
+                total: int,
+                message: str,
+            ) -> None:
+                nonlocal progress_total
+                progress_total = max(int(total), 1)
+                self.dream_tab.update_progress(
+                    processed,
+                    progress_total,
+                    message,
+                    unit_label="steps",
+                )
+                if (
+                    self._dream_progress_dialog is not None
+                    and self._dream_progress_dialog.isVisible()
+                ):
+                    self._dream_progress_dialog.update_progress(
+                        processed,
+                        progress_total,
+                        message,
+                        unit_label="steps",
+                    )
+                self.statusBar().showMessage(message)
+                QApplication.processEvents()
+
+            result = export_dream_model_report_pptx(
+                context,
+                progress_callback=_on_export_progress,
+            )
+            self.dream_tab.finish_progress(
+                "DREAM model report exported.",
+                total=progress_total,
+                unit_label="steps",
+            )
+            log_lines = [
+                "Exported DREAM model report to:",
+                f"{result.report_path}",
+            ]
+            if result.manifest_path is not None:
+                log_lines.append(f"Manifest: {result.manifest_path}")
+            if result.figure_paths:
+                log_lines.append(
+                    "The report assets folder contains the rendered figures "
+                    "used to assemble the PowerPoint."
+                )
+            else:
+                log_lines.append(
+                    "Supplemental rendered figure assets were disabled for "
+                    "this export."
+                )
+            self.dream_tab.append_log("\n".join(log_lines))
+            self.statusBar().showMessage("DREAM model report exported")
+        except Exception as exc:
+            if progress_started:
+                self.dream_tab.finish_progress(
+                    "DREAM model report export failed.",
+                    total=progress_total,
+                    unit_label="steps",
+                )
+            self._show_error("Export model report failed", str(exc))
+        finally:
+            if progress_started:
+                self._close_dream_progress_dialog()
 
     def _build_dream_export_context(
         self,
@@ -3109,6 +4319,9 @@ class SAXSMainWindow(QMainWindow):
                 "point_count": int(np.asarray(model_plot.q_values).size),
                 "includes_solvent_contribution": bool(
                     model_plot.solvent_contribution is not None
+                ),
+                "includes_structure_factor": bool(
+                    model_plot.structure_factor_trace is not None
                 ),
                 "fit_metrics": {
                     "rmse": float(model_plot.rmse),
@@ -3308,6 +4521,15 @@ class SAXSMainWindow(QMainWindow):
                 dtype=float,
             )
         )
+        structure_factor = (
+            np.asarray(model_plot.structure_factor_trace, dtype=float)
+            if model_plot.structure_factor_trace is not None
+            else np.full_like(
+                np.asarray(model_plot.q_values, dtype=float),
+                np.nan,
+                dtype=float,
+            )
+        )
         np.savetxt(
             output_path,
             np.column_stack(
@@ -3316,12 +4538,13 @@ class SAXSMainWindow(QMainWindow):
                     model_plot.experimental_intensities,
                     model_plot.model_intensities,
                     solvent_contribution,
+                    structure_factor,
                 ]
             ),
             delimiter=",",
             header=(
                 "q,experimental_intensity,model_intensity,"
-                "solvent_contribution"
+                "solvent_contribution,structure_factor"
             ),
             comments="",
         )
@@ -3683,12 +4906,884 @@ class SAXSMainWindow(QMainWindow):
         except Exception as exc:
             self._show_error("Save violin data failed", str(exc))
 
+    def _build_dream_model_report_context(
+        self,
+        *,
+        settings: DreamRunSettings,
+        output_path: Path,
+        asset_dir: Path,
+    ) -> DreamModelReportContext:
+        if self.current_settings is None or self._last_results_loader is None:
+            raise RuntimeError("Load DREAM results first.")
+        powerpoint_settings = self._effective_powerpoint_export_settings()
+        summary, model_plot, violin_plot, plot_payload = (
+            self._build_dream_export_context(settings)
+        )
+        project_paths = build_project_paths(self.current_settings.project_dir)
+        prefit_entries = tuple(
+            self.prefit_tab.parameter_entries()
+            if self.prefit_workflow is not None
+            else []
+        )
+        prefit_evaluation = None
+        if self.prefit_workflow is not None:
+            try:
+                prefit_evaluation = self.prefit_workflow.evaluate(
+                    list(prefit_entries)
+                )
+            except Exception:
+                prefit_evaluation = None
+        prefit_statistics = self._latest_prefit_statistics_payload()
+        assessments = tuple(self._report_dream_filter_assessments(settings))
+        filter_views = self._build_dream_report_filter_views(settings)
+        prior_requests = tuple(
+            self._build_report_prior_requests(powerpoint_settings)
+        )
+        q_values = np.asarray(model_plot.q_values, dtype=float)
+        q_range_text = self._format_selected_q_range_text(q_values)
+        supported_q_range = load_built_component_q_range(
+            self.current_settings.project_dir
+        )
+        supported_q_range_text = (
+            None
+            if supported_q_range is None
+            else (
+                f"{float(supported_q_range[0]):.6g} to "
+                f"{float(supported_q_range[1]):.6g}"
+            )
+        )
+        (
+            template_display_name,
+            template_module_path,
+            model_equation_text,
+            model_context_lines,
+            model_definition_lines,
+            model_reference_lines,
+        ) = self._build_report_template_details(
+            template_name=str(model_plot.template_name),
+            q_range_text=q_range_text,
+            supported_q_range_text=supported_q_range_text,
+            q_sampling_text=self._report_q_sampling_text(),
+            prefit_parameter_count=len(prefit_entries),
+            dream_active_parameter_names=tuple(
+                str(name).strip()
+                for name in summary.active_parameter_names
+                if str(name).strip()
+            ),
+            includes_solvent=bool(model_plot.solvent_contribution is not None),
+            includes_structure_factor=bool(
+                model_plot.structure_factor_trace is not None
+            ),
+        )
+        output_summary_lines = [
+            f"Report file: {output_path}",
+            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Template: {model_plot.template_name}",
+            f"Best-fit method: {settings.bestfit_method}",
+            (
+                "Posterior filter: "
+                f"{self._describe_posterior_filter(settings)}"
+            ),
+            f"Posterior samples kept: {summary.posterior_sample_count}",
+            f"DREAM RMSE: {model_plot.rmse:.6g}",
+            f"DREAM Mean |res|: {model_plot.mean_abs_residual:.6g}",
+            f"DREAM R^2: {model_plot.r_squared:.6g}",
+        ]
+        if (
+            prefit_evaluation is not None
+            and prefit_evaluation.experimental_intensities is not None
+        ):
+            prefit_metrics = self._fit_quality_metrics_from_curves(
+                np.asarray(
+                    prefit_evaluation.experimental_intensities,
+                    dtype=float,
+                ),
+                np.asarray(prefit_evaluation.model_intensities, dtype=float),
+            )
+            output_summary_lines.extend(
+                [
+                    f"Prefit RMSE: {prefit_metrics.rmse:.6g}",
+                    f"Prefit Mean |res|: {prefit_metrics.mean_abs_residual:.6g}",
+                    f"Prefit R^2: {prefit_metrics.r_squared:.6g}",
+                ]
+            )
+        directory_lines = [
+            f"Project directory: {project_paths.project_dir}",
+            f"Exported data directory: {project_paths.exported_data_dir}",
+            f"Exported plots directory: {project_paths.exported_plots_dir}",
+            f"Prefit directory: {project_paths.prefit_dir}",
+            f"DREAM run directory: {summary.run_dir}",
+            (
+                "Prior weights source: "
+                f"{self._report_prior_json_path() or 'Not available'}"
+            ),
+        ]
+        if (
+            powerpoint_settings.export_figure_assets
+            or powerpoint_settings.generate_manifest
+        ):
+            directory_lines.insert(0, f"Report assets: {asset_dir}")
+        if powerpoint_settings.generate_manifest:
+            directory_lines.insert(
+                1,
+                f"Report manifest: {asset_dir / 'report_manifest.json'}",
+            )
+        return DreamModelReportContext(
+            output_path=output_path,
+            asset_dir=asset_dir,
+            project_name=self.current_settings.project_name,
+            project_dir=Path(self.current_settings.project_dir).resolve(),
+            generated_at=datetime.now(),
+            powerpoint_settings=powerpoint_settings,
+            user_q_range_text=q_range_text,
+            supported_q_range_text=supported_q_range_text,
+            q_sampling_text=self._report_q_sampling_text(),
+            template_name=str(model_plot.template_name),
+            template_display_name=template_display_name,
+            template_module_path=template_module_path,
+            model_equation_text=model_equation_text,
+            model_context_lines=tuple(model_context_lines),
+            model_definition_lines=tuple(model_definition_lines),
+            model_reference_lines=tuple(model_reference_lines),
+            prior_histograms=prior_requests,
+            component_plot_without_solvent=self._build_report_component_plot_data(
+                include_solvent=False,
+                powerpoint_settings=powerpoint_settings,
+            ),
+            component_plot_with_solvent=self._build_report_component_plot_data(
+                include_solvent=True,
+                powerpoint_settings=powerpoint_settings,
+            ),
+            prefit_evaluation=prefit_evaluation,
+            prefit_parameter_entries=prefit_entries,
+            prefit_statistics=prefit_statistics,
+            cluster_geometry_rows=tuple(self._report_cluster_geometry_rows()),
+            solution_scattering_estimate=(
+                self._current_report_solution_scattering_estimate()
+            ),
+            dream_settings=self._copy_dream_settings(settings),
+            dream_summary=summary,
+            dream_model_plot=model_plot,
+            dream_violin_plot=violin_plot,
+            dream_violin_payload=plot_payload,
+            dream_parameter_map_entries=tuple(
+                DreamParameterEntry.from_dict(dict(entry))
+                for entry in self._last_results_loader.parameter_map_entries
+                if isinstance(entry, dict)
+            ),
+            dream_filter_assessments=assessments,
+            dream_filter_views=filter_views,
+            output_summary_lines=tuple(output_summary_lines),
+            directory_lines=tuple(directory_lines),
+        )
+
+    def _build_report_template_details(
+        self,
+        *,
+        template_name: str,
+        q_range_text: str,
+        supported_q_range_text: str | None,
+        q_sampling_text: str,
+        prefit_parameter_count: int,
+        dream_active_parameter_names: tuple[str, ...],
+        includes_solvent: bool,
+        includes_structure_factor: bool,
+    ) -> tuple[str, Path | None, str | None, list[str], list[str], list[str]]:
+        try:
+            spec = load_template_spec(template_name)
+        except Exception:
+            return (
+                template_name,
+                None,
+                None,
+                [
+                    f"Template name: {template_name}",
+                    "Template metadata could not be loaded for this report.",
+                    f"User selected q-range: {q_range_text}",
+                    (
+                        "Supported component q-range: "
+                        f"{supported_q_range_text or 'Unavailable'}"
+                    ),
+                    f"q-grid: {q_sampling_text}",
+                ],
+                [],
+                [],
+            )
+
+        description_sections = self._report_named_sections_from_text(
+            spec.description
+        )
+        source_sections = self._report_named_sections_from_template_source(
+            spec.module_path
+        )
+        model_equation_lines = self._report_template_section_lines(
+            source_sections,
+            description_sections,
+            "model equation",
+        )
+        model_equation_text = (
+            " ".join(
+                line.strip() for line in model_equation_lines if line.strip()
+            )
+            or None
+        )
+
+        context_lines = [
+            f"Template display name: {spec.display_name}",
+            f"Template key: {spec.name}",
+            f"Template module: {spec.module_path}",
+            f"LMFit entrypoint: {spec.lmfit_model_name}",
+            f"pyDREAM entrypoint: {spec.dream_model_name}",
+            f"LMFit inputs: {', '.join(spec.lmfit_inputs) or 'None'}",
+            f"pyDREAM inputs: {', '.join(spec.dream_inputs) or 'None'}",
+            (
+                "Parameter columns: "
+                f"{', '.join(spec.param_columns) or 'None'}"
+            ),
+            f"Declared static template parameters: {len(spec.parameters)}",
+            f"Prefit parameter rows in this report: {prefit_parameter_count}",
+            (
+                "DREAM active parameters: "
+                f"{', '.join(dream_active_parameter_names) or 'None'}"
+            ),
+            f"User selected q-range: {q_range_text}",
+            (
+                "Supported component q-range: "
+                f"{supported_q_range_text or 'Unavailable'}"
+            ),
+            f"q-grid: {q_sampling_text}",
+            (
+                "Best-fit plot includes solvent contribution: "
+                f"{'yes' if includes_solvent else 'no'}"
+            ),
+            (
+                "Best-fit plot includes structure factor trace: "
+                f"{'yes' if includes_structure_factor else 'no'}"
+            ),
+            (
+                "Cluster geometry metadata support: "
+                f"{'enabled' if spec.cluster_geometry_support.supported else 'disabled'}"
+            ),
+        ]
+        if spec.cluster_geometry_support.supported:
+            context_lines.extend(
+                [
+                    (
+                        "Allowed structure-factor approximations: "
+                        f"{', '.join(spec.cluster_geometry_support.allowed_sf_approximations)}"
+                    ),
+                    (
+                        "Cluster metadata fields: "
+                        f"{', '.join(spec.cluster_geometry_support.metadata_fields)}"
+                    ),
+                    (
+                        "Dynamic geometry parameters: "
+                        f"{'yes' if spec.cluster_geometry_support.dynamic_parameters else 'no'}"
+                    ),
+                    (
+                        "Runtime bindings: "
+                        + ", ".join(
+                            (
+                                f"{binding.runtime_name} <- "
+                                f"{binding.metadata_field}"
+                            )
+                            for binding in (
+                                spec.cluster_geometry_support.runtime_bindings
+                            )
+                        )
+                    ),
+                ]
+            )
+
+        definition_lines: list[str] = []
+        for heading in (
+            "purpose",
+            "scientific scope",
+            "structure factor",
+            "form factor",
+            "model organization",
+            "internal abundance normalization",
+            "model parameters",
+            "parameter definitions",
+            "fitting guidance",
+            "likelihood convention",
+            "required pydream globals",
+            "practical notes",
+            "cluster geometry metadata",
+        ):
+            section_lines = self._report_template_section_lines(
+                source_sections,
+                description_sections,
+                heading,
+            )
+            if not section_lines:
+                continue
+            if definition_lines:
+                definition_lines.append("")
+            definition_lines.append(f"{heading.title()}:")
+            definition_lines.extend(section_lines)
+
+        reference_lines = self._report_template_section_lines(
+            source_sections,
+            description_sections,
+            "relevant resources",
+            "references",
+        )
+        if not reference_lines and spec.metadata_path is not None:
+            reference_lines = [
+                "No explicit literature references were declared in the "
+                f"template metadata or source comments for {spec.name}.",
+            ]
+
+        return (
+            spec.display_name,
+            spec.module_path,
+            model_equation_text,
+            context_lines,
+            definition_lines,
+            reference_lines,
+        )
+
+    @staticmethod
+    def _report_named_sections_from_template_source(
+        module_path: Path,
+    ) -> dict[str, list[str]]:
+        try:
+            raw_lines = module_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return {}
+        comment_lines: list[str] = []
+        for raw_line in raw_lines:
+            stripped = raw_line.strip()
+            if stripped.startswith("def ") or stripped.startswith("class "):
+                break
+            if stripped.startswith("#"):
+                comment_lines.append(stripped[1:].strip())
+            elif not stripped:
+                comment_lines.append("")
+        return SAXSMainWindow._report_named_sections_from_lines(comment_lines)
+
+    @staticmethod
+    def _report_named_sections_from_text(
+        text: str,
+    ) -> dict[str, list[str]]:
+        return SAXSMainWindow._report_named_sections_from_lines(
+            text.splitlines()
+        )
+
+    @staticmethod
+    def _report_named_sections_from_lines(
+        raw_lines: list[str],
+    ) -> dict[str, list[str]]:
+        recognized_headings = {
+            "purpose",
+            "scientific scope",
+            "structure factor",
+            "form factor",
+            "model organization",
+            "model equation",
+            "internal abundance normalization",
+            "model parameters",
+            "parameter definitions",
+            "fitting guidance",
+            "likelihood convention",
+            "required pydream globals",
+            "practical notes",
+            "cluster geometry metadata",
+            "relevant resources",
+            "references",
+        }
+        sections: dict[str, list[str]] = {}
+        current_heading: str | None = None
+        current_lines: list[str] = []
+        for raw_line in raw_lines:
+            stripped = str(raw_line).strip()
+            normalized_heading = stripped[:-1].strip().lower()
+            if (
+                stripped.endswith(":")
+                and ":" not in stripped[:-1]
+                and not stripped.startswith("-")
+                and normalized_heading in recognized_headings
+            ):
+                if current_heading is not None:
+                    sections[current_heading] = [
+                        line for line in current_lines if line or line == ""
+                    ]
+                current_heading = normalized_heading
+                current_lines = []
+                continue
+            if current_heading is None:
+                continue
+            current_lines.append(stripped)
+        if current_heading is not None:
+            sections[current_heading] = [
+                line for line in current_lines if line or line == ""
+            ]
+        normalized: dict[str, list[str]] = {}
+        for heading, lines in sections.items():
+            cleaned_lines: list[str] = []
+            previous_blank = True
+            for line in lines:
+                if not line:
+                    if not previous_blank:
+                        cleaned_lines.append("")
+                    previous_blank = True
+                    continue
+                cleaned_lines.append(line)
+                previous_blank = False
+            while cleaned_lines and not cleaned_lines[0]:
+                cleaned_lines.pop(0)
+            while cleaned_lines and not cleaned_lines[-1]:
+                cleaned_lines.pop()
+            normalized[heading] = cleaned_lines
+        return normalized
+
+    @staticmethod
+    def _report_template_section_lines(
+        source_sections: dict[str, list[str]],
+        description_sections: dict[str, list[str]],
+        *section_names: str,
+    ) -> list[str]:
+        for section_name in section_names:
+            normalized = str(section_name).strip().lower()
+            lines = source_sections.get(normalized)
+            if lines:
+                return list(lines)
+            lines = description_sections.get(normalized)
+            if lines:
+                return list(lines)
+        return []
+
+    def _report_prior_json_path(self) -> Path | None:
+        current_prior_path = self.project_setup_tab.current_prior_json_path()
+        if current_prior_path is not None and current_prior_path.is_file():
+            return current_prior_path
+        if self.current_settings is None:
+            return None
+        candidate = (
+            build_project_paths(self.current_settings.project_dir).project_dir
+            / "md_prior_weights.json"
+        )
+        return candidate if candidate.is_file() else None
+
+    def _report_secondary_element(self) -> str | None:
+        return self.project_setup_tab.selected_prior_secondary_element()
+
+    def _build_report_prior_requests(
+        self,
+        powerpoint_settings: PowerPointExportSettings,
+    ) -> list[PriorHistogramRequest]:
+        prior_json_path = self._report_prior_json_path()
+        if prior_json_path is None:
+            return []
+        secondary_element = self._report_secondary_element()
+        return [
+            PriorHistogramRequest(
+                title="Structure Fraction Histogram",
+                json_path=prior_json_path,
+                mode="structure_fraction",
+                cmap=powerpoint_settings.prior_histogram_color_map,
+            ),
+            PriorHistogramRequest(
+                title="Atom Fraction Histogram",
+                json_path=prior_json_path,
+                mode="atom_fraction",
+                cmap=powerpoint_settings.prior_histogram_color_map,
+            ),
+            PriorHistogramRequest(
+                title="Solvent Sort Structure Fraction Histogram",
+                json_path=prior_json_path,
+                mode="solvent_sort_structure_fraction",
+                cmap=powerpoint_settings.solvent_sort_histogram_color_map,
+                secondary_element=secondary_element,
+            ),
+            PriorHistogramRequest(
+                title="Solvent Sort Atom Fraction Histogram",
+                json_path=prior_json_path,
+                mode="solvent_sort_atom_fraction",
+                cmap=powerpoint_settings.solvent_sort_histogram_color_map,
+                secondary_element=secondary_element,
+            ),
+        ]
+
+    def _report_data_summary(
+        self,
+        *,
+        solvent: bool,
+    ) -> ExperimentalDataSummary | None:
+        if self.current_settings is None:
+            return None
+        settings = self.current_settings
+        if solvent:
+            preferred_paths = [
+                settings.copied_solvent_data_file,
+                settings.solvent_data_path,
+            ]
+            skiprows = int(settings.solvent_header_rows)
+            q_column = settings.solvent_q_column
+            intensity_column = settings.solvent_intensity_column
+            error_column = settings.solvent_error_column
+        else:
+            preferred_paths = [
+                settings.copied_experimental_data_file,
+                settings.experimental_data_path,
+            ]
+            skiprows = int(settings.experimental_header_rows)
+            q_column = settings.experimental_q_column
+            intensity_column = settings.experimental_intensity_column
+            error_column = settings.experimental_error_column
+        resolved_path = next(
+            (
+                Path(candidate).expanduser().resolve()
+                for candidate in preferred_paths
+                if candidate
+                and Path(candidate).expanduser().resolve().is_file()
+            ),
+            None,
+        )
+        if resolved_path is None:
+            return None
+        return load_experimental_data_file(
+            resolved_path,
+            skiprows=skiprows,
+            q_column=q_column,
+            intensity_column=intensity_column,
+            error_column=error_column,
+        )
+
+    def _build_report_component_plot_data(
+        self,
+        *,
+        include_solvent: bool,
+        powerpoint_settings: PowerPointExportSettings,
+    ) -> ReportComponentPlotData | None:
+        if self.current_settings is None:
+            return None
+        paths = build_project_paths(self.current_settings.project_dir)
+        component_paths = sorted(paths.scattering_components_dir.glob("*.txt"))
+        experimental_summary = self._report_data_summary(solvent=False)
+        solvent_summary = (
+            self._report_data_summary(solvent=True)
+            if include_solvent
+            else None
+        )
+        if not component_paths and experimental_summary is None:
+            return None
+        try:
+            cmap = colormaps[powerpoint_settings.component_color_map]
+        except Exception:
+            cmap = colormaps["viridis"]
+        if len(component_paths) <= 1:
+            positions = np.asarray([0.68], dtype=float)
+        else:
+            positions = np.linspace(0.15, 0.9, len(component_paths))
+        component_series: list[ReportComponentSeries] = []
+        for component_path, position in zip(
+            component_paths,
+            positions,
+            strict=False,
+        ):
+            raw_data = np.loadtxt(component_path, comments="#")
+            if raw_data.ndim == 1:
+                raw_data = raw_data.reshape(1, -1)
+            component_series.append(
+                ReportComponentSeries(
+                    label=component_path.stem,
+                    q_values=np.asarray(raw_data[:, 0], dtype=float),
+                    intensities=np.asarray(raw_data[:, 1], dtype=float),
+                    color=to_hex(cmap(float(position)), keep_alpha=False),
+                )
+            )
+        title = (
+            "Initial SAXS traces without solvent"
+            if not include_solvent
+            else "Initial SAXS traces with solvent"
+        )
+        return ReportComponentPlotData(
+            title=title,
+            selected_q_min=(
+                float(self.current_settings.q_min)
+                if self.current_settings.q_min is not None
+                else None
+            ),
+            selected_q_max=(
+                float(self.current_settings.q_max)
+                if self.current_settings.q_max is not None
+                else None
+            ),
+            use_experimental_grid=bool(
+                self.current_settings.use_experimental_grid
+                and not self.current_settings.model_only_mode
+            ),
+            log_x=bool(
+                self.project_setup_tab.component_log_x_checkbox.isChecked()
+            ),
+            log_y=bool(
+                self.project_setup_tab.component_log_y_checkbox.isChecked()
+            ),
+            experimental_q_values=(
+                None
+                if experimental_summary is None
+                else np.asarray(experimental_summary.q_values, dtype=float)
+            ),
+            experimental_intensities=(
+                None
+                if experimental_summary is None
+                else np.asarray(experimental_summary.intensities, dtype=float)
+            ),
+            solvent_q_values=(
+                None
+                if solvent_summary is None
+                else np.asarray(solvent_summary.q_values, dtype=float)
+            ),
+            solvent_intensities=(
+                None
+                if solvent_summary is None
+                else np.asarray(solvent_summary.intensities, dtype=float)
+            ),
+            component_series=tuple(component_series),
+        )
+
+    def _latest_prefit_statistics_payload(self) -> dict[str, object]:
+        if self.current_settings is None:
+            return {}
+        paths = build_project_paths(self.current_settings.project_dir)
+        state_path = paths.prefit_dir / "prefit_state.json"
+        if not state_path.is_file():
+            return {}
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        statistics = dict(payload.get("statistics", {}))
+        statistics["saved_at"] = str(payload.get("saved_at", ""))
+        latest_snapshot = next(
+            iter(sorted(paths.prefit_dir.glob("prefit_*"), reverse=True)),
+            None,
+        )
+        if latest_snapshot is not None:
+            statistics["snapshot_dir"] = str(latest_snapshot)
+            latest_report_path = latest_snapshot / "prefit_report.txt"
+            if latest_report_path.is_file():
+                statistics["report_path"] = str(latest_report_path)
+        return statistics
+
+    def _report_cluster_geometry_rows(self) -> list[object]:
+        if self.prefit_workflow is None:
+            return []
+        try:
+            return list(self.prefit_workflow.cluster_geometry_rows())
+        except Exception:
+            return []
+
+    @staticmethod
+    def _estimate_section_count(
+        estimate: SolutionScatteringEstimate,
+    ) -> int:
+        return sum(
+            section is not None
+            for section in (
+                estimate.number_density_estimate,
+                estimate.volume_fraction_estimate,
+                estimate.attenuation_estimate,
+                estimate.fluorescence_estimate,
+            )
+        )
+
+    def _current_report_solution_scattering_estimate(
+        self,
+    ) -> SolutionScatteringEstimate | None:
+        candidates: list[SolutionScatteringEstimate] = []
+        embedded_estimate = (
+            self.prefit_tab.solute_volume_fraction_widget.current_estimate()
+        )
+        if embedded_estimate is not None:
+            candidates.append(embedded_estimate)
+        for window in (
+            self._solute_volume_fraction_tool_window,
+            self._number_density_tool_window,
+            self._attenuation_tool_window,
+            self._fluorescence_tool_window,
+        ):
+            if window is None:
+                continue
+            estimate = window.estimator_widget.current_estimate()
+            if estimate is not None:
+                candidates.append(estimate)
+        if self._last_solution_scattering_estimate is not None:
+            candidates.append(self._last_solution_scattering_estimate)
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda estimate: (
+                self._estimate_section_count(estimate),
+                estimate is self._last_solution_scattering_estimate,
+            ),
+        )
+
+    def _report_dream_filter_assessments(
+        self,
+        settings: DreamRunSettings,
+    ) -> list[dict[str, object]]:
+        if self._last_dream_filter_assessments:
+            return [dict(item) for item in self._last_dream_filter_assessments]
+        assessments, recommendation = self._evaluate_dream_posterior_filters(
+            settings
+        )
+        if recommendation is not None:
+            self._last_dream_filter_recommendation = dict(recommendation)
+        self._last_dream_filter_assessments = [
+            dict(item) for item in assessments
+        ]
+        return [dict(item) for item in assessments]
+
+    def _build_dream_report_filter_views(
+        self,
+        settings: DreamRunSettings,
+    ) -> tuple[DreamFilterReportView, ...]:
+        if self._last_results_loader is None:
+            return ()
+        views: list[DreamFilterReportView] = []
+        for mode, label in (
+            ("all_post_burnin", "All Post-burnin"),
+            ("top_percent_logp", "Top % by Log-posterior"),
+            ("top_n_logp", "Top N by Log-posterior"),
+        ):
+            candidate_settings = self._copy_dream_settings(settings)
+            candidate_settings.posterior_filter_mode = mode
+            summary = self._last_results_loader.get_summary(
+                bestfit_method=candidate_settings.bestfit_method,
+                posterior_filter_mode=candidate_settings.posterior_filter_mode,
+                posterior_top_percent=candidate_settings.posterior_top_percent,
+                posterior_top_n=candidate_settings.posterior_top_n,
+                credible_interval_low=candidate_settings.credible_interval_low,
+                credible_interval_high=(
+                    candidate_settings.credible_interval_high
+                ),
+            )
+            model_plot = self._last_results_loader.build_model_fit_data(
+                bestfit_method=candidate_settings.bestfit_method,
+                posterior_filter_mode=candidate_settings.posterior_filter_mode,
+                posterior_top_percent=candidate_settings.posterior_top_percent,
+                posterior_top_n=candidate_settings.posterior_top_n,
+                credible_interval_low=candidate_settings.credible_interval_low,
+                credible_interval_high=(
+                    candidate_settings.credible_interval_high
+                ),
+            )
+            violin_plot = self._last_results_loader.build_violin_data(
+                mode=self._effective_dream_violin_mode(candidate_settings),
+                posterior_filter_mode=candidate_settings.posterior_filter_mode,
+                posterior_top_percent=candidate_settings.posterior_top_percent,
+                posterior_top_n=candidate_settings.posterior_top_n,
+                credible_interval_low=candidate_settings.credible_interval_low,
+                credible_interval_high=(
+                    candidate_settings.credible_interval_high
+                ),
+                sample_source=candidate_settings.violin_sample_source,
+                weight_order=candidate_settings.violin_weight_order,
+            )
+            weights_violin_plot = self._last_results_loader.build_violin_data(
+                mode="weights_only",
+                posterior_filter_mode=candidate_settings.posterior_filter_mode,
+                posterior_top_percent=candidate_settings.posterior_top_percent,
+                posterior_top_n=candidate_settings.posterior_top_n,
+                credible_interval_low=candidate_settings.credible_interval_low,
+                credible_interval_high=(
+                    candidate_settings.credible_interval_high
+                ),
+                sample_source=candidate_settings.violin_sample_source,
+                weight_order=candidate_settings.violin_weight_order,
+            )
+            effective_radii_violin_plot = (
+                self._last_results_loader.build_violin_data(
+                    mode="effective_radii_only",
+                    posterior_filter_mode=(
+                        candidate_settings.posterior_filter_mode
+                    ),
+                    posterior_top_percent=(
+                        candidate_settings.posterior_top_percent
+                    ),
+                    posterior_top_n=candidate_settings.posterior_top_n,
+                    credible_interval_low=(
+                        candidate_settings.credible_interval_low
+                    ),
+                    credible_interval_high=(
+                        candidate_settings.credible_interval_high
+                    ),
+                    sample_source=candidate_settings.violin_sample_source,
+                    weight_order=candidate_settings.violin_weight_order,
+                )
+            )
+            title = label
+            is_active = mode == settings.posterior_filter_mode
+            if is_active:
+                title += " [Active]"
+            views.append(
+                DreamFilterReportView(
+                    title=title,
+                    description=self._describe_posterior_filter(
+                        candidate_settings
+                    ),
+                    filter_mode=mode,
+                    is_active=is_active,
+                    summary=summary,
+                    model_plot=model_plot,
+                    violin_plot=violin_plot,
+                    violin_payload=self.dream_tab.prepare_violin_plot_payload(
+                        summary,
+                        violin_plot,
+                    ),
+                    weights_violin_payload=(
+                        self.dream_tab.prepare_violin_plot_payload(
+                            summary,
+                            weights_violin_plot,
+                        )
+                    ),
+                    effective_radii_violin_payload=(
+                        self.dream_tab.prepare_violin_plot_payload(
+                            summary,
+                            effective_radii_violin_plot,
+                        )
+                    ),
+                )
+            )
+        return tuple(views)
+
+    def _report_q_sampling_text(self) -> str:
+        if self.current_settings is None:
+            return "Unavailable"
+        if self.current_settings.model_only_mode:
+            return f"Model-only resampled grid ({self.current_settings.q_points or 0} points)"
+        if self.current_settings.use_experimental_grid:
+            return "Experimental grid"
+        if self.current_settings.q_points is not None:
+            return f"Resampled grid ({self.current_settings.q_points} points)"
+        return "Project q-grid"
+
+    def _format_selected_q_range_text(self, q_values: np.ndarray) -> str:
+        lower = (
+            float(self.current_settings.q_min)
+            if self.current_settings is not None
+            and self.current_settings.q_min is not None
+            else float(np.min(q_values))
+        )
+        upper = (
+            float(self.current_settings.q_max)
+            if self.current_settings is not None
+            and self.current_settings.q_max is not None
+            else float(np.max(q_values))
+        )
+        return f"{lower:.6g} to {upper:.6g}"
+
     @staticmethod
     def _effective_dream_violin_mode(settings: DreamRunSettings) -> str:
         if settings.violin_value_scale_mode == "weights_unit_interval":
             return "weights_only"
         if settings.violin_value_scale_mode == "normalized_all":
             return "all_parameters"
+        if settings.violin_value_scale_mode == "effective_radii_only":
+            return "effective_radii_only"
+        if settings.violin_value_scale_mode == "additional_parameters_only":
+            return "additional_parameters_only"
         return settings.violin_parameter_mode
 
     def save_prior_plot_data_as(self) -> None:
@@ -3907,22 +6002,47 @@ class SAXSMainWindow(QMainWindow):
         method: str,
         max_nfev: int,
     ) -> dict[str, object]:
-        residuals = np.asarray(evaluation.residuals, dtype=float)
         q_values = np.asarray(evaluation.q_values, dtype=float)
-        chi_square = float(np.sum(residuals**2))
-        dof = max(
-            len(q_values) - sum(1 for entry in entries if entry.vary),
-            1,
-        )
-        reduced_chi_square = chi_square / dof
-        experimental = np.asarray(
-            evaluation.experimental_intensities,
-            dtype=float,
-        )
-        ss_total = float(np.sum((experimental - np.mean(experimental)) ** 2))
-        r_squared = (
-            1.0 - chi_square / ss_total if ss_total > 0.0 else float("nan")
-        )
+        fit_metrics: dict[str, object]
+        if (
+            evaluation.residuals is None
+            or evaluation.experimental_intensities is None
+        ):
+            fit_metrics = {
+                "mode": "model_only",
+                "chi_square": None,
+                "reduced_chi_square": None,
+                "r_squared": None,
+                "residual_rms": None,
+                "mean_absolute_residual": None,
+            }
+        else:
+            residuals = np.asarray(evaluation.residuals, dtype=float)
+            chi_square = float(np.sum(residuals**2))
+            dof = max(
+                len(q_values) - sum(1 for entry in entries if entry.vary),
+                1,
+            )
+            reduced_chi_square = chi_square / dof
+            experimental = np.asarray(
+                evaluation.experimental_intensities,
+                dtype=float,
+            )
+            ss_total = float(
+                np.sum((experimental - np.mean(experimental)) ** 2)
+            )
+            fit_metrics = {
+                "mode": "fit",
+                "chi_square": chi_square,
+                "reduced_chi_square": reduced_chi_square,
+                "r_squared": (
+                    1.0 - chi_square / ss_total
+                    if ss_total > 0.0
+                    else float("nan")
+                ),
+                "residual_rms": float(np.sqrt(np.mean(residuals**2))),
+                "mean_absolute_residual": float(np.mean(np.abs(residuals))),
+            }
         return {
             "exported_at": datetime.now().isoformat(),
             "project_dir": str(self.current_settings.project_dir),
@@ -3942,18 +6062,16 @@ class SAXSMainWindow(QMainWindow):
                 "point_count": int(len(q_values)),
                 "q_min": float(np.min(q_values)) if len(q_values) else None,
                 "q_max": float(np.max(q_values)) if len(q_values) else None,
+                "includes_structure_factor": bool(
+                    evaluation.structure_factor_trace is not None
+                ),
             },
-            "fit_metrics": {
-                "chi_square": chi_square,
-                "reduced_chi_square": reduced_chi_square,
-                "r_squared": r_squared,
-                "residual_rms": float(np.sqrt(np.mean(residuals**2))),
-                "mean_absolute_residual": float(np.mean(np.abs(residuals))),
-            },
+            "fit_metrics": fit_metrics,
             "parameter_entries": [entry.to_dict() for entry in entries],
         }
 
     def _apply_project_settings(self, settings: ProjectSettings) -> None:
+        self._prefit_missing_components_warning_shown = False
         template_specs = self._template_specs_for_dropdown(
             include_deprecated=self._show_deprecated_templates,
             selected_names=[settings.selected_model_template or ""],
@@ -3982,8 +6100,15 @@ class SAXSMainWindow(QMainWindow):
                 "Prefit summary is not available yet.\n" f"{exc}"
             )
             self.prefit_tab.set_saved_states([], None)
+        self._refresh_model_only_mode_state()
         try:
-            self._load_dream_workflow()
+            if not settings.model_only_mode:
+                self._load_dream_workflow()
+            else:
+                raise ValueError(
+                    "DREAM is disabled in Model Only Mode. Disable Model "
+                    "Only Mode and add experimental SAXS data to enable DREAM."
+                )
         except Exception as exc:
             self.dream_workflow = None
             self.dream_tab.set_available_saved_runs([])
@@ -3994,14 +6119,68 @@ class SAXSMainWindow(QMainWindow):
                 "DREAM summary is not available yet.\n" f"{exc}"
             )
             self.dream_tab.clear_plots()
+        self._refresh_model_only_mode_state()
         self._update_file_menu_state()
+
+    def _set_dream_tab_enabled(self, enabled: bool) -> None:
+        dream_index = self.tabs.indexOf(self.dream_tab)
+        if dream_index < 0:
+            return
+        self.tabs.setTabEnabled(dream_index, enabled)
+        if not enabled and self.tabs.currentIndex() == dream_index:
+            self.tabs.setCurrentWidget(self.prefit_tab)
+
+    def _refresh_model_only_mode_state(self) -> None:
+        model_only = bool(
+            self.current_settings is not None
+            and self.current_settings.model_only_mode
+        )
+        self.project_setup_tab.set_model_only_mode(model_only)
+        self.prefit_tab.set_model_only_mode(model_only)
+        prefit_enabled = (
+            self.prefit_workflow is not None
+            and self.prefit_workflow.can_run_prefit()
+        )
+        self.prefit_tab.set_prefit_execution_enabled(prefit_enabled)
+        dream_enabled = (
+            self.current_settings is not None
+            and not model_only
+            and self.prefit_workflow is not None
+            and self.prefit_workflow.can_run_prefit()
+        )
+        self._set_dream_tab_enabled(dream_enabled)
+
+    @Slot(bool)
+    def _on_model_only_mode_changed(self, enabled: bool) -> None:
+        if self.current_settings is None:
+            return
+        self.current_settings.model_only_mode = bool(enabled)
+        if enabled:
+            self.current_settings.use_experimental_grid = False
+            if self.current_settings.q_points is None:
+                self.current_settings.q_points = 500
+        if self.prefit_workflow is not None:
+            self.prefit_workflow.parameter_entries = (
+                self.prefit_tab.parameter_entries()
+            )
+            self.prefit_workflow.set_model_only_mode(enabled)
+            self.current_settings = self.prefit_workflow.settings
+            self._load_prefit_preview()
+            self.prefit_tab.set_log_text(self._format_prefit_console_intro())
+        self._invalidate_dream_workflow_cache()
+        self._refresh_model_only_mode_state()
+        self.statusBar().showMessage(
+            "Model Only Mode enabled"
+            if enabled
+            else "Model Only Mode disabled"
+        )
 
     def _settings_from_project_tab(self) -> ProjectSettings:
         project_dir = self.project_setup_tab.project_dir()
         if project_dir is None:
             raise ValueError("Select a project directory.")
         base = (
-            self.current_settings
+            ProjectSettings.from_dict(self.current_settings.to_dict())
             if self.current_settings is not None
             else ProjectSettings(
                 project_name=project_dir.name,
@@ -4010,6 +6189,7 @@ class SAXSMainWindow(QMainWindow):
         )
         base.project_name = project_dir.name
         base.project_dir = str(project_dir)
+        base.model_only_mode = self.project_setup_tab.model_only_mode()
         base.clusters_dir = (
             str(self.project_setup_tab.clusters_dir())
             if self.project_setup_tab.clusters_dir() is not None
@@ -4116,6 +6296,7 @@ class SAXSMainWindow(QMainWindow):
                 "Loaded the Best Prefit preset from the project file."
             )
         self._refresh_saved_prefit_states()
+        self._refresh_model_only_mode_state()
         return self.prefit_workflow
 
     def _apply_prefit_template_fallback(
@@ -4128,6 +6309,8 @@ class SAXSMainWindow(QMainWindow):
         )
         self.prefit_tab.set_templates(template_specs, selected_template)
         self.prefit_tab.set_autosave(settings.autosave_prefits)
+        self.prefit_tab.set_model_only_mode(settings.model_only_mode)
+        self.prefit_tab.set_prefit_execution_enabled(False)
         if selected_template:
             self._restoring_prefit_template = True
             try:
@@ -4142,11 +6325,24 @@ class SAXSMainWindow(QMainWindow):
             except Exception:
                 template_spec = None
         target = self._volume_fraction_target_for_template_spec(template_spec)
-        self.prefit_tab.set_solute_volume_fraction_visible(target is not None)
+        solvent_weight_target = self._solvent_weight_target_for_template_spec(
+            template_spec
+        )
+        self.prefit_tab.set_solute_volume_fraction_visible(
+            template_spec is not None
+        )
         if target is None:
-            self.prefit_tab.set_solute_volume_fraction_target(None, None)
+            self.prefit_tab.set_solute_volume_fraction_target(
+                None,
+                None,
+                solvent_weight_target,
+            )
         else:
-            self.prefit_tab.set_solute_volume_fraction_target(*target)
+            self.prefit_tab.set_solute_volume_fraction_target(
+                *target,
+                solvent_weight_target,
+            )
+        self._sync_solution_scattering_tool_targets()
         supports_cluster_geometry = bool(
             template_spec is not None
             and template_spec.cluster_geometry_support.supported
@@ -4189,9 +6385,37 @@ class SAXSMainWindow(QMainWindow):
                 return candidate, "solvent"
         return None
 
+    @staticmethod
+    def _solvent_weight_target_for_template_spec(
+        template_spec,
+    ) -> str | None:
+        if template_spec is None:
+            return None
+        parameter_names = {
+            str(parameter.name).strip()
+            for parameter in template_spec.parameters
+            if str(parameter.name).strip()
+        }
+        for candidate in SOLVENT_WEIGHT_PARAMETER_NAMES:
+            if candidate in parameter_names:
+                return candidate
+        return None
+
     def _load_dream_workflow(self) -> SAXSDreamWorkflow:
         if self.current_settings is None:
             raise ValueError("No project is currently loaded.")
+        if self.current_settings.model_only_mode:
+            raise ValueError(
+                "DREAM is disabled in Model Only Mode. Disable Model Only "
+                "Mode and add experimental SAXS data to enable DREAM."
+            )
+        if (
+            self.prefit_workflow is not None
+            and not self.prefit_workflow.can_run_prefit()
+        ):
+            raise ValueError(
+                "DREAM requires experimental SAXS data and an enabled prefit workflow."
+            )
         project_dir = str(Path(self.current_settings.project_dir).resolve())
         is_new_project = self._dream_workflow_project_dir != project_dir
         if self.dream_workflow is None or is_new_project:
@@ -4447,6 +6671,63 @@ class SAXSMainWindow(QMainWindow):
     ) -> DreamRunSettings:
         return DreamRunSettings.from_dict(settings.to_dict())
 
+    def _load_console_autoscroll_setting(self) -> bool:
+        raw_value = self._recent_projects_settings().value(
+            CONSOLE_AUTOSCROLL_KEY,
+            True,
+        )
+        if isinstance(raw_value, bool):
+            return raw_value
+        return str(raw_value).strip().lower() not in {
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+
+    def _toggle_console_autoscroll(self, enabled: bool) -> None:
+        self._set_console_autoscroll_enabled(enabled, persist=True)
+
+    def _set_console_autoscroll_enabled(
+        self,
+        enabled: bool,
+        *,
+        persist: bool,
+    ) -> None:
+        self._console_autoscroll_enabled = bool(enabled)
+        if hasattr(self, "console_autoscroll_action"):
+            self.console_autoscroll_action.blockSignals(True)
+            self.console_autoscroll_action.setChecked(
+                self._console_autoscroll_enabled
+            )
+            self.console_autoscroll_action.blockSignals(False)
+        if hasattr(self, "project_setup_tab"):
+            self.project_setup_tab.set_console_autoscroll_enabled(
+                self._console_autoscroll_enabled
+            )
+        if hasattr(self, "prefit_tab"):
+            self.prefit_tab.set_console_autoscroll_enabled(
+                self._console_autoscroll_enabled
+            )
+        if hasattr(self, "dream_tab"):
+            self.dream_tab.set_console_autoscroll_enabled(
+                self._console_autoscroll_enabled
+            )
+        if persist:
+            self._recent_projects_settings().setValue(
+                CONSOLE_AUTOSCROLL_KEY,
+                self._console_autoscroll_enabled,
+            )
+            self.statusBar().showMessage(
+                "Console autoscroll "
+                + (
+                    "enabled"
+                    if self._console_autoscroll_enabled
+                    else "disabled"
+                )
+            )
+
     def _recent_projects_settings(self) -> QSettings:
         return QSettings("SAXShell", "SAXS")
 
@@ -4618,6 +6899,44 @@ class SAXSMainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Opened bond analysis")
 
+    def _open_clusterdynamics_tool(self) -> None:
+        from saxshell.clusterdynamics.ui.main_window import (
+            ClusterDynamicsMainWindow,
+        )
+
+        project_dir = None
+        if self.current_settings is not None:
+            project_dir = Path(self.current_settings.project_dir).resolve()
+        window = ClusterDynamicsMainWindow(initial_project_dir=project_dir)
+        window.show()
+        window.raise_()
+        self._child_tool_windows.append(window)
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                f"Opened cluster dynamics for {project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened cluster dynamics")
+
+    def _open_clusterdynamicsml_tool(self) -> None:
+        from saxshell.clusterdynamicsml.ui.main_window import (
+            ClusterDynamicsMLMainWindow,
+        )
+
+        project_dir = None
+        if self.current_settings is not None:
+            project_dir = Path(self.current_settings.project_dir).resolve()
+        window = ClusterDynamicsMLMainWindow(initial_project_dir=project_dir)
+        window.show()
+        window.raise_()
+        self._child_tool_windows.append(window)
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                f"Opened cluster dynamics AI for {project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened cluster dynamics AI")
+
     def _open_fullrmc_tool(self) -> None:
         from saxshell.fullrmc.ui.main_window import RMCSetupMainWindow
 
@@ -4635,24 +6954,62 @@ class SAXSMainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Opened fullrmc setup")
 
-    def _open_solute_volume_fraction_tool(self) -> None:
-        window = SoluteVolumeFractionToolWindow()
+    def _open_solution_scattering_tool_window(
+        self,
+        *,
+        attribute_name: str,
+        factory,
+        status_message: str,
+    ) -> None:
+        existing_window = getattr(self, attribute_name)
+        if existing_window is not None:
+            existing_window.show()
+            existing_window.raise_()
+            existing_window.activateWindow()
+            self.statusBar().showMessage(status_message)
+            return
+
+        window = factory()
         window.estimator_widget.estimate_calculated.connect(
-            self._on_solute_volume_fraction_estimate_calculated
+            self._on_solution_scattering_estimate_calculated
         )
-        self._solute_volume_fraction_tool_window = window
-        self._sync_volume_fraction_tool_target()
+        setattr(self, attribute_name, window)
+        self._sync_solution_scattering_tool_targets()
         window.destroyed.connect(
-            lambda *_args: setattr(
-                self,
-                "_solute_volume_fraction_tool_window",
-                None,
-            )
+            lambda *_args, name=attribute_name: setattr(self, name, None)
         )
         window.show()
         window.raise_()
         self._child_tool_windows.append(window)
-        self.statusBar().showMessage("Opened volume fraction estimate")
+        self.statusBar().showMessage(status_message)
+
+    def _open_solute_volume_fraction_tool(self) -> None:
+        self._open_solution_scattering_tool_window(
+            attribute_name="_solute_volume_fraction_tool_window",
+            factory=SoluteVolumeFractionToolWindow,
+            status_message="Opened volume fraction estimate",
+        )
+
+    def _open_number_density_tool(self) -> None:
+        self._open_solution_scattering_tool_window(
+            attribute_name="_number_density_tool_window",
+            factory=NumberDensityEstimateToolWindow,
+            status_message="Opened number density estimate",
+        )
+
+    def _open_attenuation_tool(self) -> None:
+        self._open_solution_scattering_tool_window(
+            attribute_name="_attenuation_tool_window",
+            factory=AttenuationEstimateToolWindow,
+            status_message="Opened attenuation estimate",
+        )
+
+    def _open_fluorescence_tool(self) -> None:
+        self._open_solution_scattering_tool_window(
+            attribute_name="_fluorescence_tool_window",
+            factory=FluorescenceEstimateToolWindow,
+            status_message="Opened fluorescence estimate",
+        )
 
     def _show_placeholder_tool_message(self, tool_name: str) -> None:
         QMessageBox.information(
@@ -4665,47 +7022,36 @@ class SAXSMainWindow(QMainWindow):
         )
         self.statusBar().showMessage(f"{tool_name} is not available yet", 5000)
 
-    def _open_dream_output_settings_dialog(self) -> None:
-        settings = self.dream_tab.settings_payload()
-        dialog = QDialog(self)
-        dialog.setWindowTitle("DREAM Output Settings")
-        layout = QVBoxLayout(dialog)
-
-        form_layout = QFormLayout()
-        verbose_checkbox = QCheckBox("Verbose sampler output")
-        verbose_checkbox.setChecked(settings.verbose)
-        verbose_checkbox.setToolTip(
-            "Enable or disable verbose DREAM sampler progress output."
+    def _effective_powerpoint_export_settings(
+        self,
+    ) -> PowerPointExportSettings:
+        if self.current_settings is None:
+            return PowerPointExportSettings()
+        return PowerPointExportSettings.from_dict(
+            self.current_settings.powerpoint_export_settings.to_dict()
         )
-        interval_spin = QDoubleSpinBox()
-        interval_spin.setRange(0.1, 30.0)
-        interval_spin.setDecimals(1)
-        interval_spin.setSingleStep(0.1)
-        interval_spin.setValue(settings.verbose_output_interval_seconds)
-        interval_spin.setToolTip(
-            "Minimum number of seconds between DREAM runtime output "
-            "updates shown in the UI while verbose output is enabled."
-        )
-        interval_spin.setEnabled(verbose_checkbox.isChecked())
-        verbose_checkbox.toggled.connect(interval_spin.setEnabled)
-        form_layout.addRow(verbose_checkbox)
-        form_layout.addRow("Output interval (s)", interval_spin)
-        layout.addLayout(form_layout)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel
+    def _open_main_ui_settings_dialog(self) -> None:
+        dialog = MainUISettingsDialog(
+            dream_settings=self.dream_tab.settings_payload(),
+            powerpoint_settings=self._effective_powerpoint_export_settings(),
+            powerpoint_enabled=self.current_settings is not None,
+            parent=self,
         )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        verbose, interval_seconds = dialog.dream_output_values()
         self._apply_dream_output_settings(
-            verbose=verbose_checkbox.isChecked(),
-            interval_seconds=interval_spin.value(),
+            verbose=verbose,
+            interval_seconds=interval_seconds,
         )
+        if self.current_settings is not None:
+            self._apply_powerpoint_export_settings(
+                dialog.powerpoint_settings_value()
+            )
+
+    def _open_dream_output_settings_dialog(self) -> None:
+        self._open_main_ui_settings_dialog()
 
     def _apply_dream_output_settings(
         self,
@@ -4731,6 +7077,46 @@ class SAXSMainWindow(QMainWindow):
             "Save DREAM settings if you want to persist this change."
         )
         self.statusBar().showMessage("DREAM output settings updated")
+
+    def _apply_powerpoint_export_settings(
+        self,
+        settings: PowerPointExportSettings,
+    ) -> None:
+        if self.current_settings is None:
+            return
+        normalized = PowerPointExportSettings.from_dict(settings.to_dict())
+        enabled_section_count = sum(
+            int(value)
+            for value in (
+                normalized.include_prior_histograms,
+                normalized.include_initial_traces,
+                normalized.include_prefit_model,
+                normalized.include_prefit_parameters,
+                normalized.include_geometry_table,
+                normalized.include_estimator_metrics,
+                normalized.include_dream_settings,
+                normalized.include_dream_prior_table,
+                normalized.include_dream_output_model,
+                normalized.include_posterior_comparisons,
+                normalized.include_output_summary,
+                normalized.include_directory_summary,
+            )
+        )
+        self.current_settings.powerpoint_export_settings = normalized
+        self.dream_tab.append_log(
+            "Updated PowerPoint export settings.\n"
+            f"Font: {normalized.font_family}\n"
+            f"Component palette: {normalized.component_color_map}\n"
+            "Prior palettes: "
+            f"{normalized.prior_histogram_color_map} / "
+            f"{normalized.solvent_sort_histogram_color_map}\n"
+            f"Slides enabled: {enabled_section_count}/12\n"
+            f"Manifest export: {'on' if normalized.generate_manifest else 'off'}\n"
+            "Rendered figure assets: "
+            f"{'kept' if normalized.export_figure_assets else 'temporary only'}\n"
+            "Save the project if you want to persist this change."
+        )
+        self.statusBar().showMessage("PowerPoint export settings updated")
 
     def _show_version_information(self) -> None:
         QMessageBox.information(
@@ -4933,12 +7319,36 @@ class SAXSMainWindow(QMainWindow):
             if open_window is not window
         ]
 
-    def _refresh_loaded_dream_results(self) -> None:
+    def _schedule_dream_results_refresh(self, scope: int) -> None:
         if self._last_results_loader is None:
             return
+        self._pending_dream_refresh_scope = max(
+            int(self._pending_dream_refresh_scope),
+            int(scope),
+        )
+        self._dream_refresh_timer.start()
+
+    def _flush_pending_dream_refresh(self) -> None:
+        scope = int(self._pending_dream_refresh_scope)
+        self._pending_dream_refresh_scope = 0
+        if scope <= 0:
+            return
+        self._refresh_loaded_dream_results(scope=scope)
+
+    def _refresh_loaded_dream_results(
+        self,
+        *,
+        scope: int | None = None,
+    ) -> None:
+        if self._last_results_loader is None:
+            return
+        refresh_scope = (
+            int(scope) if scope is not None else self.DREAM_REFRESH_FULL
+        )
         try:
             settings = self.dream_tab.settings_payload()
-            summary = self._last_results_loader.get_summary(
+            loader = self._last_results_loader
+            summary = loader.get_summary(
                 bestfit_method=settings.bestfit_method,
                 posterior_filter_mode=settings.posterior_filter_mode,
                 posterior_top_percent=settings.posterior_top_percent,
@@ -4946,7 +7356,54 @@ class SAXSMainWindow(QMainWindow):
                 credible_interval_low=settings.credible_interval_low,
                 credible_interval_high=settings.credible_interval_high,
             )
-            model_plot = self._last_results_loader.build_model_fit_data(
+            self.dream_tab.set_summary_text(
+                self._format_dream_summary(summary, settings=settings)
+            )
+            if refresh_scope <= self.DREAM_REFRESH_STYLE:
+                if self.dream_tab.current_violin_plot_data() is None:
+                    violin_plot = loader.build_violin_data(
+                        mode=self._effective_dream_violin_mode(settings),
+                        posterior_filter_mode=settings.posterior_filter_mode,
+                        posterior_top_percent=settings.posterior_top_percent,
+                        posterior_top_n=settings.posterior_top_n,
+                        credible_interval_low=settings.credible_interval_low,
+                        credible_interval_high=settings.credible_interval_high,
+                        sample_source=settings.violin_sample_source,
+                        weight_order=settings.violin_weight_order,
+                    )
+                    self.dream_tab.plot_violin_plot(summary, violin_plot)
+                else:
+                    self.dream_tab.redraw_current_violin_plot()
+                return
+            if refresh_scope == self.DREAM_REFRESH_SUMMARY:
+                violin_plot = self.dream_tab.current_violin_plot_data()
+                if violin_plot is None:
+                    violin_plot = loader.build_violin_data(
+                        mode=self._effective_dream_violin_mode(settings),
+                        posterior_filter_mode=settings.posterior_filter_mode,
+                        posterior_top_percent=settings.posterior_top_percent,
+                        posterior_top_n=settings.posterior_top_n,
+                        credible_interval_low=settings.credible_interval_low,
+                        credible_interval_high=settings.credible_interval_high,
+                        sample_source=settings.violin_sample_source,
+                        weight_order=settings.violin_weight_order,
+                    )
+                self.dream_tab.plot_violin_plot(summary, violin_plot)
+                return
+            if refresh_scope == self.DREAM_REFRESH_VIOLIN:
+                violin_plot = loader.build_violin_data(
+                    mode=self._effective_dream_violin_mode(settings),
+                    posterior_filter_mode=settings.posterior_filter_mode,
+                    posterior_top_percent=settings.posterior_top_percent,
+                    posterior_top_n=settings.posterior_top_n,
+                    credible_interval_low=settings.credible_interval_low,
+                    credible_interval_high=settings.credible_interval_high,
+                    sample_source=settings.violin_sample_source,
+                    weight_order=settings.violin_weight_order,
+                )
+                self.dream_tab.plot_violin_plot(summary, violin_plot)
+                return
+            model_plot = loader.build_model_fit_data(
                 bestfit_method=settings.bestfit_method,
                 posterior_filter_mode=settings.posterior_filter_mode,
                 posterior_top_percent=settings.posterior_top_percent,
@@ -4954,7 +7411,7 @@ class SAXSMainWindow(QMainWindow):
                 credible_interval_low=settings.credible_interval_low,
                 credible_interval_high=settings.credible_interval_high,
             )
-            violin_plot = self._last_results_loader.build_violin_data(
+            violin_plot = loader.build_violin_data(
                 mode=self._effective_dream_violin_mode(settings),
                 posterior_filter_mode=settings.posterior_filter_mode,
                 posterior_top_percent=settings.posterior_top_percent,
@@ -4963,9 +7420,6 @@ class SAXSMainWindow(QMainWindow):
                 credible_interval_high=settings.credible_interval_high,
                 sample_source=settings.violin_sample_source,
                 weight_order=settings.violin_weight_order,
-            )
-            self.dream_tab.set_summary_text(
-                self._format_dream_summary(summary, settings=settings)
             )
             self.dream_tab.plot_model_fit(model_plot)
             self.dream_tab.plot_violin_plot(summary, violin_plot)
@@ -5360,12 +7814,23 @@ class SAXSMainWindow(QMainWindow):
             try:
                 q_values = self.prefit_workflow._component_q_values()
             except Exception:
-                q_values = np.asarray(
-                    self.prefit_workflow.experimental_data.q_values,
-                    dtype=float,
-                )
+                if self.prefit_workflow.experimental_data is not None:
+                    q_values = np.asarray(
+                        self.prefit_workflow.experimental_data.q_values,
+                        dtype=float,
+                    )
+                else:
+                    q_values = np.asarray([], dtype=float)
         run_config = self.prefit_tab.run_config()
-        if settings.use_experimental_grid:
+        if q_values.size == 0:
+            grid_text = "The active q-grid is not available yet."
+        elif settings.model_only_mode:
+            grid_text = (
+                "Model Only Mode is active. Using a forward-model q-grid with "
+                f"{len(q_values)} points from {float(q_values.min()):.6g} to "
+                f"{float(q_values.max()):.6g}."
+            )
+        elif settings.use_experimental_grid:
             grid_text = (
                 "Using the experimental q-grid cropped to the nearest "
                 "available q-points inside the requested range "
@@ -5397,6 +7862,11 @@ class SAXSMainWindow(QMainWindow):
                 if preview_block_reason is not None
                 else ""
             )
+            + (
+                "Prefit fitting is disabled while Model Only Mode is active.\n"
+                if settings.model_only_mode
+                else ""
+            )
             + "Recommended order: refine scale first, then scale + offset. "
             "Component weights w<##> are not recommended for prefit refinement.\n"
             f"Default minimizer: {run_config.method}\n"
@@ -5414,10 +7884,7 @@ class SAXSMainWindow(QMainWindow):
     ) -> str:
         if self.prefit_workflow is None:
             return "Prefit summary is not available."
-        residuals = np.asarray(evaluation.residuals, dtype=float)
         q_values = np.asarray(evaluation.q_values, dtype=float)
-        rms_residual = float(np.sqrt(np.mean(residuals**2)))
-        mean_abs_residual = float(np.mean(np.abs(residuals)))
         lines = [
             "Prefit summary:",
             f"Template: {self.prefit_workflow.template_spec.name}",
@@ -5426,8 +7893,6 @@ class SAXSMainWindow(QMainWindow):
                 f"q-range: {float(q_values.min()):.6g} to "
                 f"{float(q_values.max()):.6g}"
             ),
-            f"Residual RMS: {rms_residual:.6g}",
-            f"Mean |residual|: {mean_abs_residual:.6g}",
             f"Configured minimizer: {self.prefit_tab.run_config().method}",
             f"Configured max nfev: {self.prefit_tab.run_config().max_nfev}",
             (
@@ -5439,6 +7904,24 @@ class SAXSMainWindow(QMainWindow):
                 )
             ),
         ]
+        if (
+            evaluation.residuals is None
+            or evaluation.experimental_intensities is None
+        ):
+            lines.extend(
+                [
+                    "Mode: Model Only",
+                    "Experimental fit metrics: unavailable",
+                ]
+            )
+        else:
+            residuals = np.asarray(evaluation.residuals, dtype=float)
+            rms_residual = float(np.sqrt(np.mean(residuals**2)))
+            mean_abs_residual = float(np.mean(np.abs(residuals)))
+            lines[4:4] = [
+                f"Residual RMS: {rms_residual:.6g}",
+                f"Mean |residual|: {mean_abs_residual:.6g}",
+            ]
         if fit_result is not None:
             lines.extend(
                 [
@@ -5496,6 +7979,12 @@ class SAXSMainWindow(QMainWindow):
                 "Build a project and load its SAXS components first.",
             )
             return
+        if not self.prefit_workflow.can_run_prefit():
+            self._show_error(
+                "Scale recommendation failed",
+                "Disable Model Only Mode and load experimental SAXS data before applying autoscale.",
+            )
+            return
         try:
             entries = self.prefit_tab.parameter_entries()
             recommendation = self.prefit_workflow.recommend_scale_settings(
@@ -5508,15 +7997,46 @@ class SAXSMainWindow(QMainWindow):
                 maximum=recommendation.recommended_maximum,
                 vary=True,
             )
-            self.prefit_tab.append_log(
-                "Applied autoscale settings.\n"
-                f"Current scale: {recommendation.current_scale:.6g}\n"
-                f"Recommended scale: {recommendation.recommended_scale:.6g}\n"
-                f"Scale min: {recommendation.recommended_minimum:.6g}\n"
-                f"Scale max: {recommendation.recommended_maximum:.6g}\n"
-                f"Adjustment factor: {recommendation.adjustment_factor:.6g}\n"
-                f"Points used: {recommendation.points_used}"
+            if recommendation.recommended_offset is not None:
+                offset_kwargs: dict[str, object] = {
+                    "value": recommendation.recommended_offset,
+                }
+                if recommendation.recommended_offset_minimum is not None:
+                    offset_kwargs["minimum"] = (
+                        recommendation.recommended_offset_minimum
+                    )
+                if recommendation.recommended_offset_maximum is not None:
+                    offset_kwargs["maximum"] = (
+                        recommendation.recommended_offset_maximum
+                    )
+                self.prefit_tab.set_parameter_row(
+                    "offset",
+                    **offset_kwargs,
+                )
+            self.prefit_workflow.parameter_entries = (
+                self.prefit_tab.parameter_entries()
             )
+            offset_text = (
+                ""
+                if recommendation.recommended_offset is None
+                else (
+                    f"Current offset: "
+                    f"{(recommendation.current_offset or 0.0):.6g}\n"
+                    f"Recommended offset: "
+                    f"{recommendation.recommended_offset:.6g}\n"
+                )
+            )
+            message = (
+                "Applied autoscale settings.\n"
+                + f"Current scale: {recommendation.current_scale:.6g}\n"
+                + f"Recommended scale: {recommendation.recommended_scale:.6g}\n"
+                + f"Scale min: {recommendation.recommended_minimum:.6g}\n"
+                + f"Scale max: {recommendation.recommended_maximum:.6g}\n"
+                + offset_text
+                + f"Adjustment factor: {recommendation.adjustment_factor:.6g}\n"
+                + f"Points used: {recommendation.points_used}"
+            )
+            self.prefit_tab.append_log(message)
             self.update_prefit_model()
             self.statusBar().showMessage("Autoscale applied")
         except Exception as exc:
@@ -5526,15 +8046,27 @@ class SAXSMainWindow(QMainWindow):
         self,
         recommendation: PrefitScaleRecommendation,
     ) -> None:
-        self.prefit_tab.append_log(
-            "Recommended scale estimate available.\n"
-            f"Current scale: {recommendation.current_scale:.6g}\n"
-            f"Recommended scale: {recommendation.recommended_scale:.6g}\n"
-            f"Suggested range: {recommendation.recommended_minimum:.6g} "
-            f"to {recommendation.recommended_maximum:.6g}\n"
-            f"Adjustment factor: {recommendation.adjustment_factor:.6g}\n"
-            f"Points used: {recommendation.points_used}"
+        offset_text = (
+            ""
+            if recommendation.recommended_offset is None
+            else (
+                f"Current offset: "
+                f"{(recommendation.current_offset or 0.0):.6g}\n"
+                f"Recommended offset: "
+                f"{recommendation.recommended_offset:.6g}\n"
+            )
         )
+        message = (
+            "Recommended scale estimate available.\n"
+            + f"Current scale: {recommendation.current_scale:.6g}\n"
+            + f"Recommended scale: {recommendation.recommended_scale:.6g}\n"
+            + f"Suggested range: {recommendation.recommended_minimum:.6g} "
+            + f"to {recommendation.recommended_maximum:.6g}\n"
+            + offset_text
+            + f"Adjustment factor: {recommendation.adjustment_factor:.6g}\n"
+            + f"Points used: {recommendation.points_used}"
+        )
+        self.prefit_tab.append_log(message)
 
     def _maybe_append_scale_recommendation(
         self,
@@ -5571,9 +8103,20 @@ def launch_saxs_ui(
     app = QApplication.instance()
     owns_app = app is None
     if app is None:
+        prepare_saxshell_application_identity()
         app = QApplication([])
-    window = SAXSMainWindow(initial_project_dir=initial_project_dir)
-    window.show()
+    configure_saxshell_application(app)
+    splash = create_saxshell_startup_splash()
+    splash.show()
+    app.processEvents()
+    window: SAXSMainWindow | None = None
+    try:
+        window = SAXSMainWindow(initial_project_dir=initial_project_dir)
+        window.show()
+        splash.finish(window)
+    except Exception:
+        splash.close()
+        raise
     if owns_app:
         return int(app.exec())
     return 0

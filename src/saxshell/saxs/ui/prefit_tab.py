@@ -8,9 +8,10 @@ from matplotlib.backends.backend_qtagg import (
     NavigationToolbar2QT,
 )
 from matplotlib.figure import Figure
-from PySide6.QtCore import QPoint, Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QTextCursor
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QCheckBox,
     QComboBox,
     QGridLayout,
@@ -18,10 +19,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QScrollBar,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -37,6 +40,7 @@ from saxshell.saxs.prefit import (
     ClusterGeometryMetadataRow,
     PrefitEvaluation,
     PrefitParameterEntry,
+    resolve_prefit_parameter_entries,
 )
 from saxshell.saxs.prefit.cluster_geometry import (
     DEFAULT_IONIC_RADIUS_TYPE,
@@ -109,9 +113,14 @@ class TableCellComboBox(QComboBox):
 
 
 class PrefitTab(QWidget):
+    PARAMETER_VALUE_ROLE = int(Qt.ItemDataRole.UserRole)
+    PARAMETER_VARY_MEMORY_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+
     template_changed = Signal(str)
     show_deprecated_templates_changed = Signal(bool)
     autosave_toggled = Signal(bool)
+    field_interaction_requested = Signal()
+    parameter_reset_requested = Signal(str, str, str)
     update_model_requested = Signal()
     run_fit_requested = Signal()
     apply_recommended_scale_requested = Signal()
@@ -184,9 +193,12 @@ class PrefitTab(QWidget):
     CLUSTER_COL_ANISOTROPY = 9
     CLUSTER_COL_MAP_TO = 10
     CLUSTER_COL_NOTES = 11
+    PARAMETER_SCROLL_RESOLUTION = 2000
+    PARAMETER_SCROLL_LOG_DECADE_THRESHOLD = 2.0
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._console_autoscroll_enabled = True
         self._current_evaluation: PrefitEvaluation | None = None
         self._summary_text = ""
         self._base_log_text = ""
@@ -200,11 +212,16 @@ class PrefitTab(QWidget):
         )
         self._expanded_cluster_geometry_path_rows: set[int] = set()
         self._expanded_cluster_geometry_note_rows: set[int] = set()
+        self._model_only_mode = False
+        self._prefit_execution_enabled = True
+        self._updating_parameter_table = False
+        self._updating_parameter_scrollbar = False
         self._last_cluster_geometry_radii_type = DEFAULT_RADIUS_TYPE
         self._last_cluster_geometry_ionic_radius_type = (
             DEFAULT_IONIC_RADIUS_TYPE
         )
         self._build_ui()
+        self._install_field_interaction_watchers()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -271,6 +288,46 @@ class PrefitTab(QWidget):
 
         self._scroll_area.setWidget(content)
         root.addWidget(self._scroll_area)
+
+    def _install_field_interaction_watchers(self) -> None:
+        watched_widgets: list[QWidget] = []
+        for child in self.findChildren(QWidget):
+            if isinstance(
+                child,
+                (
+                    QAbstractSpinBox,
+                    QCheckBox,
+                    QComboBox,
+                    QLineEdit,
+                ),
+            ):
+                watched_widgets.append(child)
+        watched_widgets.extend(
+            [
+                self.parameter_table,
+                self.parameter_table.viewport(),
+                self.cluster_geometry_table,
+                self.cluster_geometry_table.viewport(),
+            ]
+        )
+        seen: set[int] = set()
+        for widget in watched_widgets:
+            widget_id = id(widget)
+            if widget_id in seen:
+                continue
+            seen.add(widget_id)
+            widget.installEventFilter(self)
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:
+        if isinstance(watched, QWidget) and watched.isEnabled():
+            if event.type() in (
+                QEvent.Type.KeyPress,
+                QEvent.Type.MouseButtonDblClick,
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.Wheel,
+            ):
+                self.field_interaction_requested.emit()
+        return super().eventFilter(watched, event)
 
     def _build_controls_group(self) -> QGroupBox:
         group = QGroupBox("Prefit Controls")
@@ -396,6 +453,7 @@ class PrefitTab(QWidget):
         )
         self.reset_button.clicked.connect(self.reset_requested.emit)
         run_cell = QWidget()
+        self._run_button_cell = run_cell
         run_cell_layout = QVBoxLayout(run_cell)
         run_cell_layout.setContentsMargins(0, 0, 0, 0)
         run_cell_layout.setSpacing(4)
@@ -403,20 +461,20 @@ class PrefitTab(QWidget):
         run_button_row.setContentsMargins(0, 0, 0, 0)
         run_button_row.addWidget(self.run_button)
         run_button_row.addWidget(self.prefit_help_button)
+        run_button_row.addStretch(1)
         run_cell_layout.addLayout(run_button_row)
-        run_cell_layout.addWidget(self.autosave_checkbox)
-        button_grid.addWidget(self.update_button, 0, 0)
-        button_grid.addWidget(run_cell, 0, 1)
+        self._prefit_control_button_grid = button_grid
+        button_grid.addWidget(run_cell, 0, 0)
+        button_grid.addWidget(self.autosave_checkbox, 0, 1)
         button_grid.addWidget(self.save_button, 1, 0)
         button_grid.addWidget(self.reset_button, 1, 1)
         button_grid.addWidget(self.set_best_button, 2, 0)
         button_grid.addWidget(self.reset_best_button, 2, 1)
         layout.addLayout(button_grid, 4, 0, 1, 3)
-        layout.addWidget(self.recommended_scale_button, 5, 0, 1, 3)
         return group
 
     def _build_solute_volume_fraction_group(self) -> QGroupBox:
-        group = QGroupBox("Solute Volume Fraction Estimator")
+        group = QGroupBox("Solution Scattering Estimators")
         layout = QVBoxLayout(group)
 
         header_row = QHBoxLayout()
@@ -430,8 +488,9 @@ class PrefitTab(QWidget):
         )
         header_row.addWidget(self.solute_volume_fraction_collapse_button)
         self.solute_volume_fraction_status_label = QLabel(
-            "This template does not expose a solute or solvent volume-"
-            "fraction parameter."
+            "These estimators can calculate solution volume fractions, "
+            "solvent attenuation scaling, and fluorescence background "
+            "proxies."
         )
         self.solute_volume_fraction_status_label.setWordWrap(True)
         header_row.addWidget(
@@ -440,9 +499,8 @@ class PrefitTab(QWidget):
         self.solute_volume_fraction_help_button = QToolButton()
         self.solute_volume_fraction_help_button.setText("?")
         self.solute_volume_fraction_help_button.setToolTip(
-            "How the solution-based solute volume fraction estimate is "
-            "defined. Click for the additive-volume formula and citation "
-            "link."
+            "How the solution-scattering estimators are defined. Click for "
+            "the volume-fraction, attenuation, and fluorescence summary."
         )
         self.solute_volume_fraction_help_button.clicked.connect(
             self._show_solute_volume_fraction_help
@@ -476,6 +534,13 @@ class PrefitTab(QWidget):
         self.show_solvent_trace_checkbox.toggled.connect(
             self._redraw_current_plot
         )
+        self.show_structure_factor_trace_checkbox = QCheckBox(
+            "Structure factor"
+        )
+        self.show_structure_factor_trace_checkbox.setChecked(False)
+        self.show_structure_factor_trace_checkbox.toggled.connect(
+            self._redraw_current_plot
+        )
         self.log_x_checkbox = QCheckBox("Log X")
         self.log_x_checkbox.setChecked(True)
         self.log_x_checkbox.toggled.connect(self._redraw_current_plot)
@@ -489,6 +554,7 @@ class PrefitTab(QWidget):
         controls.addWidget(self.show_experimental_trace_checkbox)
         controls.addWidget(self.show_model_trace_checkbox)
         controls.addWidget(self.show_solvent_trace_checkbox)
+        controls.addWidget(self.show_structure_factor_trace_checkbox)
         controls.addWidget(self.log_x_checkbox)
         controls.addWidget(self.log_y_checkbox)
         controls.addWidget(self.save_plot_data_button)
@@ -507,9 +573,84 @@ class PrefitTab(QWidget):
     def _build_parameter_group(self) -> QGroupBox:
         group = QGroupBox("Parameters")
         layout = QVBoxLayout(group)
-        self.parameter_table = QTableWidget(0, 7)
+        action_row = QHBoxLayout()
+        self._parameter_action_layout = action_row
+        action_row.addWidget(self.recommended_scale_button)
+        action_row.addWidget(self.update_button)
+        self.auto_update_checkbox = QCheckBox(
+            "Auto-update on parameter change"
+        )
+        self.auto_update_checkbox.setChecked(False)
+        self.auto_update_checkbox.setToolTip(
+            "Automatically refresh the SAXS model preview when a parameter "
+            "value in the table changes."
+        )
+        self.auto_update_checkbox.toggled.connect(
+            self._on_auto_update_checkbox_toggled
+        )
+        action_row.addWidget(self.auto_update_checkbox)
+        self.scrollable_parameter_checkbox = QCheckBox("Scrollable parameter")
+        self.scrollable_parameter_checkbox.setChecked(False)
+        self.scrollable_parameter_checkbox.setEnabled(False)
+        self.scrollable_parameter_checkbox.setToolTip(
+            "Show a scrollbar for the selected parameter and update the "
+            "model as you scrub through the allowed range."
+        )
+        self.scrollable_parameter_checkbox.toggled.connect(
+            self._on_scrollable_parameter_toggled
+        )
+        action_row.addWidget(self.scrollable_parameter_checkbox)
+        action_row.addStretch(1)
+        layout.addLayout(action_row)
+        self.parameter_scroll_panel = QWidget()
+        self.parameter_scroll_panel.setVisible(False)
+        scroll_panel_layout = QVBoxLayout(self.parameter_scroll_panel)
+        scroll_panel_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_panel_layout.setSpacing(4)
+        info_row = QHBoxLayout()
+        info_row.setContentsMargins(0, 0, 0, 0)
+        self.parameter_scroll_name_label = QLabel(
+            "Select a parameter row to scrub its value."
+        )
+        self.parameter_scroll_name_label.setWordWrap(True)
+        info_row.addWidget(self.parameter_scroll_name_label, stretch=1)
+        self.parameter_scroll_mode_label = QLabel("")
+        info_row.addWidget(self.parameter_scroll_mode_label)
+        self.parameter_scroll_value_label = QLabel("")
+        info_row.addWidget(self.parameter_scroll_value_label)
+        scroll_panel_layout.addLayout(info_row)
+        self.parameter_scroll_bar = QScrollBar(Qt.Orientation.Horizontal)
+        self.parameter_scroll_bar.setRange(
+            0,
+            self.PARAMETER_SCROLL_RESOLUTION,
+        )
+        self.parameter_scroll_bar.setSingleStep(1)
+        self.parameter_scroll_bar.setPageStep(
+            max(self.PARAMETER_SCROLL_RESOLUTION // 20, 1)
+        )
+        self.parameter_scroll_bar.valueChanged.connect(
+            self._on_parameter_scrollbar_value_changed
+        )
+        scroll_panel_layout.addWidget(self.parameter_scroll_bar)
+        layout.addWidget(self.parameter_scroll_panel)
+        self.parameter_table = QTableWidget(0, 8)
         self.parameter_table.setHorizontalHeaderLabels(
-            ["Structure", "Motif", "Param", "Value", "Vary", "Min", "Max"]
+            [
+                "Structure",
+                "Motif",
+                "Param",
+                "Value",
+                "Vary",
+                "Min",
+                "Max",
+                "Reset",
+            ]
+        )
+        self.parameter_table.itemChanged.connect(
+            self._on_parameter_table_item_changed
+        )
+        self.parameter_table.currentCellChanged.connect(
+            self._on_parameter_table_current_cell_changed
         )
         header = self.parameter_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
@@ -681,6 +822,15 @@ class PrefitTab(QWidget):
         self.autosave_checkbox.setChecked(enabled)
         self.autosave_checkbox.blockSignals(False)
 
+    def set_model_only_mode(self, enabled: bool) -> None:
+        self._model_only_mode = bool(enabled)
+        self._update_prefit_execution_control_state()
+        self._update_plot_group_title()
+
+    def set_prefit_execution_enabled(self, enabled: bool) -> None:
+        self._prefit_execution_enabled = bool(enabled)
+        self._update_prefit_execution_control_state()
+
     def set_run_config(self, *, method: str, max_nfev: int) -> None:
         method_index = self.method_combo.findText(method)
         if method_index >= 0:
@@ -703,7 +853,13 @@ class PrefitTab(QWidget):
         if self.saved_state_combo.currentIndex() < 0 and state_names:
             self.saved_state_combo.setCurrentIndex(0)
         self.saved_state_combo.blockSignals(False)
-        self.restore_state_button.setEnabled(bool(state_names))
+        has_states = bool(state_names)
+        self.saved_state_combo.setEnabled(
+            has_states and self._prefit_execution_enabled
+        )
+        self.restore_state_button.setEnabled(
+            has_states and self._prefit_execution_enabled
+        )
 
     def selected_saved_state_name(self) -> str | None:
         text = self.saved_state_combo.currentText().strip()
@@ -713,41 +869,62 @@ class PrefitTab(QWidget):
         self,
         entries: list[PrefitParameterEntry],
     ) -> None:
-        self.parameter_table.setRowCount(len(entries))
-        for row, entry in enumerate(entries):
-            self.parameter_table.setItem(
-                row, 0, QTableWidgetItem(entry.structure)
-            )
-            self.parameter_table.setItem(row, 1, QTableWidgetItem(entry.motif))
-            self.parameter_table.setItem(row, 2, QTableWidgetItem(entry.name))
-            self.parameter_table.setItem(
-                row,
-                3,
-                QTableWidgetItem(f"{entry.value:.6g}"),
-            )
-            vary_item = QTableWidgetItem()
-            vary_item.setFlags(
-                Qt.ItemFlag.ItemIsSelectable
-                | Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsUserCheckable
-            )
-            vary_item.setCheckState(
-                Qt.CheckState.Checked
-                if entry.vary
-                else Qt.CheckState.Unchecked
-            )
-            self.parameter_table.setItem(row, 4, vary_item)
-            self.parameter_table.setItem(
-                row,
-                5,
-                QTableWidgetItem(f"{entry.minimum:.6g}"),
-            )
-            self.parameter_table.setItem(
-                row,
-                6,
-                QTableWidgetItem(f"{entry.maximum:.6g}"),
-            )
+        self._updating_parameter_table = True
+        self.parameter_table.blockSignals(True)
+        try:
+            self.parameter_table.setColumnCount(8)
+            self.parameter_table.setRowCount(len(entries))
+            for row, entry in enumerate(entries):
+                self.parameter_table.setItem(
+                    row, 0, QTableWidgetItem(entry.structure)
+                )
+                self.parameter_table.setItem(
+                    row, 1, QTableWidgetItem(entry.motif)
+                )
+                self.parameter_table.setItem(
+                    row, 2, QTableWidgetItem(entry.name)
+                )
+                vary_item = QTableWidgetItem()
+                vary_item.setCheckState(
+                    Qt.CheckState.Checked
+                    if entry.vary
+                    else Qt.CheckState.Unchecked
+                )
+                self.parameter_table.setItem(row, 4, vary_item)
+                self._set_parameter_value_item(
+                    row,
+                    value=float(entry.value),
+                    value_expression=entry.value_expression,
+                    initial_value_expression=entry.initial_value_expression,
+                )
+                self.parameter_table.setItem(
+                    row,
+                    5,
+                    QTableWidgetItem(f"{entry.minimum:.6g}"),
+                )
+                self.parameter_table.setItem(
+                    row,
+                    6,
+                    QTableWidgetItem(f"{entry.maximum:.6g}"),
+                )
+                reset_button = QPushButton("Reset")
+                reset_button.setToolTip(
+                    "Reset this parameter to the template-default prefit "
+                    "value, vary setting, and bounds."
+                )
+                reset_button.clicked.connect(
+                    lambda _checked=False, structure=entry.structure, motif=entry.motif, name=entry.name: self.parameter_reset_requested.emit(
+                        structure,
+                        motif,
+                        name,
+                    )
+                )
+                self.parameter_table.setCellWidget(row, 7, reset_button)
+        finally:
+            self.parameter_table.blockSignals(False)
+            self._updating_parameter_table = False
         self.parameter_table.resizeRowsToContents()
+        self._refresh_parameter_scroll_panel()
 
     def set_cluster_geometry_visible(self, visible: bool) -> None:
         self._cluster_geometry_group.setVisible(bool(visible))
@@ -762,26 +939,41 @@ class PrefitTab(QWidget):
         self,
         parameter_name: str | None,
         fraction_kind: str | None,
+        solvent_weight_parameter: str | None = None,
     ) -> None:
+        target_messages: list[str] = []
         if parameter_name and fraction_kind:
             target_label = (
                 "solute"
                 if str(fraction_kind).strip() == "solute"
                 else "solvent"
             )
+            target_messages.append(
+                f"{target_label} SAXS-effective interaction fraction -> {parameter_name}"
+            )
+        if solvent_weight_parameter:
+            if parameter_name and fraction_kind:
+                target_messages.append(
+                    f"attenuation solvent scale -> {solvent_weight_parameter}"
+                )
+            else:
+                target_messages.append(
+                    "combined solvent background multiplier -> "
+                    f"{solvent_weight_parameter}"
+                )
+        if target_messages:
             self.solute_volume_fraction_status_label.setText(
-                "Estimate the physical "
-                f"{target_label} volume fraction and apply it to "
-                f"{parameter_name}."
+                "Automatic Prefit targets: " + "; ".join(target_messages) + "."
             )
         else:
             self.solute_volume_fraction_status_label.setText(
-                "This template does not expose a solute or solvent "
-                "volume-fraction parameter."
+                "These estimators are available for diagnostics, but the "
+                "active template does not expose an automatic Prefit target."
             )
         self.solute_volume_fraction_widget.set_target_parameter(
             parameter_name,
             fraction_kind,
+            solvent_weight_parameter,
         )
 
     def solute_volume_fraction_is_collapsed(self) -> bool:
@@ -981,16 +1173,35 @@ class PrefitTab(QWidget):
     def parameter_entries(self) -> list[PrefitParameterEntry]:
         entries: list[PrefitParameterEntry] = []
         for row in range(self.parameter_table.rowCount()):
+            value_text = self._item_text(row, 3)
+            value_expression: str | None = None
+            initial_value_expression: str | None = None
+            vary = (
+                self.parameter_table.item(row, 4).checkState()
+                == Qt.CheckState.Checked
+            )
+            try:
+                value = float(value_text)
+            except (TypeError, ValueError):
+                if not value_text:
+                    raise ValueError(
+                        "Each prefit parameter requires a numeric value or "
+                        "a linked-parameter expression."
+                    )
+                if vary:
+                    initial_value_expression = value_text
+                else:
+                    value_expression = value_text
+                value = self._parameter_item_numeric_value(
+                    self.parameter_table.item(row, 3)
+                )
             entries.append(
                 PrefitParameterEntry(
                     structure=self._item_text(row, 0),
                     motif=self._item_text(row, 1),
                     name=self._item_text(row, 2),
-                    value=float(self._item_text(row, 3)),
-                    vary=(
-                        self.parameter_table.item(row, 4).checkState()
-                        == Qt.CheckState.Checked
-                    ),
+                    value=value,
+                    vary=vary,
                     minimum=float(self._item_text(row, 5)),
                     maximum=float(self._item_text(row, 6)),
                     category=(
@@ -998,9 +1209,25 @@ class PrefitTab(QWidget):
                         if self._item_text(row, 2).startswith("w")
                         else "fit"
                     ),
+                    value_expression=value_expression,
+                    initial_value_expression=initial_value_expression,
                 )
             )
-        return entries
+        resolved_entries = resolve_prefit_parameter_entries(entries)
+        self._updating_parameter_table = True
+        self.parameter_table.blockSignals(True)
+        try:
+            for row, entry in enumerate(resolved_entries):
+                value_item = self.parameter_table.item(row, 3)
+                if value_item is not None:
+                    value_item.setData(
+                        self.PARAMETER_VALUE_ROLE,
+                        float(entry.value),
+                    )
+        finally:
+            self.parameter_table.blockSignals(False)
+            self._updating_parameter_table = False
+        return resolved_entries
 
     def find_parameter_row(self, parameter_name: str) -> int:
         for row in range(self.parameter_table.rowCount()):
@@ -1008,42 +1235,351 @@ class PrefitTab(QWidget):
                 return row
         return -1
 
+    def find_parameter_row_by_signature(
+        self,
+        structure: str,
+        motif: str,
+        parameter_name: str,
+    ) -> int:
+        for row in range(self.parameter_table.rowCount()):
+            if (
+                self._item_text(row, 0) == structure
+                and self._item_text(row, 1) == motif
+                and self._item_text(row, 2) == parameter_name
+            ):
+                return row
+        return -1
+
     def set_parameter_row(
         self,
         parameter_name: str,
         *,
+        structure: str | None = None,
+        motif: str | None = None,
         value: float | None = None,
         minimum: float | None = None,
         maximum: float | None = None,
         vary: bool | None = None,
     ) -> None:
-        row = self.find_parameter_row(parameter_name)
+        row = (
+            self.find_parameter_row_by_signature(
+                structure,
+                motif,
+                parameter_name,
+            )
+            if structure is not None and motif is not None
+            else self.find_parameter_row(parameter_name)
+        )
         if row < 0:
             raise ValueError(f"Parameter {parameter_name} was not found.")
-        if value is not None:
-            self.parameter_table.setItem(
-                row,
-                3,
-                QTableWidgetItem(f"{float(value):.6g}"),
-            )
-        if vary is not None:
-            vary_item = self.parameter_table.item(row, 4)
-            if vary_item is not None:
-                vary_item.setCheckState(
-                    Qt.CheckState.Checked if vary else Qt.CheckState.Unchecked
+        self._updating_parameter_table = True
+        self.parameter_table.blockSignals(True)
+        try:
+            if value is not None:
+                self._set_parameter_value_item(
+                    row,
+                    value=float(value),
+                    value_expression=None,
+                    initial_value_expression=None,
                 )
-        if minimum is not None:
-            self.parameter_table.setItem(
-                row,
-                5,
-                QTableWidgetItem(f"{float(minimum):.6g}"),
+            if vary is not None:
+                vary_item = self.parameter_table.item(row, 4)
+                if vary_item is not None:
+                    vary_item.setCheckState(
+                        Qt.CheckState.Checked
+                        if vary
+                        else Qt.CheckState.Unchecked
+                    )
+            if minimum is not None:
+                self.parameter_table.setItem(
+                    row,
+                    5,
+                    QTableWidgetItem(f"{float(minimum):.6g}"),
+                )
+            if maximum is not None:
+                self.parameter_table.setItem(
+                    row,
+                    6,
+                    QTableWidgetItem(f"{float(maximum):.6g}"),
+                )
+        finally:
+            self.parameter_table.blockSignals(False)
+            self._updating_parameter_table = False
+        self._refresh_parameter_scroll_panel()
+
+    def auto_update_on_parameter_change(self) -> bool:
+        return bool(self.auto_update_checkbox.isChecked())
+
+    def scrollable_parameter_enabled(self) -> bool:
+        return bool(self.scrollable_parameter_checkbox.isChecked())
+
+    def _on_parameter_table_item_changed(
+        self,
+        item: QTableWidgetItem,
+    ) -> None:
+        if item.column() in {3, 4}:
+            self._sync_parameter_row_link_state(item.row())
+        if not self._updating_parameter_table and item.column() in {3, 4}:
+            try:
+                self.parameter_entries()
+            except Exception:
+                pass
+        self._refresh_parameter_scroll_panel()
+        if self._updating_parameter_table or item.column() != 3:
+            return
+        if not self.auto_update_on_parameter_change():
+            return
+        try:
+            self.parameter_entries()
+        except Exception:
+            return
+        self.update_model_requested.emit()
+
+    def _on_auto_update_checkbox_toggled(self, enabled: bool) -> None:
+        self.scrollable_parameter_checkbox.setEnabled(bool(enabled))
+        if enabled:
+            self._refresh_parameter_scroll_panel()
+            return
+        self.scrollable_parameter_checkbox.blockSignals(True)
+        self.scrollable_parameter_checkbox.setChecked(False)
+        self.scrollable_parameter_checkbox.blockSignals(False)
+        self._refresh_parameter_scroll_panel()
+
+    def _on_scrollable_parameter_toggled(self, enabled: bool) -> None:
+        if enabled and not self.auto_update_on_parameter_change():
+            self.scrollable_parameter_checkbox.blockSignals(True)
+            self.scrollable_parameter_checkbox.setChecked(False)
+            self.scrollable_parameter_checkbox.blockSignals(False)
+        self._refresh_parameter_scroll_panel()
+
+    def _on_parameter_table_current_cell_changed(
+        self,
+        current_row: int,
+        current_column: int,
+        previous_row: int,
+        previous_column: int,
+    ) -> None:
+        del current_column, previous_row, previous_column
+        if current_row < 0:
+            return
+        self._refresh_parameter_scroll_panel()
+
+    def _refresh_parameter_scroll_panel(self) -> None:
+        if (
+            not self.auto_update_on_parameter_change()
+            or not self.scrollable_parameter_enabled()
+        ):
+            self.parameter_scroll_panel.setVisible(False)
+            return
+        row = self.parameter_table.currentRow()
+        if row < 0:
+            self.parameter_scroll_panel.setVisible(False)
+            return
+        parameter_name = self._item_text(row, 2)
+        value_item = self.parameter_table.item(row, 3)
+        value_text = self._item_text(row, 3)
+        uses_expression = self._parameter_value_uses_expression(value_text)
+        try:
+            value = (
+                self._parameter_item_numeric_value(value_item)
+                if uses_expression
+                else float(value_text)
             )
-        if maximum is not None:
-            self.parameter_table.setItem(
-                row,
-                6,
-                QTableWidgetItem(f"{float(maximum):.6g}"),
+            minimum = float(self._item_text(row, 5))
+            maximum = float(self._item_text(row, 6))
+        except (TypeError, ValueError):
+            self.parameter_scroll_name_label.setText(
+                f"{parameter_name or 'Selected parameter'} has no numeric range."
             )
+            self.parameter_scroll_mode_label.setText("")
+            self.parameter_scroll_value_label.setText("")
+            self.parameter_scroll_bar.setEnabled(False)
+            self.parameter_scroll_panel.setVisible(True)
+            return
+        lower = min(minimum, maximum)
+        upper = max(minimum, maximum)
+        if not np.isfinite(lower) or not np.isfinite(upper) or lower == upper:
+            self.parameter_scroll_name_label.setText(
+                f"{parameter_name or 'Selected parameter'} has no usable range."
+            )
+            self.parameter_scroll_mode_label.setText("")
+            self.parameter_scroll_value_label.setText(f"Value {value:.6g}")
+            self.parameter_scroll_bar.setEnabled(False)
+            self.parameter_scroll_panel.setVisible(True)
+            return
+        scroll_mode = self._parameter_scroll_mode(lower, upper)
+        self.parameter_scroll_name_label.setText(
+            f"{parameter_name} [{lower:.6g}, {upper:.6g}]"
+        )
+        if uses_expression:
+            vary_item = self.parameter_table.item(row, 4)
+            expression_mode = (
+                "Initial expression seed"
+                if vary_item is not None
+                and vary_item.checkState() == Qt.CheckState.Checked
+                else "Dependent expression"
+            )
+            self.parameter_scroll_mode_label.setText(
+                f"{scroll_mode.capitalize()} scroll | {expression_mode}"
+            )
+        else:
+            self.parameter_scroll_mode_label.setText(
+                f"{scroll_mode.capitalize()} scroll"
+            )
+        self.parameter_scroll_value_label.setText(f"Value {value:.6g}")
+        position = self._parameter_scroll_position_for_value(
+            value,
+            lower,
+            upper,
+            scroll_mode,
+        )
+        self._updating_parameter_scrollbar = True
+        self.parameter_scroll_bar.blockSignals(True)
+        try:
+            self.parameter_scroll_bar.setEnabled(True)
+            self.parameter_scroll_bar.setValue(position)
+        finally:
+            self.parameter_scroll_bar.blockSignals(False)
+            self._updating_parameter_scrollbar = False
+        self.parameter_scroll_panel.setVisible(True)
+
+    def _on_parameter_scrollbar_value_changed(self, position: int) -> None:
+        if self._updating_parameter_scrollbar:
+            return
+        row = self.parameter_table.currentRow()
+        if row < 0:
+            return
+        try:
+            minimum = float(self._item_text(row, 5))
+            maximum = float(self._item_text(row, 6))
+        except (TypeError, ValueError):
+            return
+        lower = min(minimum, maximum)
+        upper = max(minimum, maximum)
+        if not np.isfinite(lower) or not np.isfinite(upper) or lower == upper:
+            return
+        scroll_mode = self._parameter_scroll_mode(lower, upper)
+        value = self._parameter_scroll_value_for_position(
+            position,
+            lower,
+            upper,
+            scroll_mode,
+        )
+        item = self.parameter_table.item(row, 3)
+        if item is None:
+            item = QTableWidgetItem()
+            self.parameter_table.setItem(row, 3, item)
+        formatted = f"{float(value):.6g}"
+        self.parameter_scroll_value_label.setText(f"Value {formatted}")
+        if item.text().strip() == formatted:
+            return
+        item.setText(formatted)
+
+    def _parameter_scroll_mode(
+        self,
+        minimum: float,
+        maximum: float,
+    ) -> str:
+        if minimum == 0.0 or maximum == 0.0 or minimum * maximum < 0.0:
+            return "linear"
+        decade_span = abs(
+            np.log10(abs(float(maximum))) - np.log10(abs(float(minimum)))
+        )
+        return (
+            "log"
+            if decade_span >= self.PARAMETER_SCROLL_LOG_DECADE_THRESHOLD
+            else "linear"
+        )
+
+    def _parameter_scroll_position_for_value(
+        self,
+        value: float,
+        minimum: float,
+        maximum: float,
+        scroll_mode: str,
+    ) -> int:
+        clamped_value = min(max(float(value), minimum), maximum)
+        lower = self._parameter_scroll_transform(
+            minimum,
+            minimum,
+            maximum,
+            scroll_mode,
+        )
+        upper = self._parameter_scroll_transform(
+            maximum,
+            minimum,
+            maximum,
+            scroll_mode,
+        )
+        transformed_value = self._parameter_scroll_transform(
+            clamped_value,
+            minimum,
+            maximum,
+            scroll_mode,
+        )
+        if np.isclose(upper, lower):
+            return 0
+        fraction = (transformed_value - lower) / (upper - lower)
+        fraction = float(np.clip(fraction, 0.0, 1.0))
+        return int(round(fraction * self.PARAMETER_SCROLL_RESOLUTION))
+
+    def _parameter_scroll_value_for_position(
+        self,
+        position: int,
+        minimum: float,
+        maximum: float,
+        scroll_mode: str,
+    ) -> float:
+        lower = self._parameter_scroll_transform(
+            minimum,
+            minimum,
+            maximum,
+            scroll_mode,
+        )
+        upper = self._parameter_scroll_transform(
+            maximum,
+            minimum,
+            maximum,
+            scroll_mode,
+        )
+        fraction = float(position) / float(self.PARAMETER_SCROLL_RESOLUTION)
+        fraction = float(np.clip(fraction, 0.0, 1.0))
+        transformed_value = lower + fraction * (upper - lower)
+        value = self._parameter_scroll_inverse_transform(
+            transformed_value,
+            minimum,
+            maximum,
+            scroll_mode,
+        )
+        return float(np.clip(value, minimum, maximum))
+
+    @staticmethod
+    def _parameter_scroll_transform(
+        value: float,
+        minimum: float,
+        maximum: float,
+        scroll_mode: str,
+    ) -> float:
+        numeric_value = float(value)
+        if scroll_mode != "log":
+            return numeric_value
+        if minimum < 0.0 and maximum < 0.0:
+            return -float(np.log10(-numeric_value))
+        return float(np.log10(numeric_value))
+
+    @staticmethod
+    def _parameter_scroll_inverse_transform(
+        value: float,
+        minimum: float,
+        maximum: float,
+        scroll_mode: str,
+    ) -> float:
+        numeric_value = float(value)
+        if scroll_mode != "log":
+            return numeric_value
+        if minimum < 0.0 and maximum < 0.0:
+            return -(10.0 ** (-numeric_value))
+        return 10.0**numeric_value
 
     def run_config(self) -> PrefitRunConfig:
         return PrefitRunConfig(
@@ -1062,6 +1598,7 @@ class PrefitTab(QWidget):
             axis.set_xscale("linear")
         self.figure.clear()
         self._update_prefit_trace_toggle_state(evaluation)
+        self._update_plot_group_title()
         if evaluation is None:
             axis = self.figure.add_subplot(111)
             axis.text(
@@ -1075,13 +1612,23 @@ class PrefitTab(QWidget):
             self.canvas.draw()
             return
 
-        grid = self.figure.add_gridspec(2, 1, height_ratios=[3, 1])
-        top = self.figure.add_subplot(grid[0, 0])
-        bottom = self.figure.add_subplot(grid[1, 0], sharex=top)
+        has_experimental = evaluation.experimental_intensities is not None
+        has_residuals = evaluation.residuals is not None
+        if has_experimental and has_residuals:
+            grid = self.figure.add_gridspec(2, 1, height_ratios=[3, 1])
+            top = self.figure.add_subplot(grid[0, 0])
+            bottom = self.figure.add_subplot(grid[1, 0], sharex=top)
+        else:
+            top = self.figure.add_subplot(111)
+            bottom = None
 
         plotted_lines = []
+        structure_axis = None
 
-        if self.show_experimental_trace_checkbox.isChecked():
+        if (
+            has_experimental
+            and self.show_experimental_trace_checkbox.isChecked()
+        ):
             (experimental_line,) = top.plot(
                 evaluation.q_values,
                 evaluation.experimental_intensities,
@@ -1110,6 +1657,35 @@ class PrefitTab(QWidget):
                     label="Solvent contribution",
                 )
                 plotted_lines.append(solvent_line)
+
+        if (
+            self.show_structure_factor_trace_checkbox.isChecked()
+            and evaluation.structure_factor_trace is not None
+        ):
+            structure_values = np.asarray(
+                evaluation.structure_factor_trace,
+                dtype=float,
+            )
+            structure_mask = np.isfinite(structure_values)
+            if np.any(structure_mask):
+                structure_axis = top.twinx()
+                structure_axis.set_xscale(
+                    "log" if self.log_x_checkbox.isChecked() else "linear"
+                )
+                (structure_line,) = structure_axis.plot(
+                    np.asarray(evaluation.q_values, dtype=float)[
+                        structure_mask
+                    ],
+                    structure_values[structure_mask],
+                    color="tab:purple",
+                    linestyle="--",
+                    linewidth=1.5,
+                    label="Structure factor S(q)",
+                )
+                structure_axis.set_ylabel("S(q)", color="tab:purple")
+                structure_axis.tick_params(axis="y", colors="tab:purple")
+                structure_axis.spines["right"].set_color("tab:purple")
+                plotted_lines.append(structure_line)
 
         if self.show_model_trace_checkbox.isChecked():
             (model_line,) = top.plot(
@@ -1140,17 +1716,20 @@ class PrefitTab(QWidget):
         if plotted_lines:
             self._build_interactive_legend(top, plotted_lines)
 
-        bottom.axhline(0.0, color="0.5", linewidth=1.0)
-        bottom.plot(
-            evaluation.q_values,
-            evaluation.residuals,
-            color="tab:blue",
-        )
-        bottom.set_xscale(
-            "log" if self.log_x_checkbox.isChecked() else "linear"
-        )
-        bottom.set_xlabel("q (Å⁻¹)")
-        bottom.set_ylabel("Residual")
+        if bottom is not None and evaluation.residuals is not None:
+            bottom.axhline(0.0, color="0.5", linewidth=1.0)
+            bottom.plot(
+                evaluation.q_values,
+                evaluation.residuals,
+                color="tab:blue",
+            )
+            bottom.set_xscale(
+                "log" if self.log_x_checkbox.isChecked() else "linear"
+            )
+            bottom.set_xlabel("q (Å⁻¹)")
+            bottom.set_ylabel("Residual")
+        else:
+            top.set_xlabel("q (Å⁻¹)")
         self.figure.tight_layout()
         self.canvas.draw()
 
@@ -1161,6 +1740,14 @@ class PrefitTab(QWidget):
     def _prefit_metric_lines(
         evaluation: PrefitEvaluation,
     ) -> list[str]:
+        if (
+            evaluation.experimental_intensities is None
+            or evaluation.residuals is None
+        ):
+            return [
+                "Model Only Mode",
+                "Experimental fit metrics unavailable",
+            ]
         experimental_values = np.asarray(
             evaluation.experimental_intensities,
             dtype=float,
@@ -1179,11 +1766,19 @@ class PrefitTab(QWidget):
             if total_sum_squares > 0.0
             else 1.0
         )
-        return [
+        metric_lines = [
             f"RMSE: {rmse:.4g}",
             f"Mean |res|: {mean_abs_residual:.4g}",
             f"R²: {r_squared:.4g}",
         ]
+        non_positive_model_points = int(
+            np.count_nonzero(np.isfinite(model_values) & (model_values <= 0.0))
+        )
+        if non_positive_model_points:
+            metric_lines.append(
+                f"Model <= 0 at {non_positive_model_points} q-points"
+            )
+        return metric_lines
 
     def append_log(self, message: str) -> None:
         stripped = message.strip()
@@ -1199,24 +1794,161 @@ class PrefitTab(QWidget):
         self._summary_text = text.strip()
         self._render_output()
 
+    def set_console_autoscroll_enabled(self, enabled: bool) -> None:
+        self._console_autoscroll_enabled = bool(enabled)
+        if self._console_autoscroll_enabled:
+            self._scroll_output_to_end()
+
     def _item_text(self, row: int, column: int) -> str:
         item = self.parameter_table.item(row, column)
         return item.text().strip() if item is not None else ""
 
+    def _parameter_item_numeric_value(
+        self,
+        item: QTableWidgetItem | None,
+    ) -> float:
+        if item is None:
+            return 0.0
+        raw_value = item.data(self.PARAMETER_VALUE_ROLE)
+        try:
+            return float(raw_value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _parameter_value_uses_expression(self, value_text: str) -> bool:
+        stripped = value_text.strip()
+        if not stripped:
+            return False
+        try:
+            float(stripped)
+        except (TypeError, ValueError):
+            return True
+        return False
+
+    def _set_parameter_value_item(
+        self,
+        row: int,
+        *,
+        value: float,
+        value_expression: str | None,
+        initial_value_expression: str | None,
+    ) -> None:
+        display_text = (
+            value_expression.strip()
+            if value_expression is not None and value_expression.strip()
+            else (
+                initial_value_expression.strip()
+                if initial_value_expression is not None
+                and initial_value_expression.strip()
+                else f"{float(value):.6g}"
+            )
+        )
+        value_item = QTableWidgetItem(display_text)
+        value_item.setData(self.PARAMETER_VALUE_ROLE, float(value))
+        self.parameter_table.setItem(row, 3, value_item)
+        self._sync_parameter_row_link_state(row)
+
+    def _sync_parameter_row_link_state(self, row: int) -> None:
+        if row < 0:
+            return
+        vary_item = self.parameter_table.item(row, 4)
+        value_item = self.parameter_table.item(row, 3)
+        if vary_item is None or value_item is None:
+            return
+        linked = self._parameter_value_uses_expression(self._item_text(row, 3))
+        resolved_value = self._parameter_item_numeric_value(value_item)
+        was_updating = self._updating_parameter_table
+        self._updating_parameter_table = True
+        self.parameter_table.blockSignals(True)
+        try:
+            vary_item.setFlags(
+                Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            if not linked:
+                vary_item.setToolTip(
+                    "Enable to vary this parameter during fitting."
+                )
+                value_item.setToolTip("")
+                return
+            if vary_item.checkState() == Qt.CheckState.Checked:
+                vary_item.setToolTip(
+                    "Artemis-style guess behavior: with Vary enabled, the "
+                    "Value expression is evaluated into the starting numeric "
+                    "value and the parameter may still refine within Min/Max."
+                )
+                value_item.setToolTip(
+                    "Initial expression seed. With Vary enabled, the Value "
+                    "expression resolves to the current numeric value "
+                    f"({resolved_value:.6g}) before fitting, but the "
+                    "parameter then varies independently."
+                )
+                return
+            vary_item.setToolTip(
+                "Artemis-style def behavior: with Vary disabled, the Value "
+                "expression is treated as a live dependent parameter and its "
+                "Min/Max are ignored during fitting."
+            )
+            value_item.setToolTip(
+                "Dependent expression. With Vary disabled, this parameter "
+                "follows the expression entered in the Value column. Current "
+                f"resolved value: {resolved_value:.6g}."
+            )
+        finally:
+            self.parameter_table.blockSignals(False)
+            self._updating_parameter_table = was_updating
+
     def _redraw_current_plot(self) -> None:
         self.plot_evaluation(self._current_evaluation)
+
+    def _update_prefit_execution_control_state(self) -> None:
+        enabled = bool(self._prefit_execution_enabled)
+        self.method_combo.setEnabled(enabled)
+        self.nfev_spin.setEnabled(enabled)
+        self.saved_state_combo.setEnabled(
+            enabled and self.saved_state_combo.count() > 0
+        )
+        self.restore_state_button.setEnabled(
+            enabled and self.saved_state_combo.count() > 0
+        )
+        self.run_button.setEnabled(enabled)
+        self.recommended_scale_button.setEnabled(enabled)
+        self.autosave_checkbox.setEnabled(enabled)
+        self.save_button.setEnabled(enabled)
+
+    def _update_plot_group_title(self) -> None:
+        has_experimental = (
+            self._current_evaluation is not None
+            and self._current_evaluation.experimental_intensities is not None
+        )
+        if self._model_only_mode or not has_experimental:
+            self._plot_group.setTitle("Model Preview")
+            return
+        self._plot_group.setTitle("Model vs Experimental")
 
     def _update_prefit_trace_toggle_state(
         self,
         evaluation: PrefitEvaluation | None,
     ) -> None:
         has_evaluation = evaluation is not None
+        has_experimental = (
+            has_evaluation and evaluation.experimental_intensities is not None
+        )
         has_solvent = (
             has_evaluation and evaluation.solvent_contribution is not None
         )
-        self.show_experimental_trace_checkbox.setEnabled(has_evaluation)
+        has_structure_factor = (
+            has_evaluation and evaluation.structure_factor_trace is not None
+        )
+        self.show_experimental_trace_checkbox.setEnabled(
+            bool(has_experimental)
+        )
         self.show_model_trace_checkbox.setEnabled(has_evaluation)
         self.show_solvent_trace_checkbox.setEnabled(bool(has_solvent))
+        self.show_structure_factor_trace_checkbox.setEnabled(
+            bool(has_structure_factor)
+        )
 
     def _on_cluster_geometry_mapping_changed(
         self,
@@ -1794,7 +2526,7 @@ class PrefitTab(QWidget):
         self.cluster_geometry_progress_bar.setFormat("%v / %m files")
 
     def _build_interactive_legend(self, axis, lines: list[object]) -> None:
-        legend = axis.legend()
+        legend = axis.legend(handles=lines, loc="best")
         if legend is None:
             return
         legend_handles = getattr(legend, "legend_handles", None)
@@ -1847,6 +2579,7 @@ class PrefitTab(QWidget):
         self._update_template_tooltip()
 
     def _render_output(self, *, scroll_to_end: bool = False) -> None:
+        del scroll_to_end
         sections: list[str] = []
         if self._summary_text:
             sections.append("Prefit Summary\n" + self._summary_text)
@@ -1857,10 +2590,39 @@ class PrefitTab(QWidget):
         ]
         if history_parts:
             sections.append("Prefit Console\n" + "\n\n".join(history_parts))
+        scrollbar = self.output_box.verticalScrollBar()
+        previous_value = scrollbar.value()
+        previous_maximum = max(scrollbar.maximum(), 1)
         self.output_box.setPlainText("\n\n".join(sections).strip())
-        if scroll_to_end:
-            scrollbar = self.output_box.verticalScrollBar()
-            scrollbar.setValue(scrollbar.maximum())
+        if self._console_autoscroll_enabled:
+            self._scroll_output_to_end()
+            return
+        updated_scrollbar = self.output_box.verticalScrollBar()
+        if updated_scrollbar.maximum() > 0:
+            position_fraction = previous_value / previous_maximum
+            updated_scrollbar.setValue(
+                int(round(position_fraction * updated_scrollbar.maximum()))
+            )
+
+    def _scroll_output_to_end(self) -> None:
+        cursor = self.output_box.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.output_box.setTextCursor(cursor)
+        self.output_box.ensureCursorVisible()
+        scrollbar = self.output_box.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        QTimer.singleShot(
+            0,
+            self._scroll_output_to_end_once,
+        )
+
+    def _scroll_output_to_end_once(self) -> None:
+        cursor = self.output_box.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.output_box.setTextCursor(cursor)
+        self.output_box.ensureCursorVisible()
+        scrollbar = self.output_box.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def _show_ionic_radius_help(self) -> None:
         QMessageBox.information(
@@ -1872,7 +2634,7 @@ class PrefitTab(QWidget):
     def _show_solute_volume_fraction_help(self) -> None:
         QMessageBox.information(
             self,
-            "Solute Volume Fraction Estimate Help",
+            "Solution Scattering Estimate Help",
             self.SOLUTE_VOLUME_FRACTION_HELP_TEXT,
         )
 

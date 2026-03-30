@@ -201,9 +201,148 @@ class DreamBestFitSelection:
 
 
 @dataclass(slots=True)
+class PowerPointExportSettings:
+    font_family: str = "Arial"
+    component_color_map: str = "viridis"
+    prior_histogram_color_map: str = "viridis"
+    solvent_sort_histogram_color_map: str = "summer"
+    text_color: str = "#1f2933"
+    experimental_trace_color: str = "#111827"
+    model_trace_color: str = "#86d549"
+    residual_trace_color: str = "#375a8c"
+    solvent_trace_color: str = "#20a386"
+    structure_factor_color: str = "#e5e419"
+    table_header_fill: str = "#E5E7EB"
+    table_even_row_fill: str = "#FFFFFF"
+    table_odd_row_fill: str = "#F3F4F6"
+    table_rule_color: str = "#4B5563"
+    include_prior_histograms: bool = True
+    include_initial_traces: bool = True
+    include_prefit_model: bool = True
+    include_prefit_parameters: bool = True
+    include_geometry_table: bool = True
+    include_estimator_metrics: bool = True
+    include_dream_settings: bool = True
+    include_dream_prior_table: bool = True
+    include_dream_output_model: bool = True
+    include_posterior_comparisons: bool = True
+    include_output_summary: bool = True
+    include_directory_summary: bool = True
+    generate_manifest: bool = True
+    export_figure_assets: bool = True
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "PowerPointExportSettings":
+        if not isinstance(payload, dict):
+            return cls()
+        return cls(
+            font_family=_normalized_nonempty_text(
+                payload.get("font_family"),
+                default="Arial",
+            ),
+            component_color_map=_normalized_nonempty_text(
+                payload.get("component_color_map"),
+                default="viridis",
+            ),
+            prior_histogram_color_map=_normalized_nonempty_text(
+                payload.get("prior_histogram_color_map"),
+                default="viridis",
+            ),
+            solvent_sort_histogram_color_map=_normalized_nonempty_text(
+                payload.get("solvent_sort_histogram_color_map"),
+                default="summer",
+            ),
+            text_color=_normalized_hex_color(
+                payload.get("text_color"),
+                default="#1f2933",
+            ),
+            experimental_trace_color=_normalized_hex_color(
+                payload.get("experimental_trace_color"),
+                default="#111827",
+            ),
+            model_trace_color=_normalized_hex_color(
+                payload.get("model_trace_color"),
+                default="#86d549",
+            ),
+            residual_trace_color=_normalized_hex_color(
+                payload.get("residual_trace_color"),
+                default="#375a8c",
+            ),
+            solvent_trace_color=_normalized_hex_color(
+                payload.get("solvent_trace_color"),
+                default="#20a386",
+            ),
+            structure_factor_color=_normalized_hex_color(
+                payload.get("structure_factor_color"),
+                default="#e5e419",
+            ),
+            table_header_fill=_normalized_hex_color(
+                payload.get("table_header_fill"),
+                default="#E5E7EB",
+            ),
+            table_even_row_fill=_normalized_hex_color(
+                payload.get("table_even_row_fill"),
+                default="#FFFFFF",
+            ),
+            table_odd_row_fill=_normalized_hex_color(
+                payload.get("table_odd_row_fill"),
+                default="#F3F4F6",
+            ),
+            table_rule_color=_normalized_hex_color(
+                payload.get("table_rule_color"),
+                default="#4B5563",
+            ),
+            include_prior_histograms=bool(
+                payload.get("include_prior_histograms", True)
+            ),
+            include_initial_traces=bool(
+                payload.get("include_initial_traces", True)
+            ),
+            include_prefit_model=bool(
+                payload.get("include_prefit_model", True)
+            ),
+            include_prefit_parameters=bool(
+                payload.get("include_prefit_parameters", True)
+            ),
+            include_geometry_table=bool(
+                payload.get("include_geometry_table", True)
+            ),
+            include_estimator_metrics=bool(
+                payload.get("include_estimator_metrics", True)
+            ),
+            include_dream_settings=bool(
+                payload.get("include_dream_settings", True)
+            ),
+            include_dream_prior_table=bool(
+                payload.get("include_dream_prior_table", True)
+            ),
+            include_dream_output_model=bool(
+                payload.get("include_dream_output_model", True)
+            ),
+            include_posterior_comparisons=bool(
+                payload.get("include_posterior_comparisons", True)
+            ),
+            include_output_summary=bool(
+                payload.get("include_output_summary", True)
+            ),
+            include_directory_summary=bool(
+                payload.get("include_directory_summary", True)
+            ),
+            generate_manifest=bool(payload.get("generate_manifest", True)),
+            export_figure_assets=bool(
+                payload.get("export_figure_assets", True)
+            ),
+        )
+
+
+@dataclass(slots=True)
 class ProjectSettings:
     project_name: str
     project_dir: str
+    model_only_mode: bool = False
     clusters_dir: str | None = None
     experimental_data_path: str | None = None
     copied_experimental_data_file: str | None = None
@@ -248,6 +387,9 @@ class ProjectSettings:
     )
     selected_model_template: str | None = None
     autosave_prefits: bool = False
+    powerpoint_export_settings: PowerPointExportSettings = field(
+        default_factory=PowerPointExportSettings
+    )
 
     @property
     def resolved_project_dir(self) -> Path:
@@ -322,6 +464,9 @@ class ProjectSettings:
         payload["dream_favorite_history"] = [
             entry.to_dict() for entry in self.dream_favorite_history
         ]
+        payload["powerpoint_export_settings"] = (
+            self.powerpoint_export_settings.to_dict()
+        )
         return payload
 
     @classmethod
@@ -329,6 +474,7 @@ class ProjectSettings:
         return cls(
             project_name=str(payload.get("project_name", "SAXS Project")),
             project_dir=str(payload.get("project_dir", "")),
+            model_only_mode=bool(payload.get("model_only_mode", False)),
             clusters_dir=_optional_str(payload.get("clusters_dir")),
             experimental_data_path=_optional_str(
                 payload.get("experimental_data_path")
@@ -431,6 +577,9 @@ class ProjectSettings:
                 payload.get("selected_model_template")
             ),
             autosave_prefits=bool(payload.get("autosave_prefits", False)),
+            powerpoint_export_settings=PowerPointExportSettings.from_dict(
+                payload.get("powerpoint_export_settings", {})
+            ),
         )
 
 
@@ -451,6 +600,20 @@ def _optional_int(value: object) -> int | None:
     if value in (None, ""):
         return None
     return int(value)
+
+
+def _normalized_nonempty_text(value: object, *, default: str) -> str:
+    text = _optional_str(value)
+    return text if text is not None else default
+
+
+def _normalized_hex_color(value: object, *, default: str) -> str:
+    text = _optional_str(value)
+    if text is None:
+        return default
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", text):
+        return text.upper()
+    return default
 
 
 def _normalized_elements(values: object) -> list[str]:
@@ -718,9 +881,12 @@ class SAXSProjectManager:
     ) -> ProjectBuildResult:
         paths = build_project_paths(settings.project_dir)
         self.ensure_project_dirs(paths)
-        staged_data_path = self.stage_experimental_data(settings)
-        self.stage_solvent_data(settings)
-        experimental_data = self.load_experimental_data(settings)
+        staged_data_path: Path | None = None
+        experimental_data: ExperimentalDataSummary | None = None
+        if not settings.model_only_mode:
+            staged_data_path = self.stage_experimental_data(settings)
+            self.stage_solvent_data(settings)
+            experimental_data = self.load_experimental_data(settings)
         q_values = self._build_q_grid(settings, experimental_data)
         builder = DebyeProfileBuilder(
             q_values=q_values,
@@ -776,9 +942,12 @@ class SAXSProjectManager:
     ) -> ProjectBuildResult:
         paths = build_project_paths(settings.project_dir)
         self.ensure_project_dirs(paths)
-        staged_data_path = self.stage_experimental_data(settings)
-        self.stage_solvent_data(settings)
-        experimental_data = self.load_experimental_data(settings)
+        staged_data_path: Path | None = None
+        experimental_data: ExperimentalDataSummary | None = None
+        if not settings.model_only_mode:
+            staged_data_path = self.stage_experimental_data(settings)
+            self.stage_solvent_data(settings)
+            experimental_data = self.load_experimental_data(settings)
         q_values = self._build_q_grid(settings, experimental_data)
         clusters_dir = settings.resolved_clusters_dir
         if clusters_dir is None:
@@ -893,8 +1062,11 @@ class SAXSProjectManager:
     def _build_q_grid(
         self,
         settings: ProjectSettings,
-        experimental_data: ExperimentalDataSummary,
+        experimental_data: ExperimentalDataSummary | None,
     ) -> np.ndarray:
+        if experimental_data is None:
+            return self._build_model_only_q_grid(settings)
+
         q_values = experimental_data.q_values
         q_min = (
             settings.q_min
@@ -929,6 +1101,43 @@ class SAXSProjectManager:
                 settings.q_points,
             )
         return filtered_q
+
+    def _build_model_only_q_grid(
+        self,
+        settings: ProjectSettings,
+    ) -> np.ndarray:
+        supported_range = load_built_component_q_range(settings.project_dir)
+        q_min = (
+            float(settings.q_min)
+            if settings.q_min is not None
+            else (
+                float(supported_range[0])
+                if supported_range is not None
+                else None
+            )
+        )
+        q_max = (
+            float(settings.q_max)
+            if settings.q_max is not None
+            else (
+                float(supported_range[1])
+                if supported_range is not None
+                else None
+            )
+        )
+        if q_min is None or q_max is None:
+            raise ValueError(
+                "Model Only Mode requires q min and q max before SAXS "
+                "components or prior weights can be generated."
+            )
+        if q_min > q_max:
+            raise ValueError("q min must be less than or equal to q max.")
+        q_points = (
+            int(settings.q_points)
+            if settings.q_points is not None and settings.q_points > 1
+            else 500
+        )
+        return np.linspace(q_min, q_max, q_points)
 
     def _component_entries_from_clusters(
         self,

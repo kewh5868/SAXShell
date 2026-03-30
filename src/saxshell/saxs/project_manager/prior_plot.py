@@ -24,12 +24,16 @@ def _natural_sort_key(value: str) -> list[object]:
     ]
 
 
-def _load_prior_payload(json_path: str | Path) -> dict[str, object]:
+def _load_prior_payload(
+    json_path: str | Path | dict[str, object],
+) -> dict[str, object]:
+    if isinstance(json_path, dict):
+        return dict(json_path)
     return json.loads(Path(json_path).read_text(encoding="utf-8"))
 
 
 def export_prior_plot_data(
-    json_path: str | Path,
+    json_path: str | Path | dict[str, object],
     output_path: str | Path,
     *,
     mode: str = "structure_fraction",
@@ -48,7 +52,7 @@ def export_prior_plot_data(
         )
         for motif in sorted(motifs, key=_natural_sort_key):
             motif_payload = motifs[motif]
-            count = int(motif_payload.get("count", 0))
+            count = float(motif_payload.get("count", 0.0) or 0.0)
             structure_fraction = count / total_files if total_files else 0.0
             atom_fraction = (
                 (count * atom_count)
@@ -60,7 +64,7 @@ def export_prior_plot_data(
                         ),
                         1,
                     )
-                    * int(other_payload.get("count", 0))
+                    * float(other_payload.get("count", 0.0) or 0.0)
                     for other_label, motif_dict in structures.items()
                     for other_payload in motif_dict.values()
                 )
@@ -102,7 +106,7 @@ def export_prior_plot_data(
 
 
 def build_prior_histogram_export_payload(
-    json_path: str | Path,
+    json_path: str | Path | dict[str, object],
     *,
     mode: str = "structure_fraction",
     value_mode: str = "percent",
@@ -132,7 +136,7 @@ def build_prior_histogram_export_payload(
     total_files = float(payload.get("total_files", 0) or 0.0)
     atom_weight_total = sum(
         max(sum(int(token) for token in re.findall(r"(\d+)", label)), 1)
-        * int(motif_payload.get("count", 0))
+        * float(motif_payload.get("count", 0.0) or 0.0)
         for label, motif_dict in structures.items()
         for motif_payload in motif_dict.values()
     )
@@ -171,8 +175,9 @@ def build_prior_histogram_export_payload(
                     int(segment),
                 )
             else:
-                count = int(
-                    structures[label].get(str(segment), {}).get("count", 0)
+                count = float(
+                    structures[label].get(str(segment), {}).get("count", 0.0)
+                    or 0.0
                 )
             if is_atom_fraction:
                 base_value = float(count * atom_count)
@@ -200,7 +205,7 @@ def build_prior_histogram_export_payload(
 
 
 def export_prior_histogram_table(
-    json_path: str | Path,
+    json_path: str | Path | dict[str, object],
     output_path: str | Path,
     *,
     mode: str = "structure_fraction",
@@ -256,7 +261,7 @@ def export_prior_histogram_table(
 
 
 def export_prior_histogram_npy(
-    json_path: str | Path,
+    json_path: str | Path | dict[str, object],
     output_path: str | Path,
     *,
     mode: str = "structure_fraction",
@@ -276,7 +281,7 @@ def export_prior_histogram_npy(
 
 
 def plot_md_prior_histogram(
-    json_path: str | Path,
+    json_path: str | Path | dict[str, object],
     *,
     mode: str = "structure_fraction",
     secondary_element: str | None = None,
@@ -399,7 +404,7 @@ def plot_md_prior_histogram(
 
 
 def list_secondary_filter_elements(
-    json_path: str | Path,
+    json_path: str | Path | dict[str, object],
 ) -> list[str]:
     payload = _load_prior_payload(json_path)
     return _payload_secondary_filter_elements(payload)
@@ -456,20 +461,20 @@ def _secondary_segment_count(
     motif_payloads: dict[str, object],
     secondary_element: str | None,
     segment_value: int,
-) -> int:
+) -> float:
     if secondary_element is None:
-        return 0
+        return 0.0
     count_key = str(int(segment_value))
-    total = 0
+    total = 0.0
     for motif_payload in motif_payloads.values():
         secondary_distributions = motif_payload.get(
             "secondary_atom_distributions",
             {},
         )
-        total += int(
+        total += float(
             secondary_distributions.get(secondary_element, {}).get(
                 count_key,
-                0,
+                0.0,
             )
         )
     return total

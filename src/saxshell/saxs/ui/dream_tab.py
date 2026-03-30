@@ -9,7 +9,7 @@ from matplotlib.backends.backend_qtagg import (
 from matplotlib.colors import to_hex
 from matplotlib.figure import Figure
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QTextOption, QValidator
+from PySide6.QtGui import QColor, QTextCursor, QTextOption, QValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QAbstractScrollArea,
@@ -120,6 +120,8 @@ class ScientificDoubleSpinBox(QDoubleSpinBox):
 class DreamTab(QWidget):
     ACTIVE_SETTINGS_LABEL = "Active project settings"
     NO_SAVED_RUNS_LABEL = "No saved DREAM runs"
+    RUNTIME_OUTPUT_FLUSH_INTERVAL_MS = 300
+    MAX_VIOLIN_PLOT_SAMPLES = 4096
 
     edit_parameter_map_requested = Signal()
     save_settings_requested = Signal()
@@ -128,26 +130,45 @@ class DreamTab(QWidget):
     run_dream_requested = Signal()
     load_results_requested = Signal()
     save_report_requested = Signal()
+    recycle_output_requested = Signal()
+    export_model_report_requested = Signal()
     save_model_fit_requested = Signal()
     save_violin_data_requested = Signal()
     settings_preset_changed = Signal(str)
     visualization_settings_changed = Signal()
+    results_settings_changed = Signal()
+    summary_settings_changed = Signal()
+    violin_data_settings_changed = Signal()
+    violin_style_settings_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._console_autoscroll_enabled = True
         self._summary_text = ""
         self._base_log_text = ""
         self._history_messages: list[str] = []
         self._live_output_history_index: int | None = None
+        self._pending_runtime_output_lines: list[str] = []
         self._applying_search_filter_preset = False
         self._current_model_plot_data: DreamModelPlotData | None = None
+        self._current_summary: DreamSummary | None = None
+        self._current_violin_plot_data: DreamViolinPlotData | None = None
         self._model_legend_line_map: dict[object, object] = {}
         self._model_legend_handle_lookup: dict[str, object] = {}
+        self._suspend_visualization_notifications = False
         self._blink_timer = QTimer(self)
         self._blink_timer.setInterval(180)
         self._blink_timer.timeout.connect(self._advance_button_blink)
         self._blink_remaining = 0
         self._blink_target_button: QPushButton | None = None
+        self._runtime_output_flush_timer = QTimer(self)
+        self._runtime_output_flush_timer.setSingleShot(True)
+        self._runtime_output_flush_timer.setInterval(
+            self.RUNTIME_OUTPUT_FLUSH_INTERVAL_MS
+        )
+        self._runtime_output_flush_timer.timeout.connect(
+            self._flush_pending_runtime_output
+        )
         self._build_ui()
         self.set_settings(DreamRunSettings(), preset_name=None)
 
@@ -521,7 +542,7 @@ class DreamTab(QWidget):
         self.bestfit_method_combo.addItem("Chain Mean MAP", "chain_mean")
         self.bestfit_method_combo.addItem("Median", "median")
         self.bestfit_method_combo.currentIndexChanged.connect(
-            lambda _index: self.visualization_settings_changed.emit()
+            self._on_bestfit_method_changed
         )
         self.violin_mode_combo = QComboBox()
         self.violin_mode_combo.addItem(
@@ -530,8 +551,16 @@ class DreamTab(QWidget):
         self.violin_mode_combo.addItem("All Parameters", "all_parameters")
         self.violin_mode_combo.addItem("Weights Only", "weights_only")
         self.violin_mode_combo.addItem("Fit Parameters", "fit_parameters")
+        self.violin_mode_combo.addItem(
+            "Effective Radii Only",
+            "effective_radii_only",
+        )
+        self.violin_mode_combo.addItem(
+            "Additional Parameters Only",
+            "additional_parameters_only",
+        )
         self.violin_mode_combo.currentIndexChanged.connect(
-            lambda _index: self.visualization_settings_changed.emit()
+            self._on_violin_mode_changed
         )
         bestfit_tip = (
             "Choose how posterior samples are reduced to one best-fit "
@@ -545,7 +574,8 @@ class DreamTab(QWidget):
         )
         violin_tip = (
             "Choose which subset of posterior parameters is shown in the "
-            "violin plot."
+            "violin plot, including weight-only, effective-radius-only, "
+            "and additional-parameter-only views."
         )
         violin_label = QLabel("Violin data")
         self._set_widget_tooltip(
@@ -563,7 +593,7 @@ class DreamTab(QWidget):
         self.weight_order_combo.addItem("Weight Index", "weight_index")
         self.weight_order_combo.addItem("Structure Order", "structure_order")
         self.weight_order_combo.currentIndexChanged.connect(
-            lambda _index: self.visualization_settings_changed.emit()
+            self._on_weight_order_changed
         )
         weight_order_tip = (
             "Choose whether weight parameters stay in their original w-index "
@@ -590,13 +620,22 @@ class DreamTab(QWidget):
         self.violin_value_scale_combo.addItem(
             "Normalized 0-1 (All)", "normalized_all"
         )
+        self.violin_value_scale_combo.addItem(
+            "Effective Radii Only",
+            "effective_radii_only",
+        )
+        self.violin_value_scale_combo.addItem(
+            "Additional Parameters Only",
+            "additional_parameters_only",
+        )
         self.violin_value_scale_combo.currentIndexChanged.connect(
-            lambda _index: self.visualization_settings_changed.emit()
+            self._on_violin_value_scale_changed
         )
         value_scale_tip = (
             "Choose whether the posterior violin plot uses native parameter "
-            "values, only the weight parameters on a 0-1 fraction scale, or "
-            "all parameters normalized independently onto a 0-1 axis."
+            "values, only the weight parameters on a 0-1 fraction scale, "
+            "all parameters normalized independently onto a 0-1 axis, or "
+            "effective-radius-only / additional-parameter-only views."
         )
         value_scale_label = QLabel("Y-axis scale")
         self._set_widget_tooltip(
@@ -747,7 +786,7 @@ class DreamTab(QWidget):
         self.violin_outline_width_spin.setSingleStep(0.1)
         self.violin_outline_width_spin.setValue(0.8)
         self.violin_outline_width_spin.valueChanged.connect(
-            lambda _value: self.visualization_settings_changed.emit()
+            self._on_violin_outline_width_changed
         )
         outline_width_label = QLabel("Width")
         self._set_widget_tooltip(
@@ -832,6 +871,24 @@ class DreamTab(QWidget):
             "Save a text report of the currently loaded DREAM posterior summary."
         )
         self.report_button.clicked.connect(self.save_report_requested.emit)
+        self.recycle_button = QPushButton("Recycle")
+        self.recycle_button.setToolTip(
+            "Copy the currently selected DREAM best-fit parameter values into "
+            "the Prefit parameter table so you can manually refine them "
+            "before running DREAM again."
+        )
+        self.recycle_button.clicked.connect(self.recycle_output_requested.emit)
+        self.export_model_report_button = QPushButton(
+            "Export Model Report (PPTX)"
+        )
+        self.export_model_report_button.setToolTip(
+            "Create a multi-slide PowerPoint report for the current DREAM "
+            "fit, including project information, prior histograms, prefit "
+            "state, posterior filtering comparisons, and output paths."
+        )
+        self.export_model_report_button.clicked.connect(
+            self.export_model_report_requested.emit
+        )
 
         row += 1
         action_sections = QWidget()
@@ -854,6 +911,14 @@ class DreamTab(QWidget):
         analysis_layout.addWidget(self.saved_runs_combo, 0, 1, 1, 2)
         analysis_layout.addWidget(self.load_button, 1, 0)
         analysis_layout.addWidget(self.report_button, 1, 1)
+        analysis_layout.addWidget(self.recycle_button, 1, 2)
+        analysis_layout.addWidget(
+            self.export_model_report_button,
+            2,
+            0,
+            1,
+            3,
+        )
         action_sections_layout.addWidget(self.setup_actions_group)
         action_sections_layout.addWidget(self.analysis_actions_group)
         layout.addWidget(action_sections, row, 0, 1, 4)
@@ -904,7 +969,7 @@ class DreamTab(QWidget):
             lambda _index: self._mark_search_filter_preset_custom()
         )
         self.violin_sample_source_combo.currentIndexChanged.connect(
-            lambda _index: self.visualization_settings_changed.emit()
+            self._on_violin_sample_source_changed
         )
         violin_source_tip = (
             "Choose whether the violin plot shows the full filtered "
@@ -931,7 +996,7 @@ class DreamTab(QWidget):
             lambda _value: self._mark_search_filter_preset_custom()
         )
         self.posterior_top_percent_spin.valueChanged.connect(
-            lambda _value: self.visualization_settings_changed.emit()
+            self._on_posterior_top_percent_changed
         )
         top_percent_tip = (
             "Default percent used whenever Top % log-posterior screening is "
@@ -952,7 +1017,7 @@ class DreamTab(QWidget):
             lambda _value: self._mark_search_filter_preset_custom()
         )
         self.posterior_top_n_spin.valueChanged.connect(
-            lambda _value: self.visualization_settings_changed.emit()
+            self._on_posterior_top_n_changed
         )
         top_n_tip = (
             "Default count used whenever Top N log-posterior screening is "
@@ -988,7 +1053,7 @@ class DreamTab(QWidget):
         self.credible_interval_low_spin.setSingleStep(1.0)
         self.credible_interval_low_spin.setValue(16.0)
         self.credible_interval_low_spin.valueChanged.connect(
-            lambda _value: self.visualization_settings_changed.emit()
+            self._on_credible_interval_low_changed
         )
         interval_low_tip = (
             "Lower percentile used for the posterior interval bars and "
@@ -1007,7 +1072,7 @@ class DreamTab(QWidget):
         self.credible_interval_high_spin.setSingleStep(1.0)
         self.credible_interval_high_spin.setValue(84.0)
         self.credible_interval_high_spin.valueChanged.connect(
-            lambda _value: self.visualization_settings_changed.emit()
+            self._on_credible_interval_high_changed
         )
         interval_high_tip = (
             "Upper percentile used for the posterior interval bars and "
@@ -1096,6 +1161,13 @@ class DreamTab(QWidget):
         self.show_solvent_trace_checkbox.toggled.connect(
             self._redraw_current_model_plot
         )
+        self.show_structure_factor_trace_checkbox = QCheckBox(
+            "Structure factor"
+        )
+        self.show_structure_factor_trace_checkbox.setChecked(False)
+        self.show_structure_factor_trace_checkbox.toggled.connect(
+            self._redraw_current_model_plot
+        )
         self.model_log_x_checkbox = QCheckBox("Log X")
         self.model_log_x_checkbox.setChecked(True)
         self.model_log_x_checkbox.toggled.connect(
@@ -1109,6 +1181,7 @@ class DreamTab(QWidget):
         controls.addWidget(self.show_experimental_trace_checkbox)
         controls.addWidget(self.show_model_trace_checkbox)
         controls.addWidget(self.show_solvent_trace_checkbox)
+        controls.addWidget(self.show_structure_factor_trace_checkbox)
         controls.addWidget(self.model_log_x_checkbox)
         controls.addWidget(self.model_log_y_checkbox)
         controls.addStretch(1)
@@ -1269,108 +1342,112 @@ class DreamTab(QWidget):
         *,
         preset_name: str | None = None,
     ) -> None:
+        self._suspend_visualization_notifications = True
         self._applying_search_filter_preset = True
-        self.settings_preset_combo.blockSignals(True)
-        self.settings_preset_combo.setCurrentText(
-            preset_name or self.ACTIVE_SETTINGS_LABEL
-        )
-        self.settings_preset_combo.blockSignals(False)
-        self.model_name_edit.setText(settings.model_name or "")
-        self.chains_spin.setValue(settings.nchains)
-        self.iterations_spin.setValue(settings.niterations)
-        self.burnin_spin.setValue(settings.burnin_percent)
-        self.history_thin_spin.setValue(settings.history_thin)
-        self.nseedchains_spin.setValue(settings.nseedchains)
-        self.crossover_burnin_spin.setValue(settings.crossover_burnin)
-        self.lambda_spin.setValue(settings.lamb)
-        self.zeta_spin.setValue(settings.zeta)
-        self.snooker_spin.setValue(settings.snooker)
-        self.p_gamma_unity_spin.setValue(settings.p_gamma_unity)
-        self.history_file_edit.setText(settings.history_file or "")
-        self.verbose_checkbox.setChecked(settings.verbose)
-        self.parallel_checkbox.setChecked(settings.parallel)
-        self.adapt_checkbox.setChecked(settings.adapt_crossover)
-        self.restart_checkbox.setChecked(settings.restart)
-        self._set_combo_data(
-            self.search_filter_preset_combo,
-            settings.search_filter_preset or "custom",
-        )
-        self._set_combo_data(
-            self.bestfit_method_combo, settings.bestfit_method
-        )
-        self.verbose_interval_spin.setValue(
-            settings.verbose_output_interval_seconds
-        )
-        self._set_combo_data(
-            self.posterior_filter_combo,
-            settings.posterior_filter_mode,
-        )
-        self.posterior_top_percent_spin.setValue(
-            settings.posterior_top_percent
-        )
-        self.posterior_top_n_spin.setValue(settings.posterior_top_n)
-        self.auto_filter_assessment_checkbox.setChecked(
-            settings.auto_select_best_posterior_filter
-        )
-        self.credible_interval_low_spin.setValue(
-            settings.credible_interval_low
-        )
-        self.credible_interval_high_spin.setValue(
-            settings.credible_interval_high
-        )
-        self._set_combo_data(
-            self.violin_mode_combo,
-            settings.violin_parameter_mode,
-        )
-        self._set_combo_data(
-            self.violin_sample_source_combo,
-            settings.violin_sample_source,
-        )
-        self._set_combo_data(
-            self.weight_order_combo,
-            settings.violin_weight_order,
-        )
-        self._set_combo_data(
-            self.violin_value_scale_combo,
-            settings.violin_value_scale_mode,
-        )
-        self._configure_plot_color_button(
-            self.violin_custom_color_button,
-            settings.violin_custom_color,
-            label="Custom violin",
-        )
-        if not self._set_combo_data(
-            self.violin_palette_combo,
-            settings.violin_palette,
-        ):
-            self._set_combo_data(
-                self.violin_palette_combo,
-                "custom_solid",
+        try:
+            self.settings_preset_combo.blockSignals(True)
+            self.settings_preset_combo.setCurrentText(
+                preset_name or self.ACTIVE_SETTINGS_LABEL
             )
-        self._configure_plot_color_button(
-            self.violin_point_color_button,
-            settings.violin_point_color,
-            label="Point",
-        )
-        self._configure_plot_color_button(
-            self.interval_color_button,
-            settings.violin_interval_color,
-            label="Interval",
-        )
-        self._configure_plot_color_button(
-            self.median_color_button,
-            settings.violin_median_color,
-            label="Median",
-        )
-        self._configure_plot_color_button(
-            self.violin_outline_color_button,
-            settings.violin_outline_color,
-            label="Outline",
-        )
-        self.violin_outline_width_spin.setValue(
-            float(settings.violin_outline_width)
-        )
-        self._applying_search_filter_preset = False
+            self.settings_preset_combo.blockSignals(False)
+            self.model_name_edit.setText(settings.model_name or "")
+            self.chains_spin.setValue(settings.nchains)
+            self.iterations_spin.setValue(settings.niterations)
+            self.burnin_spin.setValue(settings.burnin_percent)
+            self.history_thin_spin.setValue(settings.history_thin)
+            self.nseedchains_spin.setValue(settings.nseedchains)
+            self.crossover_burnin_spin.setValue(settings.crossover_burnin)
+            self.lambda_spin.setValue(settings.lamb)
+            self.zeta_spin.setValue(settings.zeta)
+            self.snooker_spin.setValue(settings.snooker)
+            self.p_gamma_unity_spin.setValue(settings.p_gamma_unity)
+            self.history_file_edit.setText(settings.history_file or "")
+            self.verbose_checkbox.setChecked(settings.verbose)
+            self.parallel_checkbox.setChecked(settings.parallel)
+            self.adapt_checkbox.setChecked(settings.adapt_crossover)
+            self.restart_checkbox.setChecked(settings.restart)
+            self._set_combo_data(
+                self.search_filter_preset_combo,
+                settings.search_filter_preset or "custom",
+            )
+            self._set_combo_data(
+                self.bestfit_method_combo, settings.bestfit_method
+            )
+            self.verbose_interval_spin.setValue(
+                settings.verbose_output_interval_seconds
+            )
+            self._set_combo_data(
+                self.posterior_filter_combo,
+                settings.posterior_filter_mode,
+            )
+            self.posterior_top_percent_spin.setValue(
+                settings.posterior_top_percent
+            )
+            self.posterior_top_n_spin.setValue(settings.posterior_top_n)
+            self.auto_filter_assessment_checkbox.setChecked(
+                settings.auto_select_best_posterior_filter
+            )
+            self.credible_interval_low_spin.setValue(
+                settings.credible_interval_low
+            )
+            self.credible_interval_high_spin.setValue(
+                settings.credible_interval_high
+            )
+            self._set_combo_data(
+                self.violin_mode_combo,
+                settings.violin_parameter_mode,
+            )
+            self._set_combo_data(
+                self.violin_sample_source_combo,
+                settings.violin_sample_source,
+            )
+            self._set_combo_data(
+                self.weight_order_combo,
+                settings.violin_weight_order,
+            )
+            self._set_combo_data(
+                self.violin_value_scale_combo,
+                settings.violin_value_scale_mode,
+            )
+            self._configure_plot_color_button(
+                self.violin_custom_color_button,
+                settings.violin_custom_color,
+                label="Custom violin",
+            )
+            if not self._set_combo_data(
+                self.violin_palette_combo,
+                settings.violin_palette,
+            ):
+                self._set_combo_data(
+                    self.violin_palette_combo,
+                    "custom_solid",
+                )
+            self._configure_plot_color_button(
+                self.violin_point_color_button,
+                settings.violin_point_color,
+                label="Point",
+            )
+            self._configure_plot_color_button(
+                self.interval_color_button,
+                settings.violin_interval_color,
+                label="Interval",
+            )
+            self._configure_plot_color_button(
+                self.median_color_button,
+                settings.violin_median_color,
+                label="Median",
+            )
+            self._configure_plot_color_button(
+                self.violin_outline_color_button,
+                settings.violin_outline_color,
+                label="Outline",
+            )
+            self.violin_outline_width_spin.setValue(
+                float(settings.violin_outline_width)
+            )
+        finally:
+            self._applying_search_filter_preset = False
+            self._suspend_visualization_notifications = False
         self._update_violin_style_controls()
         self._update_posterior_filter_controls()
         self._update_verbose_output_controls()
@@ -1539,6 +1616,7 @@ class DreamTab(QWidget):
         )
 
     def append_log(self, message: str) -> None:
+        self._flush_pending_runtime_output()
         stripped = message.strip()
         if stripped:
             self._history_messages.append(stripped)
@@ -1546,6 +1624,8 @@ class DreamTab(QWidget):
         self._render_output(scroll_to_end=True)
 
     def set_log_text(self, text: str) -> None:
+        self._runtime_output_flush_timer.stop()
+        self._pending_runtime_output_lines = []
         self._base_log_text = text.strip()
         self._history_messages = []
         self._live_output_history_index = None
@@ -1555,20 +1635,36 @@ class DreamTab(QWidget):
         self._summary_text = text.strip()
         self._render_output()
 
+    def set_console_autoscroll_enabled(self, enabled: bool) -> None:
+        self._console_autoscroll_enabled = bool(enabled)
+        if self._console_autoscroll_enabled:
+            self._scroll_output_to_end()
+
     def append_runtime_output(self, message: str) -> None:
         stripped = message.rstrip()
         if not stripped:
             return
+        self._pending_runtime_output_lines.append(stripped)
+        if not self._runtime_output_flush_timer.isActive():
+            self._runtime_output_flush_timer.start()
+
+    def _flush_pending_runtime_output(self) -> None:
+        if not self._pending_runtime_output_lines:
+            return
+        chunk = "\n".join(self._pending_runtime_output_lines)
+        self._pending_runtime_output_lines = []
         if self._live_output_history_index is None:
-            self._history_messages.append("DREAM Runtime Output\n" + stripped)
+            self._history_messages.append("DREAM Runtime Output\n" + chunk)
             self._live_output_history_index = len(self._history_messages) - 1
         else:
             self._history_messages[self._live_output_history_index] += (
-                "\n" + stripped
+                "\n" + chunk
             )
         self._render_output(scroll_to_end=True)
 
     def finish_runtime_output(self) -> None:
+        self._runtime_output_flush_timer.stop()
+        self._flush_pending_runtime_output()
         self._live_output_history_index = None
 
     def clear_plots(self) -> None:
@@ -1581,11 +1677,47 @@ class DreamTab(QWidget):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("")
 
-    def finish_progress(self, message: str) -> None:
+    def begin_progress(
+        self,
+        total: int,
+        message: str,
+        *,
+        unit_label: str = "steps",
+    ) -> None:
+        total = max(int(total), 1)
         self.progress_label.setText(message)
-        self.progress_bar.setRange(0, 1)
-        self.progress_bar.setValue(1)
-        self.progress_bar.setFormat("%v / %m runs")
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat(f"%v / %m {unit_label}")
+
+    def update_progress(
+        self,
+        processed: int,
+        total: int,
+        message: str,
+        *,
+        unit_label: str = "steps",
+    ) -> None:
+        total = max(int(total), 1)
+        processed = max(0, min(int(processed), total))
+        self.progress_label.setText(message)
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(processed)
+        self.progress_bar.setFormat(f"%v / %m {unit_label}")
+
+    def finish_progress(
+        self,
+        message: str,
+        *,
+        total: int | None = None,
+        unit_label: str = "runs",
+    ) -> None:
+        if total is None:
+            total = 1
+        self.progress_label.setText(message)
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(total)
+        self.progress_bar.setFormat(f"%v / %m {unit_label}")
 
     def reset_progress(self) -> None:
         self.progress_label.setText("Progress: idle")
@@ -1612,7 +1744,7 @@ class DreamTab(QWidget):
                 va="center",
             )
             axis.set_axis_off()
-            self.model_canvas.draw()
+            self.model_canvas.draw_idle()
             return
 
         grid = self.model_figure.add_gridspec(2, 1, height_ratios=[3, 1])
@@ -1622,6 +1754,7 @@ class DreamTab(QWidget):
         )
 
         plotted_lines: list[object] = []
+        structure_axis = None
         if self.show_experimental_trace_checkbox.isChecked():
             experimental_artist = top_axis.scatter(
                 plot_data.q_values,
@@ -1652,6 +1785,36 @@ class DreamTab(QWidget):
                     label="Solvent contribution",
                 )
                 plotted_lines.append(solvent_line)
+        if (
+            self.show_structure_factor_trace_checkbox.isChecked()
+            and plot_data.structure_factor_trace is not None
+        ):
+            structure_values = np.asarray(
+                plot_data.structure_factor_trace,
+                dtype=float,
+            )
+            structure_mask = np.isfinite(structure_values)
+            if np.any(structure_mask):
+                structure_axis = top_axis.twinx()
+                structure_axis.set_xscale(
+                    "log"
+                    if self.model_log_x_checkbox.isChecked()
+                    else "linear"
+                )
+                (structure_line,) = structure_axis.plot(
+                    np.asarray(plot_data.q_values, dtype=float)[
+                        structure_mask
+                    ],
+                    structure_values[structure_mask],
+                    color="tab:purple",
+                    linestyle="--",
+                    linewidth=1.5,
+                    label="Structure factor S(q)",
+                )
+                structure_axis.set_ylabel("S(q)", color="tab:purple")
+                structure_axis.tick_params(axis="y", colors="tab:purple")
+                structure_axis.spines["right"].set_color("tab:purple")
+                plotted_lines.append(structure_line)
         if self.show_model_trace_checkbox.isChecked():
             (model_line,) = top_axis.plot(
                 plot_data.q_values,
@@ -1707,7 +1870,7 @@ class DreamTab(QWidget):
         if plotted_lines:
             self._build_interactive_model_legend(top_axis, plotted_lines)
         self.model_figure.tight_layout()
-        self.model_canvas.draw()
+        self.model_canvas.draw_idle()
 
     def _redraw_current_model_plot(self) -> None:
         self.plot_model_fit(self._current_model_plot_data)
@@ -1720,14 +1883,20 @@ class DreamTab(QWidget):
         has_solvent = (
             has_plot_data and plot_data.solvent_contribution is not None
         )
+        has_structure_factor = (
+            has_plot_data and plot_data.structure_factor_trace is not None
+        )
         self.show_experimental_trace_checkbox.setEnabled(has_plot_data)
         self.show_model_trace_checkbox.setEnabled(has_plot_data)
         self.show_solvent_trace_checkbox.setEnabled(bool(has_solvent))
+        self.show_structure_factor_trace_checkbox.setEnabled(
+            bool(has_structure_factor)
+        )
 
     def _build_interactive_model_legend(
         self, axis, lines: list[object]
     ) -> None:
-        legend = axis.legend(loc="best")
+        legend = axis.legend(handles=lines, loc="best")
         if legend is None:
             return
         legend_handles = getattr(legend, "legend_handles", None)
@@ -1766,6 +1935,8 @@ class DreamTab(QWidget):
         summary: DreamSummary | None,
         violin_data: DreamViolinPlotData | None,
     ) -> None:
+        self._current_summary = summary
+        self._current_violin_plot_data = violin_data
         self.violin_figure.clear()
         axis = self.violin_figure.add_subplot(111)
         if (
@@ -1782,13 +1953,14 @@ class DreamTab(QWidget):
                 va="center",
             )
             axis.set_axis_off()
-            self.violin_canvas.draw()
+            self.violin_canvas.draw_idle()
             return
 
         payload = self.prepare_violin_plot_payload(summary, violin_data)
+        display_samples = self._display_violin_samples(payload["samples"])
         positions = np.arange(1, len(payload["display_names"]) + 1)
         violin_parts = axis.violinplot(
-            payload["samples"],
+            display_samples,
             positions=positions,
             showmedians=True,
         )
@@ -1842,7 +2014,19 @@ class DreamTab(QWidget):
             axis.set_ylim(*payload["y_limits"])
         axis.legend(loc="best")
         self.violin_figure.tight_layout()
-        self.violin_canvas.draw()
+        self.violin_canvas.draw_idle()
+
+    def redraw_current_violin_plot(self) -> None:
+        self.plot_violin_plot(
+            self._current_summary,
+            self._current_violin_plot_data,
+        )
+
+    def current_summary(self) -> DreamSummary | None:
+        return self._current_summary
+
+    def current_violin_plot_data(self) -> DreamViolinPlotData | None:
+        return self._current_violin_plot_data
 
     def prepare_violin_plot_payload(
         self,
@@ -2028,6 +2212,7 @@ class DreamTab(QWidget):
             button.setGraphicsEffect(None)
 
     def _render_output(self, *, scroll_to_end: bool = False) -> None:
+        del scroll_to_end
         sections: list[str] = []
         if self._summary_text:
             sections.append("DREAM Summary\n" + self._summary_text)
@@ -2038,10 +2223,39 @@ class DreamTab(QWidget):
         ]
         if history_parts:
             sections.append("DREAM Console\n" + "\n\n".join(history_parts))
+        scrollbar = self.output_box.verticalScrollBar()
+        previous_value = scrollbar.value()
+        previous_maximum = max(scrollbar.maximum(), 1)
         self.output_box.setPlainText("\n\n".join(sections).strip())
-        if scroll_to_end:
-            scrollbar = self.output_box.verticalScrollBar()
-            scrollbar.setValue(scrollbar.maximum())
+        if self._console_autoscroll_enabled:
+            self._scroll_output_to_end()
+            return
+        updated_scrollbar = self.output_box.verticalScrollBar()
+        if updated_scrollbar.maximum() > 0:
+            position_fraction = previous_value / previous_maximum
+            updated_scrollbar.setValue(
+                int(round(position_fraction * updated_scrollbar.maximum()))
+            )
+
+    def _scroll_output_to_end(self) -> None:
+        cursor = self.output_box.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.output_box.setTextCursor(cursor)
+        self.output_box.ensureCursorVisible()
+        scrollbar = self.output_box.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        QTimer.singleShot(
+            0,
+            self._scroll_output_to_end_once,
+        )
+
+    def _scroll_output_to_end_once(self) -> None:
+        cursor = self.output_box.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.output_box.setTextCursor(cursor)
+        self.output_box.ensureCursorVisible()
+        scrollbar = self.output_box.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def _browse_history_file(self) -> None:
         selected, _filter = QFileDialog.getOpenFileName(
@@ -2055,7 +2269,7 @@ class DreamTab(QWidget):
 
     def _on_violin_palette_changed(self, _index: int) -> None:
         self._update_violin_style_controls()
-        self.visualization_settings_changed.emit()
+        self._notify_violin_style_settings_changed()
 
     def _update_violin_style_controls(self) -> None:
         self.violin_custom_color_button.setEnabled(True)
@@ -2126,12 +2340,12 @@ class DreamTab(QWidget):
             chosen.name(),
             label=label,
         )
-        self.visualization_settings_changed.emit()
+        self._notify_violin_style_settings_changed()
 
     def _on_posterior_filter_mode_changed(self, _index: int) -> None:
         self._mark_search_filter_preset_custom()
         self._update_posterior_filter_controls()
-        self.visualization_settings_changed.emit()
+        self._notify_results_settings_changed()
 
     def _on_search_filter_preset_changed(self, _index: int) -> None:
         if self._applying_search_filter_preset:
@@ -2146,6 +2360,7 @@ class DreamTab(QWidget):
         if preset is None:
             return
         self._applying_search_filter_preset = True
+        self._suspend_visualization_notifications = True
         try:
             self.chains_spin.setValue(int(preset["nchains"]))
             self.iterations_spin.setValue(int(preset["niterations"]))
@@ -2170,7 +2385,8 @@ class DreamTab(QWidget):
             self._update_posterior_filter_controls()
         finally:
             self._applying_search_filter_preset = False
-        self.visualization_settings_changed.emit()
+            self._suspend_visualization_notifications = False
+        self._notify_results_settings_changed()
 
     def _mark_search_filter_preset_custom(self) -> None:
         if self._applying_search_filter_preset:
@@ -2184,6 +2400,76 @@ class DreamTab(QWidget):
     def _update_posterior_filter_controls(self) -> None:
         self.posterior_top_percent_spin.setEnabled(True)
         self.posterior_top_n_spin.setEnabled(True)
+
+    def _notify_results_settings_changed(self) -> None:
+        if self._suspend_visualization_notifications:
+            return
+        self.results_settings_changed.emit()
+        self.visualization_settings_changed.emit()
+
+    def _notify_summary_settings_changed(self) -> None:
+        if self._suspend_visualization_notifications:
+            return
+        self.summary_settings_changed.emit()
+        self.visualization_settings_changed.emit()
+
+    def _notify_violin_data_settings_changed(self) -> None:
+        if self._suspend_visualization_notifications:
+            return
+        self.violin_data_settings_changed.emit()
+        self.visualization_settings_changed.emit()
+
+    def _notify_violin_style_settings_changed(self) -> None:
+        if self._suspend_visualization_notifications:
+            return
+        self.violin_style_settings_changed.emit()
+        self.visualization_settings_changed.emit()
+
+    def _on_bestfit_method_changed(self, _index: int) -> None:
+        self._notify_results_settings_changed()
+
+    def _on_violin_mode_changed(self, _index: int) -> None:
+        self._notify_violin_data_settings_changed()
+
+    def _on_violin_sample_source_changed(self, _index: int) -> None:
+        self._notify_violin_data_settings_changed()
+
+    def _on_weight_order_changed(self, _index: int) -> None:
+        self._notify_violin_data_settings_changed()
+
+    def _on_violin_value_scale_changed(self, _index: int) -> None:
+        self._notify_violin_data_settings_changed()
+
+    def _on_violin_outline_width_changed(self, _value: float) -> None:
+        self._notify_violin_style_settings_changed()
+
+    def _on_posterior_top_percent_changed(self, _value: float) -> None:
+        self._notify_results_settings_changed()
+
+    def _on_posterior_top_n_changed(self, _value: int) -> None:
+        self._notify_results_settings_changed()
+
+    def _on_credible_interval_low_changed(self, _value: float) -> None:
+        self._notify_summary_settings_changed()
+
+    def _on_credible_interval_high_changed(self, _value: float) -> None:
+        self._notify_summary_settings_changed()
+
+    @classmethod
+    def _display_violin_samples(cls, samples: object) -> np.ndarray:
+        display_samples = np.asarray(samples, dtype=float)
+        if display_samples.ndim == 1:
+            display_samples = display_samples.reshape(-1, 1)
+        max_samples = max(int(cls.MAX_VIOLIN_PLOT_SAMPLES), 1)
+        if display_samples.shape[0] <= max_samples:
+            return display_samples
+        sample_indices = np.linspace(
+            0,
+            display_samples.shape[0] - 1,
+            max_samples,
+            dtype=int,
+        )
+        return display_samples[sample_indices]
 
     @staticmethod
     def _build_action_group(

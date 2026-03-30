@@ -12,7 +12,9 @@ from saxshell.saxs.prefit import (
     SAXSPrefitWorkflow,
     compute_cluster_geometry_metadata,
     load_cluster_geometry_metadata,
+    resolve_prefit_parameter_entries,
 )
+from saxshell.saxs.prefit.workflow import constrained_prefit_residuals
 from saxshell.saxs.project_manager import (
     SAXSProjectManager,
     build_project_paths,
@@ -20,6 +22,11 @@ from saxshell.saxs.project_manager import (
 from saxshell.saxs.solute_volume_fraction import (
     SoluteVolumeFractionSettings,
     calculate_solute_volume_fraction_estimate,
+)
+from saxshell.saxs.solution_scattering_estimator import (
+    BeamGeometrySettings,
+    SolutionScatteringEstimatorSettings,
+    calculate_solution_scattering_estimate,
 )
 
 POLY_LMA_HS_TEMPLATE = "template_pydream_poly_lma_hs"
@@ -64,7 +71,6 @@ def _build_minimal_saxs_project(tmp_path):
         vol_frac=0.0,
         scale=5e-4,
     )
-
     experimental_path = paths.experimental_data_dir / "exp_demo.txt"
     np.savetxt(
         experimental_path,
@@ -165,7 +171,6 @@ def _build_poly_lma_geometry_project(
         offset=0.0,
         log_sigma=-9.21,
     )
-
     experimental_path = paths.experimental_data_dir / "exp_demo.txt"
     np.savetxt(
         experimental_path,
@@ -254,6 +259,230 @@ def test_saxs_prefit_workflow_recommends_scale_from_model_difference(tmp_path):
     assert recommendation.recommended_scale == pytest.approx(5e-4)
     assert recommendation.recommended_minimum == pytest.approx(5e-5)
     assert recommendation.recommended_maximum == pytest.approx(5e-3)
+    assert recommendation.current_offset == pytest.approx(0.0)
+    assert recommendation.recommended_offset == pytest.approx(0.05)
+    assert recommendation.points_used == 8
+
+
+def test_constrained_prefit_residuals_penalize_non_positive_model_values():
+    experimental = np.asarray([1.0, 0.8, 0.6], dtype=float)
+    model = np.asarray([1.1, -0.2, np.nan], dtype=float)
+
+    residuals = constrained_prefit_residuals(experimental, model)
+
+    assert residuals.shape == (6,)
+    assert residuals[0] == pytest.approx(0.1)
+    assert residuals[3] == pytest.approx(0.0)
+    assert residuals[4] > 25.0
+    assert residuals[5] > residuals[4]
+
+
+def test_saxs_prefit_workflow_resolves_and_persists_linked_parameters(
+    tmp_path,
+):
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    workflow = SAXSPrefitWorkflow(project_dir)
+    entries = workflow.load_parameter_entries()
+    scale_entry = next(entry for entry in entries if entry.name == "scale")
+    offset_entry = next(entry for entry in entries if entry.name == "offset")
+    scale_entry.value = 2.5e-4
+    offset_entry.initial_value_expression = "*scale"
+    offset_entry.vary = True
+
+    resolved_entries = resolve_prefit_parameter_entries(entries)
+    resolved_offset = next(
+        entry for entry in resolved_entries if entry.name == "offset"
+    )
+    assert resolved_offset.initial_value_expression == "*scale"
+    assert resolved_offset.value_expression is None
+    assert resolved_offset.value == pytest.approx(2.5e-4)
+    assert resolved_offset.vary is True
+
+    fit_result = workflow.run_fit(
+        resolved_entries, method="leastsq", max_nfev=50
+    )
+    fitted_offset = next(
+        entry
+        for entry in fit_result.parameter_entries
+        if entry.name == "offset"
+    )
+    assert fitted_offset.initial_value_expression == "*scale"
+    assert fitted_offset.value_expression is None
+    assert fitted_offset.vary is True
+
+    workflow.save_fit(fit_result.parameter_entries)
+    state_payload = json.loads(
+        (paths.prefit_dir / "prefit_state.json").read_text(encoding="utf-8")
+    )
+    state_offset = next(
+        entry
+        for entry in state_payload["parameter_entries"]
+        if entry["name"] == "offset"
+    )
+    assert state_offset["initial_value_expression"] == "*scale"
+
+    prefit_payload = json.loads(
+        (paths.prefit_dir / "pd_prefit_params.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert (
+        prefit_payload["fit_parameter_meta"]["offset"]["initial_expression"]
+        == "*scale"
+    )
+
+
+def test_saxs_prefit_workflow_preserves_dependent_parameter_expressions(
+    tmp_path,
+):
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    workflow = SAXSPrefitWorkflow(project_dir)
+    entries = workflow.load_parameter_entries()
+    scale_entry = next(entry for entry in entries if entry.name == "scale")
+    offset_entry = next(entry for entry in entries if entry.name == "offset")
+    scale_entry.value = 2.5e-4
+    offset_entry.value_expression = "*scale"
+    offset_entry.vary = False
+
+    resolved_entries = resolve_prefit_parameter_entries(entries)
+    resolved_offset = next(
+        entry for entry in resolved_entries if entry.name == "offset"
+    )
+    assert resolved_offset.value_expression == "*scale"
+    assert resolved_offset.initial_value_expression is None
+    assert resolved_offset.value == pytest.approx(2.5e-4)
+    assert resolved_offset.vary is False
+
+    fit_result = workflow.run_fit(
+        resolved_entries,
+        method="leastsq",
+        max_nfev=50,
+    )
+    fitted_offset = next(
+        entry
+        for entry in fit_result.parameter_entries
+        if entry.name == "offset"
+    )
+    assert fitted_offset.value_expression == "*scale"
+    assert fitted_offset.initial_value_expression is None
+    assert fitted_offset.vary is False
+
+    workflow.save_fit(fit_result.parameter_entries)
+    state_payload = json.loads(
+        (paths.prefit_dir / "prefit_state.json").read_text(encoding="utf-8")
+    )
+    state_offset = next(
+        entry
+        for entry in state_payload["parameter_entries"]
+        if entry["name"] == "offset"
+    )
+    assert state_offset["value_expression"] == "*scale"
+
+
+def test_saxs_prefit_workflow_rejects_autoscale_for_linked_scale_or_offset(
+    tmp_path,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    workflow = SAXSPrefitWorkflow(project_dir)
+    entries = workflow.load_parameter_entries()
+    offset_entry = next(entry for entry in entries if entry.name == "offset")
+    offset_entry.value_expression = "*scale"
+
+    with pytest.raises(ValueError, match="offset is linked"):
+        workflow.recommend_scale_settings(entries)
+
+
+def test_saxs_prefit_workflow_allows_autoscale_for_expression_seed_parameters(
+    tmp_path,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    workflow = SAXSPrefitWorkflow(project_dir)
+    entries = workflow.load_parameter_entries()
+    offset_entry = next(entry for entry in entries if entry.name == "offset")
+    offset_entry.initial_value_expression = "*scale"
+    offset_entry.vary = True
+
+    recommendation = workflow.recommend_scale_settings(entries)
+
+    assert recommendation.recommended_scale > 0.0
+
+
+def test_saxs_prefit_workflow_supports_model_only_evaluation(tmp_path):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.model_only_mode = True
+    settings.use_experimental_grid = False
+    settings.q_points = 8
+    manager.save_project(settings)
+
+    workflow = SAXSPrefitWorkflow(project_dir)
+    evaluation = workflow.evaluate()
+
+    assert evaluation.experimental_intensities is None
+    assert evaluation.residuals is None
+    assert evaluation.is_model_only is True
+    assert workflow.can_run_prefit() is False
+    with pytest.raises(ValueError, match="Model Only Mode"):
+        workflow.run_fit(method="leastsq", max_nfev=100)
+
+
+def test_saxs_prefit_workflow_recommends_scale_with_weighted_solvent_trace(
+    tmp_path,
+):
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    solvent_q = np.linspace(0.05, 0.3, 8)
+    solvent_intensity = np.linspace(1.5, 2.2, 8)
+    solvent_path = tmp_path / "autoscale_solvent_trace.dat"
+    np.savetxt(solvent_path, np.column_stack([solvent_q, solvent_intensity]))
+
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.solvent_data_path = str(solvent_path)
+    settings.copied_solvent_data_file = None
+    manager.save_project(settings)
+
+    template_module = load_template_module(
+        "template_pd_likelihood_monosq_decoupled"
+    )
+    q_values = np.linspace(0.05, 0.3, 8)
+    component = np.linspace(10.0, 17.0, 8)
+    experimental = template_module.lmfit_model_profile(
+        q_values,
+        solvent_intensity,
+        [component],
+        w0=0.6,
+        solv_w=0.5,
+        offset=0.05,
+        eff_r=9.0,
+        vol_frac=0.0,
+        scale=5e-4,
+    )
+    experimental_path = paths.experimental_data_dir / "exp_demo.txt"
+    np.savetxt(experimental_path, np.column_stack([q_values, experimental]))
+    settings = manager.load_project(project_dir)
+    settings.experimental_data_path = str(experimental_path)
+    settings.copied_experimental_data_file = str(experimental_path)
+    manager.save_project(settings)
+
+    workflow = SAXSPrefitWorkflow(project_dir)
+    entries = workflow.load_parameter_entries()
+    for entry in entries:
+        if entry.name == "solv_w":
+            entry.value = 0.5
+        if entry.name == "scale":
+            entry.value = 1e-6
+            entry.minimum = 1e-7
+            entry.maximum = 1e-5
+
+    recommendation = workflow.recommend_scale_settings(entries)
+
+    assert recommendation.current_scale == pytest.approx(1e-6)
+    assert recommendation.recommended_scale == pytest.approx(5e-4)
+    assert recommendation.recommended_minimum == pytest.approx(5e-5)
+    assert recommendation.recommended_maximum == pytest.approx(5e-3)
+    assert recommendation.current_offset == pytest.approx(0.0)
+    assert recommendation.recommended_offset == pytest.approx(0.05)
     assert recommendation.points_used == 8
 
 
@@ -349,6 +578,165 @@ def test_monosq_prefit_workflow_does_not_expose_solute_volume_fraction_target(
 
     assert not workflow.supports_volume_fraction_estimator()
     assert workflow.volume_fraction_estimator_target() is None
+
+
+def test_monosq_prefit_workflow_exposes_solvent_weight_target(tmp_path):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    workflow = SAXSPrefitWorkflow(project_dir)
+
+    assert workflow.solvent_weight_estimator_target() == "solv_w"
+
+
+def test_poly_lma_prefit_workflow_exposes_solvent_weight_target(tmp_path):
+    project_dir, _paths, _radius = _build_poly_lma_geometry_project(tmp_path)
+    workflow = SAXSPrefitWorkflow(project_dir)
+
+    assert workflow.solvent_weight_estimator_target() == "solvent_scale"
+
+
+def test_poly_lma_prefit_defaults_fix_solvent_subtraction_controls(tmp_path):
+    project_dir, _paths, _radius = _build_poly_lma_geometry_project(tmp_path)
+    workflow = SAXSPrefitWorkflow(project_dir)
+    entries_by_name = {
+        entry.name: entry for entry in workflow.load_template_reset_entries()
+    }
+
+    assert entries_by_name["phi_solute"].vary is False
+    assert entries_by_name["solvent_scale"].vary is False
+
+
+def test_poly_lma_prefit_rejects_redundant_solvent_subtraction_fit(tmp_path):
+    project_dir, _paths, _radius = _build_poly_lma_geometry_project(tmp_path)
+    workflow = SAXSPrefitWorkflow(project_dir)
+    entries = workflow.load_parameter_entries()
+    for entry in entries:
+        if entry.name in {"phi_solute", "solvent_scale"}:
+            entry.vary = True
+
+    with pytest.raises(
+        ValueError,
+        match="cannot both vary during fitting",
+    ):
+        workflow.run_fit(entries, method="leastsq", max_nfev=50)
+
+
+def test_solution_scattering_estimate_reports_attenuation_and_scale():
+    estimate = calculate_solution_scattering_estimate(
+        SolutionScatteringEstimatorSettings(
+            solution=SolutionPropertiesSettings(
+                mode="mass",
+                solution_density=1.0,
+                solute_stoich="Cs1Pb1I3",
+                solvent_stoich="H2O",
+                molar_mass_solute=620.0,
+                molar_mass_solvent=18.015,
+                mass_solute=1.0,
+                mass_solvent=9.0,
+            ),
+            solute_density_g_per_ml=2.0,
+            solvent_density_g_per_ml=1.0,
+            beam=BeamGeometrySettings(
+                incident_energy_kev=17.0,
+                capillary_size_mm=1.0,
+                capillary_geometry="cylindrical",
+                beam_profile="uniform",
+                beam_footprint_width_mm=0.4,
+                beam_footprint_height_mm=0.4,
+            ),
+        )
+    )
+
+    assert estimate.number_density_estimate is not None
+    assert estimate.number_density_estimate.number_density_a3 > 0.0
+    assert estimate.volume_fraction_estimate is not None
+    assert estimate.interaction_contrast_estimate is not None
+    assert estimate.attenuation_estimate is not None
+    attenuation = estimate.attenuation_estimate
+    assert attenuation.solvent_scattering_scale_factor > 0.0
+    assert attenuation.solvent_scattering_scale_factor < 1.0
+    assert attenuation.sample_linear_attenuation_inv_cm > 0.0
+    assert attenuation.sample_linear_attenuation_inv_cm > (
+        attenuation.sample_solvent_linear_attenuation_inv_cm
+    )
+    assert 0.0 < attenuation.sample_transmission < 1.0
+    assert 0.0 < attenuation.neat_solvent_transmission < 1.0
+    assert (
+        estimate.interaction_contrast_estimate.saxs_effective_solute_interaction_ratio
+        < estimate.volume_fraction_estimate.solute_volume_fraction
+    )
+
+
+def test_solution_scattering_estimate_reports_saxs_effective_interaction_ratio():
+    estimate = calculate_solution_scattering_estimate(
+        SolutionScatteringEstimatorSettings(
+            solution=SolutionPropertiesSettings(
+                mode="molarity_per_liter",
+                solution_density=1.1,
+                solute_stoich="Pb1I2",
+                solvent_stoich="C3H7NO",
+                molar_mass_solute=461.0,
+                molar_mass_solvent=73.09,
+                molarity=0.5,
+                molarity_element="Pb",
+            ),
+            solute_density_g_per_ml=None,
+            solvent_density_g_per_ml=0.94,
+        )
+    )
+
+    assert estimate.volume_fraction_estimate is not None
+    assert estimate.interaction_contrast_estimate is not None
+    interaction = estimate.interaction_contrast_estimate
+    assert (
+        interaction.physical_solute_associated_volume_fraction
+        == pytest.approx(
+            estimate.volume_fraction_estimate.solute_volume_fraction
+        )
+    )
+    assert 0.0 < interaction.saxs_effective_solute_interaction_ratio < 1.0
+    assert 0.0 < interaction.saxs_effective_solvent_background_ratio < 1.0
+    assert (
+        interaction.saxs_effective_solute_interaction_ratio
+        == pytest.approx(
+            1.0 - interaction.saxs_effective_solvent_background_ratio
+        )
+    )
+    assert (
+        interaction.saxs_effective_solute_interaction_ratio
+        > interaction.physical_solute_associated_volume_fraction
+    )
+    summary = estimate.summary_text()
+    assert "Physical solute-associated volume fraction estimate" in summary
+    assert "SAXS-effective interaction contrast estimate" in summary
+    assert "Model-facing solvent defaults" in summary
+
+
+def test_solution_scattering_estimate_reports_fluorescence_lines():
+    estimate = calculate_solution_scattering_estimate(
+        SolutionScatteringEstimatorSettings(
+            solution=SolutionPropertiesSettings(
+                mode="mass",
+                solution_density=1.0,
+                solute_stoich="Cs1Pb1I3",
+                solvent_stoich="H2O",
+                molar_mass_solute=620.0,
+                molar_mass_solvent=18.015,
+                mass_solute=1.0,
+                mass_solvent=9.0,
+            ),
+            solute_density_g_per_ml=2.0,
+            solvent_density_g_per_ml=1.0,
+            calculate_solute_volume_fraction=False,
+            calculate_solvent_scattering_contribution=False,
+            calculate_sample_fluorescence_yield=True,
+        )
+    )
+
+    assert estimate.fluorescence_estimate is not None
+    fluorescence = estimate.fluorescence_estimate
+    assert fluorescence.total_primary_detected_yield > 0.0
+    assert fluorescence.total_secondary_detected_yield >= 0.0
+    assert fluorescence.line_estimates
 
 
 def test_run_prefit_preserves_manual_parameter_values_outside_old_bounds(
@@ -481,8 +869,93 @@ def test_saxs_prefit_workflow_evaluates_solvent_contribution(tmp_path):
     assert np.allclose(evaluation.solvent_intensities, solvent_intensity)
     assert np.allclose(
         evaluation.solvent_contribution,
-        solvent_intensity * 0.5 * 2e-3,
+        solvent_intensity * 0.5,
     )
+
+
+def test_saxs_prefit_workflow_evaluates_monosq_structure_factor_trace(
+    tmp_path,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    workflow = SAXSPrefitWorkflow(project_dir)
+    entries = workflow.load_parameter_entries()
+    eff_r = 11.0
+    vol_frac = 0.03
+    for entry in entries:
+        if entry.name == "eff_r":
+            entry.value = eff_r
+        if entry.name == "vol_frac":
+            entry.value = vol_frac
+
+    evaluation = workflow.evaluate(entries)
+    template_module = load_template_module(
+        "template_pd_likelihood_monosq_decoupled"
+    )
+
+    assert evaluation.structure_factor_trace is not None
+    assert np.allclose(
+        evaluation.structure_factor_trace,
+        template_module.calc_monodisperse_sq(
+            eff_r,
+            vol_frac,
+            evaluation.q_values,
+        ),
+    )
+
+
+def test_poly_lma_prefit_evaluates_structure_factor_trace(tmp_path):
+    project_dir, _paths, effective_radius = _build_poly_lma_geometry_project(
+        tmp_path,
+        template_name=POLY_LMA_HS_TEMPLATE,
+    )
+    workflow = SAXSPrefitWorkflow(project_dir)
+    workflow.compute_cluster_geometry_table()
+    entries = workflow.load_parameter_entries()
+    phi_int = 0.02
+    for entry in entries:
+        if entry.name == "phi_int":
+            entry.value = phi_int
+
+    evaluation = workflow.evaluate(entries)
+    template_module = load_template_module(POLY_LMA_HS_TEMPLATE)
+
+    assert evaluation.structure_factor_trace is not None
+    assert np.allclose(
+        evaluation.structure_factor_trace,
+        template_module.calc_hardsphere_sq(
+            effective_radius,
+            phi_int,
+            evaluation.q_values,
+        ),
+    )
+
+
+def test_poly_lma_prefit_clamps_saved_solvent_weight_bounds(tmp_path):
+    project_dir, _paths, _effective_radius = _build_poly_lma_geometry_project(
+        tmp_path
+    )
+    workflow = SAXSPrefitWorkflow(project_dir)
+    entries = workflow.load_template_reset_entries()
+    for entry in entries:
+        if entry.name == "solvent_scale":
+            entry.value = 1.6
+            entry.minimum = 0.0
+            entry.maximum = 5.0
+    workflow.settings.template_reset_parameter_entries = [
+        entry.to_dict() for entry in entries
+    ]
+    workflow.project_manager.save_project(workflow.settings)
+
+    reloaded = SAXSPrefitWorkflow(project_dir)
+    solvent_entry = next(
+        entry
+        for entry in reloaded.load_template_reset_entries()
+        if entry.name == "solvent_scale"
+    )
+
+    assert solvent_entry.value == pytest.approx(1.0)
+    assert solvent_entry.minimum == pytest.approx(0.0)
+    assert solvent_entry.maximum == pytest.approx(1.0)
 
 
 def test_saxs_prefit_workflow_persists_template_reset_and_best_prefit(

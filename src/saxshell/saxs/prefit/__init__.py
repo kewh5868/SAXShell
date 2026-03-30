@@ -17,6 +17,8 @@ from .workflow import (
     PrefitSavedState,
     PrefitScaleRecommendation,
     SAXSPrefitWorkflow,
+    normalize_prefit_parameter_expression,
+    resolve_prefit_parameter_entries,
 )
 
 __all__ = [
@@ -35,5 +37,7 @@ __all__ = [
     "compute_cluster_geometry_metadata",
     "copy_cluster_geometry_rows",
     "load_cluster_geometry_metadata",
+    "normalize_prefit_parameter_expression",
+    "resolve_prefit_parameter_entries",
     "save_cluster_geometry_metadata",
 ]

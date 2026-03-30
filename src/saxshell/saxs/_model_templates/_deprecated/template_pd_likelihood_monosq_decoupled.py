@@ -40,6 +40,20 @@ def calc_monodisperse_sq(r, vol_frac, q_values):
     return np.asarray(sqs)
 
 
+def _bounded_solvent_weight(value):
+    return float(np.clip(float(value), 0.0, 1.0))
+
+
+def structure_factor_profile(q, solvent_data, model_data, **params):
+    """Return the pure hard-sphere structure-factor trace S(q)."""
+    del solvent_data, model_data
+    return calc_monodisperse_sq(
+        params["eff_r"],
+        params["vol_frac"],
+        np.asarray(q, dtype=float),
+    )
+
+
 def lmfit_model_profile(q, solvent_data, model_data, **params):
     """Evaluate the lmfit SAXS profile model."""
     weight_keys = sorted(
@@ -47,7 +61,7 @@ def lmfit_model_profile(q, solvent_data, model_data, **params):
         key=lambda key: int(key.lstrip("w")),
     )
     weights = [params[key] for key in weight_keys]
-    solv_w = params["solv_w"]
+    solv_w = _bounded_solvent_weight(params["solv_w"])
     offset = params["offset"]
     eff_r = params["eff_r"]
     vol_frac = params["vol_frac"]
@@ -57,9 +71,9 @@ def lmfit_model_profile(q, solvent_data, model_data, **params):
     for weight, component in zip(weights, model_data):
         mixture += weight * component
 
-    iq = mixture * calc_monodisperse_sq(eff_r, vol_frac, q)
-    iq += solv_w * solvent_data
-    return iq * scale + offset
+    solute_intensity = mixture * calc_monodisperse_sq(eff_r, vol_frac, q)
+    solvent_contribution = solv_w * np.asarray(solvent_data, dtype=float)
+    return scale * solute_intensity + solvent_contribution + offset
 
 
 def model_monosq(params):
@@ -68,7 +82,7 @@ def model_monosq(params):
 
     n_profiles = len(theoretical_intensities)
     weights = params[:n_profiles]
-    solv_w = params[n_profiles]
+    solv_w = _bounded_solvent_weight(params[n_profiles])
     offset = params[n_profiles + 1]
     eff_r = params[n_profiles + 2]
     vol_frac = params[n_profiles + 3]
@@ -78,9 +92,15 @@ def model_monosq(params):
     for weight, component in zip(weights, theoretical_intensities):
         mixture += weight * component
 
-    iq = mixture * calc_monodisperse_sq(eff_r, vol_frac, q_values)
-    iq += solv_w * solvent_intensities
-    return iq * scale + offset
+    solute_intensity = mixture * calc_monodisperse_sq(
+        eff_r,
+        vol_frac,
+        q_values,
+    )
+    solvent_contribution = solv_w * np.asarray(
+        solvent_intensities, dtype=float
+    )
+    return scale * solute_intensity + solvent_contribution + offset
 
 
 def log_likelihood_monosq(params):

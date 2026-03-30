@@ -27,6 +27,7 @@ from saxshell.saxs.dream.settings import (
 )
 from saxshell.saxs.prefit import SAXSPrefitWorkflow
 from saxshell.saxs.project_manager import (
+    ProjectSettings,
     SAXSProjectManager,
     build_project_paths,
 )
@@ -66,6 +67,23 @@ class SAXSDreamWorkflow:
         self.parameter_map_path = self.paths.dream_dir / "pd_param_map.json"
         self.settings_presets_dir = self.paths.dream_dir / "settings_presets"
         self.settings_presets_dir.mkdir(parents=True, exist_ok=True)
+
+    def apply_project_settings(
+        self,
+        settings: ProjectSettings,
+    ) -> None:
+        incoming_settings = ProjectSettings.from_dict(settings.to_dict())
+        if incoming_settings.resolved_project_dir != self.paths.project_dir:
+            raise ValueError(
+                "Cannot apply project settings from a different SAXS project."
+            )
+        self.settings = incoming_settings
+        self.paths = build_project_paths(self.settings.project_dir)
+        self.dream_settings_path = self.paths.dream_dir / "pd_settings.json"
+        self.parameter_map_path = self.paths.dream_dir / "pd_param_map.json"
+        self.settings_presets_dir = self.paths.dream_dir / "settings_presets"
+        self.settings_presets_dir.mkdir(parents=True, exist_ok=True)
+        self.prefit_workflow.apply_project_settings(incoming_settings)
 
     def load_settings(self) -> DreamRunSettings:
         settings = load_dream_settings(self.dream_settings_path)

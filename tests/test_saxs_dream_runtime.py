@@ -61,7 +61,6 @@ def _build_minimal_saxs_project(tmp_path):
         vol_frac=0.0,
         scale=5e-4,
     )
-
     experimental_path = paths.experimental_data_dir / "exp_demo.txt"
     np.savetxt(experimental_path, np.column_stack([q_values, experimental]))
     _write_component_file(
@@ -152,7 +151,6 @@ def _build_poly_lma_geometry_project(
         offset=0.0,
         log_sigma=-9.21,
     )
-
     experimental_path = paths.experimental_data_dir / "exp_demo.txt"
     np.savetxt(experimental_path, np.column_stack([q_values, experimental]))
     _write_component_file(

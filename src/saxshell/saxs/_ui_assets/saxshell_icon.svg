@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="SAXSShell icon">
+  <defs>
+    <linearGradient id="nodeFill" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#55b3ff" />
+      <stop offset="100%" stop-color="#0f4aa6" />
+    </linearGradient>
+  </defs>
+
+  <g fill="none" stroke="#0f4aa6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M54 336C145 330 223 326 301 330C356 333 400 327 458 309" stroke-width="14" />
+    <path d="M282 327C330 345 390 332 432 296C457 276 477 270 494 276" stroke-width="14" />
+    <path d="M298 172C252 144 193 150 160 199C141 226 137 260 147 290" stroke-width="11" />
+    <path d="M188 185C157 189 132 207 117 234" stroke-width="11" />
+    <path d="M181 211C152 214 127 230 113 255" stroke-width="11" />
+    <path d="M176 243C150 247 130 262 118 282" stroke-width="11" />
+    <path d="M140 296C136 213 193 145 282 141C343 138 398 175 417 233C436 291 413 355 360 386" stroke-width="14" />
+  </g>
+
+  <g stroke="#0f4aa6" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M256 201L212 236L256 272L300 236Z" fill="none" />
+    <line x1="256" y1="201" x2="256" y2="272" />
+    <line x1="212" y1="236" x2="300" y2="236" />
+
+    <circle cx="256" cy="236" r="18" fill="#ffffff" />
+    <circle cx="256" cy="195" r="16" fill="url(#nodeFill)" />
+    <circle cx="212" cy="236" r="16" fill="url(#nodeFill)" />
+    <circle cx="300" cy="236" r="16" fill="url(#nodeFill)" />
+    <circle cx="256" cy="277" r="16" fill="url(#nodeFill)" />
+  </g>
+
+  <g fill="#0f4aa6">
+    <circle cx="364" cy="340" r="2.5" />
+    <circle cx="382" cy="334" r="4.2" />
+    <circle cx="401" cy="327" r="5.7" />
+    <circle cx="420" cy="319" r="6.8" />
+    <circle cx="439" cy="311" r="4.1" />
+  </g>
+</svg>
