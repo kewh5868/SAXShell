@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -135,6 +136,7 @@ class DreamTab(QWidget):
     save_model_fit_requested = Signal()
     save_violin_data_requested = Signal()
     settings_preset_changed = Signal(str)
+    apply_filter_requested = Signal()
     visualization_settings_changed = Signal()
     results_settings_changed = Signal()
     summary_settings_changed = Signal()
@@ -156,6 +158,7 @@ class DreamTab(QWidget):
         self._model_legend_line_map: dict[object, object] = {}
         self._model_legend_handle_lookup: dict[str, object] = {}
         self._suspend_visualization_notifications = False
+        self._filter_settings_dirty = False
         self._blink_timer = QTimer(self)
         self._blink_timer.setInterval(180)
         self._blink_timer.timeout.connect(self._advance_button_blink)
@@ -226,6 +229,10 @@ class DreamTab(QWidget):
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(12)
         content_layout.addWidget(self._build_settings_group())
+        content_layout.addWidget(self._build_setup_actions_group())
+        content_layout.addWidget(self._build_posterior_filter_group())
+        content_layout.addWidget(self._build_filter_status_group())
+        content_layout.addWidget(self._build_analysis_actions_group())
         content_layout.addWidget(self._build_parameter_map_group())
         content_layout.addWidget(self._output_group)
         content_layout.addStretch(1)
@@ -476,7 +483,7 @@ class DreamTab(QWidget):
         self.verbose_interval_spin.setDecimals(1)
         self.verbose_interval_spin.setSingleStep(0.1)
         self.verbose_checkbox.setChecked(True)
-        self.verbose_interval_spin.setValue(1.0)
+        self.verbose_interval_spin.setValue(5.0)
         self.parallel_checkbox = QCheckBox("Run chains in parallel")
         self.adapt_checkbox = QCheckBox("Adapt crossover")
         self.restart_checkbox = QCheckBox("Restart previous run")
@@ -536,7 +543,66 @@ class DreamTab(QWidget):
         layout.addWidget(history_label, row, 0)
         layout.addWidget(history_row, row, 1, 1, 3)
 
-        row += 1
+        self._set_combo_data(self.search_filter_preset_combo, "medium")
+        self._update_verbose_output_controls()
+        return group
+
+    def _build_setup_actions_group(self) -> QGroupBox:
+        self.edit_button = QPushButton("Edit Priors")
+        self.edit_button.setToolTip(
+            "Open the DREAM prior editor and save the parameter map before "
+            "running a refinement."
+        )
+        self.edit_button.clicked.connect(
+            self.edit_parameter_map_requested.emit
+        )
+        self.save_settings_button = QPushButton("Save Settings")
+        self.save_settings_button.setToolTip(
+            "Save the current DREAM settings to the active project state "
+            "and optionally create a named reusable settings preset."
+        )
+        self.save_settings_button.clicked.connect(
+            self.save_settings_requested.emit
+        )
+        self.write_button = QPushButton("Write Runtime Bundle")
+        self.write_button.setToolTip(
+            "Generate the DREAM runtime script bundle using the current "
+            "prefit state, settings, and saved parameter map."
+        )
+        self.write_button.clicked.connect(self.write_runtime_requested.emit)
+        self.preview_button = QPushButton("Preview Runtime Bundle")
+        self.preview_button.setToolTip(
+            "Open the most recently written DREAM runtime script in the "
+            "system's default text editor."
+        )
+        self.preview_button.clicked.connect(
+            self.preview_runtime_requested.emit
+        )
+        self.run_button = QPushButton("Run DREAM")
+        self.run_button.setToolTip(
+            "Execute the DREAM refinement using the current settings and "
+            "saved parameter map."
+        )
+        self.run_button.clicked.connect(self.run_dream_requested.emit)
+        self.setup_actions_group = self._build_action_group(
+            "DREAM Setup",
+            [
+                self.edit_button,
+                self.save_settings_button,
+                self.write_button,
+                self.preview_button,
+                self.run_button,
+            ],
+        )
+        return self.setup_actions_group
+
+    def _build_posterior_filter_group(self) -> QGroupBox:
+        group = QGroupBox("Posterior Filtering")
+        layout = QGridLayout(group)
+        layout.setColumnStretch(1, 1)
+        layout.setColumnStretch(3, 1)
+
+        row = 0
         self.bestfit_method_combo = QComboBox()
         self.bestfit_method_combo.addItem("MAP", "map")
         self.bestfit_method_combo.addItem("Chain Mean MAP", "chain_mean")
@@ -606,10 +672,6 @@ class DreamTab(QWidget):
             self.weight_order_combo,
             weight_order_tip,
         )
-        layout.addWidget(weight_order_label, row, 0)
-        layout.addWidget(self.weight_order_combo, row, 1, 1, 3)
-
-        row += 1
         self.violin_value_scale_combo = QComboBox()
         self.violin_value_scale_combo.addItem(
             "Parameter Value", "parameter_value"
@@ -643,10 +705,278 @@ class DreamTab(QWidget):
             self.violin_value_scale_combo,
             value_scale_tip,
         )
-        layout.addWidget(value_scale_label, row, 0)
-        layout.addWidget(self.violin_value_scale_combo, row, 1, 1, 3)
+        layout.addWidget(weight_order_label, row, 0)
+        layout.addWidget(self.weight_order_combo, row, 1)
+        layout.addWidget(value_scale_label, row, 2)
+        layout.addWidget(self.violin_value_scale_combo, row, 3)
 
         row += 1
+        self.stoichiometry_elements_edit = QLineEdit()
+        self.stoichiometry_elements_edit.setPlaceholderText("e.g. Pb, I")
+        self.stoichiometry_elements_edit.textChanged.connect(
+            lambda _text: self._notify_results_settings_changed()
+        )
+        stoichiometry_elements_tip = (
+            "Elements used to evaluate model stoichiometry, entered in the "
+            "desired ratio order, for example Pb, I."
+        )
+        stoichiometry_elements_label = QLabel("Target elements")
+        self._set_widget_tooltip(
+            stoichiometry_elements_label,
+            self.stoichiometry_elements_edit,
+            stoichiometry_elements_tip,
+        )
+        self.stoichiometry_ratio_edit = QLineEdit()
+        self.stoichiometry_ratio_edit.setPlaceholderText("e.g. 1:2")
+        self.stoichiometry_ratio_edit.textChanged.connect(
+            lambda _text: self._notify_results_settings_changed()
+        )
+        stoichiometry_ratio_tip = (
+            "Target stoichiometric ratio for the selected elements, for "
+            "example 1:2."
+        )
+        stoichiometry_ratio_label = QLabel("Target ratio")
+        self._set_widget_tooltip(
+            stoichiometry_ratio_label,
+            self.stoichiometry_ratio_edit,
+            stoichiometry_ratio_tip,
+        )
+        layout.addWidget(stoichiometry_elements_label, row, 0)
+        layout.addWidget(self.stoichiometry_elements_edit, row, 1)
+        layout.addWidget(stoichiometry_ratio_label, row, 2)
+        layout.addWidget(self.stoichiometry_ratio_edit, row, 3)
+
+        row += 1
+        self.stoichiometry_filter_checkbox = QCheckBox(
+            "Enable stoichiometry filter"
+        )
+        self.stoichiometry_filter_checkbox.toggled.connect(
+            self._on_stoichiometry_filter_toggled
+        )
+        self.stoichiometry_filter_checkbox.setToolTip(
+            "Keep only DREAM posterior samples whose weighted cluster "
+            "stoichiometry falls within the target tolerance."
+        )
+        self.stoichiometry_tolerance_spin = QDoubleSpinBox()
+        self.stoichiometry_tolerance_spin.setRange(0.0, 1000.0)
+        self.stoichiometry_tolerance_spin.setDecimals(2)
+        self.stoichiometry_tolerance_spin.setSingleStep(0.5)
+        self.stoichiometry_tolerance_spin.setValue(5.0)
+        self.stoichiometry_tolerance_spin.valueChanged.connect(
+            self._on_stoichiometry_tolerance_changed
+        )
+        stoichiometry_tolerance_tip = (
+            "Maximum allowed percent deviation from the target weighted "
+            "stoichiometric ratio."
+        )
+        stoichiometry_tolerance_label = QLabel("Tolerance (%)")
+        self._set_widget_tooltip(
+            stoichiometry_tolerance_label,
+            self.stoichiometry_tolerance_spin,
+            stoichiometry_tolerance_tip,
+        )
+        layout.addWidget(self.stoichiometry_filter_checkbox, row, 0, 1, 2)
+        layout.addWidget(stoichiometry_tolerance_label, row, 2)
+        layout.addWidget(self.stoichiometry_tolerance_spin, row, 3)
+
+        self.posterior_filter_combo = QComboBox()
+        self.posterior_filter_combo.addItem(
+            "All Post-burnin Samples", "all_post_burnin"
+        )
+        self.posterior_filter_combo.addItem(
+            "Top % by Log-posterior", "top_percent_logp"
+        )
+        self.posterior_filter_combo.addItem(
+            "Top N by Log-posterior", "top_n_logp"
+        )
+        self.posterior_filter_combo.currentIndexChanged.connect(
+            self._on_posterior_filter_mode_changed
+        )
+        filter_tip = (
+            "Choose which posterior samples are kept after burn-in before "
+            "the best-fit summary, violin plot, and statistics report are "
+            "computed."
+        )
+        filter_label = QLabel("Posterior filter")
+        self._set_widget_tooltip(
+            filter_label,
+            self.posterior_filter_combo,
+            filter_tip,
+        )
+
+        self.violin_sample_source_combo = QComboBox()
+        self.violin_sample_source_combo.addItem(
+            "Filtered Posterior", "filtered_posterior"
+        )
+        self.violin_sample_source_combo.addItem(
+            "MAP Chain Only", "map_chain_only"
+        )
+        self.violin_sample_source_combo.currentIndexChanged.connect(
+            lambda _index: self._mark_search_filter_preset_custom()
+        )
+        self.violin_sample_source_combo.currentIndexChanged.connect(
+            self._on_violin_sample_source_changed
+        )
+        violin_source_tip = (
+            "Choose whether the violin plot shows the full filtered "
+            "posterior sample set or only the filtered samples from the "
+            "chain containing the global MAP point."
+        )
+        violin_source_label = QLabel("Violin samples")
+        self._set_widget_tooltip(
+            violin_source_label,
+            self.violin_sample_source_combo,
+            violin_source_tip,
+        )
+        row += 1
+        layout.addWidget(filter_label, row, 0)
+        layout.addWidget(self.posterior_filter_combo, row, 1)
+        layout.addWidget(violin_source_label, row, 2)
+        layout.addWidget(self.violin_sample_source_combo, row, 3)
+
+        self.posterior_top_percent_spin = QDoubleSpinBox()
+        self.posterior_top_percent_spin.setRange(0.1, 100.0)
+        self.posterior_top_percent_spin.setDecimals(2)
+        self.posterior_top_percent_spin.setSingleStep(1.0)
+        self.posterior_top_percent_spin.setValue(10.0)
+        self.posterior_top_percent_spin.valueChanged.connect(
+            lambda _value: self._mark_search_filter_preset_custom()
+        )
+        self.posterior_top_percent_spin.valueChanged.connect(
+            self._on_posterior_top_percent_changed
+        )
+        top_percent_tip = (
+            "Default percent used whenever Top % log-posterior screening is "
+            "evaluated or selected. The automatic post-run filter "
+            "assessment also uses this value."
+        )
+        top_percent_label = QLabel("Top % default")
+        self._set_widget_tooltip(
+            top_percent_label,
+            self.posterior_top_percent_spin,
+            top_percent_tip,
+        )
+
+        self.posterior_top_n_spin = QSpinBox()
+        self.posterior_top_n_spin.setRange(1, 10_000_000)
+        self.posterior_top_n_spin.setValue(500)
+        self.posterior_top_n_spin.valueChanged.connect(
+            lambda _value: self._mark_search_filter_preset_custom()
+        )
+        self.posterior_top_n_spin.valueChanged.connect(
+            self._on_posterior_top_n_changed
+        )
+        top_n_tip = (
+            "Default count used whenever Top N log-posterior screening is "
+            "evaluated or selected. The automatic post-run filter "
+            "assessment also uses this value."
+        )
+        top_n_label = QLabel("Top N default")
+        self._set_widget_tooltip(
+            top_n_label,
+            self.posterior_top_n_spin,
+            top_n_tip,
+        )
+        row += 1
+        layout.addWidget(top_percent_label, row, 0)
+        layout.addWidget(self.posterior_top_percent_spin, row, 1)
+        layout.addWidget(top_n_label, row, 2)
+        layout.addWidget(self.posterior_top_n_spin, row, 3)
+
+        self.auto_filter_assessment_checkbox = QCheckBox(
+            "Auto-select best filter after run"
+        )
+        self.auto_filter_assessment_checkbox.setChecked(True)
+        self.auto_filter_assessment_checkbox.setToolTip(
+            "After a DREAM refinement completes, evaluate All Post-burnin, "
+            "Top % by log-posterior, and Top N by log-posterior using the "
+            "default Top % / Top N values above, then automatically apply "
+            "the filter with the best fit quality."
+        )
+        row += 1
+        layout.addWidget(self.auto_filter_assessment_checkbox, row, 0, 1, 4)
+
+        self.credible_interval_low_spin = QDoubleSpinBox()
+        self.credible_interval_low_spin.setRange(0.0, 99.9)
+        self.credible_interval_low_spin.setDecimals(1)
+        self.credible_interval_low_spin.setSingleStep(1.0)
+        self.credible_interval_low_spin.setValue(16.0)
+        self.credible_interval_low_spin.valueChanged.connect(
+            self._on_credible_interval_low_changed
+        )
+        interval_low_tip = (
+            "Lower percentile used for the posterior interval bars and "
+            "reported statistics."
+        )
+        interval_low_label = QLabel("Interval low (%)")
+        self._set_widget_tooltip(
+            interval_low_label,
+            self.credible_interval_low_spin,
+            interval_low_tip,
+        )
+
+        self.credible_interval_high_spin = QDoubleSpinBox()
+        self.credible_interval_high_spin.setRange(0.1, 100.0)
+        self.credible_interval_high_spin.setDecimals(1)
+        self.credible_interval_high_spin.setSingleStep(1.0)
+        self.credible_interval_high_spin.setValue(84.0)
+        self.credible_interval_high_spin.valueChanged.connect(
+            self._on_credible_interval_high_changed
+        )
+        interval_high_tip = (
+            "Upper percentile used for the posterior interval bars and "
+            "reported statistics."
+        )
+        interval_high_label = QLabel("Interval high (%)")
+        self._set_widget_tooltip(
+            interval_high_label,
+            self.credible_interval_high_spin,
+            interval_high_tip,
+        )
+        row += 1
+        layout.addWidget(interval_low_label, row, 0)
+        layout.addWidget(self.credible_interval_low_spin, row, 1)
+        layout.addWidget(interval_high_label, row, 2)
+        layout.addWidget(self.credible_interval_high_spin, row, 3)
+
+        row += 1
+        layout.addWidget(
+            self._build_collapsible_color_options_widget(),
+            row,
+            0,
+            1,
+            4,
+        )
+
+        self._update_posterior_filter_controls()
+        self._update_violin_style_controls()
+        return group
+
+    def _build_collapsible_color_options_widget(self) -> QWidget:
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(6)
+
+        self.color_options_toggle_button = QToolButton()
+        self.color_options_toggle_button.setText("Color Options")
+        self.color_options_toggle_button.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        self.color_options_toggle_button.setArrowType(Qt.ArrowType.RightArrow)
+        self.color_options_toggle_button.setCheckable(True)
+        self.color_options_toggle_button.setChecked(False)
+        self.color_options_toggle_button.clicked.connect(
+            self._toggle_color_options_collapsed
+        )
+        container_layout.addWidget(self.color_options_toggle_button)
+
+        self.color_options_panel = QWidget()
+        color_layout = QGridLayout(self.color_options_panel)
+        color_layout.setContentsMargins(12, 0, 0, 0)
+        color_layout.setColumnStretch(1, 1)
+        color_layout.setColumnStretch(3, 1)
+
         self.violin_palette_combo = QComboBox()
         for label, palette in [
             ("Blues", "Blues"),
@@ -678,6 +1008,7 @@ class DreamTab(QWidget):
             self.violin_palette_combo,
             violin_palette_tip,
         )
+
         point_color_tip = (
             "Choose the color used for the selected best-fit scatter points "
             "overlaid on the violin plot."
@@ -697,12 +1028,11 @@ class DreamTab(QWidget):
             self.violin_point_color_button,
             point_color_tip,
         )
-        layout.addWidget(violin_palette_label, row, 0)
-        layout.addWidget(self.violin_palette_combo, row, 1)
-        layout.addWidget(point_color_label, row, 2)
-        layout.addWidget(self.violin_point_color_button, row, 3)
+        color_layout.addWidget(violin_palette_label, 0, 0)
+        color_layout.addWidget(self.violin_palette_combo, 0, 1)
+        color_layout.addWidget(point_color_label, 0, 2)
+        color_layout.addWidget(self.violin_point_color_button, 0, 3)
 
-        row += 1
         self.violin_custom_color_button = QPushButton()
         self.violin_custom_color_button.clicked.connect(
             self._choose_violin_custom_color
@@ -739,12 +1069,11 @@ class DreamTab(QWidget):
             self.interval_color_button,
             interval_color_tip,
         )
-        layout.addWidget(violin_custom_label, row, 0)
-        layout.addWidget(self.violin_custom_color_button, row, 1)
-        layout.addWidget(interval_color_label, row, 2)
-        layout.addWidget(self.interval_color_button, row, 3)
+        color_layout.addWidget(violin_custom_label, 1, 0)
+        color_layout.addWidget(self.violin_custom_color_button, 1, 1)
+        color_layout.addWidget(interval_color_label, 1, 2)
+        color_layout.addWidget(self.interval_color_button, 1, 3)
 
-        row += 1
         self.median_color_button = QPushButton()
         self.median_color_button.clicked.connect(self._choose_median_color)
         self._configure_plot_color_button(
@@ -802,55 +1131,37 @@ class DreamTab(QWidget):
         outline_layout.addWidget(self.violin_outline_color_button)
         outline_layout.addWidget(outline_width_label)
         outline_layout.addWidget(self.violin_outline_width_spin)
-        layout.addWidget(median_color_label, row, 0)
-        layout.addWidget(self.median_color_button, row, 1)
-        layout.addWidget(outline_widget, row, 2, 1, 2)
+        color_layout.addWidget(median_color_label, 2, 0)
+        color_layout.addWidget(self.median_color_button, 2, 1)
+        color_layout.addWidget(outline_widget, 2, 2, 1, 2)
 
-        row += 1
-        layout.addWidget(
-            self._build_posterior_filter_group(),
-            row,
-            0,
-            1,
-            4,
-        )
+        self.color_options_panel.setVisible(False)
+        container_layout.addWidget(self.color_options_panel)
+        return container
 
-        self.edit_button = QPushButton("Edit Priors")
-        self.edit_button.setToolTip(
-            "Open the DREAM prior editor and save the parameter map before "
-            "running a refinement."
+    def _build_filter_status_group(self) -> QGroupBox:
+        self.filter_status_group = QGroupBox("Filter Status")
+        layout = QVBoxLayout(self.filter_status_group)
+        self.filter_status_box = QTextEdit()
+        self.filter_status_box.setReadOnly(True)
+        self.filter_status_box.setMinimumHeight(140)
+        layout.addWidget(self.filter_status_box)
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        self.apply_filter_button = QPushButton("Apply Filter")
+        self.apply_filter_button.clicked.connect(
+            self.apply_filter_requested.emit
         )
-        self.edit_button.clicked.connect(
-            self.edit_parameter_map_requested.emit
+        button_row.addWidget(self.apply_filter_button)
+        layout.addLayout(button_row)
+        self.set_filter_status_text(
+            "No DREAM dataset is loaded yet. Load a run, then apply posterior "
+            "filter settings from this panel."
         )
-        self.save_settings_button = QPushButton("Save Settings")
-        self.save_settings_button.setToolTip(
-            "Save the current DREAM settings to the active project state "
-            "and optionally create a named reusable settings preset."
-        )
-        self.save_settings_button.clicked.connect(
-            self.save_settings_requested.emit
-        )
-        self.write_button = QPushButton("Write Runtime Bundle")
-        self.write_button.setToolTip(
-            "Generate the DREAM runtime script bundle using the current "
-            "prefit state, settings, and saved parameter map."
-        )
-        self.write_button.clicked.connect(self.write_runtime_requested.emit)
-        self.preview_button = QPushButton("Preview Runtime Bundle")
-        self.preview_button.setToolTip(
-            "Open the most recently written DREAM runtime script in the "
-            "system's default text editor."
-        )
-        self.preview_button.clicked.connect(
-            self.preview_runtime_requested.emit
-        )
-        self.run_button = QPushButton("Run DREAM")
-        self.run_button.setToolTip(
-            "Execute the DREAM refinement using the current settings and "
-            "saved parameter map."
-        )
-        self.run_button.clicked.connect(self.run_dream_requested.emit)
+        self.set_filter_dirty(False)
+        return self.filter_status_group
+
+    def _build_analysis_actions_group(self) -> QGroupBox:
         self.saved_runs_combo = QComboBox()
         self.saved_runs_combo.setToolTip(
             "Choose a completed DREAM run from the active project to "
@@ -889,22 +1200,6 @@ class DreamTab(QWidget):
         self.export_model_report_button.clicked.connect(
             self.export_model_report_requested.emit
         )
-
-        row += 1
-        action_sections = QWidget()
-        action_sections_layout = QVBoxLayout(action_sections)
-        action_sections_layout.setContentsMargins(0, 0, 0, 0)
-        action_sections_layout.setSpacing(10)
-        self.setup_actions_group = self._build_action_group(
-            "DREAM Setup",
-            [
-                self.edit_button,
-                self.save_settings_button,
-                self.write_button,
-                self.preview_button,
-                self.run_button,
-            ],
-        )
         self.analysis_actions_group = QGroupBox("DREAM Analysis")
         analysis_layout = QGridLayout(self.analysis_actions_group)
         analysis_layout.addWidget(QLabel("Saved run"), 0, 0)
@@ -919,178 +1214,7 @@ class DreamTab(QWidget):
             1,
             3,
         )
-        action_sections_layout.addWidget(self.setup_actions_group)
-        action_sections_layout.addWidget(self.analysis_actions_group)
-        layout.addWidget(action_sections, row, 0, 1, 4)
-        self._set_combo_data(self.search_filter_preset_combo, "medium")
-        self._update_verbose_output_controls()
-        self._update_violin_style_controls()
-        return group
-
-    def _build_posterior_filter_group(self) -> QGroupBox:
-        group = QGroupBox("Posterior Filtering")
-        layout = QGridLayout(group)
-        layout.setColumnStretch(1, 1)
-        layout.setColumnStretch(3, 1)
-
-        self.posterior_filter_combo = QComboBox()
-        self.posterior_filter_combo.addItem(
-            "All Post-burnin Samples", "all_post_burnin"
-        )
-        self.posterior_filter_combo.addItem(
-            "Top % by Log-posterior", "top_percent_logp"
-        )
-        self.posterior_filter_combo.addItem(
-            "Top N by Log-posterior", "top_n_logp"
-        )
-        self.posterior_filter_combo.currentIndexChanged.connect(
-            self._on_posterior_filter_mode_changed
-        )
-        filter_tip = (
-            "Choose which posterior samples are kept after burn-in before "
-            "the best-fit summary, violin plot, and statistics report are "
-            "computed."
-        )
-        filter_label = QLabel("Posterior filter")
-        self._set_widget_tooltip(
-            filter_label,
-            self.posterior_filter_combo,
-            filter_tip,
-        )
-
-        self.violin_sample_source_combo = QComboBox()
-        self.violin_sample_source_combo.addItem(
-            "Filtered Posterior", "filtered_posterior"
-        )
-        self.violin_sample_source_combo.addItem(
-            "MAP Chain Only", "map_chain_only"
-        )
-        self.violin_sample_source_combo.currentIndexChanged.connect(
-            lambda _index: self._mark_search_filter_preset_custom()
-        )
-        self.violin_sample_source_combo.currentIndexChanged.connect(
-            self._on_violin_sample_source_changed
-        )
-        violin_source_tip = (
-            "Choose whether the violin plot shows the full filtered "
-            "posterior sample set or only the filtered samples from the "
-            "chain containing the global MAP point."
-        )
-        violin_source_label = QLabel("Violin samples")
-        self._set_widget_tooltip(
-            violin_source_label,
-            self.violin_sample_source_combo,
-            violin_source_tip,
-        )
-        layout.addWidget(filter_label, 0, 0)
-        layout.addWidget(self.posterior_filter_combo, 0, 1)
-        layout.addWidget(violin_source_label, 0, 2)
-        layout.addWidget(self.violin_sample_source_combo, 0, 3)
-
-        self.posterior_top_percent_spin = QDoubleSpinBox()
-        self.posterior_top_percent_spin.setRange(0.1, 100.0)
-        self.posterior_top_percent_spin.setDecimals(2)
-        self.posterior_top_percent_spin.setSingleStep(1.0)
-        self.posterior_top_percent_spin.setValue(10.0)
-        self.posterior_top_percent_spin.valueChanged.connect(
-            lambda _value: self._mark_search_filter_preset_custom()
-        )
-        self.posterior_top_percent_spin.valueChanged.connect(
-            self._on_posterior_top_percent_changed
-        )
-        top_percent_tip = (
-            "Default percent used whenever Top % log-posterior screening is "
-            "evaluated or selected. The automatic post-run filter "
-            "assessment also uses this value."
-        )
-        top_percent_label = QLabel("Top % default")
-        self._set_widget_tooltip(
-            top_percent_label,
-            self.posterior_top_percent_spin,
-            top_percent_tip,
-        )
-
-        self.posterior_top_n_spin = QSpinBox()
-        self.posterior_top_n_spin.setRange(1, 10_000_000)
-        self.posterior_top_n_spin.setValue(500)
-        self.posterior_top_n_spin.valueChanged.connect(
-            lambda _value: self._mark_search_filter_preset_custom()
-        )
-        self.posterior_top_n_spin.valueChanged.connect(
-            self._on_posterior_top_n_changed
-        )
-        top_n_tip = (
-            "Default count used whenever Top N log-posterior screening is "
-            "evaluated or selected. The automatic post-run filter "
-            "assessment also uses this value."
-        )
-        top_n_label = QLabel("Top N default")
-        self._set_widget_tooltip(
-            top_n_label,
-            self.posterior_top_n_spin,
-            top_n_tip,
-        )
-        layout.addWidget(top_percent_label, 1, 0)
-        layout.addWidget(self.posterior_top_percent_spin, 1, 1)
-        layout.addWidget(top_n_label, 1, 2)
-        layout.addWidget(self.posterior_top_n_spin, 1, 3)
-
-        self.auto_filter_assessment_checkbox = QCheckBox(
-            "Auto-select best filter after run"
-        )
-        self.auto_filter_assessment_checkbox.setChecked(True)
-        self.auto_filter_assessment_checkbox.setToolTip(
-            "After a DREAM refinement completes, evaluate All Post-burnin, "
-            "Top % by log-posterior, and Top N by log-posterior using the "
-            "default Top % / Top N values above, then automatically apply "
-            "the filter with the best fit quality."
-        )
-        layout.addWidget(self.auto_filter_assessment_checkbox, 2, 0, 1, 4)
-
-        self.credible_interval_low_spin = QDoubleSpinBox()
-        self.credible_interval_low_spin.setRange(0.0, 99.9)
-        self.credible_interval_low_spin.setDecimals(1)
-        self.credible_interval_low_spin.setSingleStep(1.0)
-        self.credible_interval_low_spin.setValue(16.0)
-        self.credible_interval_low_spin.valueChanged.connect(
-            self._on_credible_interval_low_changed
-        )
-        interval_low_tip = (
-            "Lower percentile used for the posterior interval bars and "
-            "reported statistics."
-        )
-        interval_low_label = QLabel("Interval low (%)")
-        self._set_widget_tooltip(
-            interval_low_label,
-            self.credible_interval_low_spin,
-            interval_low_tip,
-        )
-
-        self.credible_interval_high_spin = QDoubleSpinBox()
-        self.credible_interval_high_spin.setRange(0.1, 100.0)
-        self.credible_interval_high_spin.setDecimals(1)
-        self.credible_interval_high_spin.setSingleStep(1.0)
-        self.credible_interval_high_spin.setValue(84.0)
-        self.credible_interval_high_spin.valueChanged.connect(
-            self._on_credible_interval_high_changed
-        )
-        interval_high_tip = (
-            "Upper percentile used for the posterior interval bars and "
-            "reported statistics."
-        )
-        interval_high_label = QLabel("Interval high (%)")
-        self._set_widget_tooltip(
-            interval_high_label,
-            self.credible_interval_high_spin,
-            interval_high_tip,
-        )
-        layout.addWidget(interval_low_label, 3, 0)
-        layout.addWidget(self.credible_interval_low_spin, 3, 1)
-        layout.addWidget(interval_high_label, 3, 2)
-        layout.addWidget(self.credible_interval_high_spin, 3, 3)
-
-        self._update_posterior_filter_controls()
-        return group
+        return self.analysis_actions_group
 
     def _build_parameter_map_group(self) -> QGroupBox:
         group = QGroupBox("Current Prior Map")
@@ -1409,6 +1533,18 @@ class DreamTab(QWidget):
                 self.violin_value_scale_combo,
                 settings.violin_value_scale_mode,
             )
+            self.stoichiometry_elements_edit.setText(
+                settings.stoichiometry_target_elements_text
+            )
+            self.stoichiometry_ratio_edit.setText(
+                settings.stoichiometry_target_ratio_text
+            )
+            self.stoichiometry_filter_checkbox.setChecked(
+                settings.stoichiometry_filter_enabled
+            )
+            self.stoichiometry_tolerance_spin.setValue(
+                float(settings.stoichiometry_tolerance_percent)
+            )
             self._configure_plot_color_button(
                 self.violin_custom_color_button,
                 settings.violin_custom_color,
@@ -1493,6 +1629,18 @@ class DreamTab(QWidget):
             violin_sample_source=self.selected_violin_sample_source(),
             violin_weight_order=self.selected_weight_order(),
             violin_value_scale_mode=self.selected_violin_value_scale_mode(),
+            stoichiometry_target_elements_text=(
+                self.stoichiometry_elements_edit.text().strip()
+            ),
+            stoichiometry_target_ratio_text=(
+                self.stoichiometry_ratio_edit.text().strip()
+            ),
+            stoichiometry_filter_enabled=bool(
+                self.stoichiometry_filter_checkbox.isChecked()
+            ),
+            stoichiometry_tolerance_percent=float(
+                self.stoichiometry_tolerance_spin.value()
+            ),
             violin_palette=self.selected_violin_palette(),
             violin_custom_color=self.selected_violin_custom_color(),
             violin_point_color=self.selected_violin_point_color(),
@@ -1634,6 +1782,20 @@ class DreamTab(QWidget):
     def set_summary_text(self, text: str) -> None:
         self._summary_text = text.strip()
         self._render_output()
+
+    def set_filter_status_text(self, text: str) -> None:
+        self.filter_status_box.setPlainText(text.strip())
+
+    def set_filter_dirty(self, dirty: bool) -> None:
+        self._filter_settings_dirty = bool(dirty)
+        self.apply_filter_button.setEnabled(bool(dirty))
+        base_text = self.apply_filter_button.text().replace(" *", "")
+        self.apply_filter_button.setText(
+            f"{base_text} *" if self._filter_settings_dirty else base_text
+        )
+
+    def filter_settings_dirty(self) -> bool:
+        return bool(self._filter_settings_dirty)
 
     def set_console_autoscroll_enabled(self, enabled: bool) -> None:
         self._console_autoscroll_enabled = bool(enabled)
@@ -2359,6 +2521,11 @@ class DreamTab(QWidget):
         preset = DREAM_SEARCH_FILTER_PRESETS.get(preset_name)
         if preset is None:
             return
+        if not hasattr(self, "posterior_filter_combo") or not hasattr(
+            self,
+            "violin_sample_source_combo",
+        ):
+            return
         self._applying_search_filter_preset = True
         self._suspend_visualization_notifications = True
         try:
@@ -2400,6 +2567,16 @@ class DreamTab(QWidget):
     def _update_posterior_filter_controls(self) -> None:
         self.posterior_top_percent_spin.setEnabled(True)
         self.posterior_top_n_spin.setEnabled(True)
+        self.stoichiometry_tolerance_spin.setEnabled(
+            self.stoichiometry_filter_checkbox.isChecked()
+        )
+
+    def _toggle_color_options_collapsed(self, _checked: bool = False) -> None:
+        expanded = bool(self.color_options_toggle_button.isChecked())
+        self.color_options_toggle_button.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self.color_options_panel.setVisible(expanded)
 
     def _notify_results_settings_changed(self) -> None:
         if self._suspend_visualization_notifications:
@@ -2454,6 +2631,13 @@ class DreamTab(QWidget):
 
     def _on_credible_interval_high_changed(self, _value: float) -> None:
         self._notify_summary_settings_changed()
+
+    def _on_stoichiometry_filter_toggled(self, _checked: bool) -> None:
+        self._update_posterior_filter_controls()
+        self._notify_results_settings_changed()
+
+    def _on_stoichiometry_tolerance_changed(self, _value: float) -> None:
+        self._notify_results_settings_changed()
 
     @classmethod
     def _display_violin_samples(cls, samples: object) -> np.ndarray:

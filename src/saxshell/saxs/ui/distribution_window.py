@@ -12,7 +12,7 @@ from matplotlib.backends.backend_qtagg import (
     NavigationToolbar2QT,
 )
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -86,6 +86,7 @@ INTERACTIVE_CENTER_HANDLE_SIZE = 78
 INTERACTIVE_WIDTH_HANDLE_SIZE = 70
 INTERACTIVE_CENTER_HANDLE_Y_FRACTION = 0.88
 INTERACTIVE_WIDTH_HANDLE_Y_FRACTION = 0.18
+INTERACTIVE_PREVIEW_THROTTLE_MS = 20
 
 
 @dataclass(slots=True)
@@ -293,6 +294,7 @@ class WeightDistributionPreviewWindow(QMainWindow):
 
 class DistributionSetupWindow(QMainWindow):
     saved = Signal(list)
+    _session_skip_effective_radius_vary_warning = False
 
     def __init__(
         self,
@@ -312,6 +314,14 @@ class DistributionSetupWindow(QMainWindow):
         self._interactive_handles: _InteractiveHandleArtists | None = None
         self._drag_state: _InteractiveDragState | None = None
         self._plot_window_state: _PlotWindowState | None = None
+        self._pending_drag_preview: tuple[int, DreamParameterEntry] | None = (
+            None
+        )
+        self._interactive_preview_timer = QTimer(self)
+        self._interactive_preview_timer.setSingleShot(True)
+        self._interactive_preview_timer.timeout.connect(
+            self._flush_interactive_drag_preview
+        )
         self._build_ui()
         self.load_entries(entries)
 
@@ -525,6 +535,8 @@ class DistributionSetupWindow(QMainWindow):
             self._normalized_entry_copy(entry) for entry in entries
         ]
         self._plot_window_state = None
+        self._pending_drag_preview = None
+        self._interactive_preview_timer.stop()
         if update_reset_entries:
             self._reset_entries = [
                 self._normalized_entry_copy(entry)
@@ -771,6 +783,9 @@ class DistributionSetupWindow(QMainWindow):
             self._set_group_status_for_row(row, "custom")
             if entry is not None and row == self.table.currentRow():
                 self._plot_entry(entry, row=row)
+            return
+        if column in {GUIDE_LOW_COLUMN, GUIDE_HIGH_COLUMN}:
+            self._on_distribution_guide_changed(row, column)
 
     def _reset_row_to_baseline(self, row: int) -> None:
         if row < 0 or row >= len(self._reset_entries):
@@ -956,20 +971,31 @@ class DistributionSetupWindow(QMainWindow):
         param_name = self.table.item(row, 3).text().strip()
         if not self._is_effective_radius_parameter(param_name):
             return
-        message = (
-            "It is not recommended to vary effective-radius parameters in "
-            "the DREAM prior map.\n\n"
-            f"Selected parameter: {param_name}"
-        )
         self.console.append(
             "Warning: effective-radius parameters are not recommended for "
             f"DREAM variation ({param_name})."
         )
-        QMessageBox.warning(
-            self,
-            "Effective radius variation warning",
-            message,
+        self._show_effective_radius_vary_warning(param_name)
+
+    def _show_effective_radius_vary_warning(self, param_name: str) -> None:
+        if type(self)._session_skip_effective_radius_vary_warning:
+            return
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Effective radius variation warning")
+        dialog.setText(
+            "It is not recommended to vary effective-radius parameters in "
+            "the DREAM prior map."
         )
+        dialog.setInformativeText(f"Selected parameter: {param_name}")
+        dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        skip_checkbox = QCheckBox(
+            "Don't show this type of warning again during this session"
+        )
+        dialog.setCheckBox(skip_checkbox)
+        dialog.exec()
+        if skip_checkbox.isChecked():
+            type(self)._session_skip_effective_radius_vary_warning = True
 
     def _show_weight_prior_preview(self) -> None:
         entries = self.current_entries()
@@ -1056,6 +1082,8 @@ class DistributionSetupWindow(QMainWindow):
             start_entry = self._entry_from_row(row)
         except Exception:
             return
+        self._interactive_preview_timer.stop()
+        self._pending_drag_preview = None
         y_limits = event.inaxes.get_ylim()
         self._drag_state = _InteractiveDragState(
             row=row,
@@ -1082,12 +1110,22 @@ class DistributionSetupWindow(QMainWindow):
         )
         if preview_entry is None:
             return
+        if self._entries_match(
+            self._drag_state.preview_entry,
+            preview_entry,
+        ):
+            return
         self._drag_state.preview_entry = preview_entry
-        self._plot_entry(preview_entry, row=self._drag_state.row)
+        self._schedule_interactive_drag_preview(
+            preview_entry,
+            row=self._drag_state.row,
+        )
 
     def _on_plot_mouse_release(self, _event) -> None:
         if self._drag_state is None:
             return
+        self._interactive_preview_timer.stop()
+        self._pending_drag_preview = None
         drag_state = self._drag_state
         self._drag_state = None
         if self._entries_match(
@@ -1108,6 +1146,28 @@ class DistributionSetupWindow(QMainWindow):
 
     def _on_plot_mouse_leave(self, _event) -> None:
         self._on_plot_mouse_release(None)
+
+    def _schedule_interactive_drag_preview(
+        self,
+        entry: DreamParameterEntry,
+        *,
+        row: int,
+    ) -> None:
+        self._pending_drag_preview = (
+            int(row),
+            DreamParameterEntry.from_dict(entry.to_dict()),
+        )
+        if not self._interactive_preview_timer.isActive():
+            self._interactive_preview_timer.start(
+                INTERACTIVE_PREVIEW_THROTTLE_MS
+            )
+
+    def _flush_interactive_drag_preview(self) -> None:
+        if self._pending_drag_preview is None:
+            return
+        row, entry = self._pending_drag_preview
+        self._pending_drag_preview = None
+        self._plot_entry(entry, row=row, interactive_preview=True)
 
     def _interactive_handle_kind_at_event(self, event) -> str | None:
         if self._interactive_handles is None:
@@ -1222,6 +1282,7 @@ class DistributionSetupWindow(QMainWindow):
         *,
         row: int | None = None,
         force_rescale: bool = False,
+        interactive_preview: bool = False,
     ) -> None:
         plot_row = row if row is not None else int(self.table.currentRow())
         current_window = self._current_plot_window_state(plot_row)
@@ -1332,7 +1393,8 @@ class DistributionSetupWindow(QMainWindow):
                 va="center",
             )
             axis.set_axis_off()
-        self.figure.tight_layout()
+        if not interactive_preview:
+            self.figure.tight_layout()
         if self._drag_state is None:
             self.canvas.draw()
         else:
@@ -2067,20 +2129,20 @@ class DistributionSetupWindow(QMainWindow):
                 guide_tooltip = (
                     f"{guide_kind} for the current {entry.distribution} prior."
                 )
-        self._set_read_only_table_item(
+        self._set_distribution_guide_item(
             row,
             GUIDE_LOW_COLUMN,
             guide_low_text,
             tooltip=guide_tooltip,
         )
-        self._set_read_only_table_item(
+        self._set_distribution_guide_item(
             row,
             GUIDE_HIGH_COLUMN,
             guide_high_text,
             tooltip=guide_tooltip,
         )
 
-    def _set_read_only_table_item(
+    def _set_distribution_guide_item(
         self,
         row: int,
         column: int,
@@ -2093,7 +2155,6 @@ class DistributionSetupWindow(QMainWindow):
             item = self.table.item(row, column)
             if item is None:
                 item = QTableWidgetItem()
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 item.setTextAlignment(
                     Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
                 )
@@ -2102,6 +2163,43 @@ class DistributionSetupWindow(QMainWindow):
             item.setToolTip(tooltip)
         finally:
             self.table.blockSignals(was_blocked)
+
+    def _on_distribution_guide_changed(self, row: int, column: int) -> None:
+        guide_item = self.table.item(row, column)
+        guide_text = "" if guide_item is None else guide_item.text().strip()
+        guide_label = "low" if column == GUIDE_LOW_COLUMN else "high"
+        handle_kind = (
+            "left_width" if column == GUIDE_LOW_COLUMN else "right_width"
+        )
+        try:
+            target_value = float(guide_text)
+            entry = self._entry_from_row(row)
+            updated_entry = self._width_drag_adjusted_entry(
+                entry,
+                handle_kind=handle_kind,
+                target_x=target_value,
+            )
+        except Exception as exc:
+            self._refresh_distribution_guides_for_row(
+                row,
+                entry=(
+                    self._entry_from_row(row)
+                    if 0 <= row < self.table.rowCount()
+                    else None
+                ),
+            )
+            self.console.append(
+                "Invalid guide "
+                f"{guide_label} value for {self._row_status_label(row)}: {exc}"
+            )
+            return
+        self._apply_entry_to_row(row, updated_entry)
+        self._set_group_status_for_row(row, "custom")
+        self.console.append(
+            "Updated guide "
+            f"{guide_label} for {updated_entry.param} -> "
+            f"{target_value:.6g}."
+        )
 
 
 def _x_coordinate_is_valid_for_scale(

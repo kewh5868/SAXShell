@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +14,7 @@ import numpy as np
 from saxshell.saxs.debye import (
     ClusterBin,
     DebyeProfileBuilder,
+    compute_debye_intensity,
     discover_cluster_bins,
     scan_structure_element_counts,
     scan_structure_elements,
@@ -26,14 +29,17 @@ ProgressCallback = Callable[[int, int, str], None]
 class ProjectPaths:
     project_dir: Path
     project_file: Path
+    saved_distributions_dir: Path
     experimental_data_dir: Path
     scattering_components_dir: Path
+    predicted_scattering_components_dir: Path
     exported_results_dir: Path
     exported_plots_dir: Path
     exported_data_dir: Path
     plots_dir: Path
     prefit_dir: Path
     cluster_geometry_metadata_file: Path
+    predicted_cluster_geometry_metadata_file: Path
     dream_dir: Path
     dream_runtime_dir: Path
     reports_dir: Path
@@ -44,8 +50,12 @@ def build_project_paths(project_dir: str | Path) -> ProjectPaths:
     return ProjectPaths(
         project_dir=project_dir,
         project_file=project_dir / "saxs_project.json",
+        saved_distributions_dir=project_dir / "saved_distributions",
         experimental_data_dir=project_dir / "experimental_data",
         scattering_components_dir=project_dir / "scattering_components",
+        predicted_scattering_components_dir=(
+            project_dir / "scattering_components_predicted_structures"
+        ),
         exported_results_dir=project_dir / "exported_results",
         exported_plots_dir=project_dir / "exported_results" / "plots",
         exported_data_dir=project_dir / "exported_results" / "data",
@@ -53,6 +63,11 @@ def build_project_paths(project_dir: str | Path) -> ProjectPaths:
         prefit_dir=project_dir / "prefit",
         cluster_geometry_metadata_file=(
             project_dir / "prefit" / "cluster_geometry_metadata.json"
+        ),
+        predicted_cluster_geometry_metadata_file=(
+            project_dir
+            / "prefit"
+            / "cluster_geometry_metadata_predicted_structures.json"
         ),
         dream_dir=project_dir / "dream",
         dream_runtime_dir=project_dir / "dream" / "runtime_scripts",
@@ -62,9 +77,22 @@ def build_project_paths(project_dir: str | Path) -> ProjectPaths:
 
 def load_built_component_q_range(
     project_dir: str | Path,
+    *,
+    include_predicted_structures: bool = False,
+    component_dir: str | Path | None = None,
 ) -> tuple[float, float] | None:
-    paths = build_project_paths(project_dir)
-    component_files = sorted(paths.scattering_components_dir.glob("*.txt"))
+    resolved_component_dir = (
+        Path(component_dir).expanduser().resolve()
+        if component_dir is not None
+        else (
+            build_project_paths(
+                project_dir
+            ).predicted_scattering_components_dir
+            if include_predicted_structures
+            else build_project_paths(project_dir).scattering_components_dir
+        )
+    )
+    component_files = sorted(resolved_component_dir.glob("*.txt"))
     if not component_files:
         return None
 
@@ -125,6 +153,9 @@ class ProjectBuildResult:
     md_prior_weights_path: Path | None = None
     model_map_path: Path | None = None
     prior_plot_data_path: Path | None = None
+    used_predicted_structure_weights: bool = False
+    predicted_dataset_file: Path | None = None
+    predicted_component_count: int = 0
 
 
 @dataclass(slots=True)
@@ -140,6 +171,52 @@ class _ClusterInventory:
     available_elements: list[str]
     cluster_rows: list[dict[str, object]]
     total_files: int
+
+
+@dataclass(slots=True, frozen=True)
+class ProjectArtifactPaths:
+    root_dir: Path
+    plots_dir: Path
+    component_dir: Path
+    component_map_file: Path
+    prior_weights_file: Path
+    prior_plot_data_file: Path
+    prefit_dir: Path
+    cluster_geometry_metadata_file: Path
+    predicted_cluster_geometry_metadata_file: Path
+    dream_dir: Path
+    dream_runtime_dir: Path
+    distribution_id: str | None = None
+    distribution_metadata_file: Path | None = None
+    uses_distribution_storage: bool = False
+    includes_predicted_structures: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class PredictedStructuresProjectState:
+    dataset_file: Path | None
+    prediction_count: int
+    component_artifacts_ready: bool
+    prior_artifacts_ready: bool
+
+
+@dataclass(slots=True, frozen=True)
+class SavedDistributionRecord:
+    distribution_id: str
+    label: str
+    distribution_dir: Path
+    metadata_path: Path
+    created_at: str | None = None
+    updated_at: str | None = None
+    use_predicted_structure_weights: bool = False
+    exclude_elements: tuple[str, ...] = ()
+    clusters_dir: str | None = None
+    q_min: float | None = None
+    q_max: float | None = None
+    use_experimental_grid: bool = True
+    q_points: int | None = None
+    component_artifacts_ready: bool = False
+    prior_artifacts_ready: bool = False
 
 
 @dataclass(slots=True)
@@ -343,6 +420,7 @@ class ProjectSettings:
     project_name: str
     project_dir: str
     model_only_mode: bool = False
+    use_predicted_structure_weights: bool = False
     clusters_dir: str | None = None
     experimental_data_path: str | None = None
     copied_experimental_data_file: str | None = None
@@ -381,6 +459,7 @@ class ProjectSettings:
     best_prefit_parameter_entries: list[dict[str, object]] = field(
         default_factory=list
     )
+    prefit_sequence_history_enabled: bool = False
     dream_favorite_selection: DreamBestFitSelection | None = None
     dream_favorite_history: list[DreamBestFitSelection] = field(
         default_factory=list
@@ -475,6 +554,9 @@ class ProjectSettings:
             project_name=str(payload.get("project_name", "SAXS Project")),
             project_dir=str(payload.get("project_dir", "")),
             model_only_mode=bool(payload.get("model_only_mode", False)),
+            use_predicted_structure_weights=bool(
+                payload.get("use_predicted_structure_weights", False)
+            ),
             clusters_dir=_optional_str(payload.get("clusters_dir")),
             experimental_data_path=_optional_str(
                 payload.get("experimental_data_path")
@@ -567,6 +649,9 @@ class ProjectSettings:
             best_prefit_parameter_entries=_normalized_parameter_payloads(
                 payload.get("best_prefit_parameter_entries", [])
             ),
+            prefit_sequence_history_enabled=bool(
+                payload.get("prefit_sequence_history_enabled", False)
+            ),
             dream_favorite_selection=_optional_dream_bestfit_selection(
                 payload.get("dream_favorite_selection")
             ),
@@ -581,6 +666,270 @@ class ProjectSettings:
                 payload.get("powerpoint_export_settings", {})
             ),
         )
+
+
+def distribution_id_for_settings(settings: ProjectSettings) -> str:
+    payload = _distribution_signature_payload(settings)
+    signature = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha1(signature).hexdigest()[:10]
+    mode = (
+        "predicted-structures"
+        if settings.use_predicted_structure_weights
+        else "observed-only"
+    )
+    excluded = (
+        "exclude-" + "-".join(sorted(set(settings.exclude_elements)))
+        if settings.exclude_elements
+        else "exclude-none"
+    )
+    return f"{mode}__{excluded}__{digest}"
+
+
+def distribution_label_for_settings(settings: ProjectSettings) -> str:
+    mode = (
+        "Observed + Predicted Structures"
+        if settings.use_predicted_structure_weights
+        else "Observed Only"
+    )
+    excluded = ", ".join(sorted(set(settings.exclude_elements))) or "None"
+    if settings.q_min is None or settings.q_max is None:
+        q_range = "default"
+    else:
+        q_range = f"{float(settings.q_min):.6g} to {float(settings.q_max):.6g}"
+    grid = (
+        "experimental grid"
+        if settings.use_experimental_grid
+        else f"resample {int(settings.q_points or 0)}"
+    )
+    return (
+        f"{mode} | Excluded: {excluded} | q-range: {q_range} | "
+        f"Grid: {grid}"
+    )
+
+
+def project_artifact_paths(
+    settings: ProjectSettings,
+    *,
+    storage_mode: str = "auto",
+) -> ProjectArtifactPaths:
+    paths = build_project_paths(settings.project_dir)
+    normalized_mode = str(storage_mode).strip().lower() or "auto"
+    use_distribution_storage = normalized_mode == "distribution" or (
+        normalized_mode == "auto"
+        and _project_has_saved_distributions(paths.project_dir)
+    )
+    root_dir = paths.project_dir
+    distribution_id: str | None = None
+    distribution_metadata_file: Path | None = None
+    uses_distribution_storage = False
+    if use_distribution_storage:
+        distribution_id = distribution_id_for_settings(settings)
+        root_dir = paths.saved_distributions_dir / distribution_id
+        distribution_metadata_file = root_dir / "distribution.json"
+        uses_distribution_storage = True
+    includes_predicted_structures = bool(
+        settings.use_predicted_structure_weights
+    )
+    if includes_predicted_structures:
+        component_dir = root_dir / "scattering_components_predicted_structures"
+        component_map_file = root_dir / "md_saxs_map_predicted_structures.json"
+        prior_weights_file = (
+            root_dir / "md_prior_weights_predicted_structures.json"
+        )
+        prior_plot_data_file = (
+            root_dir
+            / "plots"
+            / "prior_histogram_data_predicted_structures.json"
+        )
+    else:
+        component_dir = root_dir / "scattering_components"
+        component_map_file = root_dir / "md_saxs_map.json"
+        prior_weights_file = root_dir / "md_prior_weights.json"
+        prior_plot_data_file = root_dir / "plots" / "prior_histogram_data.json"
+    prefit_dir = root_dir / "prefit"
+    dream_dir = root_dir / "dream"
+    return ProjectArtifactPaths(
+        root_dir=root_dir,
+        plots_dir=root_dir / "plots",
+        component_dir=component_dir,
+        component_map_file=component_map_file,
+        prior_weights_file=prior_weights_file,
+        prior_plot_data_file=prior_plot_data_file,
+        prefit_dir=prefit_dir,
+        cluster_geometry_metadata_file=(
+            prefit_dir / "cluster_geometry_metadata.json"
+        ),
+        predicted_cluster_geometry_metadata_file=(
+            prefit_dir / "cluster_geometry_metadata_predicted_structures.json"
+        ),
+        dream_dir=dream_dir,
+        dream_runtime_dir=dream_dir / "runtime_scripts",
+        distribution_id=distribution_id,
+        distribution_metadata_file=distribution_metadata_file,
+        uses_distribution_storage=uses_distribution_storage,
+        includes_predicted_structures=includes_predicted_structures,
+    )
+
+
+def _distribution_signature_payload(
+    settings: ProjectSettings,
+) -> dict[str, object]:
+    experimental_source = _distribution_experimental_data_path(settings)
+    q_min, q_max = _distribution_signature_q_range(settings)
+    return {
+        "clusters_dir": (
+            None
+            if settings.resolved_clusters_dir is None
+            else str(settings.resolved_clusters_dir)
+        ),
+        "use_predicted_structure_weights": bool(
+            settings.use_predicted_structure_weights
+        ),
+        "exclude_elements": sorted(set(settings.exclude_elements)),
+        "q_min": q_min,
+        "q_max": q_max,
+        "use_experimental_grid": bool(settings.use_experimental_grid),
+        "q_points": (
+            None
+            if settings.use_experimental_grid
+            else _optional_int(settings.q_points)
+        ),
+        "model_only_mode": bool(settings.model_only_mode),
+        "experimental_data_path": (
+            None
+            if settings.use_experimental_grid is False
+            else (
+                None
+                if experimental_source is None
+                else str(experimental_source)
+            )
+        ),
+    }
+
+
+def _distribution_experimental_data_path(
+    settings: ProjectSettings,
+) -> str | None:
+    for candidate in (
+        settings.experimental_data_path,
+        settings.copied_experimental_data_file,
+    ):
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        try:
+            return str(Path(text).expanduser().resolve())
+        except Exception:
+            return text
+    return None
+
+
+def _distribution_signature_q_range(
+    settings: ProjectSettings,
+) -> tuple[float | None, float | None]:
+    q_min = _optional_float(settings.q_min)
+    q_max = _optional_float(settings.q_max)
+    if (
+        settings.model_only_mode
+        or not settings.use_experimental_grid
+        or q_min is None
+        or q_max is None
+    ):
+        return q_min, q_max
+    default_range = _distribution_default_experimental_q_range(settings)
+    if default_range is None:
+        return q_min, q_max
+    default_q_min, default_q_max = default_range
+    tolerance = _distribution_q_range_tolerance(
+        default_q_min,
+        default_q_max,
+    )
+    if (
+        abs(q_min - default_q_min) <= tolerance
+        and abs(q_max - default_q_max) <= tolerance
+    ):
+        return None, None
+    return q_min, q_max
+
+
+def _distribution_default_experimental_q_range(
+    settings: ProjectSettings,
+) -> tuple[float, float] | None:
+    experimental_source = _distribution_experimental_data_path(settings)
+    if experimental_source is None:
+        return None
+    try:
+        summary = load_experimental_data_file(
+            experimental_source,
+            skiprows=settings.experimental_header_rows,
+            q_column=settings.experimental_q_column,
+            intensity_column=settings.experimental_intensity_column,
+            error_column=settings.experimental_error_column,
+        )
+    except Exception:
+        return None
+    q_values = np.asarray(summary.q_values, dtype=float)
+    if q_values.size == 0:
+        return None
+    return float(np.min(q_values)), float(np.max(q_values))
+
+
+def _distribution_q_range_tolerance(
+    lower: float,
+    upper: float,
+) -> float:
+    return max(
+        1e-12,
+        1e-9 * max(abs(lower), abs(upper), 1.0),
+    )
+
+
+def _project_has_saved_distributions(project_dir: str | Path) -> bool:
+    saved_dir = build_project_paths(project_dir).saved_distributions_dir
+    if not saved_dir.is_dir():
+        return False
+    return any(path.is_dir() for path in saved_dir.iterdir())
+
+
+def _distribution_metadata_from_payload(
+    distribution_dir: Path,
+    metadata_path: Path,
+    payload: dict[str, object],
+) -> SavedDistributionRecord | None:
+    distribution_id = str(payload.get("distribution_id", "")).strip()
+    label = str(payload.get("label", "")).strip()
+    if not distribution_id or not label:
+        return None
+    exclude_elements = tuple(
+        _normalized_elements(payload.get("exclude_elements", []))
+    )
+    return SavedDistributionRecord(
+        distribution_id=distribution_id,
+        label=label,
+        distribution_dir=distribution_dir,
+        metadata_path=metadata_path,
+        created_at=_optional_str(payload.get("created_at")),
+        updated_at=_optional_str(payload.get("updated_at")),
+        use_predicted_structure_weights=bool(
+            payload.get("use_predicted_structure_weights", False)
+        ),
+        exclude_elements=exclude_elements,
+        clusters_dir=_optional_str(payload.get("clusters_dir")),
+        q_min=_optional_float(payload.get("q_min")),
+        q_max=_optional_float(payload.get("q_max")),
+        use_experimental_grid=bool(payload.get("use_experimental_grid", True)),
+        q_points=_optional_int(payload.get("q_points")),
+        component_artifacts_ready=bool(
+            payload.get("component_artifacts_ready", False)
+        ),
+        prior_artifacts_ready=bool(
+            payload.get("prior_artifacts_ready", False)
+        ),
+    )
 
 
 def _optional_str(value: object) -> str | None:
@@ -768,8 +1117,10 @@ class SAXSProjectManager:
     def ensure_project_dirs(self, paths: ProjectPaths) -> None:
         for directory in (
             paths.project_dir,
+            paths.saved_distributions_dir,
             paths.experimental_data_dir,
             paths.scattering_components_dir,
+            paths.predicted_scattering_components_dir,
             paths.exported_results_dir,
             paths.exported_plots_dir,
             paths.exported_data_dir,
@@ -778,6 +1129,20 @@ class SAXSProjectManager:
             paths.dream_dir,
             paths.dream_runtime_dir,
             paths.reports_dir,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+
+    def ensure_artifact_dirs(
+        self,
+        artifact_paths: ProjectArtifactPaths,
+    ) -> None:
+        for directory in (
+            artifact_paths.root_dir,
+            artifact_paths.plots_dir,
+            artifact_paths.component_dir,
+            artifact_paths.prefit_dir,
+            artifact_paths.dream_dir,
+            artifact_paths.dream_runtime_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
@@ -855,6 +1220,176 @@ class SAXSProjectManager:
             total_files=inventory.total_files,
         )
 
+    def inspect_predicted_structures(
+        self,
+        project_dir: str | Path,
+    ) -> PredictedStructuresProjectState:
+        paths = build_project_paths(project_dir)
+        dataset_file = self._latest_predicted_structures_dataset_file(
+            paths.project_dir
+        )
+        prediction_count = 0
+        if dataset_file is not None:
+            try:
+                payload = json.loads(dataset_file.read_text(encoding="utf-8"))
+            except Exception:
+                payload = {}
+            prediction_count = len(payload.get("predictions", []))
+        component_artifacts_ready = bool(
+            paths.predicted_scattering_components_dir.is_dir()
+            and any(paths.predicted_scattering_components_dir.glob("*.txt"))
+            and (
+                paths.project_dir / "md_saxs_map_predicted_structures.json"
+            ).is_file()
+        )
+        prior_artifacts_ready = bool(
+            (
+                paths.project_dir
+                / "md_prior_weights_predicted_structures.json"
+            ).is_file()
+        )
+        return PredictedStructuresProjectState(
+            dataset_file=dataset_file,
+            prediction_count=int(prediction_count),
+            component_artifacts_ready=component_artifacts_ready,
+            prior_artifacts_ready=prior_artifacts_ready,
+        )
+
+    def list_saved_distributions(
+        self,
+        project_dir: str | Path,
+    ) -> list[SavedDistributionRecord]:
+        saved_dir = build_project_paths(project_dir).saved_distributions_dir
+        if not saved_dir.is_dir():
+            return []
+        records: list[SavedDistributionRecord] = []
+        for distribution_dir in saved_dir.iterdir():
+            if not distribution_dir.is_dir():
+                continue
+            metadata_path = distribution_dir / "distribution.json"
+            if not metadata_path.is_file():
+                continue
+            try:
+                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            record = _distribution_metadata_from_payload(
+                distribution_dir,
+                metadata_path,
+                payload,
+            )
+            if record is not None:
+                records.append(record)
+        records.sort(
+            key=lambda record: (
+                record.updated_at or "",
+                record.created_at or "",
+                record.label.lower(),
+            ),
+            reverse=True,
+        )
+        return records
+
+    def load_saved_distribution(
+        self,
+        project_dir: str | Path,
+        distribution_id: str,
+    ) -> SavedDistributionRecord:
+        distribution_dir = (
+            build_project_paths(project_dir).saved_distributions_dir
+            / str(distribution_id).strip()
+        )
+        metadata_path = distribution_dir / "distribution.json"
+        if not metadata_path.is_file():
+            raise FileNotFoundError(
+                "No saved distribution metadata was found for "
+                f"{distribution_id}."
+            )
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        record = _distribution_metadata_from_payload(
+            distribution_dir,
+            metadata_path,
+            payload,
+        )
+        if record is None:
+            raise ValueError(
+                f"Saved distribution metadata in {metadata_path} is invalid."
+            )
+        return record
+
+    def predicted_structure_cluster_bins(
+        self,
+        project_dir: str | Path,
+        *,
+        included_components: set[tuple[str, str]] | None = None,
+    ) -> list[ClusterBin]:
+        loaded_dataset = self._load_latest_predicted_structures_dataset(
+            project_dir
+        )
+        requested_components = (
+            {
+                (
+                    str(structure).strip(),
+                    str(motif).strip() or "no_motif",
+                )
+                for structure, motif in included_components
+            }
+            if included_components is not None
+            else None
+        )
+        cluster_bins: list[ClusterBin] = []
+        discovered_components: set[tuple[str, str]] = set()
+        for prediction in loaded_dataset.result.predictions:
+            structure = str(prediction.label).strip()
+            motif = _predicted_structure_motif(int(prediction.rank))
+            component_key = (structure, motif)
+            if (
+                requested_components is not None
+                and component_key not in requested_components
+            ):
+                continue
+            source_path = self._predicted_structure_source_path(
+                loaded_dataset,
+                prediction,
+            )
+            if source_path is None or not source_path.is_file():
+                raise FileNotFoundError(
+                    "Predicted Structures mode is enabled, but the XYZ file "
+                    f"for predicted structure {structure}/{motif} could not "
+                    "be found in this project. Re-run Cluster Dynamics ML "
+                    "or rebuild the prediction bundle before computing "
+                    "cluster geometry metadata."
+                )
+            cluster_bins.append(
+                ClusterBin(
+                    structure=structure,
+                    motif=motif,
+                    source_dir=source_path.parent,
+                    files=(source_path,),
+                    representative=source_path.name,
+                )
+            )
+            discovered_components.add(component_key)
+        if requested_components is not None:
+            missing_components = sorted(
+                requested_components - discovered_components,
+                key=lambda item: (
+                    _natural_sort_key(item[0]),
+                    _natural_sort_key(item[1]),
+                ),
+            )
+            if missing_components:
+                missing_text = ", ".join(
+                    f"{structure}/{motif}"
+                    for structure, motif in missing_components
+                )
+                raise FileNotFoundError(
+                    "Predicted Structures mode is enabled, but the "
+                    "geometry source files for these predicted structures "
+                    f"could not be resolved: {missing_text}."
+                )
+        return cluster_bins
+
     def build_scattering_project(
         self,
         settings: ProjectSettings,
@@ -880,7 +1415,12 @@ class SAXSProjectManager:
         progress_callback: ProgressCallback | None = None,
     ) -> ProjectBuildResult:
         paths = build_project_paths(settings.project_dir)
+        artifact_paths = project_artifact_paths(
+            settings,
+            storage_mode="distribution",
+        )
         self.ensure_project_dirs(paths)
+        self.ensure_artifact_dirs(artifact_paths)
         staged_data_path: Path | None = None
         experimental_data: ExperimentalDataSummary | None = None
         if not settings.model_only_mode:
@@ -888,11 +1428,6 @@ class SAXSProjectManager:
             self.stage_solvent_data(settings)
             experimental_data = self.load_experimental_data(settings)
         q_values = self._build_q_grid(settings, experimental_data)
-        builder = DebyeProfileBuilder(
-            q_values=q_values,
-            exclude_elements=settings.exclude_elements or None,
-            output_dir=paths.scattering_components_dir,
-        )
         clusters_dir = settings.resolved_clusters_dir
         if clusters_dir is None:
             raise ValueError(
@@ -904,34 +1439,85 @@ class SAXSProjectManager:
         )
         settings.available_elements = cluster_inventory.available_elements
         settings.cluster_inventory_rows = cluster_inventory.cluster_rows
-        averaged_components = builder.build_profiles(
-            cluster_bins=cluster_inventory.cluster_bins,
-            progress_callback=progress_callback,
-            progress_total=max(cluster_inventory.total_files, 1),
+        component_entries = self._component_entries_from_cluster_bins(
+            cluster_inventory.cluster_bins
         )
-
-        component_entries = [
-            ProjectComponentEntry(
-                structure=component.structure,
-                motif=component.motif,
-                file_count=component.file_count,
-                representative=component.representative,
-                profile_file=component.output_path.name,
-                source_dir=str(component.source_dir),
+        reused_observed_components = (
+            settings.use_predicted_structure_weights
+            and self._reuse_observed_component_artifacts(
+                settings,
+                artifact_paths=artifact_paths,
+                component_entries=component_entries,
+                progress_callback=progress_callback,
             )
-            for component in averaged_components
-        ]
+        )
+        if not reused_observed_components:
+            builder = DebyeProfileBuilder(
+                q_values=q_values,
+                exclude_elements=settings.exclude_elements or None,
+                output_dir=artifact_paths.component_dir,
+            )
+            averaged_components = builder.build_profiles(
+                cluster_bins=cluster_inventory.cluster_bins,
+                progress_callback=progress_callback,
+                progress_total=max(cluster_inventory.total_files, 1),
+            )
+            component_entries = [
+                ProjectComponentEntry(
+                    structure=component.structure,
+                    motif=component.motif,
+                    file_count=component.file_count,
+                    representative=component.representative,
+                    profile_file=component.output_path.name,
+                    source_dir=str(component.source_dir),
+                )
+                for component in averaged_components
+            ]
+        cluster_rows = list(cluster_inventory.cluster_rows)
+        predicted_dataset_file: Path | None = None
+        predicted_component_count = 0
+        if settings.use_predicted_structure_weights:
+            (
+                component_entries,
+                cluster_rows,
+                predicted_available_elements,
+                predicted_dataset_file,
+                predicted_component_count,
+            ) = self._augment_components_with_predicted_structures(
+                settings,
+                artifact_paths=artifact_paths,
+                q_values=q_values,
+                component_entries=component_entries,
+                cluster_inventory=cluster_inventory,
+            )
+            settings.available_elements = sorted(
+                {
+                    *settings.available_elements,
+                    *predicted_available_elements,
+                },
+                key=_natural_sort_key,
+            )
+            settings.cluster_inventory_rows = cluster_rows
 
-        model_map_path = paths.project_dir / "md_saxs_map.json"
+        model_map_path = artifact_paths.component_map_file
         self._write_component_map(model_map_path, component_entries)
+        self._write_distribution_metadata(
+            settings,
+            artifact_paths=artifact_paths,
+        )
         self.save_project(settings)
 
         return ProjectBuildResult(
             q_values=q_values,
             component_entries=component_entries,
-            cluster_rows=cluster_inventory.cluster_rows,
+            cluster_rows=cluster_rows,
             staged_experimental_data_path=staged_data_path,
             model_map_path=model_map_path,
+            used_predicted_structure_weights=(
+                settings.use_predicted_structure_weights
+            ),
+            predicted_dataset_file=predicted_dataset_file,
+            predicted_component_count=predicted_component_count,
         )
 
     def generate_prior_weights(
@@ -941,7 +1527,12 @@ class SAXSProjectManager:
         progress_callback: ProgressCallback | None = None,
     ) -> ProjectBuildResult:
         paths = build_project_paths(settings.project_dir)
+        artifact_paths = project_artifact_paths(
+            settings,
+            storage_mode="distribution",
+        )
         self.ensure_project_dirs(paths)
+        self.ensure_artifact_dirs(artifact_paths)
         staged_data_path: Path | None = None
         experimental_data: ExperimentalDataSummary | None = None
         if not settings.model_only_mode:
@@ -963,8 +1554,11 @@ class SAXSProjectManager:
         component_entries = self._component_entries_from_cluster_bins(
             cluster_inventory.cluster_bins
         )
-        md_prior_weights_path = paths.project_dir / "md_prior_weights.json"
-        prior_plot_data_path = paths.plots_dir / "prior_histogram_data.json"
+        md_prior_weights_path = artifact_paths.prior_weights_file
+        prior_plot_data_path = artifact_paths.prior_plot_data_file
+        cluster_rows = list(cluster_inventory.cluster_rows)
+        predicted_dataset_file: Path | None = None
+        predicted_component_count = 0
         if progress_callback is not None:
             progress_callback(
                 0,
@@ -981,15 +1575,43 @@ class SAXSProjectManager:
                         f"{entry.structure}/{entry.motif}"
                     ),
                 )
-        self._write_md_prior_weights(
-            md_prior_weights_path=md_prior_weights_path,
-            clusters_dir=clusters_dir,
-            component_entries=component_entries,
-            cluster_bins=cluster_inventory.cluster_bins,
-            available_elements=cluster_inventory.available_elements,
-            q_values=q_values,
-        )
+        if settings.use_predicted_structure_weights:
+            (
+                cluster_rows,
+                predicted_available_elements,
+                predicted_dataset_file,
+                predicted_component_count,
+            ) = self._write_md_prior_weights_with_predicted_structures(
+                md_prior_weights_path=md_prior_weights_path,
+                clusters_dir=clusters_dir,
+                component_entries=component_entries,
+                cluster_bins=cluster_inventory.cluster_bins,
+                available_elements=cluster_inventory.available_elements,
+                q_values=q_values,
+                settings=settings,
+            )
+            settings.available_elements = sorted(
+                {
+                    *cluster_inventory.available_elements,
+                    *predicted_available_elements,
+                },
+                key=_natural_sort_key,
+            )
+            settings.cluster_inventory_rows = cluster_rows
+        else:
+            self._write_md_prior_weights(
+                md_prior_weights_path=md_prior_weights_path,
+                clusters_dir=clusters_dir,
+                component_entries=component_entries,
+                cluster_bins=cluster_inventory.cluster_bins,
+                available_elements=cluster_inventory.available_elements,
+                q_values=q_values,
+            )
         export_prior_plot_data(md_prior_weights_path, prior_plot_data_path)
+        self._write_distribution_metadata(
+            settings,
+            artifact_paths=artifact_paths,
+        )
         self.save_project(settings)
         if progress_callback is not None:
             progress_callback(
@@ -1000,10 +1622,72 @@ class SAXSProjectManager:
         return ProjectBuildResult(
             q_values=q_values,
             component_entries=component_entries,
-            cluster_rows=cluster_inventory.cluster_rows,
+            cluster_rows=cluster_rows,
             staged_experimental_data_path=staged_data_path,
             md_prior_weights_path=md_prior_weights_path,
             prior_plot_data_path=prior_plot_data_path,
+            used_predicted_structure_weights=(
+                settings.use_predicted_structure_weights
+            ),
+            predicted_dataset_file=predicted_dataset_file,
+            predicted_component_count=predicted_component_count,
+        )
+
+    def _write_distribution_metadata(
+        self,
+        settings: ProjectSettings,
+        *,
+        artifact_paths: ProjectArtifactPaths,
+    ) -> None:
+        metadata_path = artifact_paths.distribution_metadata_file
+        if metadata_path is None:
+            return
+        now = datetime.now().isoformat(timespec="seconds")
+        created_at = now
+        if metadata_path.is_file():
+            try:
+                existing = json.loads(
+                    metadata_path.read_text(encoding="utf-8")
+                )
+            except Exception:
+                existing = {}
+            created_at = str(existing.get("created_at", now)).strip() or now
+        component_ready = bool(
+            artifact_paths.component_dir.is_dir()
+            and any(artifact_paths.component_dir.glob("*.txt"))
+            and artifact_paths.component_map_file.is_file()
+        )
+        prior_ready = bool(artifact_paths.prior_weights_file.is_file())
+        payload = {
+            "schema_version": 1,
+            "distribution_id": artifact_paths.distribution_id,
+            "label": distribution_label_for_settings(settings),
+            "created_at": created_at,
+            "updated_at": now,
+            "use_predicted_structure_weights": bool(
+                settings.use_predicted_structure_weights
+            ),
+            "exclude_elements": sorted(set(settings.exclude_elements)),
+            "clusters_dir": (
+                None
+                if settings.resolved_clusters_dir is None
+                else str(settings.resolved_clusters_dir)
+            ),
+            "q_min": _optional_float(settings.q_min),
+            "q_max": _optional_float(settings.q_max),
+            "use_experimental_grid": bool(settings.use_experimental_grid),
+            "q_points": (
+                None
+                if settings.use_experimental_grid
+                else _optional_int(settings.q_points)
+            ),
+            "component_artifacts_ready": component_ready,
+            "prior_artifacts_ready": prior_ready,
+        }
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text(
+            json.dumps(payload, indent=2) + "\n",
+            encoding="utf-8",
         )
 
     def _resolve_experimental_source(self, settings: ProjectSettings) -> Path:
@@ -1106,7 +1790,29 @@ class SAXSProjectManager:
         self,
         settings: ProjectSettings,
     ) -> np.ndarray:
-        supported_range = load_built_component_q_range(settings.project_dir)
+        artifact_paths = project_artifact_paths(settings)
+        supported_range = load_built_component_q_range(
+            settings.project_dir,
+            include_predicted_structures=(
+                settings.use_predicted_structure_weights
+            ),
+            component_dir=artifact_paths.component_dir,
+        )
+        if (
+            supported_range is None
+            and settings.use_predicted_structure_weights
+        ):
+            supported_range = load_built_component_q_range(
+                settings.project_dir,
+                component_dir=project_artifact_paths(
+                    ProjectSettings.from_dict(
+                        {
+                            **settings.to_dict(),
+                            "use_predicted_structure_weights": False,
+                        }
+                    )
+                ).component_dir,
+            )
         q_min = (
             float(settings.q_min)
             if settings.q_min is not None
@@ -1373,13 +2079,621 @@ class SAXSProjectManager:
         model_map_path: Path,
         component_entries: list[ProjectComponentEntry],
     ) -> None:
+        model_map_path.write_text(
+            json.dumps(
+                {"saxs_map": self._component_map_payload(component_entries)},
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _component_map_payload(
+        component_entries: list[ProjectComponentEntry],
+    ) -> dict[str, dict[str, str]]:
         payload: dict[str, dict[str, str]] = {}
         for entry in component_entries:
             payload.setdefault(entry.structure, {})
             payload[entry.structure][entry.motif] = entry.profile_file
-        model_map_path.write_text(
-            json.dumps({"saxs_map": payload}, indent=2) + "\n",
+        return payload
+
+    def _observed_only_distribution_artifact_paths(
+        self,
+        settings: ProjectSettings,
+    ) -> ProjectArtifactPaths | None:
+        if not settings.use_predicted_structure_weights:
+            return None
+        observed_settings = replace(
+            settings,
+            use_predicted_structure_weights=False,
+        )
+        return project_artifact_paths(
+            observed_settings,
+            storage_mode="distribution",
+        )
+
+    def _reuse_observed_component_artifacts(
+        self,
+        settings: ProjectSettings,
+        *,
+        artifact_paths: ProjectArtifactPaths,
+        component_entries: list[ProjectComponentEntry],
+        progress_callback: ProgressCallback | None = None,
+    ) -> bool:
+        observed_artifact_paths = (
+            self._observed_only_distribution_artifact_paths(settings)
+        )
+        if observed_artifact_paths is None:
+            return False
+        if not observed_artifact_paths.component_map_file.is_file():
+            return False
+        try:
+            component_map_payload = json.loads(
+                observed_artifact_paths.component_map_file.read_text(
+                    encoding="utf-8"
+                )
+            )
+        except Exception:
+            return False
+        expected_map = self._component_map_payload(component_entries)
+        if component_map_payload.get("saxs_map") != expected_map:
+            return False
+        missing_files = [
+            entry.profile_file
+            for entry in component_entries
+            if not (
+                observed_artifact_paths.component_dir / entry.profile_file
+            ).is_file()
+        ]
+        if missing_files:
+            return False
+        if progress_callback is not None:
+            progress_callback(
+                0,
+                max(len(component_entries), 1),
+                (
+                    "Reusing observed SAXS components from the matching "
+                    "Observed Only distribution..."
+                ),
+            )
+        for index, entry in enumerate(component_entries, start=1):
+            source_path = (
+                observed_artifact_paths.component_dir / entry.profile_file
+            )
+            destination_path = (
+                artifact_paths.component_dir / entry.profile_file
+            )
+            if source_path.resolve() != destination_path.resolve():
+                shutil.copy2(source_path, destination_path)
+            if progress_callback is not None:
+                progress_callback(
+                    index,
+                    max(len(component_entries), 1),
+                    (
+                        "Reusing observed SAXS components: "
+                        f"{entry.structure}/{entry.motif}"
+                    ),
+                )
+        return True
+
+    def _augment_components_with_predicted_structures(
+        self,
+        settings: ProjectSettings,
+        *,
+        artifact_paths: ProjectArtifactPaths,
+        q_values: np.ndarray,
+        component_entries: list[ProjectComponentEntry],
+        cluster_inventory: _ClusterInventory,
+    ) -> tuple[
+        list[ProjectComponentEntry],
+        list[dict[str, object]],
+        list[str],
+        Path,
+        int,
+    ]:
+        (
+            loaded_dataset,
+            observed_motif_weights,
+            predicted_payloads,
+            predicted_available_elements,
+        ) = self._predicted_structure_weight_payload(
+            settings,
+            cluster_inventory=cluster_inventory,
+        )
+        combined_entries = list(component_entries)
+        for payload in predicted_payloads:
+            prediction = payload["prediction"]
+            motif = str(payload["motif"])
+            source_path = payload["source_path"]
+            source_dir = (
+                source_path.parent
+                if source_path is not None
+                else build_project_paths(
+                    settings.project_dir
+                ).predicted_scattering_components_dir.parent
+            )
+            profile_file = self._component_profile_filename(
+                prediction.label,
+                motif,
+            )
+            profile_path = artifact_paths.component_dir / profile_file
+            trace = np.asarray(
+                compute_debye_intensity(
+                    prediction.generated_coordinates,
+                    list(prediction.generated_elements),
+                    q_values,
+                ),
+                dtype=float,
+            )
+            self._write_predicted_component_file(profile_path, q_values, trace)
+            combined_entries.append(
+                ProjectComponentEntry(
+                    structure=prediction.label,
+                    motif=motif,
+                    file_count=1,
+                    representative=(
+                        None if source_path is None else source_path.name
+                    ),
+                    profile_file=profile_file,
+                    source_dir=str(source_dir),
+                )
+            )
+            payload["profile_file"] = profile_file
+        cluster_rows = self._combined_cluster_rows(
+            cluster_inventory=cluster_inventory,
+            observed_motif_weights=observed_motif_weights,
+            predicted_payloads=predicted_payloads,
+        )
+        return (
+            combined_entries,
+            cluster_rows,
+            predicted_available_elements,
+            loaded_dataset.dataset_file,
+            len(predicted_payloads),
+        )
+
+    def _predicted_structure_weight_payload(
+        self,
+        settings: ProjectSettings,
+        *,
+        cluster_inventory: _ClusterInventory,
+    ) -> tuple[
+        object,
+        dict[tuple[str, str], float],
+        list[dict[str, object]],
+        list[str],
+    ]:
+        loaded_dataset = self._load_latest_predicted_structures_dataset(
+            settings.project_dir
+        )
+        from saxshell.clusterdynamicsml.workflow import (
+            _resolved_population_weights,
+        )
+
+        result = loaded_dataset.result
+        observed_weights, predicted_weights = _resolved_population_weights(
+            result.training_observations,
+            result.predictions,
+            frame_timestep_fs=float(
+                result.dynamics_result.preview.frame_timestep_fs
+            ),
+        )
+        combined_total = float(
+            np.sum(observed_weights) + np.sum(predicted_weights)
+        )
+        if combined_total <= 0.0:
+            raise ValueError(
+                "The latest Cluster Dynamics ML result did not produce any "
+                "positive observed or predicted structure weights."
+            )
+        observed_label_weights: dict[str, float] = {}
+        for observation, weight in zip(
+            result.training_observations,
+            observed_weights,
+            strict=False,
+        ):
+            observed_label_weights[observation.label] = (
+                observed_label_weights.get(observation.label, 0.0)
+                + max(float(weight), 0.0) / combined_total
+            )
+        observed_total_weight = max(float(np.sum(observed_weights)), 0.0)
+        observed_total_weight /= combined_total
+        inventory_label_counts: dict[str, int] = {}
+        for cluster_bin in cluster_inventory.cluster_bins:
+            inventory_label_counts[cluster_bin.structure] = (
+                inventory_label_counts.get(cluster_bin.structure, 0)
+                + len(cluster_bin.files)
+            )
+        if set(observed_label_weights) != set(inventory_label_counts):
+            total_inventory = max(sum(inventory_label_counts.values()), 1)
+            observed_label_weights = {
+                label: observed_total_weight * count / total_inventory
+                for label, count in inventory_label_counts.items()
+            }
+        observed_motif_weights: dict[tuple[str, str], float] = {}
+        for cluster_bin in cluster_inventory.cluster_bins:
+            label_total = max(
+                inventory_label_counts.get(cluster_bin.structure, 0), 1
+            )
+            observed_motif_weights[
+                (cluster_bin.structure, cluster_bin.motif)
+            ] = (
+                observed_label_weights.get(cluster_bin.structure, 0.0)
+                * len(cluster_bin.files)
+                / label_total
+            )
+
+        predicted_payloads: list[dict[str, object]] = []
+        predicted_available_elements = sorted(
+            {
+                str(element)
+                for prediction in result.predictions
+                for element in prediction.generated_elements
+            },
+            key=_natural_sort_key,
+        )
+        for prediction, weight in zip(
+            result.predictions,
+            predicted_weights,
+            strict=False,
+        ):
+            normalized_weight = max(float(weight), 0.0) / combined_total
+            if normalized_weight <= 0.0:
+                continue
+            motif = _predicted_structure_motif(prediction.rank)
+            predicted_payloads.append(
+                {
+                    "prediction": prediction,
+                    "motif": motif,
+                    "weight": normalized_weight,
+                    "source_path": self._predicted_structure_source_path(
+                        loaded_dataset,
+                        prediction,
+                    ),
+                }
+            )
+        if not predicted_payloads:
+            raise ValueError(
+                "Predicted Structures mode is enabled, but the latest "
+                "Cluster Dynamics ML result does not contain any non-zero "
+                "predicted structure weights to include."
+            )
+        return (
+            loaded_dataset,
+            observed_motif_weights,
+            predicted_payloads,
+            predicted_available_elements,
+        )
+
+    def _combined_cluster_rows(
+        self,
+        *,
+        cluster_inventory: _ClusterInventory,
+        observed_motif_weights: dict[tuple[str, str], float],
+        predicted_payloads: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for cluster_bin in cluster_inventory.cluster_bins:
+            source_file = (
+                str(
+                    (
+                        cluster_bin.source_dir / cluster_bin.representative
+                    ).resolve()
+                )
+                if cluster_bin.representative
+                else ""
+            )
+            rows.append(
+                {
+                    "structure": cluster_bin.structure,
+                    "motif": cluster_bin.motif,
+                    "count": int(len(cluster_bin.files)),
+                    "weight": float(
+                        observed_motif_weights.get(
+                            (cluster_bin.structure, cluster_bin.motif),
+                            0.0,
+                        )
+                    ),
+                    "source_kind": "cluster_dir",
+                    "source_dir": str(cluster_bin.source_dir),
+                    "source_file": source_file,
+                    "source_file_name": cluster_bin.representative or "",
+                    "representative": cluster_bin.representative or "",
+                }
+            )
+        for payload in predicted_payloads:
+            prediction = payload["prediction"]
+            source_path = payload["source_path"]
+            rows.append(
+                {
+                    "structure": prediction.label,
+                    "motif": str(payload["motif"]),
+                    "count": 1,
+                    "weight": float(payload["weight"]),
+                    "source_kind": "predicted_structure",
+                    "source_dir": (
+                        "" if source_path is None else str(source_path.parent)
+                    ),
+                    "source_file": (
+                        "" if source_path is None else str(source_path)
+                    ),
+                    "source_file_name": (
+                        "" if source_path is None else source_path.name
+                    ),
+                    "representative": (
+                        "" if source_path is None else source_path.name
+                    ),
+                }
+            )
+        atom_weight_total = sum(
+            float(row["weight"])
+            * _structure_atom_weight(str(row["structure"]))
+            for row in rows
+        )
+        for row in rows:
+            structure_weight = max(float(row["weight"]), 0.0)
+            row["structure_fraction_percent"] = structure_weight * 100.0
+            row["atom_fraction_percent"] = (
+                structure_weight
+                * _structure_atom_weight(str(row["structure"]))
+                / atom_weight_total
+                * 100.0
+                if atom_weight_total > 0.0
+                else 0.0
+            )
+        rows.sort(
+            key=lambda row: (
+                _natural_sort_key(str(row["structure"])),
+                _natural_sort_key(str(row["motif"])),
+            )
+        )
+        return rows
+
+    def _load_latest_predicted_structures_dataset(
+        self,
+        project_dir: str | Path,
+    ):
+        dataset_file = self._latest_predicted_structures_dataset_file(
+            project_dir
+        )
+        if dataset_file is None:
+            raise FileNotFoundError(
+                "Use Predicted Structure Weights is enabled, but no "
+                "Cluster Dynamics ML prediction bundle was found in this "
+                "project. Open Tools > Cluster Dynamics > Open Cluster "
+                "Dynamics (ML), run a prediction, then rebuild the SAXS "
+                "components or prior weights."
+            )
+        from saxshell.clusterdynamicsml import load_cluster_dynamicsai_dataset
+
+        loaded = load_cluster_dynamicsai_dataset(dataset_file)
+        if not loaded.result.predictions:
+            raise ValueError(
+                "The latest Cluster Dynamics ML result bundle does not "
+                "contain any predicted structures."
+            )
+        return loaded
+
+    def _latest_predicted_structures_dataset_file(
+        self,
+        project_dir: str | Path,
+    ) -> Path | None:
+        saved_results_dir = (
+            build_project_paths(project_dir).exported_data_dir
+            / "clusterdynamicsml"
+            / "saved_results"
+        )
+        if not saved_results_dir.is_dir():
+            return None
+        candidates = [
+            path
+            for path in saved_results_dir.rglob("*_clusterdynamicsml.json")
+            if path.is_file()
+        ]
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda path: (
+                path.stat().st_mtime,
+                path.name.lower(),
+            ),
+            reverse=True,
+        )
+        return candidates[0]
+
+    def _predicted_structure_source_path(
+        self,
+        loaded_dataset,
+        prediction,
+    ) -> Path | None:
+        comparison = getattr(loaded_dataset.result, "saxs_comparison", None)
+        if comparison is not None:
+            for entry in comparison.component_weights:
+                if (
+                    str(entry.source) == "predicted"
+                    and str(entry.label) == str(prediction.label)
+                    and entry.structure_path is not None
+                    and Path(entry.structure_path).is_file()
+                ):
+                    return Path(entry.structure_path).expanduser().resolve()
+        bundle_dir = loaded_dataset.dataset_file.parent
+        candidate = (
+            bundle_dir
+            / f"{loaded_dataset.dataset_file.stem}_predicted_structures"
+            / _predicted_structure_filename(
+                prediction.target_node_count,
+                prediction.rank,
+                prediction.label,
+            )
+        )
+        if candidate.is_file():
+            return candidate.resolve()
+        return None
+
+    def _write_predicted_component_file(
+        self,
+        output_path: Path,
+        q_values: np.ndarray,
+        intensity: np.ndarray,
+    ) -> None:
+        header = (
+            "# Number of files: 1\n"
+            "# Columns: q, S(q)_avg, S(q)_std, S(q)_se\n"
+        )
+        data = np.column_stack(
+            [
+                np.asarray(q_values, dtype=float),
+                np.asarray(intensity, dtype=float),
+                np.zeros_like(q_values, dtype=float),
+                np.zeros_like(q_values, dtype=float),
+            ]
+        )
+        np.savetxt(
+            output_path,
+            data,
+            comments="",
+            header=header,
+            fmt=["%.8f", "%.8f", "%.8f", "%.8f"],
+        )
+
+    def _write_md_prior_weights_with_predicted_structures(
+        self,
+        *,
+        md_prior_weights_path: Path,
+        clusters_dir: Path,
+        component_entries: list[ProjectComponentEntry],
+        cluster_bins: list[ClusterBin],
+        available_elements: list[str],
+        q_values: np.ndarray,
+        settings: ProjectSettings,
+    ) -> tuple[list[dict[str, object]], list[str], Path, int]:
+        cluster_inventory = _ClusterInventory(
+            cluster_bins=cluster_bins,
+            available_elements=list(available_elements),
+            cluster_rows=[],
+            total_files=sum(
+                len(cluster_bin.files) for cluster_bin in cluster_bins
+            ),
+        )
+        (
+            loaded_dataset,
+            observed_motif_weights,
+            predicted_payloads,
+            predicted_available_elements,
+        ) = self._predicted_structure_weight_payload(
+            settings,
+            cluster_inventory=cluster_inventory,
+        )
+        total_files = sum(entry.file_count for entry in component_entries)
+        payload: dict[str, object] = {
+            "origin": f"{clusters_dir.name}_predicted_structures",
+            "total_files": total_files,
+            "available_elements": sorted(
+                {
+                    *available_elements,
+                    *predicted_available_elements,
+                },
+                key=_natural_sort_key,
+            ),
+            "q_range": {
+                "qmin": float(q_values.min()),
+                "qmax": float(q_values.max()),
+                "points": int(q_values.size),
+            },
+            "value_kind": "normalized_weight",
+            "includes_predicted_structures": True,
+            "prediction_dataset_file": str(loaded_dataset.dataset_file),
+            "structures": {},
+        }
+        structures_payload: dict[str, dict[str, object]] = {}
+        cluster_bin_lookup = {
+            (cluster_bin.structure, cluster_bin.motif): cluster_bin
+            for cluster_bin in cluster_bins
+        }
+        for entry in component_entries:
+            cluster_bin = cluster_bin_lookup.get(
+                (entry.structure, entry.motif)
+            )
+            source_file = (
+                str(
+                    (
+                        Path(entry.source_dir).expanduser().resolve()
+                        / entry.representative
+                    ).resolve()
+                )
+                if entry.representative
+                else ""
+            )
+            normalized_weight = float(
+                observed_motif_weights.get((entry.structure, entry.motif), 0.0)
+            )
+            observed_only_weight = (
+                round(entry.file_count / total_files, 6)
+                if total_files
+                else 0.0
+            )
+            structures_payload.setdefault(entry.structure, {})
+            structures_payload[entry.structure][entry.motif] = {
+                "count": entry.file_count,
+                "weight": normalized_weight,
+                "normalized_weight": normalized_weight,
+                "observed_only_weight": observed_only_weight,
+                "representative": entry.representative or "",
+                "profile_file": entry.profile_file,
+                "source_kind": "cluster_dir",
+                "source_dir": entry.source_dir,
+                "source_file": source_file,
+                "source_file_name": entry.representative or "",
+                "secondary_atom_distributions": self._build_secondary_atom_distributions(
+                    cluster_bin
+                ),
+            }
+        for payload_entry in predicted_payloads:
+            prediction = payload_entry["prediction"]
+            source_path = payload_entry["source_path"]
+            motif = str(payload_entry["motif"])
+            structures_payload.setdefault(prediction.label, {})
+            structures_payload[prediction.label][motif] = {
+                "count": 1,
+                "weight": float(payload_entry["weight"]),
+                "normalized_weight": float(payload_entry["weight"]),
+                "observed_only_weight": 0.0,
+                "representative": (
+                    "" if source_path is None else source_path.name
+                ),
+                "profile_file": self._component_profile_filename(
+                    prediction.label,
+                    motif,
+                ),
+                "source_kind": "predicted_structure",
+                "source_dir": (
+                    "" if source_path is None else str(source_path.parent)
+                ),
+                "source_file": (
+                    "" if source_path is None else str(source_path)
+                ),
+                "source_file_name": (
+                    "" if source_path is None else source_path.name
+                ),
+                "secondary_atom_distributions": (
+                    _predicted_secondary_atom_distributions(prediction)
+                ),
+            }
+        payload["structures"] = structures_payload
+        md_prior_weights_path.write_text(
+            json.dumps(payload, indent=2) + "\n",
             encoding="utf-8",
+        )
+        return (
+            self._combined_cluster_rows(
+                cluster_inventory=cluster_inventory,
+                observed_motif_weights=observed_motif_weights,
+                predicted_payloads=predicted_payloads,
+            ),
+            predicted_available_elements,
+            loaded_dataset.dataset_file,
+            len(predicted_payloads),
         )
 
 
@@ -1402,6 +2716,38 @@ def _nearest_cropped_q_values(
             "The requested q-range does not overlap the experimental data."
         )
     return cropped_q
+
+
+def _predicted_structure_motif(rank: int) -> str:
+    return f"predicted_rank{int(rank):02d}"
+
+
+def _predicted_structure_filename(
+    target_node_count: int,
+    rank: int,
+    label: str,
+) -> str:
+    return f"{int(target_node_count):02d}_rank{int(rank):02d}_{label}.xyz"
+
+
+def _predicted_secondary_atom_distributions(
+    prediction,
+) -> dict[str, dict[str, int]]:
+    structure_elements = set(re.findall(r"[A-Z][a-z]*", str(prediction.label)))
+    element_counts: dict[str, int] = {}
+    for element in prediction.generated_elements:
+        normalized = str(element).strip()
+        if not normalized:
+            continue
+        element_counts[normalized] = element_counts.get(normalized, 0) + 1
+    return {
+        element: {str(int(count)): 1}
+        for element, count in sorted(
+            element_counts.items(),
+            key=lambda item: _natural_sort_key(item[0]),
+        )
+        if element not in structure_elements
+    }
 
 
 def _natural_sort_key(value: str) -> list[object]:

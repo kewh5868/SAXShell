@@ -12,7 +12,11 @@ from typing import Any
 
 import numpy as np
 
-from saxshell.saxs.debye import discover_cluster_bins, load_structure_file
+from saxshell.saxs.debye import (
+    ClusterBin,
+    discover_cluster_bins,
+    load_structure_file,
+)
 
 DEFAULT_ANISOTROPY_THRESHOLD = 1.25
 STRUCTURE_FACTOR_RECOMMENDATIONS = ("sphere", "ellipsoid")
@@ -431,6 +435,9 @@ class ClusterGeometryMetadataTable:
 def compute_cluster_geometry_metadata(
     clusters_dir: str | Path,
     *,
+    extra_cluster_bins: (
+        list[ClusterBin] | tuple[ClusterBin, ...] | None
+    ) = None,
     anisotropy_threshold: float = DEFAULT_ANISOTROPY_THRESHOLD,
     template_name: str | None = None,
     active_radii_type: str = DEFAULT_RADIUS_TYPE,
@@ -451,7 +458,9 @@ def compute_cluster_geometry_metadata(
         active_ionic_radius_type,
         default=DEFAULT_IONIC_RADIUS_TYPE,
     )
-    cluster_bins = discover_cluster_bins(resolved_clusters_dir)
+    cluster_bins = list(discover_cluster_bins(resolved_clusters_dir))
+    if extra_cluster_bins:
+        cluster_bins.extend(extra_cluster_bins)
     total_files = sum(len(cluster_bin.files) for cluster_bin in cluster_bins)
     if progress_callback is not None:
         progress_callback(

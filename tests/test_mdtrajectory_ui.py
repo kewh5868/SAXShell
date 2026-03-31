@@ -174,7 +174,7 @@ def test_main_window_suggests_cutoff_timestamp_and_unique_suffix(
     source_dir = tmp_path / "source_run"
     source_dir.mkdir()
     trajectory_file = source_dir / "traj.xyz"
-    existing_dir = source_dir / "splitxyz_t50fs"
+    existing_dir = source_dir / "splitxyz_f50fs"
     existing_dir.mkdir()
 
     window = MDTrajectoryMainWindow()
@@ -184,5 +184,5 @@ def test_main_window_suggests_cutoff_timestamp_and_unique_suffix(
     window._update_suggested_output_dir(trajectory_path=trajectory_file)
 
     assert window.export_panel.get_output_dir() == (
-        source_dir / "splitxyz_t50fs0001"
+        source_dir / "splitxyz_f50fs0001"
     )

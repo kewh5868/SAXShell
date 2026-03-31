@@ -18,6 +18,7 @@ from saxshell.saxs.dream.distributions import (
     DreamParameterEntry,
     build_default_parameter_map_from_prefit_entries,
     load_parameter_map,
+    recentered_parameter_entry,
     save_parameter_map,
 )
 from saxshell.saxs.dream.settings import (
@@ -30,6 +31,7 @@ from saxshell.saxs.project_manager import (
     ProjectSettings,
     SAXSProjectManager,
     build_project_paths,
+    project_artifact_paths,
 )
 
 
@@ -54,6 +56,7 @@ class SAXSDreamWorkflow:
         self.project_manager = SAXSProjectManager()
         self.settings = self.project_manager.load_project(project_dir)
         self.paths = build_project_paths(self.settings.project_dir)
+        self.artifact_paths = project_artifact_paths(self.settings)
         self.template_dir = (
             Path(template_dir).expanduser().resolve()
             if template_dir is not None
@@ -63,9 +66,13 @@ class SAXSDreamWorkflow:
             self.paths.project_dir,
             template_dir=self.template_dir,
         )
-        self.dream_settings_path = self.paths.dream_dir / "pd_settings.json"
-        self.parameter_map_path = self.paths.dream_dir / "pd_param_map.json"
-        self.settings_presets_dir = self.paths.dream_dir / "settings_presets"
+        self.dream_dir = self.artifact_paths.dream_dir
+        self.dream_runtime_dir = self.artifact_paths.dream_runtime_dir
+        self.prefit_dir = self.artifact_paths.prefit_dir
+        self.project_manager.ensure_artifact_dirs(self.artifact_paths)
+        self.dream_settings_path = self.dream_dir / "pd_settings.json"
+        self.parameter_map_path = self.dream_dir / "pd_param_map.json"
+        self.settings_presets_dir = self.dream_dir / "settings_presets"
         self.settings_presets_dir.mkdir(parents=True, exist_ok=True)
 
     def apply_project_settings(
@@ -79,9 +86,14 @@ class SAXSDreamWorkflow:
             )
         self.settings = incoming_settings
         self.paths = build_project_paths(self.settings.project_dir)
-        self.dream_settings_path = self.paths.dream_dir / "pd_settings.json"
-        self.parameter_map_path = self.paths.dream_dir / "pd_param_map.json"
-        self.settings_presets_dir = self.paths.dream_dir / "settings_presets"
+        self.artifact_paths = project_artifact_paths(self.settings)
+        self.dream_dir = self.artifact_paths.dream_dir
+        self.dream_runtime_dir = self.artifact_paths.dream_runtime_dir
+        self.prefit_dir = self.artifact_paths.prefit_dir
+        self.project_manager.ensure_artifact_dirs(self.artifact_paths)
+        self.dream_settings_path = self.dream_dir / "pd_settings.json"
+        self.parameter_map_path = self.dream_dir / "pd_param_map.json"
+        self.settings_presets_dir = self.dream_dir / "settings_presets"
         self.settings_presets_dir.mkdir(parents=True, exist_ok=True)
         self.prefit_workflow.apply_project_settings(incoming_settings)
 
@@ -171,6 +183,24 @@ class SAXSDreamWorkflow:
             self.save_parameter_map(entries)
         return entries
 
+    def sync_parameter_map_to_prefit(
+        self,
+        *,
+        persist: bool = True,
+    ) -> list[DreamParameterEntry]:
+        self._reload_prefit_workflow()
+        current_entries = (
+            load_parameter_map(self.parameter_map_path)
+            if self.parameter_map_path.is_file()
+            else []
+        )
+        synced_entries = self._sync_parameter_map_entries_to_prefit(
+            current_entries
+        )
+        if persist:
+            self.save_parameter_map(synced_entries)
+        return synced_entries
+
     def create_runtime_bundle(
         self,
         *,
@@ -188,7 +218,7 @@ class SAXSDreamWorkflow:
             f"dream_{self._sanitize_runtime_name(self.paths.project_dir.name)}"
             f"_{timestamp}"
         )
-        run_dir = self.paths.dream_runtime_dir / run_name
+        run_dir = self.dream_runtime_dir / run_name
         run_dir.mkdir(parents=True, exist_ok=False)
 
         runtime_script_path = run_dir / f"{run_name}.py"
@@ -341,8 +371,8 @@ class SAXSDreamWorkflow:
                     pass
 
     def _copy_prefit_snapshot(self, run_dir: Path) -> None:
-        prefit_json = self.paths.prefit_dir / "pd_prefit_params.json"
-        prefit_state = self.paths.prefit_dir / "prefit_state.json"
+        prefit_json = self.prefit_dir / "pd_prefit_params.json"
+        prefit_state = self.prefit_dir / "prefit_state.json"
         if prefit_json.is_file():
             shutil.copy2(prefit_json, run_dir / prefit_json.name)
         if prefit_state.is_file():
@@ -414,6 +444,39 @@ class SAXSDreamWorkflow:
                 )
             )
         return normalized_entries
+
+    def _sync_parameter_map_entries_to_prefit(
+        self,
+        entries: list[DreamParameterEntry],
+    ) -> list[DreamParameterEntry]:
+        default_entries = build_default_parameter_map_from_prefit_entries(
+            self.prefit_workflow.parameter_entries
+        )
+        existing_lookup = {entry.param: entry for entry in entries}
+        synced_entries: list[DreamParameterEntry] = []
+        for default_entry in default_entries:
+            existing_entry = existing_lookup.get(default_entry.param)
+            if existing_entry is None:
+                synced_entries.append(default_entry)
+                continue
+            recentered_entry = recentered_parameter_entry(
+                existing_entry,
+                default_entry.value,
+            )
+            synced_entries.append(
+                DreamParameterEntry(
+                    structure=default_entry.structure,
+                    motif=default_entry.motif,
+                    param_type=default_entry.param_type,
+                    param=default_entry.param,
+                    value=recentered_entry.value,
+                    vary=existing_entry.vary,
+                    distribution=existing_entry.distribution,
+                    dist_params=recentered_entry.dist_params,
+                    smart_preset_status=existing_entry.smart_preset_status,
+                )
+            )
+        return synced_entries
 
     @staticmethod
     def _sanitize_preset_name(preset_name: str) -> str:

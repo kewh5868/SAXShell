@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import pickle
+import re
 import shutil
 import subprocess
 import sys
@@ -102,14 +103,23 @@ from saxshell.saxs.project_manager import (
     ProjectSettings,
     SAXSProjectManager,
     build_project_paths,
+    distribution_id_for_settings,
     export_prior_histogram_npy,
     export_prior_histogram_table,
     load_built_component_q_range,
     load_experimental_data_file,
+    project_artifact_paths,
 )
 from saxshell.saxs.solute_volume_fraction import DISPLAY_FRACTION_DECIMALS
 from saxshell.saxs.solution_scattering_estimator import (
     SolutionScatteringEstimate,
+)
+from saxshell.saxs.stoichiometry import (
+    build_stoichiometry_target,
+    evaluate_weighted_stoichiometry,
+    stoichiometry_deviation_text,
+    stoichiometry_ratio_text,
+    stoichiometry_target_text,
 )
 from saxshell.saxs.template_installation import (
     format_validation_report,
@@ -771,7 +781,7 @@ class SAXSDreamRunWorker(QObject):
         project_dir: str | Path,
         bundle: DreamRunBundle,
         *,
-        verbose_output_interval_seconds: float = 1.0,
+        verbose_output_interval_seconds: float = 5.0,
     ) -> None:
         super().__init__()
         self.project_dir = str(Path(project_dir).expanduser().resolve())
@@ -822,6 +832,8 @@ class SAXSMainWindow(QMainWindow):
         self._dream_workflow_project_dir: str | None = None
         self._dream_parameter_map_saved_in_session = False
         self._active_dream_settings_snapshot: DreamRunSettings | None = None
+        self._applied_dream_analysis_settings: DreamRunSettings | None = None
+        self._last_dream_summary = None
         self._current_dream_preset_name: str | None = None
         self._last_dream_filter_assessments: list[dict[str, object]] = []
         self._last_dream_filter_recommendation: dict[str, object] | None = None
@@ -840,6 +852,9 @@ class SAXSMainWindow(QMainWindow):
         self._active_dream_run_settings: DreamRunSettings | None = None
         self._loaded_dream_run_dir: Path | None = None
         self._warn_on_prefit_template_change = True
+        self._warn_on_large_prefit_parameter_count = True
+        self._prefit_sequence_pending_manual_edits = False
+        self._prefit_sequence_baseline_entries: list[PrefitParameterEntry] = []
         self._restoring_prefit_template = False
         self._prefit_missing_components_warning_shown = False
         self._updating_deprecated_template_visibility = False
@@ -935,6 +950,12 @@ class SAXSMainWindow(QMainWindow):
         self.project_setup_tab.model_only_mode_changed.connect(
             self._on_model_only_mode_changed
         )
+        self.project_setup_tab.predicted_structure_weights_changed.connect(
+            self._on_predicted_structure_weights_changed
+        )
+        self.project_setup_tab.load_distribution_requested.connect(
+            self._load_saved_distribution
+        )
         self.project_setup_tab.scan_clusters_requested.connect(
             self.scan_clusters_from_tab
         )
@@ -976,6 +997,12 @@ class SAXSMainWindow(QMainWindow):
             self._on_prefit_field_interaction_requested
         )
         self.prefit_tab.autosave_toggled.connect(self._on_autosave_changed)
+        self.prefit_tab.sequence_history_toggled.connect(
+            self._on_prefit_sequence_history_changed
+        )
+        self.prefit_tab.parameter_table_edited.connect(
+            self._on_prefit_parameter_table_edited
+        )
         self.prefit_tab.update_model_requested.connect(
             self.update_prefit_model
         )
@@ -1052,30 +1079,23 @@ class SAXSMainWindow(QMainWindow):
         self.dream_tab.settings_preset_changed.connect(
             self._on_dream_settings_preset_changed
         )
+        self.dream_tab.apply_filter_requested.connect(
+            self._apply_dream_filter_settings
+        )
         self.dream_tab.visualization_settings_changed.connect(
-            lambda: self._schedule_dream_results_refresh(
-                self.DREAM_REFRESH_STYLE
-            )
+            self._on_dream_analysis_settings_changed
         )
         self.dream_tab.results_settings_changed.connect(
-            lambda: self._schedule_dream_results_refresh(
-                self.DREAM_REFRESH_FULL
-            )
+            self._on_dream_analysis_settings_changed
         )
         self.dream_tab.summary_settings_changed.connect(
-            lambda: self._schedule_dream_results_refresh(
-                self.DREAM_REFRESH_SUMMARY
-            )
+            self._on_dream_analysis_settings_changed
         )
         self.dream_tab.violin_data_settings_changed.connect(
-            lambda: self._schedule_dream_results_refresh(
-                self.DREAM_REFRESH_VIOLIN
-            )
+            self._on_dream_analysis_settings_changed
         )
         self.dream_tab.violin_style_settings_changed.connect(
-            lambda: self._schedule_dream_results_refresh(
-                self.DREAM_REFRESH_STYLE
-            )
+            self._on_dream_analysis_settings_changed
         )
         self._refresh_recent_projects_menu()
         self._update_file_menu_state()
@@ -1112,7 +1132,9 @@ class SAXSMainWindow(QMainWindow):
         self.file_menu.addAction(self.save_project_as_action)
 
         self.tools_menu = menu_bar.addMenu("Tools")
-        self.mdtrajectory_action = QAction("Open mdtrajectory", self)
+        self.mdtrajectory_action = QAction(
+            "Open MD Trajectory Extraction", self
+        )
         self.mdtrajectory_action.triggered.connect(
             self._open_mdtrajectory_tool
         )
@@ -1122,7 +1144,7 @@ class SAXSMainWindow(QMainWindow):
         self.cluster_action.triggered.connect(self._open_cluster_tool)
         self.tools_menu.addAction(self.cluster_action)
 
-        self.xyz2pdb_action = QAction("Open xyz2pdb Conversion", self)
+        self.xyz2pdb_action = QAction("Open XYZ -> PDB Conversion", self)
         self.xyz2pdb_action.triggered.connect(self._open_xyz2pdb_tool)
         self.tools_menu.addAction(self.xyz2pdb_action)
 
@@ -1132,43 +1154,58 @@ class SAXSMainWindow(QMainWindow):
         )
         self.tools_menu.addAction(self.bondanalysis_action)
 
+        self.cluster_dynamics_menu = self.tools_menu.addMenu(
+            "Cluster Dynamics"
+        )
         self.clusterdynamics_action = QAction(
-            "Open Cluster Dynamics",
+            "Open Cluster Dynamics (only)",
             self,
         )
         self.clusterdynamics_action.triggered.connect(
             self._open_clusterdynamics_tool
         )
-        self.tools_menu.addAction(self.clusterdynamics_action)
+        self.cluster_dynamics_menu.addAction(self.clusterdynamics_action)
 
         self.clusterdynamicsml_action = QAction(
-            "Open Cluster Dynamics ML",
+            "Open Cluster Dynamics (ML)",
             self,
         )
         self.clusterdynamicsml_action.triggered.connect(
             self._open_clusterdynamicsml_tool
         )
-        self.tools_menu.addAction(self.clusterdynamicsml_action)
+        self.cluster_dynamics_menu.addAction(self.clusterdynamicsml_action)
+
+        self.pdf_menu = self.tools_menu.addMenu("PDF")
+        self.pdfsetup_action = QAction("Open PDF Calculation", self)
+        self.pdfsetup_action.triggered.connect(self._open_pdfsetup_tool)
+        self.pdf_menu.addAction(self.pdfsetup_action)
 
         self.fullrmc_action = QAction("Open fullrmc Setup", self)
         self.fullrmc_action.triggered.connect(self._open_fullrmc_tool)
-        self.tools_menu.addAction(self.fullrmc_action)
+        self.pdf_menu.addAction(self.fullrmc_action)
 
-        self.tools_menu.addSeparator()
+        self.blenderxyz_action = QAction(
+            "Open Blender XYZ Renderer",
+            self,
+        )
+        self.blenderxyz_action.triggered.connect(self._open_blenderxyz_tool)
+        self.tools_menu.addAction(self.blenderxyz_action)
+
+        self.estimation_menu = self.tools_menu.addMenu("Estimation")
         self.volume_fraction_action = QAction(
             "Open Volume Fraction Estimate", self
         )
         self.volume_fraction_action.triggered.connect(
             self._open_solute_volume_fraction_tool
         )
-        self.tools_menu.addAction(self.volume_fraction_action)
+        self.estimation_menu.addAction(self.volume_fraction_action)
         self.number_density_action = QAction(
             "Open Number Density Estimate", self
         )
         self.number_density_action.triggered.connect(
             self._open_number_density_tool
         )
-        self.tools_menu.addAction(self.number_density_action)
+        self.estimation_menu.addAction(self.number_density_action)
         self.attenuation_estimate_action = QAction(
             "Open Attenuation Estimate",
             self,
@@ -1176,7 +1213,7 @@ class SAXSMainWindow(QMainWindow):
         self.attenuation_estimate_action.triggered.connect(
             self._open_attenuation_tool
         )
-        self.tools_menu.addAction(self.attenuation_estimate_action)
+        self.estimation_menu.addAction(self.attenuation_estimate_action)
         self.fluorescence_estimate_action = QAction(
             "Open Fluorescence Estimate",
             self,
@@ -1184,21 +1221,7 @@ class SAXSMainWindow(QMainWindow):
         self.fluorescence_estimate_action.triggered.connect(
             self._open_fluorescence_tool
         )
-        self.tools_menu.addAction(self.fluorescence_estimate_action)
-        placeholder_specs = [
-            ("PDF Calculation (Coming Soon)", "PDF Calculation"),
-        ]
-        self._placeholder_tool_actions: list[QAction] = []
-        for label, tool_name in placeholder_specs:
-            action = QAction(label, self)
-            action.triggered.connect(
-                lambda checked=False, name=tool_name: self._show_placeholder_tool_message(
-                    name
-                )
-            )
-            self.tools_menu.addAction(action)
-            self._placeholder_tool_actions.append(action)
-
+        self.estimation_menu.addAction(self.fluorescence_estimate_action)
         self.settings_menu = menu_bar.addMenu("Settings")
         self.console_autoscroll_action = QAction(
             "Autoscroll Console Output",
@@ -1473,15 +1496,28 @@ class SAXSMainWindow(QMainWindow):
             self._show_error("Build failed", str(exc))
 
     def _current_project_has_built_components(self) -> bool:
-        project_dir: Path | None
-        if self.current_settings is not None:
-            project_dir = Path(self.current_settings.project_dir).expanduser()
-        else:
-            project_dir = self.project_setup_tab.project_dir()
-        if project_dir is None:
+        try:
+            settings = self._settings_from_project_tab()
+        except Exception:
+            if self.current_settings is not None:
+                settings = ProjectSettings.from_dict(
+                    self.current_settings.to_dict()
+                )
+            else:
+                project_dir = self.project_setup_tab.project_dir()
+                if project_dir is None:
+                    return False
+                settings = ProjectSettings(
+                    project_name=project_dir.name,
+                    project_dir=str(project_dir),
+                    use_predicted_structure_weights=bool(
+                        self.project_setup_tab.use_predicted_structure_weights()
+                    ),
+                )
+        if settings is None:
             return False
-        paths = build_project_paths(project_dir)
-        return any(paths.scattering_components_dir.glob("*.txt"))
+        component_dir = project_artifact_paths(settings).component_dir
+        return component_dir.is_dir() and any(component_dir.glob("*.txt"))
 
     def _on_prefit_field_interaction_requested(self) -> None:
         if self._current_project_has_built_components():
@@ -1786,7 +1822,13 @@ class SAXSMainWindow(QMainWindow):
         self,
         settings: ProjectSettings,
     ) -> str | None:
-        supported_range = load_built_component_q_range(settings.project_dir)
+        supported_range = load_built_component_q_range(
+            settings.project_dir,
+            include_predicted_structures=(
+                settings.use_predicted_structure_weights
+            ),
+            component_dir=project_artifact_paths(settings).component_dir,
+        )
         if supported_range is None:
             return None
         supported_min, supported_max = supported_range
@@ -1953,10 +1995,6 @@ class SAXSMainWindow(QMainWindow):
         if task_name == "scan_clusters":
             cluster_result = result
             if isinstance(cluster_result, ClusterImportResult):
-                self.project_setup_tab.apply_cluster_import_data(
-                    cluster_result.available_elements,
-                    cluster_result.cluster_rows,
-                )
                 if self.current_settings is not None:
                     self.current_settings.available_elements = (
                         cluster_result.available_elements
@@ -1964,6 +2002,22 @@ class SAXSMainWindow(QMainWindow):
                     self.current_settings.cluster_inventory_rows = (
                         cluster_result.cluster_rows
                     )
+                    active_elements, active_rows = (
+                        self._active_cluster_import_view(
+                            self.current_settings,
+                            fallback_available_elements=(
+                                cluster_result.available_elements
+                            ),
+                            fallback_rows=cluster_result.cluster_rows,
+                        )
+                    )
+                else:
+                    active_elements = cluster_result.available_elements
+                    active_rows = cluster_result.cluster_rows
+                self.project_setup_tab.apply_cluster_import_data(
+                    active_elements,
+                    active_rows,
+                )
                 self.project_setup_tab.append_summary(
                     "Imported cluster files for project setup.\n"
                     f"Files scanned: {cluster_result.total_files}\n"
@@ -1983,16 +2037,30 @@ class SAXSMainWindow(QMainWindow):
             )
             self.current_settings = reloaded_settings
             self._apply_project_settings(reloaded_settings)
+            active_elements, active_rows = self._active_cluster_import_view(
+                reloaded_settings,
+                fallback_available_elements=reloaded_settings.available_elements,
+                fallback_rows=build_result.cluster_rows,
+            )
             self.project_setup_tab.apply_cluster_import_data(
-                reloaded_settings.available_elements,
-                build_result.cluster_rows,
+                active_elements,
+                active_rows,
             )
-            self.project_setup_tab.append_summary(
-                "Built SAXS components for "
-                f"{len(build_result.component_entries)} cluster bins.\n"
-                f"Saved component map: {build_result.model_map_path}\n"
-                "Generate prior weights separately when you are ready."
-            )
+            if build_result.used_predicted_structure_weights:
+                self.project_setup_tab.append_summary(
+                    "Built observed + Predicted Structures SAXS components for "
+                    f"{len(build_result.component_entries)} components.\n"
+                    f"Predicted Structures included: {build_result.predicted_component_count}\n"
+                    f"Saved component map: {build_result.model_map_path}\n"
+                    "Generate prior weights separately when you are ready."
+                )
+            else:
+                self.project_setup_tab.append_summary(
+                    "Built SAXS components for "
+                    f"{len(build_result.component_entries)} cluster bins.\n"
+                    f"Saved component map: {build_result.model_map_path}\n"
+                    "Generate prior weights separately when you are ready."
+                )
             self._refresh_component_plot()
             try:
                 self._load_prefit_workflow()
@@ -2013,16 +2081,29 @@ class SAXSMainWindow(QMainWindow):
             )
             self.current_settings = reloaded_settings
             self._apply_project_settings(reloaded_settings)
+            active_elements, active_rows = self._active_cluster_import_view(
+                reloaded_settings,
+                fallback_available_elements=reloaded_settings.available_elements,
+                fallback_rows=build_result.cluster_rows,
+            )
             self.project_setup_tab.apply_cluster_import_data(
-                reloaded_settings.available_elements,
-                build_result.cluster_rows,
+                active_elements,
+                active_rows,
             )
-            self.project_setup_tab.append_summary(
-                "Generated prior weights for "
-                f"{len(build_result.component_entries)} cluster bins.\n"
-                f"Saved prior weights: {build_result.md_prior_weights_path}\n"
-                f"Saved prior plot data: {build_result.prior_plot_data_path}"
-            )
+            if build_result.used_predicted_structure_weights:
+                self.project_setup_tab.append_summary(
+                    "Generated observed + Predicted Structures prior weights.\n"
+                    f"Predicted Structures included: {build_result.predicted_component_count}\n"
+                    f"Saved prior weights: {build_result.md_prior_weights_path}\n"
+                    f"Saved prior plot data: {build_result.prior_plot_data_path}"
+                )
+            else:
+                self.project_setup_tab.append_summary(
+                    "Generated prior weights for "
+                    f"{len(build_result.component_entries)} cluster bins.\n"
+                    f"Saved prior weights: {build_result.md_prior_weights_path}\n"
+                    f"Saved prior plot data: {build_result.prior_plot_data_path}"
+                )
             self._refresh_prior_plot()
             self.project_setup_tab.finish_activity_progress(
                 "Prior-weight generation complete."
@@ -2666,6 +2747,9 @@ class SAXSMainWindow(QMainWindow):
         self.prefit_tab.populate_parameter_table(
             self.prefit_workflow.parameter_entries
         )
+        self._set_prefit_sequence_baseline(
+            self.prefit_workflow.parameter_entries
+        )
 
     @Slot(str, str)
     def _on_prefit_cluster_geometry_sf_approximation_changed(
@@ -2692,6 +2776,9 @@ class SAXSMainWindow(QMainWindow):
         try:
             self._sync_prefit_cluster_geometry_rows()
             self.prefit_tab.populate_parameter_table(
+                self.prefit_workflow.parameter_entries
+            )
+            self._set_prefit_sequence_baseline(
                 self.prefit_workflow.parameter_entries
             )
             self._invalidate_dream_workflow_cache()
@@ -2742,6 +2829,9 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_tab.populate_parameter_table(
                 self.prefit_workflow.parameter_entries
             )
+            self._set_prefit_sequence_baseline(
+                self.prefit_workflow.parameter_entries
+            )
             self.prefit_tab.set_cluster_geometry_status_text(
                 self.prefit_workflow.cluster_geometry_status_text()
             )
@@ -2789,6 +2879,9 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_tab.populate_parameter_table(
                 self.prefit_workflow.parameter_entries
             )
+            self._set_prefit_sequence_baseline(
+                self.prefit_workflow.parameter_entries
+            )
             self.prefit_tab.set_cluster_geometry_status_text(
                 self.prefit_workflow.cluster_geometry_status_text()
             )
@@ -2828,6 +2921,7 @@ class SAXSMainWindow(QMainWindow):
         self.prefit_tab.set_summary_text(
             self._format_prefit_summary(evaluation)
         )
+        self._update_prefit_stoichiometry_status()
         self._maybe_append_scale_recommendation(
             self.prefit_workflow.parameter_entries
         )
@@ -2880,6 +2974,9 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_tab.populate_parameter_table(
                 self.prefit_workflow.parameter_entries
             )
+            self._set_prefit_sequence_baseline(
+                self.prefit_workflow.parameter_entries
+            )
             self.prefit_tab.set_cluster_geometry_status_text(
                 self.prefit_workflow.cluster_geometry_status_text()
             )
@@ -2889,6 +2986,20 @@ class SAXSMainWindow(QMainWindow):
                 f"Clusters: {len(table.rows)}\n"
                 "Active radii mode: "
                 f"{self.prefit_workflow.cluster_geometry_active_radii_type()}"
+            )
+            self._append_prefit_sequence_event(
+                "cluster_geometry_computed",
+                "Computed Prefit cluster geometry metadata.",
+                details={
+                    "clusters": len(table.rows),
+                    "active_radii_mode": (
+                        self.prefit_workflow.cluster_geometry_active_radii_type()
+                    ),
+                    "active_ionic_radius_type": (
+                        self.prefit_workflow.cluster_geometry_active_ionic_radius_type()
+                    ),
+                },
+                parameter_entries=self.prefit_workflow.parameter_entries,
             )
             self.prefit_tab.finish_cluster_geometry_progress(
                 "Cluster geometry metadata ready."
@@ -2934,6 +3045,9 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_tab.populate_parameter_table(
                 self.prefit_workflow.parameter_entries
             )
+            self._set_prefit_sequence_baseline(
+                self.prefit_workflow.parameter_entries
+            )
             self.prefit_tab.set_cluster_geometry_status_text(
                 self.prefit_workflow.cluster_geometry_status_text()
             )
@@ -2942,6 +3056,19 @@ class SAXSMainWindow(QMainWindow):
                 f"Template: {self.prefit_workflow.template_spec.name}\n"
                 f"Active radii mode: "
                 f"{self.prefit_workflow.cluster_geometry_active_radii_type()}"
+            )
+            self._append_prefit_sequence_event(
+                "cluster_geometry_updated",
+                "Updated Prefit cluster geometry metadata.",
+                details={
+                    "active_radii_mode": (
+                        self.prefit_workflow.cluster_geometry_active_radii_type()
+                    ),
+                    "active_ionic_radius_type": (
+                        self.prefit_workflow.cluster_geometry_active_ionic_radius_type()
+                    ),
+                },
+                parameter_entries=self.prefit_workflow.parameter_entries,
             )
             self._invalidate_dream_workflow_cache()
             self._load_prefit_preview()
@@ -2959,6 +3086,9 @@ class SAXSMainWindow(QMainWindow):
             )
             return
         try:
+            self._flush_prefit_sequence_pending_manual_updates(
+                trigger="update_model_preview",
+            )
             previous_evaluation = self.prefit_tab.current_evaluation()
             self._sync_prefit_cluster_geometry_rows()
             entries = self.prefit_tab.parameter_entries()
@@ -2975,6 +3105,7 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_tab.set_summary_text(
                 self._format_prefit_summary(evaluation)
             )
+            self._update_prefit_stoichiometry_status()
             self._maybe_append_scale_recommendation(entries)
             self._maybe_note_equivalent_sphere_shape_switch(
                 previous_evaluation,
@@ -3049,13 +3180,46 @@ class SAXSMainWindow(QMainWindow):
         try:
             self._sync_prefit_cluster_geometry_rows()
             config = self.prefit_tab.run_config()
+            self._flush_prefit_sequence_pending_manual_updates(
+                trigger="run_prefit",
+            )
             entries = self.prefit_tab.parameter_entries()
+            starting_entries = self._copy_prefit_entries(entries)
+            varying_parameter_names = (
+                self.prefit_workflow.grid_searchable_parameter_names(entries)
+            )
+            if (
+                len(varying_parameter_names) > 3
+                and self._warn_on_large_prefit_parameter_count
+            ):
+                continue_anyway, suppress_warning = (
+                    self._confirm_large_prefit_parameter_count(
+                        varying_parameter_names
+                    )
+                )
+                if suppress_warning:
+                    self._warn_on_large_prefit_parameter_count = False
+                if not continue_anyway:
+                    self.prefit_tab.append_log(
+                        "Prefit canceled.\n"
+                        "Reason: more than 3 independent parameters were "
+                        "selected to vary, and the run was returned to the "
+                        "parameter editor."
+                    )
+                    self.statusBar().showMessage("Prefit canceled")
+                    return
             self.prefit_workflow.parameter_entries = entries
             self.prefit_tab.append_log(
                 "Running prefit.\n"
                 f"Template: {self.prefit_workflow.template_spec.name}\n"
                 f"Minimizer: {config.method}\n"
                 f"Max nfev: {config.max_nfev}\n"
+                "Optimization strategy: "
+                + self.prefit_workflow.optimization_strategy_preview(
+                    entries,
+                    method=config.method,
+                )
+                + "\n"
                 "Autosave fit results: "
                 + (
                     "enabled"
@@ -3069,10 +3233,13 @@ class SAXSMainWindow(QMainWindow):
                 max_nfev=config.max_nfev,
             )
             self.prefit_tab.populate_parameter_table(result.parameter_entries)
+            self._set_prefit_sequence_baseline(result.parameter_entries)
             self.prefit_tab.plot_evaluation(result.evaluation)
             self.prefit_tab.append_log(
                 "Fit complete.\n"
                 f"Minimizer: {result.method}\n"
+                f"Optimization strategy: {result.optimization_strategy}\n"
+                f"Grid evaluations: {result.grid_evaluations}\n"
                 f"Max nfev request: {config.max_nfev}\n"
                 f"R^2: {result.r_squared:.6g}\n"
                 f"Reduced chi^2: {result.reduced_chi_square:.6g}\n"
@@ -3085,12 +3252,50 @@ class SAXSMainWindow(QMainWindow):
                     report_path=result.report_path,
                 )
             )
+            self._update_prefit_stoichiometry_status()
             self._refresh_saved_prefit_states(
                 selected_name=(
                     result.report_path.parent.name
                     if result.report_path is not None
                     else None
                 )
+            )
+            self._append_prefit_sequence_event(
+                "prefit_run_complete",
+                "Completed a Prefit refinement.",
+                details={
+                    "method": config.method,
+                    "max_nfev": int(config.max_nfev),
+                    "autosave_prefits": bool(
+                        self.prefit_workflow.settings.autosave_prefits
+                    ),
+                    "optimization_strategy": result.optimization_strategy,
+                    "grid_evaluations": int(result.grid_evaluations),
+                    "varying_parameters": [
+                        {
+                            "structure": entry.structure,
+                            "motif": entry.motif,
+                            "parameter_name": entry.name,
+                            "value": float(entry.value),
+                            "minimum": float(entry.minimum),
+                            "maximum": float(entry.maximum),
+                        }
+                        for entry in starting_entries
+                        if bool(entry.vary)
+                    ],
+                    "statistics": {
+                        "nfev": int(result.nfev),
+                        "chi_square": float(result.chi_square),
+                        "reduced_chi_square": float(result.reduced_chi_square),
+                        "r_squared": float(result.r_squared),
+                    },
+                    "report_path": (
+                        None
+                        if result.report_path is None
+                        else str(result.report_path)
+                    ),
+                },
+                parameter_entries=result.parameter_entries,
             )
             self._load_dream_workflow()
             self.statusBar().showMessage("Prefit complete")
@@ -3112,6 +3317,9 @@ class SAXSMainWindow(QMainWindow):
             return
         try:
             self._sync_prefit_cluster_geometry_rows()
+            self._flush_prefit_sequence_pending_manual_updates(
+                trigger="save_prefit",
+            )
             entries = self.prefit_tab.parameter_entries()
             evaluation = self.prefit_workflow.evaluate(entries)
             config = self.prefit_tab.run_config()
@@ -3136,9 +3344,25 @@ class SAXSMainWindow(QMainWindow):
                     report_path=report_path,
                 )
             )
+            self._update_prefit_stoichiometry_status()
             self._refresh_saved_prefit_states(
                 selected_name=report_path.parent.name
             )
+            self._append_prefit_sequence_event(
+                "prefit_state_saved",
+                "Saved a Prefit snapshot.",
+                details={
+                    "method": config.method,
+                    "max_nfev": int(config.max_nfev),
+                    "autosave_prefits": bool(
+                        self.prefit_tab.autosave_checkbox.isChecked()
+                    ),
+                    "report_path": str(report_path),
+                    "snapshot_name": report_path.parent.name,
+                },
+                parameter_entries=entries,
+            )
+            self._set_prefit_sequence_baseline(entries)
             self._load_dream_workflow()
             self.statusBar().showMessage("Prefit saved")
         except Exception as exc:
@@ -3252,15 +3476,26 @@ class SAXSMainWindow(QMainWindow):
     def reset_prefit_entries(self) -> None:
         if self.prefit_workflow is None:
             return
+        self._flush_prefit_sequence_pending_manual_updates(
+            trigger="reset_to_template",
+        )
         self.prefit_workflow.parameter_entries = (
             self.prefit_workflow.load_template_reset_entries()
         )
         self.prefit_tab.populate_parameter_table(
             self.prefit_workflow.parameter_entries
         )
+        self._set_prefit_sequence_baseline(
+            self.prefit_workflow.parameter_entries
+        )
         self.prefit_tab.append_log(
             "Reset parameter table to the template-default prefit preset "
             "saved in the project."
+        )
+        self._append_prefit_sequence_event(
+            "prefit_parameters_reset_to_template",
+            "Reset the Prefit parameter table to the template preset.",
+            parameter_entries=self.prefit_workflow.parameter_entries,
         )
         self.update_prefit_model()
 
@@ -3273,10 +3508,20 @@ class SAXSMainWindow(QMainWindow):
         if self.prefit_workflow is None:
             return
         try:
+            self._flush_prefit_sequence_pending_manual_updates(
+                trigger="reset_single_parameter",
+            )
+            reset_source_label = "Best Prefit / recycled preset"
+            reset_entries = self.prefit_workflow.load_best_prefit_entries()
+            if reset_entries is None:
+                reset_entries = (
+                    self.prefit_workflow.load_template_reset_entries()
+                )
+                reset_source_label = "template-default prefit preset"
             default_entry = next(
                 (
                     entry
-                    for entry in self.prefit_workflow.load_template_reset_entries()
+                    for entry in reset_entries
                     if (
                         entry.structure == structure
                         and entry.motif == motif
@@ -3301,9 +3546,24 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_workflow.parameter_entries = (
                 self.prefit_tab.parameter_entries()
             )
+            self._set_prefit_sequence_baseline(
+                self.prefit_workflow.parameter_entries
+            )
             self.prefit_tab.append_log(
-                "Reset individual parameter to the template-default prefit "
-                f"preset.\nParameter: {parameter_name}"
+                "Reset individual parameter.\n"
+                f"Parameter: {parameter_name}\n"
+                f"Source: {reset_source_label}"
+            )
+            self._append_prefit_sequence_event(
+                "prefit_parameter_reset",
+                "Reset an individual Prefit parameter.",
+                details={
+                    "structure": structure,
+                    "motif": motif,
+                    "parameter_name": parameter_name,
+                    "source": reset_source_label,
+                },
+                parameter_entries=self.prefit_workflow.parameter_entries,
             )
             self.update_prefit_model()
             self.statusBar().showMessage(f"Reset {parameter_name}")
@@ -3318,16 +3578,43 @@ class SAXSMainWindow(QMainWindow):
             )
             return
         try:
+            self._flush_prefit_sequence_pending_manual_updates(
+                trigger="set_best_prefit",
+            )
             entries = self.prefit_tab.parameter_entries()
             self.prefit_workflow.parameter_entries = entries
             self.prefit_workflow.save_best_prefit_entries(entries)
             if self.current_settings is not None:
                 self.current_settings = self.prefit_workflow.settings
+            synced_entries = self._sync_dream_parameter_map_from_prefit(
+                source_label="Best Prefit preset",
+            )
             self.prefit_tab.append_log(
                 "Saved the current parameter table as the Best Prefit preset "
                 "in the project file."
+                + (
+                    "\nUpdated the DREAM parameter map centers from the Best Prefit preset."
+                    if synced_entries is not None
+                    else ""
+                )
             )
-            self.statusBar().showMessage("Best prefit preset saved")
+            self._append_prefit_sequence_event(
+                "best_prefit_preset_saved",
+                "Saved the current table as the Best Prefit preset.",
+                details={
+                    "dream_parameter_map_updated": synced_entries is not None,
+                },
+                parameter_entries=entries,
+            )
+            self._set_prefit_sequence_baseline(entries)
+            self.statusBar().showMessage(
+                "Best prefit preset saved"
+                + (
+                    " and DREAM parameter map updated"
+                    if synced_entries is not None
+                    else ""
+                )
+            )
         except Exception as exc:
             self._show_error("Save Best Prefit failed", str(exc))
 
@@ -3339,6 +3626,9 @@ class SAXSMainWindow(QMainWindow):
             )
             return
         try:
+            self._flush_prefit_sequence_pending_manual_updates(
+                trigger="reset_to_best_prefit",
+            )
             entries = self.prefit_workflow.load_best_prefit_entries()
             if entries is None:
                 raise ValueError(
@@ -3346,9 +3636,15 @@ class SAXSMainWindow(QMainWindow):
                 )
             self.prefit_workflow.parameter_entries = entries
             self.prefit_tab.populate_parameter_table(entries)
+            self._set_prefit_sequence_baseline(entries)
             self.prefit_tab.append_log(
                 "Reset parameter table to the Best Prefit preset saved in "
                 "the project."
+            )
+            self._append_prefit_sequence_event(
+                "prefit_parameters_reset_to_best",
+                "Reset the Prefit parameter table to the Best Prefit preset.",
+                parameter_entries=entries,
             )
             self.update_prefit_model()
             self.statusBar().showMessage("Best prefit preset applied")
@@ -3370,6 +3666,9 @@ class SAXSMainWindow(QMainWindow):
             )
             return
         try:
+            self._flush_prefit_sequence_pending_manual_updates(
+                trigger="restore_prefit_state",
+            )
             saved_state = self.prefit_workflow.load_saved_state(state_name)
             if (
                 saved_state.template_name
@@ -3391,6 +3690,7 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_tab.populate_parameter_table(
                 saved_state.parameter_entries
             )
+            self._set_prefit_sequence_baseline(saved_state.parameter_entries)
             self._refresh_prefit_cluster_geometry_section()
             if saved_state.method and saved_state.max_nfev is not None:
                 self.prefit_tab.set_run_config(
@@ -3414,6 +3714,17 @@ class SAXSMainWindow(QMainWindow):
                 "Max nfev: "
                 f"{saved_state.max_nfev or self.prefit_tab.run_config().max_nfev}\n"
                 "Best Prefit preset was not modified."
+            )
+            self._append_prefit_sequence_event(
+                "prefit_state_restored",
+                "Restored a saved Prefit snapshot.",
+                details={
+                    "snapshot_name": saved_state.name,
+                    "template_name": saved_state.template_name,
+                    "method": saved_state.method,
+                    "max_nfev": saved_state.max_nfev,
+                },
+                parameter_entries=saved_state.parameter_entries,
             )
             self._invalidate_dream_workflow_cache()
             self.update_prefit_model()
@@ -3845,6 +4156,8 @@ class SAXSMainWindow(QMainWindow):
         self._dream_refresh_timer.stop()
         self._pending_dream_refresh_scope = 0
         self._last_results_loader = None
+        self._applied_dream_analysis_settings = None
+        self._last_dream_summary = None
         self.dream_tab.set_settings(display_settings, preset_name=None)
         self._last_results_loader = SAXSDreamResultsLoader(
             selected_run_dir,
@@ -3884,7 +4197,7 @@ class SAXSMainWindow(QMainWindow):
             return self._last_written_dream_bundle.runtime_script_path
         workflow = self._load_dream_workflow()
         run_dirs = sorted(
-            workflow.paths.dream_runtime_dir.glob("dream_*"),
+            workflow.dream_runtime_dir.glob("dream_*"),
             key=lambda path: path.name,
         )
         for run_dir in reversed(run_dirs):
@@ -3947,14 +4260,14 @@ class SAXSMainWindow(QMainWindow):
             )
             return
         try:
+            self._flush_prefit_sequence_pending_manual_updates(
+                trigger="recycle_dream_output",
+            )
             settings = self.dream_tab.settings_payload()
+            filter_kwargs = self._dream_filter_kwargs(settings)
             summary = self._last_results_loader.get_summary(
                 bestfit_method=settings.bestfit_method,
-                posterior_filter_mode=settings.posterior_filter_mode,
-                posterior_top_percent=settings.posterior_top_percent,
-                posterior_top_n=settings.posterior_top_n,
-                credible_interval_low=settings.credible_interval_low,
-                credible_interval_high=settings.credible_interval_high,
+                **filter_kwargs,
             )
             current_entries = self.prefit_tab.parameter_entries()
             updated_entries = []
@@ -3982,6 +4295,13 @@ class SAXSMainWindow(QMainWindow):
 
             self.prefit_tab.populate_parameter_table(updated_entries)
             self.prefit_workflow.parameter_entries = list(updated_entries)
+            self.prefit_workflow.save_best_prefit_entries(updated_entries)
+            self._set_prefit_sequence_baseline(updated_entries)
+            if self.current_settings is not None:
+                self.current_settings = self.prefit_workflow.settings
+            synced_entries = self._sync_dream_parameter_map_from_prefit(
+                source_label="recycled DREAM best fit",
+            )
             self._invalidate_dream_workflow_cache()
             self.tabs.setCurrentWidget(self.prefit_tab)
             self.prefit_tab.update_button.setFocus(
@@ -4010,7 +4330,16 @@ class SAXSMainWindow(QMainWindow):
                     "responsive. Click Update Model when you're ready to "
                     "rerender the Prefit plot."
                 ),
+                (
+                    "The recycled values are now the active Best Prefit "
+                    "preset and the single-parameter reset baseline."
+                ),
             ]
+            if synced_entries is not None:
+                log_lines.append(
+                    "Updated the DREAM parameter map centers from the "
+                    "recycled Prefit values."
+                )
             if (
                 self.prefit_workflow.template_spec.name
                 != self._last_results_loader.template_name
@@ -4036,6 +4365,22 @@ class SAXSMainWindow(QMainWindow):
                     "DREAM-only parameters not copied: " + preview
                 )
             self.prefit_tab.append_log("\n".join(log_lines))
+            self._append_prefit_sequence_event(
+                "dream_recycled_to_prefit",
+                "Recycled DREAM best-fit values into Prefit.",
+                details={
+                    "dream_run_dir": str(summary.run_dir),
+                    "bestfit_method": settings.bestfit_method,
+                    "posterior_filter": self._describe_posterior_filter(
+                        settings
+                    ),
+                    "matched_parameter_names": list(matched_names),
+                    "unmatched_prefit_names": list(unmatched_prefit_names),
+                    "unmatched_dream_names": list(unmatched_dream_names),
+                    "dream_parameter_map_updated": synced_entries is not None,
+                },
+                parameter_entries=updated_entries,
+            )
             self.dream_tab.append_log(
                 "Recycled the current DREAM best fit into the Prefit tab.\n"
                 + "\n".join(log_lines[1:])
@@ -4164,31 +4509,20 @@ class SAXSMainWindow(QMainWindow):
     ) -> tuple[object, object, object, dict[str, object]]:
         if self._last_results_loader is None:
             raise RuntimeError("Load DREAM results first.")
+        filter_kwargs = self._dream_filter_kwargs(settings)
         summary = self._last_results_loader.get_summary(
             bestfit_method=settings.bestfit_method,
-            posterior_filter_mode=settings.posterior_filter_mode,
-            posterior_top_percent=settings.posterior_top_percent,
-            posterior_top_n=settings.posterior_top_n,
-            credible_interval_low=settings.credible_interval_low,
-            credible_interval_high=settings.credible_interval_high,
+            **filter_kwargs,
         )
         model_plot = self._last_results_loader.build_model_fit_data(
             bestfit_method=settings.bestfit_method,
-            posterior_filter_mode=settings.posterior_filter_mode,
-            posterior_top_percent=settings.posterior_top_percent,
-            posterior_top_n=settings.posterior_top_n,
-            credible_interval_low=settings.credible_interval_low,
-            credible_interval_high=settings.credible_interval_high,
+            **filter_kwargs,
         )
         violin_plot = self._last_results_loader.build_violin_data(
             mode=self._effective_dream_violin_mode(settings),
-            posterior_filter_mode=settings.posterior_filter_mode,
-            posterior_top_percent=settings.posterior_top_percent,
-            posterior_top_n=settings.posterior_top_n,
-            credible_interval_low=settings.credible_interval_low,
-            credible_interval_high=settings.credible_interval_high,
             sample_source=settings.violin_sample_source,
             weight_order=settings.violin_weight_order,
+            **filter_kwargs,
         )
         plot_payload = self.dream_tab.prepare_violin_plot_payload(
             summary,
@@ -4237,6 +4571,21 @@ class SAXSMainWindow(QMainWindow):
             "auto_select_best_posterior_filter": bool(
                 settings.auto_select_best_posterior_filter
             ),
+            "stoichiometry_target_elements_text": str(
+                settings.stoichiometry_target_elements_text
+            ),
+            "stoichiometry_target_ratio_text": str(
+                settings.stoichiometry_target_ratio_text
+            ),
+            "stoichiometry_filter_enabled": bool(
+                settings.stoichiometry_filter_enabled
+            ),
+            "stoichiometry_tolerance_percent": float(
+                settings.stoichiometry_tolerance_percent
+            ),
+            "posterior_candidate_sample_count": int(
+                summary.posterior_candidate_sample_count
+            ),
             "posterior_sample_count": int(summary.posterior_sample_count),
             "credible_interval_low": float(summary.credible_interval_low),
             "credible_interval_high": float(summary.credible_interval_high),
@@ -4263,9 +4612,62 @@ class SAXSMainWindow(QMainWindow):
             "run_dir": str(summary.run_dir),
             "bestfit_method": str(summary.bestfit_method),
             "posterior_filter_mode": str(summary.posterior_filter_mode),
+            "posterior_candidate_sample_count": int(
+                summary.posterior_candidate_sample_count
+            ),
             "posterior_sample_count": int(summary.posterior_sample_count),
             "credible_interval_low": float(summary.credible_interval_low),
             "credible_interval_high": float(summary.credible_interval_high),
+            "stoichiometry_target": (
+                None
+                if summary.stoichiometry_target is None
+                else {
+                    "elements": list(summary.stoichiometry_target.elements),
+                    "ratio": list(summary.stoichiometry_target.ratio),
+                    "normalized_ratio": list(
+                        summary.stoichiometry_target.normalized_ratio
+                    ),
+                }
+            ),
+            "stoichiometry_filter_enabled": bool(
+                summary.stoichiometry_filter_enabled
+            ),
+            "stoichiometry_tolerance_percent": (
+                None
+                if summary.stoichiometry_tolerance_percent is None
+                else float(summary.stoichiometry_tolerance_percent)
+            ),
+            "stoichiometry_evaluation": (
+                None
+                if summary.stoichiometry_evaluation is None
+                else {
+                    "element_totals": dict(
+                        summary.stoichiometry_evaluation.element_totals
+                    ),
+                    "observed_ratio": (
+                        None
+                        if summary.stoichiometry_evaluation.observed_ratio
+                        is None
+                        else list(
+                            summary.stoichiometry_evaluation.observed_ratio
+                        )
+                    ),
+                    "deviation_percent_by_element": dict(
+                        summary.stoichiometry_evaluation.deviation_percent_by_element
+                    ),
+                    "max_deviation_percent": (
+                        None
+                        if summary.stoichiometry_evaluation.max_deviation_percent
+                        is None
+                        else float(
+                            summary.stoichiometry_evaluation.max_deviation_percent
+                        )
+                    ),
+                    "is_valid": bool(
+                        summary.stoichiometry_evaluation.is_valid
+                    ),
+                }
+            ),
             "full_parameter_names": [
                 str(name) for name in summary.full_parameter_names
             ],
@@ -4705,25 +5107,14 @@ class SAXSMainWindow(QMainWindow):
         ):
             candidate_settings = self._copy_dream_settings(settings)
             candidate_settings.posterior_filter_mode = mode
+            filter_kwargs = self._dream_filter_kwargs(candidate_settings)
             summary = self._last_results_loader.get_summary(
                 bestfit_method=candidate_settings.bestfit_method,
-                posterior_filter_mode=candidate_settings.posterior_filter_mode,
-                posterior_top_percent=candidate_settings.posterior_top_percent,
-                posterior_top_n=candidate_settings.posterior_top_n,
-                credible_interval_low=candidate_settings.credible_interval_low,
-                credible_interval_high=(
-                    candidate_settings.credible_interval_high
-                ),
+                **filter_kwargs,
             )
             model_plot = self._last_results_loader.build_model_fit_data(
                 bestfit_method=candidate_settings.bestfit_method,
-                posterior_filter_mode=candidate_settings.posterior_filter_mode,
-                posterior_top_percent=candidate_settings.posterior_top_percent,
-                posterior_top_n=candidate_settings.posterior_top_n,
-                credible_interval_low=candidate_settings.credible_interval_low,
-                credible_interval_high=(
-                    candidate_settings.credible_interval_high
-                ),
+                **filter_kwargs,
             )
             assessments.append(
                 {
@@ -4942,7 +5333,13 @@ class SAXSMainWindow(QMainWindow):
         q_values = np.asarray(model_plot.q_values, dtype=float)
         q_range_text = self._format_selected_q_range_text(q_values)
         supported_q_range = load_built_component_q_range(
-            self.current_settings.project_dir
+            self.current_settings.project_dir,
+            include_predicted_structures=(
+                self.current_settings.use_predicted_structure_weights
+            ),
+            component_dir=project_artifact_paths(
+                self.current_settings
+            ).component_dir,
         )
         supported_q_range_text = (
             None
@@ -5011,7 +5408,10 @@ class SAXSMainWindow(QMainWindow):
             f"Project directory: {project_paths.project_dir}",
             f"Exported data directory: {project_paths.exported_data_dir}",
             f"Exported plots directory: {project_paths.exported_plots_dir}",
-            f"Prefit directory: {project_paths.prefit_dir}",
+            (
+                "Prefit directory: "
+                f"{project_artifact_paths(self.current_settings).prefit_dir}"
+            ),
             f"DREAM run directory: {summary.run_dir}",
             (
                 "Prior weights source: "
@@ -5360,10 +5760,9 @@ class SAXSMainWindow(QMainWindow):
             return current_prior_path
         if self.current_settings is None:
             return None
-        candidate = (
-            build_project_paths(self.current_settings.project_dir).project_dir
-            / "md_prior_weights.json"
-        )
+        candidate = project_artifact_paths(
+            self.current_settings
+        ).prior_weights_file
         return candidate if candidate.is_file() else None
 
     def _report_secondary_element(self) -> str | None:
@@ -5459,8 +5858,11 @@ class SAXSMainWindow(QMainWindow):
     ) -> ReportComponentPlotData | None:
         if self.current_settings is None:
             return None
-        paths = build_project_paths(self.current_settings.project_dir)
-        component_paths = sorted(paths.scattering_components_dir.glob("*.txt"))
+        component_paths = sorted(
+            project_artifact_paths(self.current_settings).component_dir.glob(
+                "*.txt"
+            )
+        )
         experimental_summary = self._report_data_summary(solvent=False)
         solvent_summary = (
             self._report_data_summary(solvent=True)
@@ -5547,15 +5949,15 @@ class SAXSMainWindow(QMainWindow):
     def _latest_prefit_statistics_payload(self) -> dict[str, object]:
         if self.current_settings is None:
             return {}
-        paths = build_project_paths(self.current_settings.project_dir)
-        state_path = paths.prefit_dir / "prefit_state.json"
+        prefit_dir = project_artifact_paths(self.current_settings).prefit_dir
+        state_path = prefit_dir / "prefit_state.json"
         if not state_path.is_file():
             return {}
         payload = json.loads(state_path.read_text(encoding="utf-8"))
         statistics = dict(payload.get("statistics", {}))
         statistics["saved_at"] = str(payload.get("saved_at", ""))
         latest_snapshot = next(
-            iter(sorted(paths.prefit_dir.glob("prefit_*"), reverse=True)),
+            iter(sorted(prefit_dir.glob("prefit_*"), reverse=True)),
             None,
         )
         if latest_snapshot is not None:
@@ -5649,68 +6051,33 @@ class SAXSMainWindow(QMainWindow):
         ):
             candidate_settings = self._copy_dream_settings(settings)
             candidate_settings.posterior_filter_mode = mode
+            filter_kwargs = self._dream_filter_kwargs(candidate_settings)
             summary = self._last_results_loader.get_summary(
                 bestfit_method=candidate_settings.bestfit_method,
-                posterior_filter_mode=candidate_settings.posterior_filter_mode,
-                posterior_top_percent=candidate_settings.posterior_top_percent,
-                posterior_top_n=candidate_settings.posterior_top_n,
-                credible_interval_low=candidate_settings.credible_interval_low,
-                credible_interval_high=(
-                    candidate_settings.credible_interval_high
-                ),
+                **filter_kwargs,
             )
             model_plot = self._last_results_loader.build_model_fit_data(
                 bestfit_method=candidate_settings.bestfit_method,
-                posterior_filter_mode=candidate_settings.posterior_filter_mode,
-                posterior_top_percent=candidate_settings.posterior_top_percent,
-                posterior_top_n=candidate_settings.posterior_top_n,
-                credible_interval_low=candidate_settings.credible_interval_low,
-                credible_interval_high=(
-                    candidate_settings.credible_interval_high
-                ),
+                **filter_kwargs,
             )
             violin_plot = self._last_results_loader.build_violin_data(
                 mode=self._effective_dream_violin_mode(candidate_settings),
-                posterior_filter_mode=candidate_settings.posterior_filter_mode,
-                posterior_top_percent=candidate_settings.posterior_top_percent,
-                posterior_top_n=candidate_settings.posterior_top_n,
-                credible_interval_low=candidate_settings.credible_interval_low,
-                credible_interval_high=(
-                    candidate_settings.credible_interval_high
-                ),
                 sample_source=candidate_settings.violin_sample_source,
                 weight_order=candidate_settings.violin_weight_order,
+                **filter_kwargs,
             )
             weights_violin_plot = self._last_results_loader.build_violin_data(
                 mode="weights_only",
-                posterior_filter_mode=candidate_settings.posterior_filter_mode,
-                posterior_top_percent=candidate_settings.posterior_top_percent,
-                posterior_top_n=candidate_settings.posterior_top_n,
-                credible_interval_low=candidate_settings.credible_interval_low,
-                credible_interval_high=(
-                    candidate_settings.credible_interval_high
-                ),
                 sample_source=candidate_settings.violin_sample_source,
                 weight_order=candidate_settings.violin_weight_order,
+                **filter_kwargs,
             )
             effective_radii_violin_plot = (
                 self._last_results_loader.build_violin_data(
                     mode="effective_radii_only",
-                    posterior_filter_mode=(
-                        candidate_settings.posterior_filter_mode
-                    ),
-                    posterior_top_percent=(
-                        candidate_settings.posterior_top_percent
-                    ),
-                    posterior_top_n=candidate_settings.posterior_top_n,
-                    credible_interval_low=(
-                        candidate_settings.credible_interval_low
-                    ),
-                    credible_interval_high=(
-                        candidate_settings.credible_interval_high
-                    ),
                     sample_source=candidate_settings.violin_sample_source,
                     weight_order=candidate_settings.violin_weight_order,
+                    **filter_kwargs,
                 )
             )
             title = label
@@ -6085,6 +6452,17 @@ class SAXSMainWindow(QMainWindow):
         self.dream_tab.reset_progress()
         self.project_setup_tab.set_project_selected(True)
         self.project_setup_tab.set_project_settings(settings, template_specs)
+        self._refresh_saved_distributions(settings)
+        available_elements, cluster_rows = self._active_cluster_import_view(
+            settings,
+            fallback_available_elements=settings.available_elements,
+            fallback_rows=settings.cluster_inventory_rows,
+        )
+        self.project_setup_tab.apply_cluster_import_data(
+            available_elements,
+            cluster_rows,
+        )
+        self._refresh_predicted_structure_status(settings)
         self._refresh_component_plot()
         self._refresh_prior_plot()
         try:
@@ -6121,6 +6499,43 @@ class SAXSMainWindow(QMainWindow):
             self.dream_tab.clear_plots()
         self._refresh_model_only_mode_state()
         self._update_file_menu_state()
+
+    def _refresh_saved_distributions(
+        self,
+        settings: ProjectSettings | None = None,
+    ) -> None:
+        active_settings = settings or self.current_settings
+        if active_settings is None:
+            self.project_setup_tab.set_available_distributions([])
+            return
+        records = self.project_manager.list_saved_distributions(
+            active_settings.project_dir
+        )
+        labels = []
+        for record in records:
+            readiness = []
+            if record.component_artifacts_ready:
+                readiness.append("components")
+            if record.prior_artifacts_ready:
+                readiness.append("prior")
+            readiness_text = (
+                " | " + ", ".join(readiness)
+                if readiness
+                else " | metadata only"
+            )
+            labels.append(
+                (
+                    f"{record.label}{readiness_text}",
+                    record.distribution_id,
+                )
+            )
+        selected_id = (
+            distribution_id_for_settings(active_settings) if labels else None
+        )
+        self.project_setup_tab.set_available_distributions(
+            labels,
+            selected_distribution_id=selected_id,
+        )
 
     def _set_dream_tab_enabled(self, enabled: bool) -> None:
         dream_index = self.tabs.indexOf(self.dream_tab)
@@ -6175,6 +6590,58 @@ class SAXSMainWindow(QMainWindow):
             else "Model Only Mode disabled"
         )
 
+    @Slot(bool)
+    def _on_predicted_structure_weights_changed(self, enabled: bool) -> None:
+        if self.current_settings is None:
+            return
+        try:
+            settings = self._settings_from_project_tab()
+            settings.use_predicted_structure_weights = bool(enabled)
+            self.project_manager.save_project(settings)
+            self.current_settings = settings
+            self._apply_project_settings(settings)
+            self.statusBar().showMessage(
+                "Use Predicted Structure Weights enabled"
+                if enabled
+                else "Use Predicted Structure Weights disabled"
+            )
+        except Exception as exc:
+            self._show_error(
+                "Update Predicted Structures mode failed",
+                str(exc),
+            )
+
+    @Slot(str)
+    def _load_saved_distribution(self, distribution_id: str) -> None:
+        if self.current_settings is None:
+            return
+        try:
+            record = self.project_manager.load_saved_distribution(
+                self.current_settings.project_dir,
+                distribution_id,
+            )
+            settings = self._settings_from_project_tab()
+            settings.use_predicted_structure_weights = bool(
+                record.use_predicted_structure_weights
+            )
+            settings.exclude_elements = list(record.exclude_elements)
+            settings.clusters_dir = record.clusters_dir
+            settings.q_min = record.q_min
+            settings.q_max = record.q_max
+            settings.use_experimental_grid = bool(record.use_experimental_grid)
+            settings.q_points = record.q_points
+            self.project_manager.save_project(settings)
+            self.current_settings = settings
+            self._apply_project_settings(settings)
+            self.project_setup_tab.append_summary(
+                "Loaded computed distribution.\n"
+                f"Distribution: {record.label}\n"
+                f"Folder: {record.distribution_dir}"
+            )
+            self.statusBar().showMessage("Computed distribution loaded")
+        except Exception as exc:
+            self._show_error("Load distribution failed", str(exc))
+
     def _settings_from_project_tab(self) -> ProjectSettings:
         project_dir = self.project_setup_tab.project_dir()
         if project_dir is None:
@@ -6190,6 +6657,9 @@ class SAXSMainWindow(QMainWindow):
         base.project_name = project_dir.name
         base.project_dir = str(project_dir)
         base.model_only_mode = self.project_setup_tab.model_only_mode()
+        base.use_predicted_structure_weights = (
+            self.project_setup_tab.use_predicted_structure_weights()
+        )
         base.clusters_dir = (
             str(self.project_setup_tab.clusters_dir())
             if self.project_setup_tab.clusters_dir() is not None
@@ -6279,12 +6749,18 @@ class SAXSMainWindow(QMainWindow):
         self.prefit_tab.set_autosave(
             self.prefit_workflow.settings.autosave_prefits
         )
+        self.prefit_tab.set_sequence_history_enabled(
+            self.prefit_workflow.settings.prefit_sequence_history_enabled
+        )
         self._restoring_prefit_template = True
         self.prefit_tab.set_selected_template(
             self.prefit_workflow.template_spec.name
         )
         self._restoring_prefit_template = False
         self.prefit_tab.populate_parameter_table(
+            self.prefit_workflow.parameter_entries
+        )
+        self._set_prefit_sequence_baseline(
             self.prefit_workflow.parameter_entries
         )
         self._refresh_prefit_volume_fraction_section()
@@ -6309,6 +6785,9 @@ class SAXSMainWindow(QMainWindow):
         )
         self.prefit_tab.set_templates(template_specs, selected_template)
         self.prefit_tab.set_autosave(settings.autosave_prefits)
+        self.prefit_tab.set_sequence_history_enabled(
+            settings.prefit_sequence_history_enabled
+        )
         self.prefit_tab.set_model_only_mode(settings.model_only_mode)
         self.prefit_tab.set_prefit_execution_enabled(False)
         if selected_template:
@@ -6318,6 +6797,7 @@ class SAXSMainWindow(QMainWindow):
             finally:
                 self._restoring_prefit_template = False
         self.prefit_tab.populate_parameter_table([])
+        self._set_prefit_sequence_baseline([])
         template_spec = None
         if selected_template:
             try:
@@ -6450,10 +6930,17 @@ class SAXSMainWindow(QMainWindow):
                 parameter_map_entries = []
             self.dream_tab.set_parameter_map_entries(parameter_map_entries)
             self._dream_parameter_map_saved_in_session = False
+            self._applied_dream_analysis_settings = None
+            self._last_dream_summary = None
             self.dream_tab.set_log_text(self._format_dream_console_intro())
             self.dream_tab.set_summary_text(
                 "DREAM results are not loaded yet."
             )
+            self.dream_tab.set_filter_status_text(
+                "No DREAM dataset is loaded yet. Load a run, then apply "
+                "posterior or stoichiometry filters."
+            )
+            self.dream_tab.set_filter_dirty(False)
             self.dream_tab.reset_progress()
             self.dream_tab.clear_plots()
         self._refresh_saved_dream_runs()
@@ -6462,8 +6949,8 @@ class SAXSMainWindow(QMainWindow):
     def _list_saved_dream_runs(self) -> list[DreamSavedRunRecord]:
         if self.current_settings is None:
             return []
-        runtime_dir = build_project_paths(
-            self.current_settings.project_dir
+        runtime_dir = project_artifact_paths(
+            self.current_settings
         ).dream_runtime_dir
         if not runtime_dir.is_dir():
             return []
@@ -6524,8 +7011,8 @@ class SAXSMainWindow(QMainWindow):
         if self.current_settings is None:
             self.project_setup_tab.draw_prior_plot(None)
             return
-        paths = build_project_paths(self.current_settings.project_dir)
-        prior_json = paths.project_dir / "md_prior_weights.json"
+        artifact_paths = project_artifact_paths(self.current_settings)
+        prior_json = artifact_paths.prior_weights_file
         self.project_setup_tab.draw_prior_plot(
             prior_json if prior_json.is_file() else None
         )
@@ -6534,9 +7021,192 @@ class SAXSMainWindow(QMainWindow):
         if self.current_settings is None:
             self.project_setup_tab.draw_component_plot(None)
             return
-        paths = build_project_paths(self.current_settings.project_dir)
-        component_paths = sorted(paths.scattering_components_dir.glob("*.txt"))
+        artifact_paths = project_artifact_paths(self.current_settings)
+        component_paths = sorted(artifact_paths.component_dir.glob("*.txt"))
         self.project_setup_tab.draw_component_plot(component_paths or None)
+
+    def _active_cluster_import_view(
+        self,
+        settings: ProjectSettings,
+        *,
+        fallback_available_elements: list[str] | None = None,
+        fallback_rows: list[dict[str, object]] | None = None,
+    ) -> tuple[list[str], list[dict[str, object]]]:
+        artifact_paths = project_artifact_paths(settings)
+        prior_json = artifact_paths.prior_weights_file
+        if not prior_json.is_file():
+            filtered_rows = [dict(row) for row in (fallback_rows or [])]
+            if not settings.use_predicted_structure_weights:
+                filtered_rows = [
+                    row
+                    for row in filtered_rows
+                    if str(row.get("source_kind", "cluster_dir"))
+                    != "predicted_structure"
+                ]
+            return (
+                list(fallback_available_elements or []),
+                filtered_rows,
+            )
+        try:
+            payload = json.loads(prior_json.read_text(encoding="utf-8"))
+        except Exception:
+            filtered_rows = [dict(row) for row in (fallback_rows or [])]
+            if not settings.use_predicted_structure_weights:
+                filtered_rows = [
+                    row
+                    for row in filtered_rows
+                    if str(row.get("source_kind", "cluster_dir"))
+                    != "predicted_structure"
+                ]
+            return (
+                list(fallback_available_elements or []),
+                filtered_rows,
+            )
+        return (
+            [
+                str(element)
+                for element in payload.get("available_elements", [])
+                if str(element).strip()
+            ],
+            self._cluster_rows_from_prior_payload(payload),
+        )
+
+    def _cluster_rows_from_prior_payload(
+        self,
+        payload: dict[str, object],
+    ) -> list[dict[str, object]]:
+        structures = payload.get("structures", {})
+        rows: list[dict[str, object]] = []
+        atom_weight_total = sum(
+            max(
+                sum(
+                    int(token)
+                    for token in re.findall(r"(\d+)", str(structure))
+                ),
+                1,
+            )
+            * float(
+                motif_payload.get(
+                    "normalized_weight",
+                    motif_payload.get("weight", 0.0),
+                )
+                or 0.0
+            )
+            for structure, motif_map in dict(structures).items()
+            for motif_payload in dict(motif_map).values()
+            if isinstance(motif_payload, dict)
+        )
+        for structure, motif_map in dict(structures).items():
+            for motif, motif_payload in dict(motif_map).items():
+                if not isinstance(motif_payload, dict):
+                    continue
+                weight = float(
+                    motif_payload.get(
+                        "normalized_weight",
+                        motif_payload.get("weight", 0.0),
+                    )
+                    or 0.0
+                )
+                rows.append(
+                    {
+                        "structure": str(structure),
+                        "motif": str(motif),
+                        "count": int(motif_payload.get("count", 0) or 0),
+                        "weight": weight,
+                        "atom_fraction_percent": (
+                            weight
+                            * max(
+                                sum(
+                                    int(token)
+                                    for token in re.findall(
+                                        r"(\d+)",
+                                        str(structure),
+                                    )
+                                ),
+                                1,
+                            )
+                            / atom_weight_total
+                            * 100.0
+                            if atom_weight_total > 0.0
+                            else 0.0
+                        ),
+                        "structure_fraction_percent": weight * 100.0,
+                        "source_kind": str(
+                            motif_payload.get("source_kind", "cluster_dir")
+                        ),
+                        "source_dir": str(motif_payload.get("source_dir", "")),
+                        "source_file": str(
+                            motif_payload.get("source_file", "")
+                        ),
+                        "source_file_name": str(
+                            motif_payload.get("source_file_name", "")
+                        ),
+                        "representative": str(
+                            motif_payload.get("representative", "")
+                        ),
+                        "profile_file": str(
+                            motif_payload.get("profile_file", "")
+                        ),
+                    }
+                )
+        rows.sort(
+            key=lambda row: (
+                str(row["structure"]).lower(),
+                str(row["motif"]).lower(),
+            )
+        )
+        return rows
+
+    def _refresh_predicted_structure_status(
+        self,
+        settings: ProjectSettings | None = None,
+    ) -> None:
+        active_settings = settings or self.current_settings
+        if active_settings is None:
+            self.project_setup_tab.set_predicted_structure_status_text(
+                self.project_setup_tab._default_predicted_structure_status_text()
+            )
+            return
+        if not active_settings.use_predicted_structure_weights:
+            self.project_setup_tab.set_predicted_structure_status_text(
+                self.project_setup_tab._default_predicted_structure_status_text()
+            )
+            return
+        artifact_paths = project_artifact_paths(active_settings)
+        component_artifacts_ready = bool(
+            artifact_paths.component_dir.is_dir()
+            and any(artifact_paths.component_dir.glob("*.txt"))
+            and artifact_paths.component_map_file.is_file()
+        )
+        prior_artifacts_ready = bool(
+            artifact_paths.prior_weights_file.is_file()
+        )
+        predicted_state = self.project_manager.inspect_predicted_structures(
+            active_settings.project_dir
+        )
+        if component_artifacts_ready and prior_artifacts_ready:
+            self.project_setup_tab.set_predicted_structure_status_text(
+                "Predicted Structures mode is on.\n"
+                "Project Setup, Prefit, and DREAM are using the observed + "
+                "Predicted Structures SAXS components and prior weights."
+            )
+            return
+        if predicted_state.dataset_file is None:
+            self.project_setup_tab.set_predicted_structure_status_text(
+                "Predicted Structures mode is on, but no Cluster Dynamics ML "
+                "prediction bundle was found in this project.\n"
+                "Open Tools > Cluster Dynamics > Open Cluster Dynamics (ML), "
+                "run a prediction, "
+                "then rebuild SAXS components and prior weights."
+            )
+            return
+        self.project_setup_tab.set_predicted_structure_status_text(
+            "Predicted Structures mode is on.\n"
+            f"Found {predicted_state.prediction_count} predicted structure"
+            f"{'' if predicted_state.prediction_count == 1 else 's'} in "
+            f"{predicted_state.dataset_file.name}. Rebuild SAXS components "
+            "and prior weights to bring them into Project Setup, Prefit, and DREAM."
+        )
 
     def _refresh_saved_prefit_states(
         self,
@@ -6550,6 +7220,175 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_workflow.list_saved_states(),
             selected_name=selected_name,
         )
+
+    @staticmethod
+    def _copy_prefit_entries(
+        entries: list[PrefitParameterEntry],
+    ) -> list[PrefitParameterEntry]:
+        return [
+            PrefitParameterEntry.from_dict(entry.to_dict())
+            for entry in entries
+        ]
+
+    def _set_prefit_sequence_baseline(
+        self,
+        entries: list[PrefitParameterEntry] | None,
+    ) -> None:
+        self._prefit_sequence_baseline_entries = self._copy_prefit_entries(
+            entries or []
+        )
+        self._prefit_sequence_pending_manual_edits = False
+
+    def _update_prefit_stoichiometry_status(self) -> None:
+        if self.prefit_workflow is None:
+            self.prefit_tab.set_stoichiometry_status_text(
+                "Stoichiometry monitor: build a project to evaluate cluster-weight stoichiometry."
+            )
+            return
+        settings = self.dream_tab.settings_payload()
+        try:
+            target = build_stoichiometry_target(
+                settings.stoichiometry_target_elements_text,
+                settings.stoichiometry_target_ratio_text,
+            )
+        except Exception as exc:
+            self.prefit_tab.set_stoichiometry_status_text(
+                f"Stoichiometry monitor: invalid target ({exc})"
+            )
+            return
+        if target is None:
+            self.prefit_tab.set_stoichiometry_status_text(
+                "Stoichiometry monitor: configure target elements and ratio in DREAM > Posterior Filtering."
+            )
+            return
+        try:
+            entries = self.prefit_tab.parameter_entries()
+        except Exception as exc:
+            self.prefit_tab.set_stoichiometry_status_text(
+                f"Stoichiometry monitor: waiting on valid Prefit parameter values ({exc})"
+            )
+            return
+        evaluation = evaluate_weighted_stoichiometry(
+            [
+                (entry.structure, float(entry.value))
+                for entry in entries
+                if str(entry.name).startswith("w")
+            ],
+            target,
+        )
+        if not evaluation.is_valid:
+            self.prefit_tab.set_stoichiometry_status_text(
+                "Stoichiometry monitor:\n"
+                f"Target: {stoichiometry_target_text(target)}\n"
+                "Observed ratio: unavailable\n"
+                "Deviation from target: unavailable"
+            )
+            return
+        self.prefit_tab.set_stoichiometry_status_text(
+            "Stoichiometry monitor:\n"
+            f"Target: {stoichiometry_target_text(target)}\n"
+            "Observed ratio: "
+            f"{stoichiometry_ratio_text(target, evaluation.observed_ratio)}\n"
+            f"{stoichiometry_deviation_text(evaluation)}"
+        )
+
+    def _on_prefit_parameter_table_edited(self) -> None:
+        self._prefit_sequence_pending_manual_edits = True
+        self._update_prefit_stoichiometry_status()
+
+    @staticmethod
+    def _prefit_entry_change_records(
+        previous_entries: list[PrefitParameterEntry],
+        current_entries: list[PrefitParameterEntry],
+    ) -> list[dict[str, object]]:
+        def _entry_key(entry: PrefitParameterEntry) -> tuple[str, str, str]:
+            return (
+                str(entry.structure).strip(),
+                str(entry.motif).strip(),
+                str(entry.name).strip(),
+            )
+
+        previous_lookup = {
+            _entry_key(entry): entry for entry in previous_entries
+        }
+        current_lookup = {
+            _entry_key(entry): entry for entry in current_entries
+        }
+        change_records: list[dict[str, object]] = []
+        for key in sorted(set(previous_lookup) | set(current_lookup)):
+            previous_entry = previous_lookup.get(key)
+            current_entry = current_lookup.get(key)
+            previous_payload = (
+                None if previous_entry is None else previous_entry.to_dict()
+            )
+            current_payload = (
+                None if current_entry is None else current_entry.to_dict()
+            )
+            if previous_payload == current_payload:
+                continue
+            structure, motif, parameter_name = key
+            change_records.append(
+                {
+                    "structure": structure,
+                    "motif": motif,
+                    "parameter_name": parameter_name,
+                    "previous": previous_payload,
+                    "current": current_payload,
+                }
+            )
+        return change_records
+
+    def _append_prefit_sequence_event(
+        self,
+        event_type: str,
+        summary: str,
+        *,
+        details: dict[str, object] | None = None,
+        parameter_entries: list[PrefitParameterEntry] | None = None,
+        force: bool = False,
+    ) -> Path | None:
+        if self.prefit_workflow is None:
+            return None
+        try:
+            return self.prefit_workflow.append_sequence_history_event(
+                event_type,
+                summary,
+                details=details,
+                parameter_entries=parameter_entries,
+                force=force,
+            )
+        except Exception:
+            return None
+
+    def _flush_prefit_sequence_pending_manual_updates(
+        self,
+        *,
+        trigger: str,
+    ) -> list[dict[str, object]]:
+        if self.prefit_workflow is None:
+            return []
+        if not self._prefit_sequence_pending_manual_edits:
+            return []
+        try:
+            current_entries = self.prefit_tab.parameter_entries()
+        except Exception:
+            return []
+        change_records = self._prefit_entry_change_records(
+            self._prefit_sequence_baseline_entries,
+            current_entries,
+        )
+        if change_records:
+            self._append_prefit_sequence_event(
+                "manual_parameter_update",
+                "Recorded manual Prefit parameter edits.",
+                details={
+                    "trigger": trigger,
+                    "changed_parameters": change_records,
+                },
+                parameter_entries=current_entries,
+            )
+        self._set_prefit_sequence_baseline(current_entries)
+        return change_records
 
     def _save_distribution_entries(self, entries: list) -> None:
         try:
@@ -6567,6 +7406,31 @@ class SAXSMainWindow(QMainWindow):
             self._append_dream_vary_recommendation(entries)
         except Exception as exc:
             self._show_error("Save priors failed", str(exc))
+
+    def _sync_dream_parameter_map_from_prefit(
+        self,
+        *,
+        source_label: str,
+    ) -> list[DreamParameterEntry] | None:
+        if self.prefit_workflow is None:
+            return None
+        try:
+            workflow = self._load_dream_workflow()
+        except Exception:
+            return None
+        entries = workflow.sync_parameter_map_to_prefit(persist=True)
+        self._dream_parameter_map_saved_in_session = True
+        self._invalidate_written_dream_bundle()
+        self._last_dream_constraint_warning_signature = None
+        self.dream_tab.set_parameter_map_entries(entries)
+        self.dream_tab.append_log(
+            "Updated DREAM parameter map from Prefit.\n"
+            f"Source: {source_label}\n"
+            "The current DREAM priors keep their saved vary flags and "
+            "distribution families, but their centers now follow the latest "
+            "Prefit baseline."
+        )
+        return entries
 
     def _on_prefit_template_changed(self, template_name: str) -> None:
         if (
@@ -6587,11 +7451,17 @@ class SAXSMainWindow(QMainWindow):
         if disable_future_warnings:
             self._warn_on_prefit_template_change = False
         try:
+            self._flush_prefit_sequence_pending_manual_updates(
+                trigger="change_prefit_template",
+            )
             self.prefit_workflow.set_template(template_name)
             if self.current_settings is not None:
                 self.current_settings = self.prefit_workflow.settings
             self._refresh_template_selectors(selected_name=template_name)
             self.prefit_tab.populate_parameter_table(
+                self.prefit_workflow.parameter_entries
+            )
+            self._set_prefit_sequence_baseline(
                 self.prefit_workflow.parameter_entries
             )
             self._refresh_prefit_volume_fraction_section()
@@ -6611,6 +7481,15 @@ class SAXSMainWindow(QMainWindow):
                     "This template also requires cluster geometry metadata "
                     "before the prefit model can be evaluated."
                 )
+            self._append_prefit_sequence_event(
+                "prefit_template_changed",
+                "Changed the active Prefit template.",
+                details={
+                    "previous_template": current_name,
+                    "current_template": template_name,
+                },
+                parameter_entries=self.prefit_workflow.parameter_entries,
+            )
             self.statusBar().showMessage("Prefit template updated")
         except Exception as exc:
             self._restore_prefit_template_selection(current_name)
@@ -6622,9 +7501,43 @@ class SAXSMainWindow(QMainWindow):
         self.prefit_workflow.set_autosave(enabled)
         if self.current_settings is not None:
             self.current_settings = self.prefit_workflow.settings
+        self._append_prefit_sequence_event(
+            "autosave_toggled",
+            "Changed Prefit autosave setting.",
+            details={"enabled": bool(enabled)},
+            parameter_entries=self.prefit_workflow.parameter_entries,
+        )
         self.prefit_tab.append_log(
             "Autosave fit results " + ("enabled." if enabled else "disabled.")
         )
+
+    def _on_prefit_sequence_history_changed(self, enabled: bool) -> None:
+        if self.prefit_workflow is None:
+            return
+        self.prefit_workflow.set_sequence_history_enabled(enabled)
+        if self.current_settings is not None:
+            self.current_settings = self.prefit_workflow.settings
+        try:
+            current_entries = self.prefit_tab.parameter_entries()
+        except Exception:
+            current_entries = self.prefit_workflow.parameter_entries
+        self._set_prefit_sequence_baseline(current_entries)
+        history_path = self._append_prefit_sequence_event(
+            "sequence_history_logger_toggled",
+            "Changed Prefit sequence history logging.",
+            details={"enabled": bool(enabled)},
+            parameter_entries=current_entries,
+            force=True,
+        )
+        if enabled and history_path is not None:
+            self.prefit_tab.append_log(
+                "Sequence history logger enabled.\n"
+                f"History file: {history_path}"
+            )
+            self.statusBar().showMessage("Prefit sequence history enabled")
+            return
+        self.prefit_tab.append_log("Sequence history logger disabled.")
+        self.statusBar().showMessage("Prefit sequence history disabled")
 
     def _on_dream_settings_preset_changed(self, _text: str) -> None:
         if self.dream_workflow is None:
@@ -6661,9 +7574,27 @@ class SAXSMainWindow(QMainWindow):
                 "Loaded DREAM settings preset: "
                 f"{preset_name or 'active project settings'}"
             )
-            self._refresh_loaded_dream_results()
+            self._on_dream_analysis_settings_changed()
         except Exception as exc:
             self._show_error("Load DREAM settings failed", str(exc))
+
+    def _on_dream_analysis_settings_changed(self) -> None:
+        self._update_prefit_stoichiometry_status()
+        if self._last_results_loader is None:
+            self.dream_tab.set_filter_dirty(False)
+            return
+        self.dream_tab.set_filter_dirty(True)
+        self._refresh_dream_filter_status(dirty=True)
+
+    def _apply_dream_filter_settings(self) -> None:
+        if self._last_results_loader is None:
+            self.dream_tab.set_filter_status_text(
+                "No DREAM dataset is loaded yet. Load a run before applying "
+                "posterior or stoichiometry filters."
+            )
+            self.dream_tab.set_filter_dirty(False)
+            return
+        self._refresh_loaded_dream_results(scope=self.DREAM_REFRESH_FULL)
 
     @staticmethod
     def _copy_dream_settings(
@@ -6864,7 +7795,7 @@ class SAXSMainWindow(QMainWindow):
 
         window = launch_mdtrajectory_app()
         self._child_tool_windows.append(window)
-        self.statusBar().showMessage("Opened mdtrajectory")
+        self.statusBar().showMessage("Opened MD trajectory extraction")
 
     def _open_cluster_tool(self) -> None:
         from saxshell.cluster.ui.main_window import launch_cluster_ui
@@ -6877,7 +7808,7 @@ class SAXSMainWindow(QMainWindow):
 
         window = launch_xyz2pdb_ui()
         self._child_tool_windows.append(window)
-        self.statusBar().showMessage("Opened xyz2pdb conversion")
+        self.statusBar().showMessage("Opened XYZ -> PDB conversion")
 
     def _open_bondanalysis_tool(self) -> None:
         from saxshell.bondanalysis.ui.main_window import BondAnalysisMainWindow
@@ -6932,10 +7863,10 @@ class SAXSMainWindow(QMainWindow):
         self._child_tool_windows.append(window)
         if project_dir is not None:
             self.statusBar().showMessage(
-                f"Opened cluster dynamics AI for {project_dir}"
+                f"Opened cluster dynamics (ML) for {project_dir}"
             )
         else:
-            self.statusBar().showMessage("Opened cluster dynamics AI")
+            self.statusBar().showMessage("Opened cluster dynamics (ML)")
 
     def _open_fullrmc_tool(self) -> None:
         from saxshell.fullrmc.ui.main_window import RMCSetupMainWindow
@@ -6953,6 +7884,32 @@ class SAXSMainWindow(QMainWindow):
             )
         else:
             self.statusBar().showMessage("Opened fullrmc setup")
+
+    def _open_pdfsetup_tool(self) -> None:
+        from saxshell.pdf.debyer.ui.main_window import DebyerPDFMainWindow
+
+        project_dir = None
+        if self.current_settings is not None:
+            project_dir = Path(self.current_settings.project_dir).resolve()
+        window = DebyerPDFMainWindow(initial_project_dir=project_dir)
+        window.show()
+        window.raise_()
+        self._child_tool_windows.append(window)
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                f"Opened PDF calculation for {project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened PDF calculation")
+
+    def _open_blenderxyz_tool(self) -> None:
+        from saxshell.toolbox.blender.ui.main_window import (
+            launch_blender_xyz_renderer_ui,
+        )
+
+        window = launch_blender_xyz_renderer_ui()
+        self._child_tool_windows.append(window)
+        self.statusBar().showMessage("Opened Blender XYZ renderer")
 
     def _open_solution_scattering_tool_window(
         self,
@@ -7230,8 +8187,9 @@ class SAXSMainWindow(QMainWindow):
                 "Load or build a project first.",
             )
             return
-        paths = build_project_paths(self.current_settings.project_dir)
-        prior_json = paths.project_dir / "md_prior_weights.json"
+        prior_json = project_artifact_paths(
+            self.current_settings
+        ).prior_weights_file
         if not prior_json.is_file():
             self._show_error(
                 "Prior histogram unavailable",
@@ -7270,8 +8228,9 @@ class SAXSMainWindow(QMainWindow):
                 "Load or build a project first.",
             )
             return
-        paths = build_project_paths(self.current_settings.project_dir)
-        prior_json = paths.project_dir / "md_prior_weights.json"
+        prior_json = project_artifact_paths(
+            self.current_settings
+        ).prior_weights_file
         if not prior_json.is_file():
             self._show_error(
                 "Save prior histogram failed",
@@ -7286,6 +8245,7 @@ class SAXSMainWindow(QMainWindow):
                 "Select a secondary atom filter before saving a solvent-sort prior histogram image.",
             )
             return
+        paths = build_project_paths(self.current_settings.project_dir)
         paths.exported_plots_dir.mkdir(parents=True, exist_ok=True)
         secondary = self.project_setup_tab.prior_secondary_element()
         suffix = f"_{secondary}" if secondary else ""
@@ -7348,28 +8308,27 @@ class SAXSMainWindow(QMainWindow):
         try:
             settings = self.dream_tab.settings_payload()
             loader = self._last_results_loader
+            filter_kwargs = self._dream_filter_kwargs(settings)
             summary = loader.get_summary(
                 bestfit_method=settings.bestfit_method,
-                posterior_filter_mode=settings.posterior_filter_mode,
-                posterior_top_percent=settings.posterior_top_percent,
-                posterior_top_n=settings.posterior_top_n,
-                credible_interval_low=settings.credible_interval_low,
-                credible_interval_high=settings.credible_interval_high,
+                **filter_kwargs,
+            )
+            self._last_dream_summary = summary
+            self._applied_dream_analysis_settings = self._copy_dream_settings(
+                settings
             )
             self.dream_tab.set_summary_text(
                 self._format_dream_summary(summary, settings=settings)
             )
+            self._refresh_dream_filter_status()
+            self.dream_tab.set_filter_dirty(False)
             if refresh_scope <= self.DREAM_REFRESH_STYLE:
                 if self.dream_tab.current_violin_plot_data() is None:
                     violin_plot = loader.build_violin_data(
                         mode=self._effective_dream_violin_mode(settings),
-                        posterior_filter_mode=settings.posterior_filter_mode,
-                        posterior_top_percent=settings.posterior_top_percent,
-                        posterior_top_n=settings.posterior_top_n,
-                        credible_interval_low=settings.credible_interval_low,
-                        credible_interval_high=settings.credible_interval_high,
                         sample_source=settings.violin_sample_source,
                         weight_order=settings.violin_weight_order,
+                        **filter_kwargs,
                     )
                     self.dream_tab.plot_violin_plot(summary, violin_plot)
                 else:
@@ -7380,46 +8339,30 @@ class SAXSMainWindow(QMainWindow):
                 if violin_plot is None:
                     violin_plot = loader.build_violin_data(
                         mode=self._effective_dream_violin_mode(settings),
-                        posterior_filter_mode=settings.posterior_filter_mode,
-                        posterior_top_percent=settings.posterior_top_percent,
-                        posterior_top_n=settings.posterior_top_n,
-                        credible_interval_low=settings.credible_interval_low,
-                        credible_interval_high=settings.credible_interval_high,
                         sample_source=settings.violin_sample_source,
                         weight_order=settings.violin_weight_order,
+                        **filter_kwargs,
                     )
                 self.dream_tab.plot_violin_plot(summary, violin_plot)
                 return
             if refresh_scope == self.DREAM_REFRESH_VIOLIN:
                 violin_plot = loader.build_violin_data(
                     mode=self._effective_dream_violin_mode(settings),
-                    posterior_filter_mode=settings.posterior_filter_mode,
-                    posterior_top_percent=settings.posterior_top_percent,
-                    posterior_top_n=settings.posterior_top_n,
-                    credible_interval_low=settings.credible_interval_low,
-                    credible_interval_high=settings.credible_interval_high,
                     sample_source=settings.violin_sample_source,
                     weight_order=settings.violin_weight_order,
+                    **filter_kwargs,
                 )
                 self.dream_tab.plot_violin_plot(summary, violin_plot)
                 return
             model_plot = loader.build_model_fit_data(
                 bestfit_method=settings.bestfit_method,
-                posterior_filter_mode=settings.posterior_filter_mode,
-                posterior_top_percent=settings.posterior_top_percent,
-                posterior_top_n=settings.posterior_top_n,
-                credible_interval_low=settings.credible_interval_low,
-                credible_interval_high=settings.credible_interval_high,
+                **filter_kwargs,
             )
             violin_plot = loader.build_violin_data(
                 mode=self._effective_dream_violin_mode(settings),
-                posterior_filter_mode=settings.posterior_filter_mode,
-                posterior_top_percent=settings.posterior_top_percent,
-                posterior_top_n=settings.posterior_top_n,
-                credible_interval_low=settings.credible_interval_low,
-                credible_interval_high=settings.credible_interval_high,
                 sample_source=settings.violin_sample_source,
                 weight_order=settings.violin_weight_order,
+                **filter_kwargs,
             )
             self.dream_tab.plot_model_fit(model_plot)
             self.dream_tab.plot_violin_plot(summary, violin_plot)
@@ -7598,13 +8541,10 @@ class SAXSMainWindow(QMainWindow):
             return
         if not entries:
             return
+        filter_kwargs = self._dream_filter_kwargs(settings)
         model_plot = self._last_results_loader.build_model_fit_data(
             bestfit_method=settings.bestfit_method,
-            posterior_filter_mode=settings.posterior_filter_mode,
-            posterior_top_percent=settings.posterior_top_percent,
-            posterior_top_n=settings.posterior_top_n,
-            credible_interval_low=settings.credible_interval_low,
-            credible_interval_high=settings.credible_interval_high,
+            **filter_kwargs,
         )
         comparison = self._build_dream_constraint_comparison(
             model_plot=model_plot,
@@ -7683,6 +8623,10 @@ class SAXSMainWindow(QMainWindow):
                 f"Top % = {settings.posterior_top_percent:g}, "
                 f"Top N = {settings.posterior_top_n}"
             ),
+            (
+                "Posterior candidates before ranking: "
+                f"{summary.posterior_candidate_sample_count}"
+            ),
             f"Posterior samples kept: {summary.posterior_sample_count}",
             (
                 "Credible interval (%): "
@@ -7700,8 +8644,20 @@ class SAXSMainWindow(QMainWindow):
                 f"chain {summary.map_chain + 1}, step {summary.map_step + 1}"
             ),
             "",
-            "Posterior summary:",
         ]
+        lines.extend(
+            self._dream_stoichiometry_summary_lines(
+                settings,
+                evaluation=summary.stoichiometry_evaluation,
+            )
+        )
+        if lines[-1] != "":
+            lines.append("")
+        lines.extend(
+            [
+                "Posterior summary:",
+            ]
+        )
         for index, name in enumerate(summary.full_parameter_names):
             lines.append(
                 f"{name}: selected={summary.bestfit_params[index]:.6g}, "
@@ -7719,26 +8675,151 @@ class SAXSMainWindow(QMainWindow):
         if self.prefit_workflow is None:
             return "DREAM workflow is not loaded."
         settings = self.dream_tab.settings_payload()
-        return (
-            "DREAM workflow loaded.\n"
-            f"Template: {self.prefit_workflow.template_spec.name}\n"
+        stoichiometry_lines = self._dream_stoichiometry_summary_lines(settings)
+        lines = [
+            "DREAM workflow loaded.",
+            f"Template: {self.prefit_workflow.template_spec.name}",
             "Review the priors with Edit Priors and click Save Parameter "
-            "Map before running DREAM.\n"
-            f"Best-fit method: {settings.bestfit_method}\n"
-            f"Posterior filter: {self._describe_posterior_filter(settings)}\n"
+            "Map before running DREAM.",
+            f"Best-fit method: {settings.bestfit_method}",
+            f"Posterior filter: {self._describe_posterior_filter(settings)}",
             "Auto-select best filter after run: "
-            f"{'on' if settings.auto_select_best_posterior_filter else 'off'}\n"
+            f"{'on' if settings.auto_select_best_posterior_filter else 'off'}",
             f"Filter defaults: Top % = {settings.posterior_top_percent:g}, "
-            f"Top N = {settings.posterior_top_n}\n"
-            f"Violin data mode: {settings.violin_parameter_mode}\n"
-            f"Violin sample source: {settings.violin_sample_source}\n"
-            f"Weight order: {settings.violin_weight_order}\n"
-            f"Y-axis scale: {settings.violin_value_scale_mode}\n"
-            f"Violin palette: {settings.violin_palette}\n"
-            f"Point color: {settings.violin_point_color}\n"
+            f"Top N = {settings.posterior_top_n}",
+            f"Violin data mode: {settings.violin_parameter_mode}",
+            f"Violin sample source: {settings.violin_sample_source}",
+            f"Weight order: {settings.violin_weight_order}",
+            f"Y-axis scale: {settings.violin_value_scale_mode}",
+            f"Violin palette: {settings.violin_palette}",
+            f"Point color: {settings.violin_point_color}",
+        ]
+        lines.extend(stoichiometry_lines)
+        lines.append(
             "Recommendation: all refinable parameters are usually allowed "
             "to vary during DREAM refinement."
         )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _dream_filter_kwargs(
+        settings: DreamRunSettings,
+    ) -> dict[str, object]:
+        return {
+            "posterior_filter_mode": settings.posterior_filter_mode,
+            "posterior_top_percent": settings.posterior_top_percent,
+            "posterior_top_n": settings.posterior_top_n,
+            "credible_interval_low": settings.credible_interval_low,
+            "credible_interval_high": settings.credible_interval_high,
+            "stoichiometry_target_elements_text": (
+                settings.stoichiometry_target_elements_text
+            ),
+            "stoichiometry_target_ratio_text": (
+                settings.stoichiometry_target_ratio_text
+            ),
+            "stoichiometry_filter_enabled": (
+                settings.stoichiometry_filter_enabled
+            ),
+            "stoichiometry_tolerance_percent": (
+                settings.stoichiometry_tolerance_percent
+            ),
+        }
+
+    def _dream_stoichiometry_summary_lines(
+        self,
+        settings: DreamRunSettings,
+        *,
+        evaluation=None,
+        candidate_sample_count: int | None = None,
+        posterior_sample_count: int | None = None,
+    ) -> list[str]:
+        try:
+            target = build_stoichiometry_target(
+                settings.stoichiometry_target_elements_text,
+                settings.stoichiometry_target_ratio_text,
+            )
+        except Exception as exc:
+            if settings.stoichiometry_filter_enabled:
+                return [f"Stoichiometry target: invalid ({exc})"]
+            return []
+        if target is None:
+            return []
+        lines = [f"Stoichiometry target: {stoichiometry_target_text(target)}"]
+        lines.append(
+            "Stoichiometry filter: "
+            + (
+                f"on ({settings.stoichiometry_tolerance_percent:g}% tolerance)"
+                if settings.stoichiometry_filter_enabled
+                else "off"
+            )
+        )
+        if candidate_sample_count is not None:
+            lines.append(
+                f"Samples considered before posterior ranking: {candidate_sample_count}"
+            )
+        if posterior_sample_count is not None:
+            lines.append(
+                f"Posterior samples kept after filtering: {posterior_sample_count}"
+            )
+        if evaluation is not None:
+            lines.append(
+                "Selected stoichiometry: "
+                + stoichiometry_ratio_text(target, evaluation.observed_ratio)
+            )
+            lines.append(stoichiometry_deviation_text(evaluation))
+        return lines
+
+    def _refresh_dream_filter_status(
+        self, *, dirty: bool | None = None
+    ) -> None:
+        if (
+            self._last_results_loader is None
+            or self._last_dream_summary is None
+        ):
+            self.dream_tab.set_filter_status_text(
+                "No DREAM dataset is loaded yet. Load a run, then apply posterior "
+                "filter settings from this panel."
+            )
+            if dirty is not None:
+                self.dream_tab.set_filter_dirty(bool(dirty))
+            return
+        settings = self._applied_dream_analysis_settings
+        if settings is None:
+            settings = self.dream_tab.settings_payload()
+        summary = self._last_dream_summary
+        lines = [
+            f"Active run: {summary.run_dir}",
+            f"Best-fit method: {settings.bestfit_method}",
+            f"Posterior filter: {self._describe_posterior_filter(settings)}",
+            (
+                "Credible interval (%): "
+                f"{summary.credible_interval_low:g} - "
+                f"{summary.credible_interval_high:g}"
+            ),
+            f"Posterior samples kept: {summary.posterior_sample_count}",
+        ]
+        lines.extend(
+            self._dream_stoichiometry_summary_lines(
+                settings,
+                evaluation=summary.stoichiometry_evaluation,
+                candidate_sample_count=summary.posterior_candidate_sample_count,
+                posterior_sample_count=summary.posterior_sample_count,
+            )
+        )
+        pending = (
+            self.dream_tab.filter_settings_dirty()
+            if dirty is None
+            else bool(dirty)
+        )
+        if pending:
+            lines.extend(
+                [
+                    "",
+                    "Pending changes are not applied yet. Press Apply Filter "
+                    "to redraw the active DREAM dataset with the new settings.",
+                ]
+            )
+        self.dream_tab.set_filter_status_text("\n".join(lines))
 
     @staticmethod
     def _describe_posterior_filter(settings: DreamRunSettings) -> str:
@@ -7771,6 +8852,18 @@ class SAXSMainWindow(QMainWindow):
         merged.violin_weight_order = current_settings.violin_weight_order
         merged.violin_value_scale_mode = (
             current_settings.violin_value_scale_mode
+        )
+        merged.stoichiometry_target_elements_text = (
+            current_settings.stoichiometry_target_elements_text
+        )
+        merged.stoichiometry_target_ratio_text = (
+            current_settings.stoichiometry_target_ratio_text
+        )
+        merged.stoichiometry_filter_enabled = (
+            current_settings.stoichiometry_filter_enabled
+        )
+        merged.stoichiometry_tolerance_percent = (
+            current_settings.stoichiometry_tolerance_percent
         )
         merged.violin_palette = current_settings.violin_palette
         merged.violin_custom_color = current_settings.violin_custom_color
@@ -7926,6 +9019,8 @@ class SAXSMainWindow(QMainWindow):
             lines.extend(
                 [
                     f"Method: {fit_result.method}",
+                    f"Optimization strategy: {fit_result.optimization_strategy}",
+                    f"Grid evaluations: {fit_result.grid_evaluations}",
                     f"Function evals: {fit_result.nfev}",
                     f"Chi^2: {fit_result.chi_square:.6g}",
                     f"Reduced chi^2: {fit_result.reduced_chi_square:.6g}",
@@ -7935,6 +9030,44 @@ class SAXSMainWindow(QMainWindow):
         if report_path is not None:
             lines.append(f"Saved report: {report_path}")
         return "\n".join(lines)
+
+    def _confirm_large_prefit_parameter_count(
+        self,
+        varying_parameter_names: list[str],
+    ) -> tuple[bool, bool]:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Too many prefit parameters selected")
+        dialog.setText(
+            "More than 3 independent prefit parameters are selected to vary."
+        )
+        dialog.setInformativeText(
+            "The coarse-to-fine grid prefit is only used when 1-3 "
+            "parameters vary at once.\n\n"
+            f"Selected varying parameters ({len(varying_parameter_names)}): "
+            + ", ".join(varying_parameter_names)
+            + "\n\n"
+            "Continue anyway to use the current lmfit-only prefit, or go "
+            "back and edit the parameter table."
+        )
+        continue_button = dialog.addButton(
+            "Continue Anyway",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        dialog.addButton(
+            "Go Back and Edit Parameters",
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        suppress_checkbox = QCheckBox(
+            "Don't show this warning again during this session"
+        )
+        dialog.setCheckBox(suppress_checkbox)
+        dialog.setDefaultButton(continue_button)
+        dialog.exec()
+        return (
+            dialog.clickedButton() is continue_button,
+            suppress_checkbox.isChecked(),
+        )
 
     def _confirm_prefit_template_change(
         self,
@@ -7986,6 +9119,9 @@ class SAXSMainWindow(QMainWindow):
             )
             return
         try:
+            self._flush_prefit_sequence_pending_manual_updates(
+                trigger="apply_autoscale",
+            )
             entries = self.prefit_tab.parameter_entries()
             recommendation = self.prefit_workflow.recommend_scale_settings(
                 entries
@@ -8037,6 +9173,49 @@ class SAXSMainWindow(QMainWindow):
                 + f"Points used: {recommendation.points_used}"
             )
             self.prefit_tab.append_log(message)
+            current_entries = self.prefit_tab.parameter_entries()
+            self._set_prefit_sequence_baseline(current_entries)
+            self._append_prefit_sequence_event(
+                "autoscale_applied",
+                "Applied Prefit autoscale settings.",
+                details={
+                    "current_scale": float(recommendation.current_scale),
+                    "recommended_scale": float(
+                        recommendation.recommended_scale
+                    ),
+                    "recommended_minimum": float(
+                        recommendation.recommended_minimum
+                    ),
+                    "recommended_maximum": float(
+                        recommendation.recommended_maximum
+                    ),
+                    "adjustment_factor": float(
+                        recommendation.adjustment_factor
+                    ),
+                    "points_used": int(recommendation.points_used),
+                    "current_offset": (
+                        None
+                        if recommendation.current_offset is None
+                        else float(recommendation.current_offset)
+                    ),
+                    "recommended_offset": (
+                        None
+                        if recommendation.recommended_offset is None
+                        else float(recommendation.recommended_offset)
+                    ),
+                    "recommended_offset_minimum": (
+                        None
+                        if recommendation.recommended_offset_minimum is None
+                        else float(recommendation.recommended_offset_minimum)
+                    ),
+                    "recommended_offset_maximum": (
+                        None
+                        if recommendation.recommended_offset_maximum is None
+                        else float(recommendation.recommended_offset_maximum)
+                    ),
+                },
+                parameter_entries=current_entries,
+            )
             self.update_prefit_model()
             self.statusBar().showMessage("Autoscale applied")
         except Exception as exc:

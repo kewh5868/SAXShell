@@ -1,38 +1,102 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="SAXSShell icon">
   <defs>
-    <linearGradient id="nodeFill" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#55b3ff" />
-      <stop offset="100%" stop-color="#0f4aa6" />
+    <linearGradient id="shellStroke" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#032c77" />
+      <stop offset="55%" stop-color="#0a56c2" />
+      <stop offset="100%" stop-color="#20b6ff" />
     </linearGradient>
+    <linearGradient id="shellFill" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#0a5dcc" />
+      <stop offset="100%" stop-color="#083f90" />
+    </linearGradient>
+    <linearGradient id="trailFill" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#0a5dcc" />
+      <stop offset="80%" stop-color="#1ba9ff" />
+      <stop offset="100%" stop-color="#7be8ff" />
+    </linearGradient>
+    <linearGradient id="highlight" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#d3f2ff" stop-opacity="0.0" />
+      <stop offset="60%" stop-color="#d3f2ff" stop-opacity="0.7" />
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.95" />
+    </linearGradient>
+    <radialGradient id="coreFill" cx="45%" cy="35%" r="75%">
+      <stop offset="0%" stop-color="#f7fdff" />
+      <stop offset="80%" stop-color="#93ddff" />
+      <stop offset="100%" stop-color="#4fa6ff" />
+    </radialGradient>
+    <radialGradient id="nodeFill" cx="35%" cy="25%" r="85%">
+      <stop offset="0%" stop-color="#7de6ff" />
+      <stop offset="70%" stop-color="#2d9fff" />
+      <stop offset="100%" stop-color="#0d5cc8" />
+    </radialGradient>
   </defs>
 
-  <g fill="none" stroke="#0f4aa6" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M54 336C145 330 223 326 301 330C356 333 400 327 458 309" stroke-width="14" />
-    <path d="M282 327C330 345 390 332 432 296C457 276 477 270 494 276" stroke-width="14" />
-    <path d="M298 172C252 144 193 150 160 199C141 226 137 260 147 290" stroke-width="11" />
-    <path d="M188 185C157 189 132 207 117 234" stroke-width="11" />
-    <path d="M181 211C152 214 127 230 113 255" stroke-width="11" />
-    <path d="M176 243C150 247 130 262 118 282" stroke-width="11" />
-    <path d="M140 296C136 213 193 145 282 141C343 138 398 175 417 233C436 291 413 355 360 386" stroke-width="14" />
+  <g>
+    <path
+      d="M141 297C136 214 193 146 282 142C343 139 398 176 417 234C436 292 414 355 361 386C325 407 282 405 249 380C286 369 316 340 328 304C345 254 325 200 281 175C236 149 174 159 141 297Z"
+      fill="url(#shellFill)"
+      stroke="#00358f"
+      stroke-width="5"
+      stroke-linejoin="round"
+    />
+
+    <path
+      d="M55 338C146 332 223 328 301 332C356 335 401 329 459 311C445 330 427 346 407 359C374 381 333 396 288 404C216 418 135 410 54 385C44 382 38 372 40 362C42 352 47 343 55 338Z"
+      fill="url(#trailFill)"
+      stroke="#00358f"
+      stroke-width="4"
+      stroke-linejoin="round"
+    />
+
+    <path
+      d="M287 328C334 344 392 332 432 297C454 278 472 271 489 275C476 298 459 316 438 331C411 351 380 365 347 372C323 377 297 377 273 372C283 360 288 345 287 328Z"
+      fill="url(#trailFill)"
+      stroke="#00358f"
+      stroke-width="4"
+      stroke-linejoin="round"
+    />
   </g>
 
-  <g stroke="#0f4aa6" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+  <g fill="none" stroke="url(#shellStroke)" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M54 338C145 332 223 328 301 332C356 335 400 329 458 311" stroke-width="13" />
+    <path d="M287 328C334 344 392 332 432 297C457 277 477 271 494 277" stroke-width="13" />
+    <path d="M298 172C252 144 193 150 160 199C141 226 137 260 147 290" stroke-width="10" />
+    <path d="M188 185C157 189 132 207 117 234" stroke-width="10" />
+    <path d="M181 211C152 214 127 230 113 255" stroke-width="10" />
+    <path d="M176 243C150 247 130 262 118 282" stroke-width="10" />
+    <path d="M140 296C136 213 193 145 282 141C343 138 398 175 417 233C436 291 413 355 360 386" stroke-width="13" />
+    <path d="M357 352C381 313 407 286 439 264" stroke-width="8" />
+  </g>
+
+  <path
+    d="M90 357C184 353 267 343 340 328C372 322 401 314 429 302"
+    fill="none"
+    stroke="url(#highlight)"
+    stroke-width="7"
+    stroke-linecap="round"
+  />
+
+  <g stroke="#00358f" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
     <path d="M256 201L212 236L256 272L300 236Z" fill="none" />
     <line x1="256" y1="201" x2="256" y2="272" />
     <line x1="212" y1="236" x2="300" y2="236" />
 
-    <circle cx="256" cy="236" r="18" fill="#ffffff" />
+    <circle cx="256" cy="236" r="20" fill="url(#coreFill)" />
     <circle cx="256" cy="195" r="16" fill="url(#nodeFill)" />
     <circle cx="212" cy="236" r="16" fill="url(#nodeFill)" />
     <circle cx="300" cy="236" r="16" fill="url(#nodeFill)" />
     <circle cx="256" cy="277" r="16" fill="url(#nodeFill)" />
+
+    <circle cx="249" cy="228" r="6" fill="#ffffff" opacity="0.9" stroke="none" />
+    <circle cx="250" cy="189" r="4.5" fill="#ffffff" opacity="0.85" stroke="none" />
+    <circle cx="205" cy="228" r="4.5" fill="#ffffff" opacity="0.85" stroke="none" />
+    <circle cx="293" cy="228" r="4.5" fill="#ffffff" opacity="0.85" stroke="none" />
+    <circle cx="250" cy="270" r="4.5" fill="#ffffff" opacity="0.85" stroke="none" />
   </g>
 
-  <g fill="#0f4aa6">
-    <circle cx="364" cy="340" r="2.5" />
-    <circle cx="382" cy="334" r="4.2" />
-    <circle cx="401" cy="327" r="5.7" />
-    <circle cx="420" cy="319" r="6.8" />
-    <circle cx="439" cy="311" r="4.1" />
+  <g>
+    <circle cx="442" cy="259" r="13" fill="#0d5cc8" stroke="#00358f" stroke-width="4" />
+    <circle cx="441" cy="258" r="8" fill="#d8f5ff" />
+    <path d="M466 243C470 233 475 228 479 237C484 252 488 255 493 246C497 239 501 243 504 252" fill="none" stroke="url(#shellStroke)" stroke-width="5" stroke-linecap="round" />
   </g>
 </svg>

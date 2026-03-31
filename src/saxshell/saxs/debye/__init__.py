@@ -3,12 +3,15 @@ from .profiles import (
     ClusterBin,
     DebyeProfileBuilder,
     atomic_form_factor,
+    b_factor_from_sigma,
     compute_debye_intensity,
+    compute_debye_intensity_with_debye_waller,
     discover_available_elements,
     discover_cluster_bins,
     load_structure_file,
     scan_structure_element_counts,
     scan_structure_elements,
+    sigma_from_b_factor,
 )
 
 __all__ = [
@@ -16,10 +19,13 @@ __all__ = [
     "ClusterBin",
     "DebyeProfileBuilder",
     "atomic_form_factor",
+    "b_factor_from_sigma",
     "compute_debye_intensity",
+    "compute_debye_intensity_with_debye_waller",
     "discover_available_elements",
     "discover_cluster_bins",
     "load_structure_file",
     "scan_structure_element_counts",
     "scan_structure_elements",
+    "sigma_from_b_factor",
 ]

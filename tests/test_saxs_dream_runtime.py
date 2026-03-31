@@ -105,6 +105,93 @@ def _build_minimal_saxs_project(tmp_path):
     return project_dir, paths
 
 
+def _write_predicted_structure_artifacts(
+    paths,
+    *,
+    observed_weight: float = 0.75,
+    predicted_weight: float = 0.25,
+):
+    q_values = np.linspace(0.05, 0.3, 8)
+    observed = np.linspace(10.0, 17.0, 8)
+    predicted = np.linspace(4.0, 11.0, 8)
+    _write_component_file(
+        paths.predicted_scattering_components_dir / "A_no_motif.txt",
+        q_values,
+        observed,
+    )
+    _write_component_file(
+        paths.predicted_scattering_components_dir / "A2_predicted_rank01.txt",
+        q_values,
+        predicted,
+    )
+    dataset_dir = (
+        paths.exported_data_dir
+        / "clusterdynamicsml"
+        / "saved_results"
+        / "20260330_120000_demo"
+    )
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    dataset_file = dataset_dir / "20260330_120000_demo_clusterdynamicsml.json"
+    dataset_file.write_text(
+        json.dumps({"predictions": [{"label": "A2", "rank": 1}]}, indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
+    (
+        paths.project_dir / "md_prior_weights_predicted_structures.json"
+    ).write_text(
+        json.dumps(
+            {
+                "origin": "clusters_predicted_structures",
+                "total_files": 1,
+                "available_elements": ["A"],
+                "value_kind": "normalized_weight",
+                "includes_predicted_structures": True,
+                "prediction_dataset_file": str(dataset_file),
+                "structures": {
+                    "A": {
+                        "no_motif": {
+                            "count": 1,
+                            "weight": observed_weight,
+                            "normalized_weight": observed_weight,
+                            "observed_only_weight": 1.0,
+                            "representative": "frame_0001.xyz",
+                            "profile_file": "A_no_motif.txt",
+                        }
+                    },
+                    "A2": {
+                        "predicted_rank01": {
+                            "count": 1,
+                            "weight": predicted_weight,
+                            "normalized_weight": predicted_weight,
+                            "observed_only_weight": 0.0,
+                            "representative": "02_rank01_A2.xyz",
+                            "profile_file": "A2_predicted_rank01.txt",
+                            "source_kind": "predicted_structure",
+                        }
+                    },
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (paths.project_dir / "md_saxs_map_predicted_structures.json").write_text(
+        json.dumps(
+            {
+                "saxs_map": {
+                    "A": {"no_motif": "A_no_motif.txt"},
+                    "A2": {"predicted_rank01": "A2_predicted_rank01.txt"},
+                }
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _build_poly_lma_geometry_project(
     tmp_path,
     *,
@@ -319,6 +406,33 @@ def test_runtime_bundles_created_back_to_back_use_unique_run_directories(
     assert second_bundle.run_dir.is_dir()
     assert first_bundle.settings_path.is_file()
     assert second_bundle.settings_path.is_file()
+
+
+def test_dream_workflow_uses_predicted_structure_weights_when_enabled(
+    tmp_path,
+):
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    _write_predicted_structure_artifacts(paths)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.use_predicted_structure_weights = True
+    manager.save_project(settings)
+
+    workflow = SAXSDreamWorkflow(project_dir)
+    entries = workflow.create_default_parameter_map(persist=False)
+    predicted_entries = [
+        entry
+        for entry in entries
+        if entry.structure == "A2"
+        and entry.motif == "predicted_rank01"
+        and entry.param_type == "Both"
+    ]
+
+    assert workflow.prefit_workflow.component_dir == (
+        paths.predicted_scattering_components_dir
+    )
+    assert predicted_entries
+    assert predicted_entries[0].value == pytest.approx(0.25)
 
 
 def test_runtime_bundle_uses_reduced_saved_q_range_without_rebuild(tmp_path):

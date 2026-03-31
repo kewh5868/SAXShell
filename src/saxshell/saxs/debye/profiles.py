@@ -251,6 +251,24 @@ def _filter_atoms_by_elements(
     include_elements: set[str] | None = None,
     exclude_elements: set[str] | None = None,
 ) -> tuple[np.ndarray, list[str]] | None:
+    keep_indices = _filtered_atom_indices(
+        elements,
+        include_elements=include_elements,
+        exclude_elements=exclude_elements,
+    )
+    if not keep_indices:
+        return None
+    filtered_coords = np.asarray(coordinates, dtype=float)[keep_indices]
+    filtered_elements = [elements[index] for index in keep_indices]
+    return filtered_coords, filtered_elements
+
+
+def _filtered_atom_indices(
+    elements: list[str],
+    *,
+    include_elements: set[str] | None = None,
+    exclude_elements: set[str] | None = None,
+) -> list[int]:
     keep_mask = np.ones(len(elements), dtype=bool)
     if include_elements:
         keep_mask &= np.asarray(
@@ -262,13 +280,7 @@ def _filter_atoms_by_elements(
             [element not in exclude_elements for element in elements],
             dtype=bool,
         )
-    if not np.any(keep_mask):
-        return None
-    filtered_coords = np.asarray(coordinates, dtype=float)[keep_mask]
-    filtered_elements = [
-        element for element, keep in zip(elements, keep_mask) if keep
-    ]
-    return filtered_coords, filtered_elements
+    return [index for index, keep in enumerate(keep_mask) if keep]
 
 
 def compute_debye_intensity(
@@ -329,6 +341,186 @@ def compute_debye_intensity(
     rij = squareform(pdist(filtered_coords, metric="euclidean"))
     sinc_matrix = np.sinc(rij[:, :, None] * q_values[None, None, :] / np.pi)
     return np.einsum("ijm,im,jm->m", sinc_matrix, f0_matrix, f0_matrix)
+
+
+def b_factor_from_sigma(sigma: float) -> float:
+    sigma_value = max(float(sigma), 0.0)
+    return float(8.0 * np.pi**2 * sigma_value**2)
+
+
+def sigma_from_b_factor(b_factor: float) -> float:
+    b_value = max(float(b_factor), 0.0)
+    return float(np.sqrt(b_value / (8.0 * np.pi**2)))
+
+
+def _normalized_pair_key(
+    pair: tuple[str, str] | list[str],
+) -> tuple[str, str] | None:
+    if len(pair) != 2:
+        return None
+    normalized = tuple(
+        sorted(_normalized_element_symbol(str(element)) for element in pair)
+    )
+    if not all(normalized):
+        return None
+    return normalized
+
+
+def _pair_sigma_lookup(
+    *,
+    pair_sigma_by_element: (
+        dict[tuple[str, str], float] | dict[tuple[str, str], int] | None
+    ) = None,
+    pair_b_by_element: (
+        dict[tuple[str, str], float] | dict[tuple[str, str], int] | None
+    ) = None,
+) -> dict[tuple[str, str], float]:
+    sigma_lookup: dict[tuple[str, str], float] = {}
+    for pair_map, use_b_factor in (
+        (pair_b_by_element, True),
+        (pair_sigma_by_element, False),
+    ):
+        if not pair_map:
+            continue
+        for raw_key, raw_value in pair_map.items():
+            pair_key = _normalized_pair_key(list(raw_key))
+            if pair_key is None:
+                continue
+            resolved_value = (
+                sigma_from_b_factor(float(raw_value))
+                if use_b_factor
+                else max(float(raw_value), 0.0)
+            )
+            sigma_lookup[pair_key] = resolved_value
+    return sigma_lookup
+
+
+def compute_debye_intensity_with_debye_waller(
+    coordinates: np.ndarray,
+    elements: list[str],
+    q_values: np.ndarray,
+    *,
+    exclude_elements: list[str] | tuple[str, ...] | None = None,
+    f0_dictionary: dict[str, np.ndarray] | None = None,
+    pair_sigma_by_element: dict[tuple[str, str], float] | None = None,
+    pair_b_by_element: dict[tuple[str, str], float] | None = None,
+    included_pair_indices: (
+        set[tuple[int, int]]
+        | list[tuple[int, int]]
+        | tuple[tuple[int, int], ...]
+        | None
+    ) = None,
+) -> np.ndarray:
+    q_values = np.asarray(q_values, dtype=float)
+    coordinates = np.asarray(coordinates, dtype=float)
+    if coordinates.size == 0:
+        return np.zeros_like(q_values)
+
+    normalized_elements = [
+        _normalized_element_symbol(element) for element in elements
+    ]
+    exclude_set = {
+        _normalized_element_symbol(element)
+        for element in (exclude_elements or [])
+        if _normalized_element_symbol(element)
+    }
+    keep_indices = _filtered_atom_indices(
+        normalized_elements,
+        exclude_elements=exclude_set or None,
+    )
+    filtered = _filter_atoms_by_elements(
+        coordinates,
+        normalized_elements,
+        exclude_elements=exclude_set or None,
+    )
+    if filtered is None:
+        return np.zeros_like(q_values)
+    filtered_coords, filtered_elements = filtered
+
+    active_f0_dictionary = (
+        f0_dictionary
+        if f0_dictionary is not None
+        else build_f0_dictionary(filtered_elements, q_values)
+    )
+
+    missing = set(filtered_elements) - set(active_f0_dictionary.keys())
+    if missing:
+        warnings.warn(
+            "Missing f0 for elements: "
+            + ", ".join(sorted(missing))
+            + ". Substituting zeros.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    f0_matrix = np.vstack(
+        [
+            active_f0_dictionary.get(
+                element,
+                np.zeros_like(q_values, dtype=float),
+            )
+            for element in filtered_elements
+        ]
+    )
+    rij = squareform(pdist(filtered_coords, metric="euclidean"))
+    sinc_matrix = np.sinc(rij[:, :, None] * q_values[None, None, :] / np.pi)
+    sigma_lookup = _pair_sigma_lookup(
+        pair_sigma_by_element=pair_sigma_by_element,
+        pair_b_by_element=pair_b_by_element,
+    )
+    if not sigma_lookup:
+        return np.einsum("ijm,im,jm->m", sinc_matrix, f0_matrix, f0_matrix)
+
+    filtered_pair_indices: set[tuple[int, int]] | None = None
+    if included_pair_indices is not None:
+        original_to_filtered = {
+            original_index: filtered_index
+            for filtered_index, original_index in enumerate(keep_indices)
+        }
+        filtered_pair_indices = set()
+        for raw_index_a, raw_index_b in included_pair_indices:
+            if raw_index_a == raw_index_b:
+                continue
+            mapped_a = original_to_filtered.get(int(raw_index_a))
+            mapped_b = original_to_filtered.get(int(raw_index_b))
+            if mapped_a is None or mapped_b is None:
+                continue
+            filtered_pair_indices.add(
+                (min(mapped_a, mapped_b), max(mapped_a, mapped_b))
+            )
+
+    atom_count = len(filtered_elements)
+    sigma_matrix = np.zeros((atom_count, atom_count), dtype=float)
+    for index_a in range(atom_count):
+        sigma_matrix[index_a, index_a] = 0.0
+        for index_b in range(index_a + 1, atom_count):
+            if (
+                filtered_pair_indices is not None
+                and (
+                    index_a,
+                    index_b,
+                )
+                not in filtered_pair_indices
+            ):
+                continue
+            pair_key = tuple(
+                sorted(
+                    (filtered_elements[index_a], filtered_elements[index_b])
+                )
+            )
+            sigma_value = sigma_lookup.get(pair_key, 0.0)
+            sigma_matrix[index_a, index_b] = sigma_value
+            sigma_matrix[index_b, index_a] = sigma_value
+    debye_waller_matrix = np.exp(
+        -0.5 * sigma_matrix[:, :, None] ** 2 * q_values[None, None, :] ** 2
+    )
+    return np.einsum(
+        "ijm,ijm,im,jm->m",
+        sinc_matrix,
+        debye_waller_matrix,
+        f0_matrix,
+        f0_matrix,
+    )
 
 
 def discover_cluster_bins(clusters_dir: str | Path) -> list[ClusterBin]:
