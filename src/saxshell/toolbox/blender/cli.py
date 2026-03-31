@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from saxshell.pdf.debyer.ui.main_window import main
+from .ui.main_window import main
 
 __all__ = ["main"]
 
