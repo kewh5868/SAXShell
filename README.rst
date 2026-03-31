@@ -4,7 +4,7 @@
 .. |title| replace:: saxshell
 .. _title: https://kewh5868.github.io/saxshell
 
-.. |Icon| image:: https://avatars.githubusercontent.com/kewh5868
+.. |Icon| image:: https://raw.githubusercontent.com/kewh5868/SAXSShell/main/docs/source/img/saxshell_icon.png
         :target: https://kewh5868.github.io/saxshell
         :height: 100px
 

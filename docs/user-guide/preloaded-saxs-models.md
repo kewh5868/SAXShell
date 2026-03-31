@@ -49,12 +49,14 @@ I*{\mathrm{mix}}(q) = \sum*{i=0}^{N-1} w_i I_i(q)
 \]
 
 \[
-I*{\mathrm{model}}(q) =
+\begin{aligned}
+I*{\mathrm{model}}(q) ={}&
 \mathrm{scale}\, I*{\mathrm{mix}}(q)\,
-S*{\mathrm{HS}}(q; R*{\mathrm{eff}}, \phi\_{\mathrm{vol}})
+S*{\mathrm{HS}}(q; R*{\mathrm{eff}}, \phi*{\mathrm{vol}}) \\
+&+ w*{\mathrm{solv}} I\_{\mathrm{solv}}(q)
 
-- w*{\mathrm{solv}} I*{\mathrm{solv}}(q)
 - \mathrm{offset}
+  \end{aligned}
   \]
 
 ### Variables
@@ -79,7 +81,7 @@ Gaussian log-likelihood with a fixed noise scale of \(10^{-4}\):
 \sum_{k=1}^{N*q}
 \log \mathcal{N}
 \left(
-I*{\exp}(q*k)\ \middle|\ I*{\mathrm{model}}(q_k), 10^{-4}
+I*{\mathrm{exp}}(q*k) \mid I*{\mathrm{model}}(q_k), 10^{-4}
 \right)
 \]
 
@@ -115,13 +117,15 @@ x_i = \frac{w_i}{\sum_j w_j},
 \]
 
 \[
-I*{\mathrm{model}}(q) =
+\begin{aligned}
+I*{\mathrm{model}}(q) ={}&
 \mathrm{scale}\,\phi*{\mathrm{solute}}
 \sum*{i=0}^{N-1}
-x_i I_i(q) S*{\mathrm{HS}}(q; R*i^{\mathrm{eff}}, \phi*{\mathrm{int}})
+x_i I_i(q) S*{\mathrm{HS}}(q; R*i^{\mathrm{eff}}, \phi*{\mathrm{int}}) \\
+&+ s*{\mathrm{solv}} (1-\phi*{\mathrm{solute}}) I\_{\mathrm{solv}}(q)
 
-- s*{\mathrm{solv}} (1-\phi*{\mathrm{solute}}) I\_{\mathrm{solv}}(q)
 - \mathrm{offset}
+  \end{aligned}
   \]
 
 ### Variables
@@ -151,7 +155,7 @@ falls back to the cluster-geometry metadata value supplied by Prefit.
 \sum_{k=1}^{N*q}
 \log \mathcal{N}
 \left(
-I*{\exp}(q*k)\ \middle|\ I*{\mathrm{model}}(q_k), e^{\log \sigma}
+I*{\mathrm{exp}}(q*k) \mid I*{\mathrm{model}}(q_k), e^{\log \sigma}
 \right)
 \]
 
@@ -178,13 +182,15 @@ sphere-only Poly LMA model, but it allows Prefit geometry rows to be toggled
 between sphere and ellipsoid approximations.
 
 \[
-I*{\mathrm{model}}(q) =
+\begin{aligned}
+I*{\mathrm{model}}(q) ={}&
 \mathrm{scale}\,\phi*{\mathrm{solute}}
 \sum*{i=0}^{N-1}
-x_i I_i(q) S*{\mathrm{HS}}(q; R*i^{\mathrm{eff}}, \phi*{\mathrm{int}})
+x_i I_i(q) S*{\mathrm{HS}}(q; R*i^{\mathrm{eff}}, \phi*{\mathrm{int}}) \\
+&+ s*{\mathrm{solv}} (1-\phi*{\mathrm{solute}}) I\_{\mathrm{solv}}(q)
 
-- s*{\mathrm{solv}} (1-\phi*{\mathrm{solute}}) I\_{\mathrm{solv}}(q)
 - \mathrm{offset}
+  \end{aligned}
   \]
 
 The difference is how the effective interaction radius is resolved:
@@ -192,8 +198,8 @@ The difference is how the effective interaction radius is resolved:
 \[
 R*i^{\mathrm{eff}} =
 \begin{cases}
-r*{\mathrm{eff},i}, & \text{if the component is treated as a sphere} \\
-\left(a_i b_i c_i\right)^{1/3}, & \text{if the component is treated as an ellipsoid}
+r*{\mathrm{eff},i}, & \text{if the component is treated as a sphere}, \\
+\left(a_i b_i c_i\right)^{1/3}, & \text{if the component is treated as an ellipsoid}.
 \end{cases}
 \]
 

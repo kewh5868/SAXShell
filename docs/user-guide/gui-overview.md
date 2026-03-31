@@ -3,6 +3,10 @@
 SAXSShell is not a single-window application. The repository contains multiple
 Qt workflows, each with its own UI and CLI entry point.
 
+Most tools install as direct top-level commands. The SAXS and fullrmc
+applications currently route through the umbrella `saxshell` CLI, or through
+`python -m` module execution when you are running from a source checkout.
+
 ## Main applications
 
 ### `mdtrajectory`
@@ -25,17 +29,30 @@ Use this when you need time-binned cluster-distribution heatmaps, optional
 energy overlays, and lifetime / association / dissociation summaries from an
 extracted XYZ or PDB frame folder.
 
+### `clusterdynamicsml`
+
+Use this when you want to extrapolate larger cluster candidates from the
+observed smaller-cluster dynamics and structure library, generate predicted
+structure files, and compare observed-only versus observed-plus-predicted SAXS
+models.
+
 ### `bondanalysis`
 
 Use this when you need bond-pair and angle-distribution measurements on the
 cluster folders.
 
-### `saxs`
+### `pdfsetup`
+
+Use this when you need Debyer-backed trajectory-averaged PDF or partial-PDF
+calculations, saved PDF calculation sets inside a SAXSShell project, and quick
+switching between little `g(r)`, big `G(r)`, and `R(r)` representations.
+
+### `saxshell saxs`
 
 Use this for SAXS project management, prefit modeling, pyDREAM refinement, and
 template-driven workflows.
 
-### `fullrmc`
+### `saxshell fullrmc`
 
 Use this when you want to prepare downstream fullrmc or Packmol-oriented
 artifacts from a SAXS project.
@@ -81,5 +98,5 @@ TODO: add screenshots once the docs site has a stable asset pipeline and the
 UI labels settle after the current SAXS workflow changes.
 
 ??? note "Artwork Attribution"
-The SAXSShell application icon used in the SAXS UI is based on artwork
-generated with ChatGPT (OpenAI).
+The SAXSShell application icon used across the UI, documentation site, and
+repository README pages is based on artwork generated with ChatGPT (OpenAI).

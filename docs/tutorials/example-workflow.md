@@ -51,7 +51,7 @@ bondanalysis run clusters_splitxyz0001
 Open the SAXS UI and configure the project:
 
 ```bash
-saxs ui
+saxshell saxs ui
 ```
 
 In the UI:
@@ -60,6 +60,9 @@ In the UI:
 2. select the cluster folder
 3. choose the template
 4. build the project inputs
+
+From a source checkout, use
+`PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs ui`.
 
 ## Step 7: refine the Prefit model
 

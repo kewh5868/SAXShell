@@ -3,6 +3,12 @@
 This quickstart is intentionally practical. It is not the full workflow, but it
 gets you from a trajectory or cluster folder to the relevant applications.
 
+The command examples below assume the package is installed in your active
+environment. If you are launching directly from a source checkout, use the
+`PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m ...`
+pattern from [Installation](installation.md). For example, `saxshell saxs ui`
+maps to `python -m saxshell.saxs ui`.
+
 ## 1. Inspect and export frames
 
 If you are starting from a trajectory:
@@ -51,7 +57,7 @@ bondanalysis run clusters_splitxyz0001
 Open the SAXS UI:
 
 ```bash
-saxs ui
+saxshell saxs ui
 ```
 
 Inside the UI, the normal path is:
@@ -67,13 +73,13 @@ Inside the UI, the normal path is:
 You can open a project directly:
 
 ```bash
-saxs ui /path/to/project
+saxshell saxs ui /path/to/project
 ```
 
 The same pattern also exists for the `fullrmc` UI:
 
 ```bash
-fullrmc ui /path/to/project
+saxshell fullrmc ui /path/to/project
 ```
 
 ## Next step

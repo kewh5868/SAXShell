@@ -366,10 +366,19 @@ anisotropic hard-ellipsoid closure.
 
 ## CLI support
 
-The `saxs` CLI includes template management commands:
+The SAXS CLI includes template management commands through the installed
+umbrella command:
 
 ```bash
-saxs templates
-saxs templates validate path/to/template.py
-saxs templates install path/to/template.py
+saxshell saxs templates
+saxshell saxs templates validate path/to/template.py
+saxshell saxs templates install path/to/template.py
+```
+
+From a source checkout, use the module directly:
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs templates
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs templates validate path/to/template.py
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs templates install path/to/template.py
 ```

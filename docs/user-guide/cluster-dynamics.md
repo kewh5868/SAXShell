@@ -10,6 +10,10 @@ counts into:
 - a sortable lifetime table by stoichiometry label
 - reloadable JSON/CSV datasets for later plotting
 
+If you also want to extrapolate larger clusters from the observed dynamics and
+reference structures, see
+[Cluster Dynamics ML](cluster-dynamics-ml.md).
+
 ## Inputs
 
 The application expects:
