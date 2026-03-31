@@ -4,6 +4,7 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
+from matplotlib import rcParams
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import (
     NavigationToolbar2QT as NavigationToolbar,
@@ -45,8 +46,8 @@ _STRUCTURE_FILE_SUFFIXES = {".xyz", ".pdb"}
 
 
 class ClusterDynamicsMLHistogramPanel(QWidget):
-    """Plot Project Setup-style stoichiometry histograms for AI
-    results."""
+    """Plot Project Setup-style stoichiometry histograms for Cluster
+    Dynamics ML results."""
 
     def __init__(
         self,
@@ -81,7 +82,7 @@ class ClusterDynamicsMLHistogramPanel(QWidget):
         controls.addWidget(self.population_label)
         self.population_combo = QComboBox()
         self.population_combo.addItem("Observed", False)
-        self.population_combo.addItem("Observed + Surrogate", True)
+        self.population_combo.addItem("Observed + Predicted Structures", True)
         self.population_combo.currentIndexChanged.connect(
             self._on_population_changed
         )
@@ -135,7 +136,7 @@ class ClusterDynamicsMLHistogramPanel(QWidget):
             axis.text(
                 0.5,
                 0.5,
-                "Run the surrogate workflow to plot cluster stoichiometry\n"
+                "Run the prediction workflow to plot cluster stoichiometry\n"
                 "histograms for the current result.",
                 ha="center",
                 va="center",
@@ -200,7 +201,7 @@ class ClusterDynamicsMLHistogramPanel(QWidget):
             return
 
         summary_label = (
-            "Observed + surrogate populations"
+            "Observed + Predicted Structures populations"
             if include_predictions
             else "Observed populations"
         )
@@ -267,7 +268,8 @@ class ClusterDynamicsMLHistogramPanel(QWidget):
 
 
 class ClusterDynamicsMLPlotPanel(QWidget):
-    """Plot observed-only, surrogate, and component SAXS traces."""
+    """Plot observed-only, Predicted Structures, and component SAXS
+    traces."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -277,6 +279,8 @@ class ClusterDynamicsMLPlotPanel(QWidget):
         self._trace_line_lookup: dict[str, object] = {}
         self._trace_visibility: dict[str, bool] = {}
         self._component_trace_keys: list[str] = []
+        self._observed_trace_keys: list[str] = []
+        self._predicted_trace_keys: list[str] = []
         self._build_ui()
         self.refresh_plot()
 
@@ -302,6 +306,20 @@ class ClusterDynamicsMLPlotPanel(QWidget):
         self.legend_toggle_button.setChecked(True)
         self.legend_toggle_button.toggled.connect(self.refresh_plot)
         controls.addWidget(self.legend_toggle_button)
+        self.model_range_button = QPushButton("Autoscale to Model Range")
+        self.model_range_button.setCheckable(True)
+        self.model_range_button.toggled.connect(self.refresh_plot)
+        controls.addWidget(self.model_range_button)
+        self.observed_traces_button = QPushButton("Hide Observed Traces")
+        self.observed_traces_button.clicked.connect(
+            self._toggle_observed_traces
+        )
+        controls.addWidget(self.observed_traces_button)
+        self.predicted_traces_button = QPushButton("Hide Predicted Traces")
+        self.predicted_traces_button.clicked.connect(
+            self._toggle_predicted_traces
+        )
+        controls.addWidget(self.predicted_traces_button)
         self.component_traces_button = QPushButton("Hide Component Traces")
         self.component_traces_button.clicked.connect(
             self._toggle_all_component_traces
@@ -315,35 +333,43 @@ class ClusterDynamicsMLPlotPanel(QWidget):
         self.canvas.mpl_connect("pick_event", self._handle_legend_pick)
         layout.addWidget(NavigationToolbar(self.canvas, self))
         layout.addWidget(self.canvas, stretch=1)
-        self._update_component_trace_control_state()
+        self._update_trace_control_state()
 
     def set_result(self, result: ClusterDynamicsMLResult | None) -> None:
         self._result = result
         self.refresh_plot()
 
     def refresh_plot(self) -> None:
+        for axis in list(self.figure.axes):
+            try:
+                axis.set_xscale("linear")
+                axis.set_yscale("linear")
+            except Exception:
+                continue
         self.figure.clear()
         self._legend_line_map.clear()
         self._legend_handle_lookup.clear()
         self._trace_line_lookup.clear()
         self._component_trace_keys = []
+        self._observed_trace_keys = []
+        self._predicted_trace_keys = []
         if self._result is None:
             axis = self.figure.add_subplot(111)
             axis.text(
                 0.5,
                 0.5,
-                "Run the surrogate workflow to plot the SAXS\n"
+                "Run the prediction workflow to plot the SAXS\n"
                 "form-factor comparison.",
                 ha="center",
                 va="center",
                 transform=axis.transAxes,
             )
             axis.set_axis_off()
-            self._update_component_trace_control_state()
+            self._update_trace_control_state()
             self.canvas.draw_idle()
             return
 
-        axis = self.figure.add_subplot(111)
+        experimental_axis = self.figure.add_subplot(111)
         plotted_lines: list[object] = []
 
         observed_model = _build_saxs_model(
@@ -355,21 +381,55 @@ class ClusterDynamicsMLPlotPanel(QWidget):
             include_predictions=True,
         )
         if observed_model is None and combined_model is None:
-            axis.text(
+            experimental_axis.text(
                 0.5,
                 0.5,
                 "No SAXS form-factor model is available for the current result.",
                 ha="center",
                 va="center",
-                transform=axis.transAxes,
+                transform=experimental_axis.transAxes,
             )
-            axis.set_axis_off()
+            experimental_axis.set_axis_off()
         else:
-            experimental_plotted = False
+            has_experimental_trace = any(
+                model is not None
+                and model["experimental_intensity"] is not None
+                for model in (observed_model, combined_model)
+            )
+            if has_experimental_trace:
+                model_axis = experimental_axis.twinx()
+            else:
+                model_axis = experimental_axis
             plotted_any = False
+            experimental_model = (
+                observed_model
+                if observed_model is not None
+                and observed_model["experimental_intensity"] is not None
+                else combined_model
+            )
+            if (
+                experimental_model is not None
+                and experimental_model["experimental_intensity"] is not None
+            ):
+                line = _plot_saxs_trace_line(
+                    experimental_axis,
+                    q_values=experimental_model["q_values"],
+                    intensity=experimental_model["experimental_intensity"],
+                    color=_EXPERIMENTAL_COLOR,
+                    linewidth=1.2,
+                    alpha=0.75,
+                    label="experimental",
+                    gid="experimental",
+                    visible=self._trace_visibility.get("experimental", True),
+                )
+                if line is not None:
+                    plotted_lines.append(line)
+                    self._trace_line_lookup["experimental"] = line
+                    self._trace_visibility.setdefault("experimental", True)
+
             if observed_model is not None:
                 line = _plot_saxs_trace_line(
-                    axis,
+                    model_axis,
                     q_values=observed_model["q_values"],
                     intensity=observed_model["model_intensity"],
                     color=_OBSERVED_MODEL_COLOR,
@@ -389,75 +449,38 @@ class ClusterDynamicsMLPlotPanel(QWidget):
                         "observed-only model",
                         True,
                     )
-                if observed_model["experimental_intensity"] is not None:
-                    line = _plot_saxs_trace_line(
-                        axis,
-                        q_values=observed_model["q_values"],
-                        intensity=observed_model["experimental_intensity"],
-                        color=_EXPERIMENTAL_COLOR,
-                        linewidth=1.2,
-                        alpha=0.75,
-                        label="experimental",
-                        gid="experimental",
-                        visible=self._trace_visibility.get(
-                            "experimental", True
-                        ),
-                    )
-                    if line is not None:
-                        experimental_plotted = True
-                        plotted_lines.append(line)
-                        self._trace_line_lookup["experimental"] = line
-                        self._trace_visibility.setdefault("experimental", True)
+                    self._observed_trace_keys.append("observed-only model")
             if combined_model is not None:
                 line = _plot_saxs_trace_line(
-                    axis,
+                    model_axis,
                     q_values=combined_model["q_values"],
                     intensity=combined_model["model_intensity"],
                     color=_COMBINED_MODEL_COLOR,
                     linewidth=1.8,
-                    label="observed + surrogate model",
-                    gid="observed + surrogate model",
+                    label="observed + predicted structures model",
+                    gid="observed + predicted structures model",
                     visible=self._trace_visibility.get(
-                        "observed + surrogate model",
+                        "observed + predicted structures model",
                         True,
                     ),
                 )
                 if line is not None:
                     plotted_any = True
                     plotted_lines.append(line)
-                    self._trace_line_lookup["observed + surrogate model"] = (
-                        line
-                    )
+                    self._trace_line_lookup[
+                        "observed + predicted structures model"
+                    ] = line
                     self._trace_visibility.setdefault(
-                        "observed + surrogate model",
+                        "observed + predicted structures model",
                         True,
                     )
-                if (
-                    combined_model["experimental_intensity"] is not None
-                    and not experimental_plotted
-                ):
-                    line = _plot_saxs_trace_line(
-                        axis,
-                        q_values=combined_model["q_values"],
-                        intensity=combined_model["experimental_intensity"],
-                        color=_EXPERIMENTAL_COLOR,
-                        linewidth=1.2,
-                        alpha=0.75,
-                        label="experimental",
-                        gid="experimental",
-                        visible=self._trace_visibility.get(
-                            "experimental", True
-                        ),
+                    self._predicted_trace_keys.append(
+                        "observed + predicted structures model"
                     )
-                    if line is not None:
-                        experimental_plotted = True
-                        plotted_lines.append(line)
-                        self._trace_line_lookup["experimental"] = line
-                        self._trace_visibility.setdefault("experimental", True)
 
             for component_trace in _build_saxs_component_traces(self._result):
                 line = _plot_saxs_trace_line(
-                    axis,
+                    model_axis,
                     q_values=component_trace["q_values"],
                     intensity=component_trace["intensity"],
                     color=str(component_trace["color"]),
@@ -468,7 +491,7 @@ class ClusterDynamicsMLPlotPanel(QWidget):
                     gid=str(component_trace["key"]),
                     visible=self._trace_visibility.get(
                         str(component_trace["key"]),
-                        True,
+                        False,
                     ),
                 )
                 if line is None:
@@ -480,27 +503,40 @@ class ClusterDynamicsMLPlotPanel(QWidget):
                     component_key, line.get_visible()
                 )
                 self._component_trace_keys.append(component_key)
+                if str(component_trace["source"]) == "predicted":
+                    self._predicted_trace_keys.append(component_key)
+                else:
+                    self._observed_trace_keys.append(component_key)
                 plotted_lines.append(line)
 
             if not plotted_any:
-                axis.text(
+                experimental_axis.text(
                     0.5,
                     0.5,
                     "No positive SAXS values are available for the current result.",
                     ha="center",
                     va="center",
-                    transform=axis.transAxes,
+                    transform=experimental_axis.transAxes,
                 )
-                axis.set_axis_off()
+                experimental_axis.set_axis_off()
+                if (
+                    has_experimental_trace
+                    and model_axis is not experimental_axis
+                ):
+                    model_axis.set_axis_off()
             else:
-                axis.set_xscale(
-                    "log" if self.log_x_checkbox.isChecked() else "linear"
+                self._apply_saxs_axis_style(
+                    experimental_axis,
+                    is_model_axis=False,
+                    has_separate_model_axis=model_axis
+                    is not experimental_axis,
                 )
-                axis.set_yscale(
-                    "log" if self.log_y_checkbox.isChecked() else "linear"
-                )
-                axis.set_xlabel("q (Å⁻¹)")
-                axis.set_ylabel("Intensity (arb. units)")
+                if model_axis is not experimental_axis:
+                    self._apply_saxs_axis_style(
+                        model_axis,
+                        is_model_axis=True,
+                        has_separate_model_axis=True,
+                    )
                 title = "SAXS Form Factor Models"
                 title_bits: list[str] = []
                 if (
@@ -515,16 +551,19 @@ class ClusterDynamicsMLPlotPanel(QWidget):
                     and combined_model["rmse"] is not None
                 ):
                     title_bits.append(
-                        f"with surrogate RMSE {combined_model['rmse']:.4g}"
+                        "with predicted structures RMSE "
+                        f"{combined_model['rmse']:.4g}"
                     )
                 if title_bits:
                     title += " (" + "; ".join(title_bits) + ")"
-                axis.set_title(title)
+                experimental_axis.set_title(title)
                 if self.legend_toggle_button.isChecked():
-                    self._build_interactive_legend(axis, plotted_lines)
-                self._refresh_axes(axis)
+                    self._build_interactive_legend(
+                        experimental_axis, plotted_lines
+                    )
+                self._refresh_axes()
 
-        self._update_component_trace_control_state()
+        self._update_trace_control_state()
         self.figure.tight_layout()
         self.canvas.draw_idle()
 
@@ -551,6 +590,12 @@ class ClusterDynamicsMLPlotPanel(QWidget):
             if hasattr(legend_handle, "set_picker"):
                 legend_handle.set_picker(True)
                 legend_handle.set_pickradius(6)
+            if hasattr(legend_handle, "set_color"):
+                legend_handle.set_color(original_line.get_color())
+            if hasattr(legend_handle, "set_linestyle"):
+                legend_handle.set_linestyle(original_line.get_linestyle())
+            if hasattr(legend_handle, "set_linewidth"):
+                legend_handle.set_linewidth(original_line.get_linewidth())
             legend_handle.set_alpha(
                 1.0 if original_line.get_visible() else 0.25
             )
@@ -570,51 +615,309 @@ class ClusterDynamicsMLPlotPanel(QWidget):
             self._trace_visibility[line_key] = is_visible
         if hasattr(event.artist, "set_alpha"):
             event.artist.set_alpha(1.0 if is_visible else 0.25)
-        self._update_component_trace_control_state()
+        self._update_trace_control_state()
         self._refresh_axes()
         self.canvas.draw_idle()
 
     def _toggle_all_component_traces(self) -> None:
         if not self._component_trace_keys:
             return
-        any_visible = any(
-            self._trace_visibility.get(component_key, True)
-            for component_key in self._component_trace_keys
-        )
-        target_visible = not any_visible
-        for component_key in self._component_trace_keys:
-            self._trace_visibility[component_key] = target_visible
-            line = self._trace_line_lookup.get(component_key)
-            if line is not None:
-                line.set_visible(target_visible)
-            legend_line = self._legend_handle_lookup.get(component_key)
-            if legend_line is not None and hasattr(legend_line, "set_alpha"):
-                legend_line.set_alpha(1.0 if target_visible else 0.25)
-        self._update_component_trace_control_state()
+        self._toggle_trace_keys(self._component_trace_keys)
+        self._update_trace_control_state()
         self._refresh_axes()
         self.canvas.draw_idle()
 
-    def _update_component_trace_control_state(self) -> None:
+    def _toggle_observed_traces(self) -> None:
+        if not self._observed_trace_keys:
+            return
+        self._toggle_trace_keys(self._observed_trace_keys)
+        self._update_trace_control_state()
+        self._refresh_axes()
+        self.canvas.draw_idle()
+
+    def _toggle_predicted_traces(self) -> None:
+        if not self._predicted_trace_keys:
+            return
+        self._toggle_trace_keys(self._predicted_trace_keys)
+        self._update_trace_control_state()
+        self._refresh_axes()
+        self.canvas.draw_idle()
+
+    def _toggle_trace_keys(self, trace_keys: list[str]) -> None:
+        any_visible = any(
+            self._trace_visibility.get(trace_key, False)
+            for trace_key in trace_keys
+        )
+        target_visible = not any_visible
+        for trace_key in trace_keys:
+            self._trace_visibility[trace_key] = target_visible
+            line = self._trace_line_lookup.get(trace_key)
+            if line is not None:
+                line.set_visible(target_visible)
+            legend_line = self._legend_handle_lookup.get(trace_key)
+            if legend_line is not None and hasattr(legend_line, "set_alpha"):
+                legend_line.set_alpha(1.0 if target_visible else 0.25)
+
+    def _update_trace_control_state(self) -> None:
         has_components = bool(self._component_trace_keys)
         any_visible = any(
-            self._trace_visibility.get(component_key, True)
+            self._trace_visibility.get(component_key, False)
             for component_key in self._component_trace_keys
+        )
+        has_observed = bool(self._observed_trace_keys)
+        observed_visible = any(
+            self._trace_visibility.get(trace_key, False)
+            for trace_key in self._observed_trace_keys
+        )
+        has_predicted = bool(self._predicted_trace_keys)
+        predicted_visible = any(
+            self._trace_visibility.get(trace_key, False)
+            for trace_key in self._predicted_trace_keys
+        )
+        self.observed_traces_button.setEnabled(has_observed)
+        self.observed_traces_button.setText(
+            "Hide Observed Traces"
+            if observed_visible
+            else "Show Observed Traces"
+        )
+        self.predicted_traces_button.setEnabled(has_predicted)
+        self.predicted_traces_button.setText(
+            "Hide Predicted Traces"
+            if predicted_visible
+            else "Show Predicted Traces"
         )
         self.component_traces_button.setEnabled(has_components)
         self.component_traces_button.setText(
             "Hide Component Traces" if any_visible else "Show Component Traces"
         )
 
-    def _refresh_axes(self, axis=None) -> None:
-        active_axis = axis
-        if active_axis is None:
-            if not self.figure.axes:
-                return
-            active_axis = self.figure.axes[0]
-        if not hasattr(active_axis, "relim"):
+    def _apply_saxs_axis_style(
+        self,
+        axis,
+        *,
+        is_model_axis: bool,
+        has_separate_model_axis: bool,
+    ) -> None:
+        axis.set_xscale("log" if self.log_x_checkbox.isChecked() else "linear")
+        axis.set_yscale("log" if self.log_y_checkbox.isChecked() else "linear")
+        if not is_model_axis or not has_separate_model_axis:
+            axis.set_xlabel("q (Å⁻¹)")
+        if not is_model_axis:
+            axis.set_ylabel("Intensity (arb. units)")
+        elif has_separate_model_axis:
+            axis.set_ylabel("Model Intensity (arb. units)")
+
+    def _refresh_axes(self) -> None:
+        axes = self.figure.axes
+        if not axes:
             return
-        active_axis.relim(visible_only=True)
-        active_axis.autoscale_view()
+        for axis in axes:
+            if not hasattr(axis, "relim"):
+                continue
+            try:
+                axis.relim(visible_only=True)
+                axis.autoscale_view()
+            except Exception:
+                continue
+        if len(axes) == 2:
+            experimental_axis, model_axis = axes
+            if self.model_range_button.isChecked():
+                self._autoscale_to_model_range(experimental_axis, model_axis)
+            else:
+                self._normalize_model_axis(experimental_axis, model_axis)
+        elif self.model_range_button.isChecked():
+            self._autoscale_to_model_range(None, axes[0])
+
+    def _normalize_model_axis(self, experimental_axis, model_axis) -> None:
+        experimental_lines = [
+            line
+            for line in experimental_axis.get_lines()
+            if line.get_visible()
+        ]
+        model_lines = [
+            line for line in model_axis.get_lines() if line.get_visible()
+        ]
+        if not experimental_lines or not model_lines:
+            return
+        experimental_q = np.concatenate(
+            [
+                np.asarray(line.get_xdata(orig=False), dtype=float)
+                for line in experimental_lines
+            ]
+        )
+        experimental_i = np.concatenate(
+            [
+                np.asarray(line.get_ydata(orig=False), dtype=float)
+                for line in experimental_lines
+            ]
+        )
+        model_q = np.concatenate(
+            [
+                np.asarray(line.get_xdata(orig=False), dtype=float)
+                for line in model_lines
+            ]
+        )
+        model_i = np.concatenate(
+            [
+                np.asarray(line.get_ydata(orig=False), dtype=float)
+                for line in model_lines
+            ]
+        )
+        overlap_mask = (experimental_q >= float(np.nanmin(model_q))) & (
+            experimental_q <= float(np.nanmax(model_q))
+        )
+        if np.any(overlap_mask):
+            experimental_i = experimental_i[overlap_mask]
+        experimental_i = experimental_i[np.isfinite(experimental_i)]
+        model_i = model_i[np.isfinite(model_i)]
+        if self.log_y_checkbox.isChecked():
+            experimental_i = experimental_i[experimental_i > 0.0]
+            model_i = model_i[model_i > 0.0]
+        if experimental_i.size == 0 or model_i.size == 0:
+            return
+        model_axis.set_ylim(
+            self._aligned_y_limits(
+                experimental_axis.get_ylim(),
+                float(np.nanmin(experimental_i)),
+                float(np.nanmax(experimental_i)),
+                float(np.nanmin(model_i)),
+                float(np.nanmax(model_i)),
+                log_scale=self.log_y_checkbox.isChecked(),
+            )
+        )
+
+    def _autoscale_to_model_range(self, experimental_axis, model_axis) -> None:
+        model_lines = [
+            line for line in model_axis.get_lines() if line.get_visible()
+        ]
+        if not model_lines:
+            return
+        model_q_values = np.concatenate(
+            [
+                np.asarray(line.get_xdata(orig=False), dtype=float)
+                for line in model_lines
+            ]
+        )
+        model_q_values = model_q_values[np.isfinite(model_q_values)]
+        if model_q_values.size == 0:
+            return
+        q_min = float(np.nanmin(model_q_values))
+        q_max = float(np.nanmax(model_q_values))
+        model_axis.set_xlim(q_min, q_max)
+        if experimental_axis is not None:
+            experimental_axis.set_xlim(q_min, q_max)
+            self._autoscale_axis_y(experimental_axis, q_min, q_max)
+            self._normalize_model_axis(experimental_axis, model_axis)
+            return
+        self._autoscale_axis_y(model_axis, q_min, q_max)
+
+    def _autoscale_axis_y(
+        self,
+        axis,
+        q_min: float,
+        q_max: float,
+    ) -> None:
+        y_segments: list[np.ndarray] = []
+        log_scale = self.log_y_checkbox.isChecked()
+        for line in axis.get_lines():
+            if not line.get_visible():
+                continue
+            x_data = np.asarray(line.get_xdata(orig=False), dtype=float)
+            y_data = np.asarray(line.get_ydata(orig=False), dtype=float)
+            mask = (
+                np.isfinite(x_data)
+                & np.isfinite(y_data)
+                & (x_data >= q_min)
+                & (x_data <= q_max)
+            )
+            if log_scale:
+                mask &= y_data > 0.0
+            if np.any(mask):
+                y_segments.append(y_data[mask])
+        if not y_segments:
+            return
+        y_values = np.concatenate(y_segments)
+        y_min = float(np.nanmin(y_values))
+        y_max = float(np.nanmax(y_values))
+        if np.isclose(y_min, y_max):
+            padding = max(abs(y_min) * 0.05, 1e-12)
+            axis.set_ylim(y_min - padding, y_max + padding)
+            return
+        if log_scale:
+            axis.set_ylim(y_min / 1.15, y_max * 1.15)
+        else:
+            padding = 0.05 * (y_max - y_min)
+            axis.set_ylim(y_min - padding, y_max + padding)
+
+    @staticmethod
+    def _aligned_y_limits(
+        left_limits: tuple[float, float],
+        experimental_min: float,
+        experimental_max: float,
+        model_min: float,
+        model_max: float,
+        *,
+        log_scale: bool,
+    ) -> tuple[float, float]:
+        if log_scale:
+            if (
+                min(
+                    left_limits[0],
+                    left_limits[1],
+                    experimental_min,
+                    experimental_max,
+                    model_min,
+                    model_max,
+                )
+                <= 0.0
+            ):
+                log_scale = False
+        if not log_scale:
+            left_low, left_high = left_limits
+            exp_low, exp_high = sorted((experimental_min, experimental_max))
+            model_low, model_high = sorted((model_min, model_max))
+            if np.isclose(left_high, left_low) or np.isclose(
+                exp_high, exp_low
+            ):
+                padding = max(abs(model_low) * 0.1, 1e-12)
+                return model_low - padding, model_high + padding
+            p0 = (exp_low - left_low) / (left_high - left_low)
+            p1 = (exp_high - left_low) / (left_high - left_low)
+            if np.isclose(p1, p0):
+                padding = max(abs(model_low) * 0.1, 1e-12)
+                return model_low - padding, model_high + padding
+            delta = (model_high - model_low) / (p1 - p0)
+            right_low = model_low - p0 * delta
+            right_high = right_low + delta
+            return right_low, right_high
+
+        left_logs = np.log10(np.asarray(left_limits, dtype=float))
+        experimental_logs = np.log10(
+            np.asarray(
+                sorted((experimental_min, experimental_max)),
+                dtype=float,
+            )
+        )
+        model_logs = np.log10(
+            np.asarray(sorted((model_min, model_max)), dtype=float)
+        )
+        if np.isclose(left_logs[1], left_logs[0]) or np.isclose(
+            experimental_logs[1],
+            experimental_logs[0],
+        ):
+            return model_min / 1.2, model_max * 1.2
+        p0 = (experimental_logs[0] - left_logs[0]) / (
+            left_logs[1] - left_logs[0]
+        )
+        p1 = (experimental_logs[1] - left_logs[0]) / (
+            left_logs[1] - left_logs[0]
+        )
+        if np.isclose(p1, p0):
+            return model_min / 1.2, model_max * 1.2
+        delta = (model_logs[1] - model_logs[0]) / (p1 - p0)
+        right_low_log = model_logs[0] - p0 * delta
+        right_high_log = right_low_log + delta
+        return 10**right_low_log, 10**right_high_log
 
 
 def _plot_saxs_trace_line(
@@ -667,16 +970,7 @@ def _build_saxs_component_traces(
     if not component_entries:
         return []
 
-    predicted_count = sum(
-        1 for entry in component_entries if str(entry.source) == "predicted"
-    )
-    observed_count = sum(
-        1
-        for entry in component_entries
-        if str(entry.source).startswith("observed")
-    )
-    predicted_index = 0
-    observed_index = 0
+    component_colors = _component_trace_colors(len(component_entries))
     scale_factor = (
         float(comparison.scale_factor)
         if float(comparison.scale_factor) > 0.0
@@ -698,21 +992,17 @@ def _build_saxs_component_traces(
             intensity * max(float(entry.weight), 0.0) * scale_factor
         )
         source = str(entry.source)
+        color = component_colors[index]
         if source == "predicted":
-            color = _predicted_component_color(
-                predicted_index, predicted_count
-            )
-            predicted_index += 1
-            label = f"surrogate component: {entry.label}"
+            label = f"predicted structure component: {entry.label}"
             linestyle = "-"
         else:
-            color = _observed_component_color(observed_index, observed_count)
-            observed_index += 1
             label = f"observed component: {entry.label}"
             linestyle = ":"
         traces.append(
             {
                 "key": f"component:{index}:{source}:{entry.label}",
+                "source": source,
                 "label": label,
                 "q_values": q_values,
                 "intensity": weighted_intensity,
@@ -725,30 +1015,15 @@ def _build_saxs_component_traces(
     return traces
 
 
-def _predicted_component_color(index: int, total: int) -> str:
-    palette = (
-        "#c95d38",
-        "#e07a5f",
-        "#f2a65a",
-        "#d1495b",
-        "#edae49",
-        "#c1121f",
-    )
+def _component_trace_colors(total: int) -> list[str]:
     if total <= 0:
-        return palette[0]
-    return palette[index % len(palette)]
-
-
-def _observed_component_color(index: int, total: int) -> str:
-    palette = (
-        "#7f8c8d",
-        "#95a5a6",
-        "#5d6d7e",
-        "#85929e",
+        return []
+    default_cycle = list(
+        rcParams["axes.prop_cycle"].by_key().get("color", ["#1f77b4"])
     )
-    if total <= 0:
-        return palette[0]
-    return palette[index % len(palette)]
+    return [
+        default_cycle[index % len(default_cycle)] for index in range(total)
+    ]
 
 
 def _distribution_entries(

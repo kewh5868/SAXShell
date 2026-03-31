@@ -1,4 +1,4 @@
-"""Experimental larger-cluster surrogate prediction tools."""
+"""Experimental larger-cluster predicted-structure tools."""
 
 from .dataset import (
     LoadedClusterDynamicsMLDataset,
@@ -13,6 +13,7 @@ from .workflow import (
     ClusterDynamicsMLTrainingObservation,
     ClusterDynamicsMLWorkflow,
     ClusterStructureObservation,
+    DebyeWallerPairEstimate,
     PredictedClusterCandidate,
     SAXSComponentWeight,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "ClusterDynamicsMLTrainingObservation",
     "ClusterDynamicsMLWorkflow",
     "ClusterStructureObservation",
+    "DebyeWallerPairEstimate",
     "PredictedClusterCandidate",
     "SAXSComponentWeight",
     "LoadedClusterDynamicsMLDataset",

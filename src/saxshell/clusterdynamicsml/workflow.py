@@ -20,7 +20,9 @@ from saxshell.clusterdynamics import (
     ClusterLifetimeSummary,
 )
 from saxshell.saxs.debye.profiles import (
+    b_factor_from_sigma,
     compute_debye_intensity,
+    compute_debye_intensity_with_debye_waller,
     load_structure_file,
 )
 from saxshell.saxs.project_manager import (
@@ -109,7 +111,7 @@ class ClusterDynamicsMLTrainingObservation:
 
 @dataclass(slots=True)
 class PredictedClusterCandidate:
-    """Predicted larger-cluster surrogate candidate."""
+    """Predicted larger-cluster candidate."""
 
     target_node_count: int
     rank: int
@@ -144,7 +146,7 @@ class SAXSComponentWeight:
 
 @dataclass(slots=True)
 class ClusterDynamicsMLSAXSComparison:
-    """Cluster-only surrogate SAXS comparison trace."""
+    """Cluster-only predicted-structures SAXS comparison trace."""
 
     q_values: np.ndarray
     observed_raw_model_intensity: np.ndarray | None
@@ -160,7 +162,23 @@ class ClusterDynamicsMLSAXSComparison:
     component_weights: tuple[SAXSComponentWeight, ...]
     experimental_data_path: Path | None
     component_output_dir: Path | None = None
-    surrogate_structure_dir: Path | None = None
+    predicted_structure_dir: Path | None = None
+
+
+@dataclass(slots=True)
+class DebyeWallerPairEstimate:
+    source: str
+    method: str
+    label: str
+    node_count: int
+    candidate_rank: int | None
+    element_a: str
+    element_b: str
+    sigma: float
+    b_factor: float
+    support_count: int
+    aligned_pair_count: int
+    source_label: str | None = None
 
 
 @dataclass(slots=True)
@@ -197,6 +215,7 @@ class ClusterDynamicsMLResult:
     structure_observations: tuple[ClusterStructureObservation, ...]
     training_observations: tuple[ClusterDynamicsMLTrainingObservation, ...]
     predictions: tuple[PredictedClusterCandidate, ...]
+    debye_waller_estimates: tuple[DebyeWallerPairEstimate, ...]
     saxs_comparison: ClusterDynamicsMLSAXSComparison | None
     max_observed_node_count: int
     max_predicted_node_count: int | None
@@ -247,9 +266,14 @@ class _TrainingGeometryStatistics:
     atom_coordination_medians: dict[tuple[str, str], float]
 
 
+@dataclass(slots=True)
+class _DebyeWallerPairModel:
+    sigma_model: _PropertyModel
+    support_count: int
+
+
 class ClusterDynamicsMLWorkflow:
-    """Predict larger-cluster surrogate states from smaller-cluster
-    data."""
+    """Predict larger-cluster states from smaller-cluster data."""
 
     def __init__(
         self,
@@ -402,6 +426,7 @@ class ClusterDynamicsMLWorkflow:
         *,
         progress_callback: PredictionProgressCallback | None = None,
     ) -> ClusterDynamicsMLResult:
+        total_steps = 7
         preview = self.preview_selection()
         resolved_clusters_dir = preview.clusters_dir
         if resolved_clusters_dir is None or not resolved_clusters_dir.is_dir():
@@ -410,14 +435,39 @@ class ClusterDynamicsMLWorkflow:
                 "project with a saved clusters directory before running the "
                 "prediction workflow."
             )
-        self._emit(progress_callback, "Running time-binned cluster analysis.")
+        self._emit(
+            progress_callback,
+            self._status_message(
+                1,
+                total_steps,
+                "Extracting time-binned clusters and lifetime summaries.",
+                "Reading the selected frames, assigning cluster labels, and "
+                "building the observed population and lifetime summaries.",
+            ),
+        )
         dynamics_result = self._build_cluster_dynamics_workflow().analyze()
-        self._emit(progress_callback, "Loading structure ensembles.")
+        self._emit(
+            progress_callback,
+            self._status_message(
+                2,
+                total_steps,
+                "Loading observed reference structures.",
+                "Scanning the smaller-cluster structure library grouped by "
+                "stoichiometry label and selecting representative files.",
+            ),
+        )
         structure_observations = self._build_structure_observations(
             resolved_clusters_dir
         )
         self._emit(
-            progress_callback, "Joining lifetime and structure summaries."
+            progress_callback,
+            self._status_message(
+                3,
+                total_steps,
+                "Joining kinetics and structure descriptors.",
+                "Combining the cluster-dynamics lifetimes with the observed "
+                "structure counts, radii, semiaxes, and motif information.",
+            ),
         )
         training_observations = self._build_training_observations(
             dynamics_result,
@@ -448,22 +498,68 @@ class ClusterDynamicsMLWorkflow:
             )
         self._emit(
             progress_callback,
-            "Learning bond, angle, and coordination statistics from reference structures.",
+            self._status_message(
+                4,
+                total_steps,
+                "Computing bond-length, bond-angle, and coordination distributions.",
+                "Learning node, linker, shell, and non-node contact statistics "
+                "from the observed reference structures.",
+            ),
         )
-        self._emit(progress_callback, "Training surrogate trend models.")
+        geometry_statistics = self._collect_training_geometry_statistics(
+            training_observations
+        )
+        self._emit(
+            progress_callback,
+            self._status_message(
+                5,
+                total_steps,
+                "Training ML regression models and scoring predicted structures.",
+                "Fitting the weighted ridge models for stoichiometry trends, "
+                "populations, lifetimes, and size descriptors, then ranking "
+                "the predicted structure candidates.",
+            ),
+        )
         predictions = self._predict_candidates(
             training_observations,
             self._resolve_target_node_counts(observed_node_counts),
+            geometry_statistics=geometry_statistics,
         )
         self._update_prediction_population_shares(
             training_observations, predictions
         )
         self._prune_prediction_population_tail(predictions)
-        self._emit(progress_callback, "Building surrogate SAXS comparison.")
+        self._emit(
+            progress_callback,
+            self._status_message(
+                6,
+                total_steps,
+                "Estimating Debye-Waller pair disorder.",
+                "Measuring pairwise thermal-displacement statistics from the "
+                "observed structure ensembles and predicting values for the "
+                "larger structures.",
+            ),
+        )
+        debye_waller_estimates = self._build_debye_waller_estimates(
+            training_observations,
+            predictions,
+        )
+        self._emit(
+            progress_callback,
+            self._status_message(
+                7,
+                total_steps,
+                "Building predicted-structure SAXS traces and output tables.",
+                "Composing the observed and predicted structure components, "
+                "writing the structure/profile files, and fitting the cluster-only "
+                "SAXS comparison model when experimental data are available.",
+            ),
+        )
         saxs_comparison = self._build_saxs_comparison(
             training_observations,
             predictions,
             preview.experimental_data_path,
+            debye_waller_estimates=debye_waller_estimates,
         )
         max_predicted_node_count = self._resolve_max_predicted_node_count(
             predictions
@@ -496,6 +592,7 @@ class ClusterDynamicsMLWorkflow:
                 )
             ),
             predictions=tuple(predictions),
+            debye_waller_estimates=tuple(debye_waller_estimates),
             saxs_comparison=saxs_comparison,
             max_observed_node_count=max(observed_node_counts),
             max_predicted_node_count=max_predicted_node_count,
@@ -754,12 +851,15 @@ class ClusterDynamicsMLWorkflow:
         self,
         training_observations: list[ClusterDynamicsMLTrainingObservation],
         target_node_counts: tuple[int, ...],
+        *,
+        geometry_statistics: _TrainingGeometryStatistics | None = None,
     ) -> list[PredictedClusterCandidate]:
         if not target_node_counts:
             return []
-        geometry_statistics = self._collect_training_geometry_statistics(
-            training_observations
-        )
+        if geometry_statistics is None:
+            geometry_statistics = self._collect_training_geometry_statistics(
+                training_observations
+            )
         atom_type_by_element = dict(geometry_statistics.atom_type_by_element)
         node_elements = tuple(sorted(self._atom_type_elements("node")))
         non_node_elements = tuple(
@@ -1341,12 +1441,17 @@ class ClusterDynamicsMLWorkflow:
         training_observations: list[ClusterDynamicsMLTrainingObservation],
         predictions: list[PredictedClusterCandidate],
         experimental_data_path: Path | None,
+        *,
+        debye_waller_estimates: list[DebyeWallerPairEstimate],
     ) -> ClusterDynamicsMLSAXSComparison | None:
         experimental_data = self._load_experimental_data(
             experimental_data_path
         )
         q_values = self._resolve_q_values(experimental_data)
-        component_dir, surrogate_structure_dir = (
+        debye_waller_lookup = _debye_waller_sigma_lookup_by_label(
+            debye_waller_estimates
+        )
+        component_dir, predicted_structure_dir = (
             self._resolve_saxs_artifact_dirs()
         )
         observed_weights, predicted_weights = _resolved_population_weights(
@@ -1357,7 +1462,7 @@ class ClusterDynamicsMLWorkflow:
         predicted_structure_paths = [
             _write_predicted_structure_file(
                 prediction,
-                surrogate_structure_dir=surrogate_structure_dir,
+                predicted_structure_dir=predicted_structure_dir,
             )
             for prediction in predictions
         ]
@@ -1374,6 +1479,7 @@ class ClusterDynamicsMLWorkflow:
                     weight=float(weight),
                     q_values=q_values,
                     component_dir=component_dir,
+                    pair_sigma_by_element=debye_waller_lookup.get(row.label),
                 )
             ]
             if component is not None
@@ -1393,6 +1499,9 @@ class ClusterDynamicsMLWorkflow:
                     structure_path=structure_path,
                     q_values=q_values,
                     component_dir=component_dir,
+                    pair_sigma_by_element=debye_waller_lookup.get(
+                        prediction.label
+                    ),
                 )
             ]
             if component is not None
@@ -1476,8 +1585,269 @@ class ClusterDynamicsMLWorkflow:
                 None if experimental_data is None else experimental_data.path
             ),
             component_output_dir=component_dir,
-            surrogate_structure_dir=surrogate_structure_dir,
+            predicted_structure_dir=predicted_structure_dir,
         )
+
+    def _build_debye_waller_estimates(
+        self,
+        training_observations: list[ClusterDynamicsMLTrainingObservation],
+        predictions: list[PredictedClusterCandidate],
+    ) -> list[DebyeWallerPairEstimate]:
+        node_elements = tuple(sorted(self._atom_type_elements("node")))
+        non_node_elements = tuple(
+            sorted(
+                {
+                    element
+                    for row in training_observations
+                    for element in row.element_counts
+                    if element not in node_elements
+                }
+            )
+        )
+        observed_ensemble_rows = self._estimate_observed_debye_waller_pairs(
+            training_observations
+        )
+        pair_models = self._fit_debye_waller_pair_models(
+            training_observations,
+            observed_ensemble_rows,
+            node_elements=node_elements,
+            non_node_elements=non_node_elements,
+        )
+        resolved_observed_rows = self._resolve_observed_debye_waller_pairs(
+            training_observations,
+            observed_ensemble_rows=observed_ensemble_rows,
+            pair_models=pair_models,
+            node_elements=node_elements,
+            non_node_elements=non_node_elements,
+        )
+        predicted_rows = self._predict_debye_waller_pairs(
+            predictions,
+            pair_models=pair_models,
+            node_elements=node_elements,
+            non_node_elements=non_node_elements,
+        )
+        return sorted(
+            [*resolved_observed_rows, *predicted_rows],
+            key=lambda row: (
+                row.source != "observed",
+                row.node_count,
+                row.candidate_rank is not None,
+                0 if row.candidate_rank is None else row.candidate_rank,
+                row.label,
+                row.element_a,
+                row.element_b,
+            ),
+        )
+
+    def _estimate_observed_debye_waller_pairs(
+        self,
+        training_observations: list[ClusterDynamicsMLTrainingObservation],
+    ) -> list[DebyeWallerPairEstimate]:
+        tracked_elements = self._tracked_structure_elements()
+        node_elements = set(self._atom_type_elements("node"))
+        estimates: list[DebyeWallerPairEstimate] = []
+        for observation in training_observations:
+            pair_samples: dict[tuple[str, str], list[np.ndarray]] = (
+                defaultdict(list)
+            )
+            for structure_path in _structure_files_for_cluster_dir(
+                observation.structure_dir
+            ):
+                try:
+                    coords, elements = load_structure_file(structure_path)
+                except Exception:
+                    continue
+                filtered = _filtered_coordinates_and_elements(
+                    coords,
+                    elements,
+                    tracked_elements=tracked_elements,
+                )
+                if filtered is None:
+                    continue
+                filtered_coords, filtered_elements = filtered
+                distance_map = _first_shell_pair_distances_by_element(
+                    filtered_coords,
+                    filtered_elements,
+                    node_elements=node_elements,
+                    pair_cutoff_definitions=self.pair_cutoff_definitions,
+                )
+                for pair_key, distances in distance_map.items():
+                    if distances.size > 0:
+                        pair_samples[pair_key].append(distances)
+            for pair_key, samples in sorted(pair_samples.items()):
+                if len(samples) < 2:
+                    continue
+                aligned_pair_count = min(sample.size for sample in samples)
+                if aligned_pair_count <= 0:
+                    continue
+                aligned_matrix = np.asarray(
+                    [sample[:aligned_pair_count] for sample in samples],
+                    dtype=float,
+                )
+                per_rank_sigma = np.std(aligned_matrix, axis=0, ddof=0)
+                sigma = float(
+                    np.sqrt(np.mean(np.square(per_rank_sigma), dtype=float))
+                )
+                estimates.append(
+                    DebyeWallerPairEstimate(
+                        source="observed",
+                        method="ensemble",
+                        label=observation.label,
+                        node_count=observation.node_count,
+                        candidate_rank=None,
+                        element_a=pair_key[0],
+                        element_b=pair_key[1],
+                        sigma=sigma,
+                        b_factor=b_factor_from_sigma(sigma),
+                        support_count=len(samples),
+                        aligned_pair_count=int(aligned_pair_count),
+                    )
+                )
+        return estimates
+
+    def _fit_debye_waller_pair_models(
+        self,
+        training_observations: list[ClusterDynamicsMLTrainingObservation],
+        observed_ensemble_rows: list[DebyeWallerPairEstimate],
+        *,
+        node_elements: tuple[str, ...],
+        non_node_elements: tuple[str, ...],
+    ) -> dict[tuple[str, str], _DebyeWallerPairModel]:
+        training_by_label = {row.label: row for row in training_observations}
+        grouped_rows: dict[tuple[str, str], list[DebyeWallerPairEstimate]] = (
+            defaultdict(list)
+        )
+        for row in observed_ensemble_rows:
+            grouped_rows[(row.element_a, row.element_b)].append(row)
+        pair_models: dict[tuple[str, str], _DebyeWallerPairModel] = {}
+        for pair_key, rows in grouped_rows.items():
+            feature_rows: list[np.ndarray] = []
+            target_rows: list[float] = []
+            weight_rows: list[float] = []
+            for row in rows:
+                observation = training_by_label.get(row.label)
+                if observation is None:
+                    continue
+                feature_rows.append(
+                    _candidate_feature_vector(
+                        observation.element_counts,
+                        node_elements=node_elements,
+                        non_node_elements=non_node_elements,
+                    )
+                )
+                target_rows.append(float(row.sigma))
+                weight_rows.append(
+                    float(observation.stability_weight)
+                    * max(float(row.support_count), 1.0)
+                )
+            if not feature_rows:
+                continue
+            weight_array = np.asarray(weight_rows, dtype=float)
+            target_array = np.asarray(target_rows, dtype=float)
+            pair_models[pair_key] = _DebyeWallerPairModel(
+                sigma_model=_fit_property_model(
+                    np.asarray(feature_rows, dtype=float),
+                    target_array,
+                    weights=weight_array,
+                    default_value=float(
+                        np.average(target_array, weights=weight_array)
+                    ),
+                    transform="log1p",
+                    lower_bound=0.0,
+                ),
+                support_count=len(feature_rows),
+            )
+        return pair_models
+
+    def _resolve_observed_debye_waller_pairs(
+        self,
+        training_observations: list[ClusterDynamicsMLTrainingObservation],
+        *,
+        observed_ensemble_rows: list[DebyeWallerPairEstimate],
+        pair_models: dict[tuple[str, str], _DebyeWallerPairModel],
+        node_elements: tuple[str, ...],
+        non_node_elements: tuple[str, ...],
+    ) -> list[DebyeWallerPairEstimate]:
+        resolved_rows: list[DebyeWallerPairEstimate] = []
+        ensemble_lookup = {
+            (row.label, row.element_a, row.element_b): row
+            for row in observed_ensemble_rows
+        }
+        for observation in training_observations:
+            feature_vector = _candidate_feature_vector(
+                observation.element_counts,
+                node_elements=node_elements,
+                non_node_elements=non_node_elements,
+            )
+            for pair_key in _element_pair_keys_from_counts(
+                observation.element_counts
+            ):
+                ensemble_row = ensemble_lookup.get(
+                    (observation.label, pair_key[0], pair_key[1])
+                )
+                if ensemble_row is not None:
+                    resolved_rows.append(ensemble_row)
+                    continue
+                model = pair_models.get(pair_key)
+                if model is None:
+                    continue
+                sigma = float(model.sigma_model.predict(feature_vector))
+                resolved_rows.append(
+                    DebyeWallerPairEstimate(
+                        source="observed",
+                        method="ridge",
+                        label=observation.label,
+                        node_count=observation.node_count,
+                        candidate_rank=None,
+                        element_a=pair_key[0],
+                        element_b=pair_key[1],
+                        sigma=sigma,
+                        b_factor=b_factor_from_sigma(sigma),
+                        support_count=model.support_count,
+                        aligned_pair_count=0,
+                    )
+                )
+        return resolved_rows
+
+    def _predict_debye_waller_pairs(
+        self,
+        predictions: list[PredictedClusterCandidate],
+        *,
+        pair_models: dict[tuple[str, str], _DebyeWallerPairModel],
+        node_elements: tuple[str, ...],
+        non_node_elements: tuple[str, ...],
+    ) -> list[DebyeWallerPairEstimate]:
+        predicted_rows: list[DebyeWallerPairEstimate] = []
+        for prediction in predictions:
+            feature_vector = _candidate_feature_vector(
+                prediction.element_counts,
+                node_elements=node_elements,
+                non_node_elements=non_node_elements,
+            )
+            for pair_key in _element_pair_keys_from_counts(
+                prediction.element_counts
+            ):
+                model = pair_models.get(pair_key)
+                if model is None:
+                    continue
+                sigma = float(model.sigma_model.predict(feature_vector))
+                predicted_rows.append(
+                    DebyeWallerPairEstimate(
+                        source="predicted",
+                        method="ridge",
+                        label=prediction.label,
+                        node_count=prediction.target_node_count,
+                        candidate_rank=prediction.rank,
+                        element_a=pair_key[0],
+                        element_b=pair_key[1],
+                        sigma=sigma,
+                        b_factor=b_factor_from_sigma(sigma),
+                        support_count=model.support_count,
+                        aligned_pair_count=0,
+                        source_label=prediction.source_label,
+                    )
+                )
+        return predicted_rows
 
     def _resolve_q_values(
         self,
@@ -1527,10 +1897,10 @@ class ClusterDynamicsMLWorkflow:
                 / f"{self.frames_dir.name}_clusterdynamicsml"
             )
         component_dir = base_dir / "saxs_components"
-        surrogate_structure_dir = base_dir / "surrogate_structures"
+        predicted_structure_dir = base_dir / "predicted_structures"
         component_dir.mkdir(parents=True, exist_ok=True)
-        surrogate_structure_dir.mkdir(parents=True, exist_ok=True)
-        return component_dir, surrogate_structure_dir
+        predicted_structure_dir.mkdir(parents=True, exist_ok=True)
+        return component_dir, predicted_structure_dir
 
     def _build_observed_saxs_component(
         self,
@@ -1539,6 +1909,7 @@ class ClusterDynamicsMLWorkflow:
         weight: float,
         q_values: np.ndarray,
         component_dir: Path,
+        pair_sigma_by_element: dict[tuple[str, str], float] | None = None,
     ) -> _ResolvedSAXSComponent | None:
         if weight <= 0.0:
             return None
@@ -1573,8 +1944,28 @@ class ClusterDynamicsMLWorkflow:
             coords, elements = load_structure_file(
                 observation.representative_path
             )
+            included_pair_indices = (
+                _first_shell_pair_indices(
+                    coords,
+                    elements,
+                    node_elements=set(self._atom_type_elements("node")),
+                    pair_cutoff_definitions=self.pair_cutoff_definitions,
+                )
+                if pair_sigma_by_element
+                else None
+            )
             trace = np.asarray(
-                compute_debye_intensity(coords, elements, q_values),
+                (
+                    compute_debye_intensity_with_debye_waller(
+                        coords,
+                        elements,
+                        q_values,
+                        pair_sigma_by_element=pair_sigma_by_element,
+                        included_pair_indices=included_pair_indices,
+                    )
+                    if pair_sigma_by_element
+                    else compute_debye_intensity(coords, elements, q_values)
+                ),
                 dtype=float,
             )
         except Exception:
@@ -1602,15 +1993,36 @@ class ClusterDynamicsMLWorkflow:
         structure_path: Path,
         q_values: np.ndarray,
         component_dir: Path,
+        pair_sigma_by_element: dict[tuple[str, str], float] | None = None,
     ) -> _ResolvedSAXSComponent | None:
         if weight <= 0.0:
             return None
         try:
-            trace = np.asarray(
-                compute_debye_intensity(
+            included_pair_indices = (
+                _first_shell_pair_indices(
                     prediction.generated_coordinates,
                     list(prediction.generated_elements),
-                    q_values,
+                    node_elements=set(self._atom_type_elements("node")),
+                    pair_cutoff_definitions=self.pair_cutoff_definitions,
+                )
+                if pair_sigma_by_element
+                else None
+            )
+            trace = np.asarray(
+                (
+                    compute_debye_intensity_with_debye_waller(
+                        prediction.generated_coordinates,
+                        list(prediction.generated_elements),
+                        q_values,
+                        pair_sigma_by_element=pair_sigma_by_element,
+                        included_pair_indices=included_pair_indices,
+                    )
+                    if pair_sigma_by_element
+                    else compute_debye_intensity(
+                        prediction.generated_coordinates,
+                        list(prediction.generated_elements),
+                        q_values,
+                    )
                 ),
                 dtype=float,
             )
@@ -1623,7 +2035,7 @@ class ClusterDynamicsMLWorkflow:
             profile_path,
             q_values=q_values,
             intensity=trace,
-            source="predicted_surrogate",
+            source="predicted_structure",
         )
         return _ResolvedSAXSComponent(
             label=prediction.label,
@@ -2218,6 +2630,17 @@ class ClusterDynamicsMLWorkflow:
         )
 
     @staticmethod
+    def _status_message(
+        step: int,
+        total_steps: int,
+        title: str,
+        detail: str,
+    ) -> str:
+        header = f"Step {int(step)}/{int(total_steps)}: {str(title).strip()}"
+        body = str(detail).strip()
+        return header if not body else f"{header}\n{body}"
+
+    @staticmethod
     def _emit(
         callback: PredictionProgressCallback | None,
         message: str,
@@ -2513,10 +2936,10 @@ def _predicted_structure_file_stem(
 def _write_predicted_structure_file(
     prediction: PredictedClusterCandidate,
     *,
-    surrogate_structure_dir: Path,
+    predicted_structure_dir: Path,
 ) -> Path:
     structure_path = (
-        surrogate_structure_dir
+        predicted_structure_dir
         / f"{_predicted_structure_file_stem(prediction)}.xyz"
     )
     _write_xyz_structure(
@@ -2675,6 +3098,183 @@ def _normalized_element_symbol(raw_value: str) -> str:
     if not text:
         return ""
     return text[:1].upper() + text[1:].lower()
+
+
+def _structure_files_for_cluster_dir(structure_dir: Path) -> tuple[Path, ...]:
+    if not structure_dir.is_dir():
+        return ()
+    return tuple(
+        sorted(
+            (
+                path
+                for path in structure_dir.rglob("*")
+                if path.is_file() and path.suffix.lower() in {".xyz", ".pdb"}
+            ),
+            key=lambda path: str(path),
+        )
+    )
+
+
+def _filtered_coordinates_and_elements(
+    coordinates: np.ndarray,
+    elements: list[str] | tuple[str, ...],
+    *,
+    tracked_elements: set[str],
+) -> tuple[np.ndarray, list[str]] | None:
+    normalized_elements = [
+        _normalized_element_symbol(element) for element in elements
+    ]
+    keep_indices = [
+        index
+        for index, element in enumerate(normalized_elements)
+        if element and (not tracked_elements or element in tracked_elements)
+    ]
+    if len(keep_indices) < 2:
+        return None
+    return (
+        np.asarray(coordinates, dtype=float)[keep_indices],
+        [normalized_elements[index] for index in keep_indices],
+    )
+
+
+def _sorted_pair_distances_by_element(
+    coordinates: np.ndarray,
+    elements: list[str] | tuple[str, ...],
+) -> dict[tuple[str, str], np.ndarray]:
+    pair_values: dict[tuple[str, str], list[float]] = defaultdict(list)
+    coords = np.asarray(coordinates, dtype=float)
+    normalized_elements = [
+        _normalized_element_symbol(element) for element in elements
+    ]
+    for index_a, index_b in combinations(range(len(normalized_elements)), 2):
+        element_a = normalized_elements[index_a]
+        element_b = normalized_elements[index_b]
+        if not element_a or not element_b:
+            continue
+        pair_key = tuple(sorted((element_a, element_b)))
+        pair_values[pair_key].append(
+            float(np.linalg.norm(coords[index_a] - coords[index_b]))
+        )
+    return {
+        pair_key: np.asarray(sorted(values), dtype=float)
+        for pair_key, values in pair_values.items()
+        if values
+    }
+
+
+def _first_shell_pair_indices(
+    coordinates: np.ndarray,
+    elements: list[str] | tuple[str, ...],
+    *,
+    node_elements: set[str],
+    pair_cutoff_definitions: PairCutoffDefinitions,
+) -> set[tuple[int, int]]:
+    coords = np.asarray(coordinates, dtype=float)
+    normalized_elements = [
+        _normalized_element_symbol(element) for element in elements
+    ]
+    pair_indices: set[tuple[int, int]] = set()
+
+    for index_a, index_b in combinations(range(len(normalized_elements)), 2):
+        element_a = normalized_elements[index_a]
+        element_b = normalized_elements[index_b]
+        if not element_a or not element_b:
+            continue
+        cutoff = _pair_cutoff_distance(
+            element_a,
+            element_b,
+            pair_cutoff_definitions=pair_cutoff_definitions,
+        )
+        if cutoff is None:
+            continue
+        distance = float(np.linalg.norm(coords[index_a] - coords[index_b]))
+        if distance <= float(cutoff) * 1.15:
+            pair_indices.add((min(index_a, index_b), max(index_a, index_b)))
+
+    node_indices = [
+        index
+        for index, element in enumerate(normalized_elements)
+        if element in node_elements
+    ]
+    if len(node_indices) >= 2:
+        node_edges = _node_scaffold_edges(
+            coords[node_indices],
+            [normalized_elements[index] for index in node_indices],
+            pair_cutoff_definitions=pair_cutoff_definitions,
+        )
+        for local_index_a, local_index_b in node_edges:
+            global_index_a = node_indices[local_index_a]
+            global_index_b = node_indices[local_index_b]
+            pair_indices.add(
+                (
+                    min(global_index_a, global_index_b),
+                    max(global_index_a, global_index_b),
+                )
+            )
+
+    return pair_indices
+
+
+def _first_shell_pair_distances_by_element(
+    coordinates: np.ndarray,
+    elements: list[str] | tuple[str, ...],
+    *,
+    node_elements: set[str],
+    pair_cutoff_definitions: PairCutoffDefinitions,
+) -> dict[tuple[str, str], np.ndarray]:
+    pair_indices = _first_shell_pair_indices(
+        coordinates,
+        elements,
+        node_elements=node_elements,
+        pair_cutoff_definitions=pair_cutoff_definitions,
+    )
+    if not pair_indices:
+        return {}
+    coords = np.asarray(coordinates, dtype=float)
+    normalized_elements = [
+        _normalized_element_symbol(element) for element in elements
+    ]
+    pair_values: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for index_a, index_b in sorted(pair_indices):
+        element_a = normalized_elements[index_a]
+        element_b = normalized_elements[index_b]
+        if not element_a or not element_b:
+            continue
+        pair_key = tuple(sorted((element_a, element_b)))
+        pair_values[pair_key].append(
+            float(np.linalg.norm(coords[index_a] - coords[index_b]))
+        )
+    return {
+        pair_key: np.asarray(sorted(values), dtype=float)
+        for pair_key, values in pair_values.items()
+        if values
+    }
+
+
+def _element_pair_keys_from_counts(
+    counts: dict[str, int],
+) -> tuple[tuple[str, str], ...]:
+    normalized = _normalized_counts(counts)
+    active_elements = sorted(
+        element for element, count in normalized.items() if int(count) > 0
+    )
+    pair_keys: list[tuple[str, str]] = []
+    for index, element_a in enumerate(active_elements):
+        if normalized.get(element_a, 0) >= 2:
+            pair_keys.append((element_a, element_a))
+        for element_b in active_elements[index + 1 :]:
+            if normalized.get(element_b, 0) > 0:
+                pair_keys.append((element_a, element_b))
+    return tuple(pair_keys)
+
+
+def _debye_waller_sigma_lookup_by_label(
+    rows: list[DebyeWallerPairEstimate] | tuple[DebyeWallerPairEstimate, ...],
+) -> dict[str, dict[tuple[str, str], float]]:
+    lookup: dict[str, dict[tuple[str, str], float]] = defaultdict(dict)
+    for row in rows:
+        lookup[row.label][(row.element_a, row.element_b)] = float(row.sigma)
+    return {label: dict(pair_map) for label, pair_map in lookup.items()}
 
 
 def _candidate_feature_vector(

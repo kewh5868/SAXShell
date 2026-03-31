@@ -279,7 +279,7 @@ def export_cluster_dynamicsai_report_pptx(
     selection_summary: str,
     result_summary: str,
     dynamics_figure: Figure | None,
-    surrogate_figure: Figure | None,
+    predicted_structures_figure: Figure | None,
     output_path: str | Path,
     settings: PowerPointExportSettings | None = None,
     project_dir: str | Path | None = None,
@@ -390,16 +390,22 @@ def export_cluster_dynamicsai_report_pptx(
             placeholder="No observed cluster-distribution plot is available.",
         ),
         _FigureSection(
-            title="Surrogate SAXS Comparison",
-            subtitle="Observed-only and observed + surrogate SAXS traces",
-            figure=surrogate_figure,
-            placeholder="No surrogate SAXS plot is available for this result.",
+            title="Predicted Structures SAXS Comparison",
+            subtitle=(
+                "Observed-only and observed + Predicted Structures SAXS traces"
+            ),
+            figure=predicted_structures_figure,
+            placeholder=(
+                "No Predicted Structures SAXS plot is available for this result."
+            ),
         ),
     ]
     table_sections = [
         _TableSection(
             title="Observed Cluster Lifetimes",
-            subtitle="Lifetime statistics used by the surrogate workflow",
+            subtitle=(
+                "Lifetime statistics used by the Predicted Structures workflow"
+            ),
             columns=lifetime_columns,
             rows=lifetime_rows,
             rows_per_slide=11,
@@ -431,7 +437,9 @@ def export_cluster_dynamicsai_report_pptx(
         ),
         _TableSection(
             title="Predicted Larger Clusters",
-            subtitle="Ranked surrogate candidates above the current threshold",
+            subtitle=(
+                "Ranked candidates for Predicted Structures above the current threshold"
+            ),
             columns=prediction_columns,
             rows=prediction_rows,
             rows_per_slide=8,
@@ -464,7 +472,7 @@ def export_cluster_dynamicsai_report_pptx(
     ]
     return _export_cluster_report_pptx(
         report_title="ClusterDynamicsML Report",
-        cover_subtitle="Cluster extrapolation and surrogate SAXS analysis",
+        cover_subtitle="Cluster extrapolation and Predicted Structures SAXS analysis",
         cover_lines=cover_lines,
         text_sections=text_sections,
         figure_sections=figure_sections,
