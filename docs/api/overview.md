@@ -17,10 +17,15 @@ classes that are most likely to be imported directly.
 ### Cluster dynamics
 
 - `saxshell.clusterdynamics.workflow.ClusterDynamicsWorkflow`
+- `saxshell.clusterdynamicsml.workflow.ClusterDynamicsMLWorkflow`
 
 ### Bond analysis
 
 - `saxshell.bondanalysis.workflow.BondAnalysisWorkflow`
+
+### PDF calculation
+
+- `saxshell.pdf.debyer.workflow.DebyerPDFWorkflow`
 
 ### XYZ to PDB conversion
 
@@ -49,9 +54,15 @@ from their Python surface:
 
 ```bash
 saxshell --help
-saxs --help
+saxshell saxs --help
 clusters --help
 mdtrajectory --help
+```
+
+From a source checkout, you can inspect the SAXS CLI directly with:
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs --help
 ```
 
 ## TODO

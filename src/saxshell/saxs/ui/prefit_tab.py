@@ -119,7 +119,9 @@ class PrefitTab(QWidget):
     template_changed = Signal(str)
     show_deprecated_templates_changed = Signal(bool)
     autosave_toggled = Signal(bool)
+    sequence_history_toggled = Signal(bool)
     field_interaction_requested = Signal()
+    parameter_table_edited = Signal()
     parameter_reset_requested = Signal(str, str, str)
     update_model_requested = Signal()
     run_fit_requested = Signal()
@@ -371,6 +373,18 @@ class PrefitTab(QWidget):
         layout.addWidget(QLabel("Max nfev"), 2, 0)
         layout.addWidget(self.nfev_spin, 2, 1, 1, 2)
 
+        self.sequence_history_checkbox = QCheckBox("Sequence history logger")
+        self.sequence_history_checkbox.setChecked(False)
+        self.sequence_history_checkbox.setToolTip(
+            "Record Prefit actions, manual parameter changes, autoscale "
+            "updates, and fit runs into prefit_sequence_history.json in the "
+            "active distribution Prefit folder."
+        )
+        self.sequence_history_checkbox.toggled.connect(
+            self.sequence_history_toggled.emit
+        )
+        layout.addWidget(self.sequence_history_checkbox, 3, 0, 1, 3)
+
         self.saved_state_combo = QComboBox()
         self.saved_state_combo.setToolTip(
             "Choose one of the timestamped prefit snapshot folders saved in "
@@ -390,8 +404,15 @@ class PrefitTab(QWidget):
         restore_layout.setContentsMargins(0, 0, 0, 0)
         restore_layout.addWidget(self.saved_state_combo, stretch=1)
         restore_layout.addWidget(self.restore_state_button)
-        layout.addWidget(QLabel("Saved states"), 3, 0)
-        layout.addWidget(restore_row, 3, 1, 1, 2)
+        layout.addWidget(QLabel("Saved states"), 4, 0)
+        layout.addWidget(restore_row, 4, 1, 1, 2)
+
+        self.stoichiometry_status_label = QLabel(
+            "Stoichiometry monitor: configure target elements and ratio in "
+            "DREAM > Posterior Filtering."
+        )
+        self.stoichiometry_status_label.setWordWrap(True)
+        layout.addWidget(self.stoichiometry_status_label, 5, 0, 1, 3)
 
         button_grid = QGridLayout()
         self.update_button = QPushButton("Update Model")
@@ -420,7 +441,8 @@ class PrefitTab(QWidget):
         self.set_best_button = QPushButton("Set Best Prefit Params")
         self.set_best_button.setToolTip(
             "Save the current prefit parameter table into the project file as "
-            "the Best Prefit preset for future reloads and quick restores."
+            "the Best Prefit preset for future reloads and quick restores, "
+            "and update the DREAM parameter-map centers to match it."
         )
         self.set_best_button.clicked.connect(
             self.set_best_prefit_requested.emit
@@ -470,7 +492,7 @@ class PrefitTab(QWidget):
         button_grid.addWidget(self.reset_button, 1, 1)
         button_grid.addWidget(self.set_best_button, 2, 0)
         button_grid.addWidget(self.reset_best_button, 2, 1)
-        layout.addLayout(button_grid, 4, 0, 1, 3)
+        layout.addLayout(button_grid, 6, 0, 1, 3)
         return group
 
     def _build_solute_volume_fraction_group(self) -> QGroupBox:
@@ -821,6 +843,11 @@ class PrefitTab(QWidget):
         self.autosave_checkbox.blockSignals(True)
         self.autosave_checkbox.setChecked(enabled)
         self.autosave_checkbox.blockSignals(False)
+
+    def set_sequence_history_enabled(self, enabled: bool) -> None:
+        self.sequence_history_checkbox.blockSignals(True)
+        self.sequence_history_checkbox.setChecked(bool(enabled))
+        self.sequence_history_checkbox.blockSignals(False)
 
     def set_model_only_mode(self, enabled: bool) -> None:
         self._model_only_mode = bool(enabled)
@@ -1319,6 +1346,13 @@ class PrefitTab(QWidget):
     ) -> None:
         if item.column() in {3, 4}:
             self._sync_parameter_row_link_state(item.row())
+        if not self._updating_parameter_table and item.column() in {
+            3,
+            4,
+            5,
+            6,
+        }:
+            self.parameter_table_edited.emit()
         if not self._updating_parameter_table and item.column() in {3, 4}:
             try:
                 self.parameter_entries()
@@ -1793,6 +1827,9 @@ class PrefitTab(QWidget):
     def set_summary_text(self, text: str) -> None:
         self._summary_text = text.strip()
         self._render_output()
+
+    def set_stoichiometry_status_text(self, text: str) -> None:
+        self.stoichiometry_status_label.setText(text.strip())
 
     def set_console_autoscroll_enabled(self, enabled: bool) -> None:
         self._console_autoscroll_enabled = bool(enabled)

@@ -8,6 +8,8 @@ repo_name: kewh5868/SAXSShell
 
 theme:
   name: material
+  logo: source/img/saxshell_icon.svg
+  favicon: source/img/saxshell_favicon.png
   features:
     - navigation.sections
     - navigation.expand
@@ -68,6 +70,8 @@ nav:
       - Project Configuration: user-guide/project-configuration.md
       - Cluster Extraction: user-guide/cluster-extraction.md
       - Cluster Dynamics: user-guide/cluster-dynamics.md
+      - Cluster Dynamics ML: user-guide/cluster-dynamics-ml.md
+      - PDF Calculation: user-guide/pdf-calculation.md
       - SAXS Prefit: user-guide/saxs-prefit.md
       - Pre-loaded SAXS Models: user-guide/preloaded-saxs-models.md
       - LMFit Workflow: user-guide/lmfit-workflow.md

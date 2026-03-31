@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from saxshell.mdtrajectory import MDTrajectoryWorkflow
@@ -61,9 +62,18 @@ def test_workflow_supports_notebook_style_end_to_end_usage(tmp_path):
 
     assert summary["n_frames"] == 4
     assert suggested.cutoff_time_fs == 50.0
-    assert selection.output_dir == tmp_path / "splitxyz_t50fs"
+    assert selection.output_dir == tmp_path / "splitxyz_f50fs"
     assert selection.preview.selected_frames == 3
     assert export.output_dir == selection.output_dir
+    assert (
+        export.metadata_file == export.output_dir / "mdtrajectory_export.json"
+    )
+    metadata_payload = json.loads(export.metadata_file.read_text())
+    assert metadata_payload["selection"]["applied_cutoff_fs"] == 50.0
+    assert (
+        metadata_payload["written_frames"][0]["filename"] == "frame_0001.xyz"
+    )
+    assert metadata_payload["written_frames"][0]["time_fs"] == 50.0
     assert [path.name for path in export.written_files] == [
         "frame_0001.xyz",
         "frame_0002.xyz",
@@ -131,7 +141,7 @@ def test_mdtrajectory_cli_export_runs_complete_headless_workflow(
     )
 
     captured = capsys.readouterr()
-    output_dir = tmp_path / "splitxyz_t50fs"
+    output_dir = tmp_path / "splitxyz_f50fs"
 
     assert exit_code == 0
     assert "Frame export complete." in captured.out

@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 import saxshell.saxs.prefit.cluster_geometry as cluster_geometry_module
+import saxshell.saxs.prefit.workflow as prefit_workflow_module
+import saxshell.saxs.project_manager.project as project_module
+from saxshell.clusterdynamicsml.workflow import (
+    ClusterDynamicsMLTrainingObservation,
+    PredictedClusterCandidate,
+)
 from saxshell.fullrmc.solution_properties import SolutionPropertiesSettings
 from saxshell.saxs._model_templates import load_template_module
+from saxshell.saxs.debye.profiles import AveragedComponent, ClusterBin
 from saxshell.saxs.prefit import (
     SAXSPrefitWorkflow,
     compute_cluster_geometry_metadata,
@@ -18,6 +26,7 @@ from saxshell.saxs.prefit.workflow import constrained_prefit_residuals
 from saxshell.saxs.project_manager import (
     SAXSProjectManager,
     build_project_paths,
+    project_artifact_paths,
 )
 from saxshell.saxs.solute_volume_fraction import (
     SoluteVolumeFractionSettings,
@@ -114,6 +123,95 @@ def _build_minimal_saxs_project(tmp_path):
     settings.selected_model_template = template_name
     manager.save_project(settings)
     return project_dir, paths
+
+
+def _write_predicted_structure_artifacts(
+    paths,
+    *,
+    observed_weight: float = 0.75,
+    predicted_weight: float = 0.25,
+):
+    q_values = np.linspace(0.05, 0.3, 8)
+    observed = np.linspace(10.0, 17.0, 8)
+    predicted = np.linspace(4.0, 11.0, 8)
+    _write_component_file(
+        paths.predicted_scattering_components_dir / "A_no_motif.txt",
+        q_values,
+        observed,
+    )
+    _write_component_file(
+        paths.predicted_scattering_components_dir / "A2_predicted_rank01.txt",
+        q_values,
+        predicted,
+    )
+    dataset_dir = (
+        paths.exported_data_dir
+        / "clusterdynamicsml"
+        / "saved_results"
+        / "20260330_120000_demo"
+    )
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    dataset_file = dataset_dir / "20260330_120000_demo_clusterdynamicsml.json"
+    dataset_file.write_text(
+        json.dumps({"predictions": [{"label": "A2", "rank": 1}]}, indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
+    (
+        paths.project_dir / "md_prior_weights_predicted_structures.json"
+    ).write_text(
+        json.dumps(
+            {
+                "origin": "clusters_predicted_structures",
+                "total_files": 1,
+                "available_elements": ["A"],
+                "value_kind": "normalized_weight",
+                "includes_predicted_structures": True,
+                "prediction_dataset_file": str(dataset_file),
+                "structures": {
+                    "A": {
+                        "no_motif": {
+                            "count": 1,
+                            "weight": observed_weight,
+                            "normalized_weight": observed_weight,
+                            "observed_only_weight": 1.0,
+                            "representative": "frame_0001.xyz",
+                            "profile_file": "A_no_motif.txt",
+                            "source_kind": "cluster_dir",
+                        }
+                    },
+                    "A2": {
+                        "predicted_rank01": {
+                            "count": 1,
+                            "weight": predicted_weight,
+                            "normalized_weight": predicted_weight,
+                            "observed_only_weight": 0.0,
+                            "representative": "02_rank01_A2.xyz",
+                            "profile_file": "A2_predicted_rank01.txt",
+                            "source_kind": "predicted_structure",
+                        }
+                    },
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (paths.project_dir / "md_saxs_map_predicted_structures.json").write_text(
+        json.dumps(
+            {
+                "saxs_map": {
+                    "A": {"no_motif": "A_no_motif.txt"},
+                    "A2": {"predicted_rank01": "A2_predicted_rank01.txt"},
+                }
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return dataset_file
 
 
 def _build_poly_lma_geometry_project(
@@ -242,6 +340,734 @@ def test_saxs_prefit_workflow_evaluates_and_autosaves_when_enabled(tmp_path):
     assert (snapshot_dir / "pd_prefit_params.json").is_file()
     assert (snapshot_dir / "prefit_curve.txt").is_file()
     assert (snapshot_dir / "prefit_report.txt").is_file()
+
+
+def test_saxs_prefit_workflow_uses_grid_seed_for_small_varying_sets(
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    workflow = SAXSPrefitWorkflow(project_dir)
+    entries = workflow.load_parameter_entries()
+    for entry in entries:
+        entry.vary = False
+
+    scale_entry = next(entry for entry in entries if entry.name == "scale")
+    scale_entry.vary = True
+    scale_entry.value = 1e-5
+    scale_entry.minimum = 1e-5
+    scale_entry.maximum = 1e-3
+
+    seeded_values: dict[str, float] = {}
+
+    class FakeResult:
+        def __init__(self, params):
+            self.params = params
+            self.nfev = 0
+
+    def fake_minimize(objective, params, method, max_nfev):
+        del objective, method, max_nfev
+        seeded_values["scale"] = float(params["scale"].value)
+        return FakeResult(params)
+
+    monkeypatch.setattr(prefit_workflow_module, "minimize", fake_minimize)
+    monkeypatch.setattr(
+        prefit_workflow_module,
+        "fit_report",
+        lambda _result: "fake lmfit report",
+    )
+
+    result = workflow.run_fit(entries, method="leastsq", max_nfev=50)
+
+    assert seeded_values["scale"] > 1e-5
+    assert result.optimization_strategy.startswith("coarse-to-fine grid")
+    assert result.grid_evaluations > 0
+    assert "Coarse-to-fine grid sweep" in result.fit_report
+
+
+def test_saxs_prefit_workflow_skips_grid_seed_for_large_varying_sets(
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    workflow = SAXSPrefitWorkflow(project_dir)
+    entries = workflow.load_parameter_entries()
+    varying_names = [entry.name for entry in entries[:4]]
+
+    for entry in entries:
+        entry.vary = entry.name in varying_names
+
+    seeded_values: dict[str, float] = {}
+
+    class FakeResult:
+        def __init__(self, params):
+            self.params = params
+            self.nfev = 0
+
+    def fake_minimize(objective, params, method, max_nfev):
+        del objective, method, max_nfev
+        seeded_values.update(
+            {name: float(params[name].value) for name in varying_names}
+        )
+        return FakeResult(params)
+
+    monkeypatch.setattr(prefit_workflow_module, "minimize", fake_minimize)
+    monkeypatch.setattr(
+        prefit_workflow_module,
+        "fit_report",
+        lambda _result: "fake lmfit report",
+    )
+
+    result = workflow.run_fit(entries, method="leastsq", max_nfev=50)
+
+    assert seeded_values == {
+        name: pytest.approx(
+            next(entry.value for entry in entries if entry.name == name)
+        )
+        for name in varying_names
+    }
+    assert result.optimization_strategy == "lmfit leastsq"
+    assert result.grid_evaluations == 0
+    assert "Coarse-to-fine grid sweep" not in result.fit_report
+
+
+def test_saxs_prefit_workflow_uses_predicted_structure_artifacts_when_enabled(
+    tmp_path,
+):
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    _write_predicted_structure_artifacts(paths)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.use_predicted_structure_weights = True
+    manager.save_project(settings)
+
+    workflow = SAXSPrefitWorkflow(project_dir)
+    component_lookup = {
+        (component.structure, component.motif): component
+        for component in workflow.components
+    }
+
+    assert workflow.component_dir == paths.predicted_scattering_components_dir
+    assert (
+        workflow.component_map_path.name
+        == "md_saxs_map_predicted_structures.json"
+    )
+    assert (
+        workflow.prior_weights_path.name
+        == "md_prior_weights_predicted_structures.json"
+    )
+    assert set(component_lookup) == {
+        ("A", "no_motif"),
+        ("A2", "predicted_rank01"),
+    }
+    assert component_lookup[("A", "no_motif")].weight_value == pytest.approx(
+        0.75
+    )
+    assert component_lookup[
+        ("A2", "predicted_rank01")
+    ].weight_value == pytest.approx(0.25)
+
+
+def test_project_manager_builds_predicted_structure_components_and_prior_weights(
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    clusters_dir = paths.project_dir / "clusters"
+    structure_dir = clusters_dir / "A"
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    observed_structure = structure_dir / "frame_0001.xyz"
+    observed_structure.write_text(
+        "1\nframe 1\nA 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    settings.clusters_dir = str(clusters_dir)
+    settings.use_predicted_structure_weights = True
+    manager.save_project(settings)
+
+    observed_component = np.linspace(10.0, 17.0, 8)
+    predicted_component = np.linspace(4.0, 11.0, 8)
+
+    def fake_build_profiles(
+        builder,
+        *,
+        cluster_bins,
+        progress_callback=None,
+        progress_total=None,
+        **kwargs,
+    ):
+        del progress_callback, progress_total, kwargs
+        output_path = builder.output_dir / "A_no_motif.txt"
+        _write_component_file(
+            output_path, builder.q_values, observed_component
+        )
+        cluster_bin = cluster_bins[0]
+        return [
+            AveragedComponent(
+                structure=cluster_bin.structure,
+                motif=cluster_bin.motif,
+                file_count=len(cluster_bin.files),
+                representative=cluster_bin.representative,
+                source_dir=cluster_bin.source_dir,
+                q_values=np.asarray(builder.q_values, dtype=float),
+                mean_intensity=np.asarray(observed_component, dtype=float),
+                std_intensity=np.zeros_like(builder.q_values, dtype=float),
+                se_intensity=np.zeros_like(builder.q_values, dtype=float),
+                output_path=output_path,
+            )
+        ]
+
+    monkeypatch.setattr(
+        project_module.DebyeProfileBuilder,
+        "build_profiles",
+        fake_build_profiles,
+    )
+    monkeypatch.setattr(
+        project_module,
+        "compute_debye_intensity",
+        lambda coordinates, elements, q_values: np.asarray(
+            predicted_component,
+            dtype=float,
+        ),
+    )
+
+    dataset_dir = (
+        paths.exported_data_dir
+        / "clusterdynamicsml"
+        / "saved_results"
+        / "20260330_120000_demo"
+    )
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    dataset_file = dataset_dir / "20260330_120000_demo_clusterdynamicsml.json"
+    dataset_file.write_text("{}\n", encoding="utf-8")
+    predicted_dir = dataset_dir / (f"{dataset_file.stem}_predicted_structures")
+    predicted_dir.mkdir(parents=True, exist_ok=True)
+    predicted_structure = predicted_dir / "02_rank01_A2.xyz"
+    predicted_structure.write_text(
+        "2\npredicted\nA 0.0 0.0 0.0\nA 1.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    loaded_dataset = SimpleNamespace(
+        dataset_file=dataset_file,
+        result=SimpleNamespace(
+            training_observations=(
+                ClusterDynamicsMLTrainingObservation(
+                    label="A",
+                    node_count=1,
+                    cluster_size=1,
+                    element_counts={"A": 1},
+                    file_count=1,
+                    representative_path=observed_structure,
+                    structure_dir=structure_dir,
+                    motifs=("no_motif",),
+                    mean_atom_count=1.0,
+                    mean_radius_of_gyration=1.0,
+                    mean_max_radius=1.0,
+                    mean_semiaxis_a=1.0,
+                    mean_semiaxis_b=1.0,
+                    mean_semiaxis_c=1.0,
+                    total_observations=1,
+                    occupied_frames=1,
+                    mean_count_per_frame=1.0,
+                    occupancy_fraction=1.0,
+                    association_events=0,
+                    dissociation_events=0,
+                    association_rate_per_ps=0.0,
+                    dissociation_rate_per_ps=0.0,
+                    completed_lifetime_count=1,
+                    window_truncated_lifetime_count=0,
+                    mean_lifetime_fs=10.0,
+                    std_lifetime_fs=0.0,
+                ),
+            ),
+            predictions=(
+                PredictedClusterCandidate(
+                    target_node_count=2,
+                    rank=1,
+                    label="A2",
+                    element_counts={"A": 2},
+                    predicted_mean_count_per_frame=0.2,
+                    predicted_occupancy_fraction=1.0,
+                    predicted_mean_lifetime_fs=20.0,
+                    predicted_association_rate_per_ps=0.0,
+                    predicted_dissociation_rate_per_ps=0.0,
+                    predicted_mean_radius_of_gyration=1.0,
+                    predicted_mean_max_radius=1.0,
+                    predicted_mean_semiaxis_a=1.0,
+                    predicted_mean_semiaxis_b=1.0,
+                    predicted_mean_semiaxis_c=1.0,
+                    predicted_population_share=100.0,
+                    predicted_stability_score=1.0,
+                    source_label="A",
+                    notes="",
+                    generated_elements=("A", "A"),
+                    generated_coordinates=np.asarray(
+                        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                        dtype=float,
+                    ),
+                ),
+            ),
+            dynamics_result=SimpleNamespace(
+                preview=SimpleNamespace(frame_timestep_fs=1.0)
+            ),
+            saxs_comparison=None,
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_load_latest_predicted_structures_dataset",
+        lambda project_dir: loaded_dataset,
+    )
+
+    component_result = manager.build_scattering_components(settings)
+    prior_result = manager.generate_prior_weights(settings)
+    artifact_paths = project_artifact_paths(
+        settings,
+        storage_mode="distribution",
+    )
+    predicted_map = json.loads(
+        artifact_paths.component_map_file.read_text(encoding="utf-8")
+    )
+    prior_payload = json.loads(
+        artifact_paths.prior_weights_file.read_text(encoding="utf-8")
+    )
+    predicted_entry = prior_payload["structures"]["A2"]["predicted_rank01"]
+
+    assert component_result.used_predicted_structure_weights
+    assert component_result.predicted_component_count == 1
+    assert prior_result.used_predicted_structure_weights
+    assert prior_result.predicted_component_count == 1
+    assert (
+        predicted_map["saxs_map"]["A2"]["predicted_rank01"]
+        == "A2_predicted_rank01.txt"
+    )
+    assert prior_payload["value_kind"] == "normalized_weight"
+    assert prior_payload["includes_predicted_structures"] is True
+    assert predicted_entry["source_kind"] == "predicted_structure"
+    assert predicted_entry["profile_file"] == "A2_predicted_rank01.txt"
+    assert predicted_entry["normalized_weight"] > 0.0
+    assert predicted_entry["observed_only_weight"] == pytest.approx(0.0)
+    assert (artifact_paths.component_dir / "A2_predicted_rank01.txt").is_file()
+
+
+def test_project_manager_reuses_observed_components_for_predicted_distribution(
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    clusters_dir = paths.project_dir / "clusters"
+    structure_dir = clusters_dir / "A"
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    observed_structure = structure_dir / "frame_0001.xyz"
+    observed_structure.write_text(
+        "1\nframe 1\nA 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    settings.clusters_dir = str(clusters_dir)
+    manager.save_project(settings)
+
+    observed_component = np.linspace(10.0, 17.0, 8)
+    predicted_component = np.linspace(4.0, 11.0, 8)
+    build_calls: list[str] = []
+
+    def fake_build_profiles(
+        builder,
+        *,
+        cluster_bins,
+        progress_callback=None,
+        progress_total=None,
+        **kwargs,
+    ):
+        del progress_callback, progress_total, kwargs
+        build_calls.append(str(builder.output_dir))
+        output_path = builder.output_dir / "A_no_motif.txt"
+        _write_component_file(
+            output_path,
+            builder.q_values,
+            observed_component,
+        )
+        cluster_bin = cluster_bins[0]
+        return [
+            AveragedComponent(
+                structure=cluster_bin.structure,
+                motif=cluster_bin.motif,
+                file_count=len(cluster_bin.files),
+                representative=cluster_bin.representative,
+                source_dir=cluster_bin.source_dir,
+                q_values=np.asarray(builder.q_values, dtype=float),
+                mean_intensity=np.asarray(observed_component, dtype=float),
+                std_intensity=np.zeros_like(builder.q_values, dtype=float),
+                se_intensity=np.zeros_like(builder.q_values, dtype=float),
+                output_path=output_path,
+            )
+        ]
+
+    monkeypatch.setattr(
+        project_module.DebyeProfileBuilder,
+        "build_profiles",
+        fake_build_profiles,
+    )
+    monkeypatch.setattr(
+        project_module,
+        "compute_debye_intensity",
+        lambda coordinates, elements, q_values: np.asarray(
+            predicted_component,
+            dtype=float,
+        ),
+    )
+
+    dataset_dir = (
+        paths.exported_data_dir
+        / "clusterdynamicsml"
+        / "saved_results"
+        / "20260330_120000_demo"
+    )
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    dataset_file = dataset_dir / "20260330_120000_demo_clusterdynamicsml.json"
+    dataset_file.write_text("{}\n", encoding="utf-8")
+    predicted_dir = dataset_dir / (f"{dataset_file.stem}_predicted_structures")
+    predicted_dir.mkdir(parents=True, exist_ok=True)
+    predicted_structure = predicted_dir / "02_rank01_A2.xyz"
+    predicted_structure.write_text(
+        "2\npredicted\nA 0.0 0.0 0.0\nA 1.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    loaded_dataset = SimpleNamespace(
+        dataset_file=dataset_file,
+        result=SimpleNamespace(
+            training_observations=(
+                ClusterDynamicsMLTrainingObservation(
+                    label="A",
+                    node_count=1,
+                    cluster_size=1,
+                    element_counts={"A": 1},
+                    file_count=1,
+                    representative_path=observed_structure,
+                    structure_dir=structure_dir,
+                    motifs=("no_motif",),
+                    mean_atom_count=1.0,
+                    mean_radius_of_gyration=1.0,
+                    mean_max_radius=1.0,
+                    mean_semiaxis_a=1.0,
+                    mean_semiaxis_b=1.0,
+                    mean_semiaxis_c=1.0,
+                    total_observations=1,
+                    occupied_frames=1,
+                    mean_count_per_frame=1.0,
+                    occupancy_fraction=1.0,
+                    association_events=0,
+                    dissociation_events=0,
+                    association_rate_per_ps=0.0,
+                    dissociation_rate_per_ps=0.0,
+                    completed_lifetime_count=1,
+                    window_truncated_lifetime_count=0,
+                    mean_lifetime_fs=10.0,
+                    std_lifetime_fs=0.0,
+                ),
+            ),
+            predictions=(
+                PredictedClusterCandidate(
+                    target_node_count=2,
+                    rank=1,
+                    label="A2",
+                    element_counts={"A": 2},
+                    predicted_mean_count_per_frame=0.2,
+                    predicted_occupancy_fraction=1.0,
+                    predicted_mean_lifetime_fs=20.0,
+                    predicted_association_rate_per_ps=0.0,
+                    predicted_dissociation_rate_per_ps=0.0,
+                    predicted_mean_radius_of_gyration=1.0,
+                    predicted_mean_max_radius=1.0,
+                    predicted_mean_semiaxis_a=1.0,
+                    predicted_mean_semiaxis_b=1.0,
+                    predicted_mean_semiaxis_c=1.0,
+                    predicted_population_share=100.0,
+                    predicted_stability_score=1.0,
+                    source_label="A",
+                    notes="",
+                    generated_elements=("A", "A"),
+                    generated_coordinates=np.asarray(
+                        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                        dtype=float,
+                    ),
+                ),
+            ),
+            dynamics_result=SimpleNamespace(
+                preview=SimpleNamespace(frame_timestep_fs=1.0)
+            ),
+            saxs_comparison=None,
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_load_latest_predicted_structures_dataset",
+        lambda project_dir: loaded_dataset,
+    )
+
+    manager.build_scattering_components(settings)
+    observed_artifacts = project_artifact_paths(
+        settings,
+        storage_mode="distribution",
+    )
+
+    predicted_settings = manager.load_project(project_dir)
+    predicted_settings.clusters_dir = str(clusters_dir)
+    predicted_settings.use_predicted_structure_weights = True
+    manager.save_project(predicted_settings)
+    component_result = manager.build_scattering_components(predicted_settings)
+    predicted_artifacts = project_artifact_paths(
+        predicted_settings,
+        storage_mode="distribution",
+    )
+
+    assert build_calls == [str(observed_artifacts.component_dir)]
+    assert (
+        component_result.model_map_path
+        == predicted_artifacts.component_map_file
+    )
+    assert (predicted_artifacts.component_dir / "A_no_motif.txt").is_file()
+    assert (
+        predicted_artifacts.component_dir / "A2_predicted_rank01.txt"
+    ).is_file()
+    np.testing.assert_allclose(
+        np.loadtxt(
+            predicted_artifacts.component_dir / "A_no_motif.txt",
+            comments="#",
+        )[:, 1],
+        observed_component,
+    )
+
+
+def test_project_manager_saves_distribution_artifacts_and_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    clusters_dir = paths.project_dir / "clusters"
+    structure_dir = clusters_dir / "A"
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    (structure_dir / "frame_0001.xyz").write_text(
+        "2\nframe 1\nA 0.0 0.0 0.0\nH 1.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    settings.clusters_dir = str(clusters_dir)
+    settings.exclude_elements = ["H"]
+    manager.save_project(settings)
+
+    observed_component = np.linspace(10.0, 17.0, 8)
+    captured_exclusions: list[set[str]] = []
+
+    def fake_build_profiles(
+        builder,
+        *,
+        cluster_bins,
+        progress_callback=None,
+        progress_total=None,
+        **kwargs,
+    ):
+        del progress_callback, progress_total, kwargs
+        captured_exclusions.append(set(builder.exclude_elements))
+        output_path = builder.output_dir / "A_no_motif.txt"
+        _write_component_file(
+            output_path,
+            builder.q_values,
+            observed_component,
+        )
+        cluster_bin = cluster_bins[0]
+        return [
+            AveragedComponent(
+                structure=cluster_bin.structure,
+                motif=cluster_bin.motif,
+                file_count=len(cluster_bin.files),
+                representative=cluster_bin.representative,
+                source_dir=cluster_bin.source_dir,
+                q_values=np.asarray(builder.q_values, dtype=float),
+                mean_intensity=np.asarray(observed_component, dtype=float),
+                std_intensity=np.zeros_like(builder.q_values, dtype=float),
+                se_intensity=np.zeros_like(builder.q_values, dtype=float),
+                output_path=output_path,
+            )
+        ]
+
+    monkeypatch.setattr(
+        project_module.DebyeProfileBuilder,
+        "build_profiles",
+        fake_build_profiles,
+    )
+
+    component_result = manager.build_scattering_components(settings)
+    prior_result = manager.generate_prior_weights(settings)
+    artifact_paths = project_artifact_paths(settings)
+    records = manager.list_saved_distributions(project_dir)
+    metadata_payload = json.loads(
+        artifact_paths.distribution_metadata_file.read_text(encoding="utf-8")
+    )
+
+    assert captured_exclusions == [{"H"}]
+    assert artifact_paths.uses_distribution_storage
+    assert component_result.model_map_path == artifact_paths.component_map_file
+    assert (
+        prior_result.md_prior_weights_path == artifact_paths.prior_weights_file
+    )
+    assert artifact_paths.component_map_file.is_file()
+    assert artifact_paths.prior_weights_file.is_file()
+    assert artifact_paths.distribution_metadata_file.is_file()
+    assert metadata_payload["exclude_elements"] == ["H"]
+    assert metadata_payload["component_artifacts_ready"] is True
+    assert metadata_payload["prior_artifacts_ready"] is True
+    assert len(records) == 1
+    assert records[0].distribution_id == artifact_paths.distribution_id
+    assert records[0].exclude_elements == ("H",)
+    assert records[0].component_artifacts_ready
+    assert records[0].prior_artifacts_ready
+
+
+def test_prefit_cluster_geometry_includes_predicted_structures_when_enabled(
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, paths, _ = _build_poly_lma_geometry_project(tmp_path)
+    _write_predicted_structure_artifacts(paths)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.use_predicted_structure_weights = True
+    manager.save_project(settings)
+
+    predicted_dir = tmp_path / "predicted_geometry"
+    predicted_dir.mkdir(parents=True, exist_ok=True)
+    predicted_structure = predicted_dir / "02_rank01_A2.xyz"
+    predicted_structure.write_text(
+        "2\npredicted\nA 0.0 0.0 0.0\nA 1.4 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    workflow = SAXSPrefitWorkflow(project_dir)
+    monkeypatch.setattr(
+        workflow.project_manager,
+        "predicted_structure_cluster_bins",
+        lambda project_dir, included_components=None: [
+            ClusterBin(
+                structure="A2",
+                motif="predicted_rank01",
+                source_dir=predicted_structure.parent,
+                files=(predicted_structure,),
+                representative=predicted_structure.name,
+            )
+        ],
+    )
+
+    table = workflow.compute_cluster_geometry_table()
+    row_lookup = {(row.structure, row.motif): row for row in table.rows}
+    geometry_entries = [
+        entry
+        for entry in workflow.parameter_entries
+        if entry.category == "geometry"
+    ]
+
+    assert workflow.cluster_geometry_metadata_path == (
+        paths.predicted_cluster_geometry_metadata_file
+    )
+    assert paths.predicted_cluster_geometry_metadata_file.is_file()
+    assert set(row_lookup) == {
+        ("A", "no_motif"),
+        ("A2", "predicted_rank01"),
+    }
+    assert row_lookup[("A2", "predicted_rank01")].effective_radius > 0.0
+    assert row_lookup[("A2", "predicted_rank01")].mapped_parameter == "w1"
+    assert row_lookup[("A2", "predicted_rank01")].cluster_path == str(
+        predicted_structure.parent.resolve()
+    )
+    assert any(
+        entry.structure == "A2" and entry.motif == "predicted_rank01"
+        for entry in geometry_entries
+    )
+
+
+def test_prefit_workflow_apply_project_settings_updates_geometry_mode(
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, paths, _ = _build_poly_lma_geometry_project(tmp_path)
+    workflow = SAXSPrefitWorkflow(project_dir)
+    observed_table = workflow.compute_cluster_geometry_table()
+
+    assert workflow.cluster_geometry_metadata_path == (
+        paths.cluster_geometry_metadata_file
+    )
+    assert {(row.structure, row.motif) for row in observed_table.rows} == {
+        ("A", "no_motif")
+    }
+
+    _write_predicted_structure_artifacts(paths)
+    predicted_dir = tmp_path / "predicted_geometry_toggle"
+    predicted_dir.mkdir(parents=True, exist_ok=True)
+    predicted_structure = predicted_dir / "02_rank01_A2.xyz"
+    predicted_structure.write_text(
+        "2\npredicted\nA 0.0 0.0 0.0\nA 1.6 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        workflow.project_manager,
+        "predicted_structure_cluster_bins",
+        lambda project_dir, included_components=None: [
+            ClusterBin(
+                structure="A2",
+                motif="predicted_rank01",
+                source_dir=predicted_structure.parent,
+                files=(predicted_structure,),
+                representative=predicted_structure.name,
+            )
+        ],
+    )
+    manager = SAXSProjectManager()
+    predicted_settings = manager.load_project(project_dir)
+    predicted_settings.use_predicted_structure_weights = True
+    manager.save_project(predicted_settings)
+
+    workflow.apply_project_settings(predicted_settings)
+    predicted_table = workflow.compute_cluster_geometry_table()
+
+    assert workflow.cluster_geometry_metadata_path == (
+        paths.predicted_cluster_geometry_metadata_file
+    )
+    assert {(row.structure, row.motif) for row in predicted_table.rows} == {
+        ("A", "no_motif"),
+        ("A2", "predicted_rank01"),
+    }
+    assert {
+        (component.structure, component.motif)
+        for component in workflow.components
+    } == {("A", "no_motif"), ("A2", "predicted_rank01")}
+    assert any(
+        entry.structure == "A2"
+        for entry in workflow.parameter_entries
+        if entry.category in {"weight", "geometry"}
+    )
+
+    observed_settings = manager.load_project(project_dir)
+    observed_settings.use_predicted_structure_weights = False
+    manager.save_project(observed_settings)
+    workflow.apply_project_settings(observed_settings)
+
+    assert workflow.cluster_geometry_metadata_path == (
+        paths.cluster_geometry_metadata_file
+    )
+    assert workflow.cluster_geometry_table is not None
+    assert {
+        (row.structure, row.motif)
+        for row in workflow.cluster_geometry_table.rows
+    } == {("A", "no_motif")}
+    assert {
+        (component.structure, component.motif)
+        for component in workflow.components
+    } == {("A", "no_motif")}
+    assert all(entry.structure != "A2" for entry in workflow.parameter_entries)
 
 
 def test_saxs_prefit_workflow_recommends_scale_from_model_difference(tmp_path):

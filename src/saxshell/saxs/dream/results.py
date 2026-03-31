@@ -11,7 +11,14 @@ from saxshell.saxs._model_templates import (
     load_template_spec,
 )
 from saxshell.saxs.prefit import ClusterGeometryMetadataTable
-from saxshell.saxs.stoichiometry import stoich_sort_key
+from saxshell.saxs.stoichiometry import (
+    StoichiometryEvaluation,
+    StoichiometryTarget,
+    build_stoichiometry_target,
+    evaluate_weighted_stoichiometry,
+    parse_stoich_label,
+    stoich_sort_key,
+)
 
 
 @dataclass(slots=True)
@@ -29,9 +36,14 @@ class DreamSummary:
     map_step: int
     chain_map_logps: np.ndarray
     posterior_filter_mode: str
+    posterior_candidate_sample_count: int
     posterior_sample_count: int
     credible_interval_low: float
     credible_interval_high: float
+    stoichiometry_target: StoichiometryTarget | None
+    stoichiometry_evaluation: StoichiometryEvaluation | None
+    stoichiometry_filter_enabled: bool
+    stoichiometry_tolerance_percent: float | None
     run_dir: Path
 
 
@@ -76,6 +88,7 @@ class _PosteriorView:
     map_chain: int
     map_step: int
     chain_map_logps: np.ndarray
+    candidate_sample_count: int
     sample_count: int
     credible_interval_low: float
     credible_interval_high: float
@@ -179,6 +192,12 @@ class SAXSDreamResultsLoader:
             tuple[object, ...], DreamViolinPlotData
         ] = {}
         self._parameter_entry_lookup = self._build_parameter_entry_lookup()
+        self._stoichiometry_weight_map_cache: dict[
+            tuple[str, ...], tuple[np.ndarray, np.ndarray, tuple[str, ...]]
+        ] = {}
+        self._stoichiometry_mask_cache: dict[
+            tuple[object, ...], np.ndarray
+        ] = {}
         self._apply_burnin()
 
     def _apply_burnin(self) -> None:
@@ -209,6 +228,10 @@ class SAXSDreamResultsLoader:
         posterior_top_n: int = 500,
         credible_interval_low: float = 16.0,
         credible_interval_high: float = 84.0,
+        stoichiometry_target_elements_text: str = "",
+        stoichiometry_target_ratio_text: str = "",
+        stoichiometry_filter_enabled: bool = False,
+        stoichiometry_tolerance_percent: float = 5.0,
     ) -> DreamSummary:
         view = self._posterior_view(
             filter_mode=posterior_filter_mode,
@@ -216,6 +239,15 @@ class SAXSDreamResultsLoader:
             top_n=posterior_top_n,
             credible_interval_low=credible_interval_low,
             credible_interval_high=credible_interval_high,
+            stoichiometry_target_elements_text=stoichiometry_target_elements_text,
+            stoichiometry_target_ratio_text=stoichiometry_target_ratio_text,
+            stoichiometry_filter_enabled=stoichiometry_filter_enabled,
+            stoichiometry_tolerance_percent=stoichiometry_tolerance_percent,
+        )
+        stoichiometry_target = self._resolve_stoichiometry_target(
+            stoichiometry_target_elements_text=stoichiometry_target_elements_text,
+            stoichiometry_target_ratio_text=stoichiometry_target_ratio_text,
+            required=False,
         )
         cache_key = (
             str(bestfit_method),
@@ -224,14 +256,27 @@ class SAXSDreamResultsLoader:
             int(view.top_n),
             round(float(view.credible_interval_low), 6),
             round(float(view.credible_interval_high), 6),
+            (
+                tuple(stoichiometry_target.elements)
+                if stoichiometry_target is not None
+                else ()
+            ),
+            (
+                tuple(stoichiometry_target.ratio)
+                if stoichiometry_target is not None
+                else ()
+            ),
+            bool(stoichiometry_filter_enabled),
+            round(float(stoichiometry_tolerance_percent), 6),
         )
         cached = self._summary_cache.get(cache_key)
         if cached is not None:
             return cached
         best_active = self._select_best_params(bestfit_method, view)
+        best_full = self.expand_params(best_active)
         summary = DreamSummary(
             bestfit_method=bestfit_method,
-            bestfit_params=self.expand_params(best_active),
+            bestfit_params=best_full,
             map_params=self.expand_params(view.map_params),
             chain_mean_params=self.expand_params(view.chain_mean_params),
             median_params=self.expand_params(view.median_params),
@@ -243,9 +288,21 @@ class SAXSDreamResultsLoader:
             map_step=int(view.map_step),
             chain_map_logps=np.asarray(view.chain_map_logps, dtype=float),
             posterior_filter_mode=view.filter_mode,
+            posterior_candidate_sample_count=int(view.candidate_sample_count),
             posterior_sample_count=int(view.sample_count),
             credible_interval_low=float(view.credible_interval_low),
             credible_interval_high=float(view.credible_interval_high),
+            stoichiometry_target=stoichiometry_target,
+            stoichiometry_evaluation=self._evaluate_parameter_stoichiometry(
+                best_full,
+                stoichiometry_target,
+            ),
+            stoichiometry_filter_enabled=bool(stoichiometry_filter_enabled),
+            stoichiometry_tolerance_percent=(
+                float(stoichiometry_tolerance_percent)
+                if stoichiometry_target is not None
+                else None
+            ),
             run_dir=self.run_dir,
         )
         self._summary_cache[cache_key] = summary
@@ -260,12 +317,20 @@ class SAXSDreamResultsLoader:
         posterior_top_n: int = 500,
         credible_interval_low: float = 16.0,
         credible_interval_high: float = 84.0,
+        stoichiometry_target_elements_text: str = "",
+        stoichiometry_target_ratio_text: str = "",
+        stoichiometry_filter_enabled: bool = False,
+        stoichiometry_tolerance_percent: float = 5.0,
     ) -> DreamModelPlotData:
         cache_key = (
             str(bestfit_method),
             str(posterior_filter_mode),
             round(float(posterior_top_percent), 6),
             int(posterior_top_n),
+            str(stoichiometry_target_elements_text).strip(),
+            str(stoichiometry_target_ratio_text).strip(),
+            bool(stoichiometry_filter_enabled),
+            round(float(stoichiometry_tolerance_percent), 6),
         )
         cached = self._model_plot_cache.get(cache_key)
         if cached is not None:
@@ -277,6 +342,10 @@ class SAXSDreamResultsLoader:
             posterior_top_n=posterior_top_n,
             credible_interval_low=credible_interval_low,
             credible_interval_high=credible_interval_high,
+            stoichiometry_target_elements_text=stoichiometry_target_elements_text,
+            stoichiometry_target_ratio_text=stoichiometry_target_ratio_text,
+            stoichiometry_filter_enabled=stoichiometry_filter_enabled,
+            stoichiometry_tolerance_percent=stoichiometry_tolerance_percent,
         )
         model_module = load_template_module(self.template_name)
         template_spec = load_template_spec(self.template_name)
@@ -351,6 +420,10 @@ class SAXSDreamResultsLoader:
         credible_interval_high: float = 84.0,
         sample_source: str = "filtered_posterior",
         weight_order: str = "weight_index",
+        stoichiometry_target_elements_text: str = "",
+        stoichiometry_target_ratio_text: str = "",
+        stoichiometry_filter_enabled: bool = False,
+        stoichiometry_tolerance_percent: float = 5.0,
     ) -> DreamViolinPlotData:
         cache_key = (
             str(mode),
@@ -359,6 +432,10 @@ class SAXSDreamResultsLoader:
             int(posterior_top_n),
             str(sample_source),
             str(weight_order),
+            str(stoichiometry_target_elements_text).strip(),
+            str(stoichiometry_target_ratio_text).strip(),
+            bool(stoichiometry_filter_enabled),
+            round(float(stoichiometry_tolerance_percent), 6),
         )
         cached = self._violin_data_cache.get(cache_key)
         if cached is not None:
@@ -369,6 +446,10 @@ class SAXSDreamResultsLoader:
             top_n=posterior_top_n,
             credible_interval_low=credible_interval_low,
             credible_interval_high=credible_interval_high,
+            stoichiometry_target_elements_text=stoichiometry_target_elements_text,
+            stoichiometry_target_ratio_text=stoichiometry_target_ratio_text,
+            stoichiometry_filter_enabled=stoichiometry_filter_enabled,
+            stoichiometry_tolerance_percent=stoichiometry_tolerance_percent,
         )
         active_samples = self._active_samples_for_source(
             view,
@@ -448,6 +529,10 @@ class SAXSDreamResultsLoader:
         credible_interval_high: float = 84.0,
         violin_parameter_mode: str = "varying_parameters",
         violin_sample_source: str = "filtered_posterior",
+        stoichiometry_target_elements_text: str = "",
+        stoichiometry_target_ratio_text: str = "",
+        stoichiometry_filter_enabled: bool = False,
+        stoichiometry_tolerance_percent: float = 5.0,
     ) -> Path:
         summary = self.get_summary(
             bestfit_method=bestfit_method,
@@ -456,6 +541,10 @@ class SAXSDreamResultsLoader:
             posterior_top_n=posterior_top_n,
             credible_interval_low=credible_interval_low,
             credible_interval_high=credible_interval_high,
+            stoichiometry_target_elements_text=stoichiometry_target_elements_text,
+            stoichiometry_target_ratio_text=stoichiometry_target_ratio_text,
+            stoichiometry_filter_enabled=stoichiometry_filter_enabled,
+            stoichiometry_tolerance_percent=stoichiometry_tolerance_percent,
         )
         lines = [
             f"Run directory: {self.run_dir}",
@@ -473,6 +562,34 @@ class SAXSDreamResultsLoader:
             "",
             "Posterior summary:",
         ]
+        if summary.stoichiometry_target is not None:
+            lines.insert(
+                6,
+                (
+                    "Stoichiometry target: "
+                    + ":".join(summary.stoichiometry_target.elements)
+                    + " = "
+                    + ":".join(
+                        f"{value:g}"
+                        for value in summary.stoichiometry_target.ratio
+                    )
+                ),
+            )
+            lines.insert(
+                7,
+                (
+                    "Stoichiometry filter: "
+                    + ("on" if summary.stoichiometry_filter_enabled else "off")
+                ),
+            )
+            if summary.stoichiometry_filter_enabled:
+                lines.insert(
+                    8,
+                    (
+                        "Stoichiometry tolerance (%): "
+                        f"{float(summary.stoichiometry_tolerance_percent or 0.0):g}"
+                    ),
+                )
         if posterior_filter_mode == "top_percent_logp":
             lines.insert(
                 4,
@@ -585,10 +702,19 @@ class SAXSDreamResultsLoader:
         top_n: int,
         credible_interval_low: float,
         credible_interval_high: float,
+        stoichiometry_target_elements_text: str = "",
+        stoichiometry_target_ratio_text: str = "",
+        stoichiometry_filter_enabled: bool = False,
+        stoichiometry_tolerance_percent: float = 5.0,
     ) -> _PosteriorView:
         low, high = self._normalize_interval_bounds(
             credible_interval_low,
             credible_interval_high,
+        )
+        stoichiometry_target = self._resolve_stoichiometry_target(
+            stoichiometry_target_elements_text=stoichiometry_target_elements_text,
+            stoichiometry_target_ratio_text=stoichiometry_target_ratio_text,
+            required=stoichiometry_filter_enabled,
         )
         key = (
             filter_mode,
@@ -596,15 +722,46 @@ class SAXSDreamResultsLoader:
             int(top_n),
             round(low, 6),
             round(high, 6),
+            (
+                tuple(stoichiometry_target.elements)
+                if stoichiometry_target is not None
+                else ()
+            ),
+            (
+                tuple(stoichiometry_target.ratio)
+                if stoichiometry_target is not None
+                else ()
+            ),
+            bool(stoichiometry_filter_enabled),
+            round(float(stoichiometry_tolerance_percent), 6),
         )
         cached = self._posterior_view_cache.get(key)
         if cached is not None:
             return cached
 
+        available_mask: np.ndarray | None = None
+        candidate_sample_count = int(self.log_ps.size)
+        if stoichiometry_filter_enabled:
+            if stoichiometry_target is None:
+                raise ValueError(
+                    "Enter stoichiometry target elements and a target ratio "
+                    "before enabling stoichiometry filtering."
+                )
+            available_mask = self._stoichiometry_filter_mask(
+                stoichiometry_target,
+                tolerance_percent=stoichiometry_tolerance_percent,
+            )
+            candidate_sample_count = int(np.count_nonzero(available_mask))
+            if candidate_sample_count == 0:
+                raise ValueError(
+                    "No DREAM samples satisfy the active stoichiometry filter."
+                )
+
         sample_mask = self._posterior_mask(
             filter_mode=filter_mode,
             top_percent=top_percent,
             top_n=top_n,
+            available_mask=available_mask,
         )
         samples_flat = np.asarray(
             self.sampled_params[sample_mask], dtype=float
@@ -674,6 +831,7 @@ class SAXSDreamResultsLoader:
             map_chain=map_chain,
             map_step=map_step,
             chain_map_logps=chain_map_logps,
+            candidate_sample_count=candidate_sample_count,
             sample_count=int(samples_flat.shape[0]),
             credible_interval_low=float(low),
             credible_interval_high=float(high),
@@ -742,32 +900,168 @@ class SAXSDreamResultsLoader:
         filter_mode: str,
         top_percent: float,
         top_n: int,
+        available_mask: np.ndarray | None = None,
     ) -> np.ndarray:
+        if available_mask is None:
+            available = np.ones_like(self.log_ps, dtype=bool)
+        else:
+            available = np.asarray(available_mask, dtype=bool)
+            if available.shape != self.log_ps.shape:
+                raise ValueError(
+                    "Stoichiometry filter mask shape does not match the DREAM samples."
+                )
         if filter_mode == "all_post_burnin":
-            return np.ones_like(self.log_ps, dtype=bool)
+            return available
         if filter_mode not in {"top_percent_logp", "top_n_logp"}:
             raise ValueError(
                 "posterior_filter_mode must be 'all_post_burnin', "
                 "'top_percent_logp', or 'top_n_logp'."
             )
         flat_log_ps = np.asarray(self.log_ps.reshape(-1), dtype=float)
+        available_flat = np.asarray(available.reshape(-1), dtype=bool)
         if flat_log_ps.size == 0:
             raise ValueError("No DREAM samples were found after burn-in.")
-        sorted_indices = np.argsort(flat_log_ps)[::-1]
+        candidate_indices = np.flatnonzero(available_flat)
+        if candidate_indices.size == 0:
+            return np.zeros_like(self.log_ps, dtype=bool)
+        candidate_log_ps = flat_log_ps[candidate_indices]
+        sorted_positions = np.argsort(candidate_log_ps)[::-1]
         if filter_mode == "top_percent_logp":
             keep_count = int(
                 np.ceil(
-                    flat_log_ps.size
+                    candidate_indices.size
                     * max(min(float(top_percent), 100.0), 0.1)
                     / 100.0
                 )
             )
         else:
             keep_count = int(top_n)
-        keep_count = max(1, min(keep_count, flat_log_ps.size))
+        keep_count = max(1, min(keep_count, candidate_indices.size))
         mask = np.zeros(flat_log_ps.size, dtype=bool)
-        mask[sorted_indices[:keep_count]] = True
+        selected_indices = candidate_indices[sorted_positions[:keep_count]]
+        mask[selected_indices] = True
         return mask.reshape(self.log_ps.shape)
+
+    def _resolve_stoichiometry_target(
+        self,
+        *,
+        stoichiometry_target_elements_text: str,
+        stoichiometry_target_ratio_text: str,
+        required: bool = False,
+    ) -> StoichiometryTarget | None:
+        if (
+            not str(stoichiometry_target_elements_text).strip()
+            and not str(stoichiometry_target_ratio_text).strip()
+        ):
+            return None
+        if not required and (
+            not str(stoichiometry_target_elements_text).strip()
+            or not str(stoichiometry_target_ratio_text).strip()
+        ):
+            return None
+        return build_stoichiometry_target(
+            stoichiometry_target_elements_text,
+            stoichiometry_target_ratio_text,
+        )
+
+    def _stoichiometry_weight_mapping(
+        self,
+        target: StoichiometryTarget,
+    ) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
+        cached = self._stoichiometry_weight_map_cache.get(target.elements)
+        if cached is not None:
+            return cached
+        parameter_indices: list[int] = []
+        count_rows: list[list[float]] = []
+        structures: list[str] = []
+        for index, parameter_name in enumerate(self.full_parameter_names):
+            if not str(parameter_name).startswith("w"):
+                continue
+            entry = self._parameter_entry_lookup.get(str(parameter_name), {})
+            structure = str(entry.get("structure", "")).strip()
+            if not structure:
+                continue
+            counts = parse_stoich_label(structure)
+            row = [
+                float(counts.get(element, 0)) for element in target.elements
+            ]
+            if not any(value > 0.0 for value in row):
+                continue
+            parameter_indices.append(index)
+            count_rows.append(row)
+            structures.append(structure)
+        mapping = (
+            np.asarray(parameter_indices, dtype=int),
+            np.asarray(count_rows, dtype=float),
+            tuple(structures),
+        )
+        self._stoichiometry_weight_map_cache[target.elements] = mapping
+        return mapping
+
+    def _evaluate_parameter_stoichiometry(
+        self,
+        params_full: np.ndarray,
+        target: StoichiometryTarget | None,
+    ) -> StoichiometryEvaluation | None:
+        if target is None:
+            return None
+        parameter_indices, _count_rows, structures = (
+            self._stoichiometry_weight_mapping(target)
+        )
+        if parameter_indices.size == 0 or not structures:
+            return None
+        full_values = np.asarray(params_full, dtype=float)
+        weights = np.maximum(full_values[parameter_indices], 0.0)
+        return evaluate_weighted_stoichiometry(
+            zip(structures, weights.tolist(), strict=False),
+            target,
+        )
+
+    def _stoichiometry_filter_mask(
+        self,
+        target: StoichiometryTarget,
+        *,
+        tolerance_percent: float,
+    ) -> np.ndarray:
+        key = (
+            tuple(target.elements),
+            tuple(target.ratio),
+            round(float(tolerance_percent), 6),
+        )
+        cached = self._stoichiometry_mask_cache.get(key)
+        if cached is not None:
+            return cached
+
+        parameter_indices, count_matrix, _structures = (
+            self._stoichiometry_weight_mapping(target)
+        )
+        if parameter_indices.size == 0 or count_matrix.size == 0:
+            mask = np.zeros_like(self.log_ps, dtype=bool)
+            self._stoichiometry_mask_cache[key] = mask
+            return mask
+
+        expanded_samples = self._expanded_flat_samples()
+        weights = np.maximum(expanded_samples[:, parameter_indices], 0.0)
+        totals = np.asarray(weights @ count_matrix, dtype=float)
+        if totals.ndim == 1:
+            totals = totals.reshape(-1, 1)
+        reference = np.asarray(totals[:, 0], dtype=float)
+        valid = np.isfinite(reference) & (reference > 0.0)
+        if totals.shape[1] <= 1:
+            mask = valid.reshape(self.log_ps.shape)
+            self._stoichiometry_mask_cache[key] = mask
+            return mask
+
+        normalized = np.zeros_like(totals, dtype=float)
+        normalized[valid] = totals[valid] / reference[valid, np.newaxis]
+        target_ratio = np.asarray(target.normalized_ratio, dtype=float)
+        deviations = np.abs(normalized[:, 1:] - target_ratio[1:])
+        deviations = deviations / target_ratio[1:] * 100.0
+        max_deviation = np.max(deviations, axis=1)
+        valid &= max_deviation <= float(max(tolerance_percent, 0.0))
+        mask = valid.reshape(self.log_ps.shape)
+        self._stoichiometry_mask_cache[key] = mask
+        return mask
 
     @staticmethod
     def _normalize_interval_bounds(

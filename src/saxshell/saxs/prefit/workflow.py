@@ -4,6 +4,7 @@ import json
 import re
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from itertools import product
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +33,9 @@ from saxshell.saxs.project_manager import (
     ProjectSettings,
     SAXSProjectManager,
     build_project_paths,
+    distribution_id_for_settings,
     load_built_component_q_range,
+    project_artifact_paths,
 )
 
 
@@ -75,6 +78,13 @@ SOLVENT_WEIGHT_PARAMETER_NAMES = (
 PREFIT_MODEL_POSITIVE_FLOOR_RELATIVE = 1e-9
 PREFIT_MODEL_NEGATIVE_PENALTY_MULTIPLIER = 25.0
 PREFIT_MODEL_NONFINITE_PENALTY_MULTIPLIER = 100.0
+PREFIT_GRID_SWEEP_PARAMETER_LIMIT = 3
+PREFIT_GRID_SWEEP_LEVEL_POINTS: dict[int, tuple[int, ...]] = {
+    1: (9, 7, 7),
+    2: (5, 5, 5),
+    3: (4, 4, 4),
+}
+PREFIT_SEQUENCE_HISTORY_FILENAME = "prefit_sequence_history.json"
 
 
 def q_range_boundary_tolerance(
@@ -388,6 +398,20 @@ def validate_prefit_parameter_identifiability(
         )
 
 
+def _prefit_grid_searchable_entries(
+    entries: list[PrefitParameterEntry],
+) -> list[PrefitParameterEntry]:
+    return [
+        entry
+        for entry in entries
+        if bool(entry.vary)
+        and _parameter_value_expression(entry) is None
+        and np.isfinite(float(entry.minimum))
+        and np.isfinite(float(entry.maximum))
+        and float(entry.maximum) > float(entry.minimum)
+    ]
+
+
 @dataclass(slots=True)
 class PrefitEvaluation:
     q_values: np.ndarray
@@ -413,6 +437,8 @@ class PrefitFitResult:
     chi_square: float
     reduced_chi_square: float
     r_squared: float
+    optimization_strategy: str
+    grid_evaluations: int = 0
     report_path: Path | None = None
 
 
@@ -428,6 +454,19 @@ class PrefitScaleRecommendation:
     recommended_offset: float | None = None
     recommended_offset_minimum: float | None = None
     recommended_offset_maximum: float | None = None
+
+
+@dataclass(slots=True)
+class PrefitGridSweepResult:
+    parameter_names: tuple[str, ...]
+    best_values: dict[str, float]
+    evaluations: int
+    best_score: float
+    levels: int
+
+    @property
+    def strategy_label(self) -> str:
+        return f"coarse-to-fine grid ({len(self.parameter_names)}D)"
 
 
 @dataclass(slots=True)
@@ -468,14 +507,15 @@ class SAXSPrefitWorkflow:
             self.template_spec.name,
             self.template_dir,
         )
-        self.component_map_path = self.paths.project_dir / "md_saxs_map.json"
-        self.prior_weights_path = (
-            self.paths.project_dir / "md_prior_weights.json"
-        )
+        self.artifact_paths = project_artifact_paths(self.settings)
+        self.component_map_path = self.artifact_paths.component_map_file
+        self.prior_weights_path = self.artifact_paths.prior_weights_file
+        self.component_dir = self.artifact_paths.component_dir
+        self.prefit_dir = self.artifact_paths.prefit_dir
         self.solvent_data = self._load_solvent_trace()
         self.components = self._load_components()
         self.cluster_geometry_metadata_path = (
-            self.paths.cluster_geometry_metadata_file
+            self._cluster_geometry_metadata_path_for_settings(self.settings)
         )
         self.cluster_geometry_table = self._load_cluster_geometry_table()
         self._template_default_entries = (
@@ -528,21 +568,29 @@ class SAXSPrefitWorkflow:
             )
         self.settings = incoming_settings
         self.paths = build_project_paths(self.settings.project_dir)
-        self.component_map_path = self.paths.project_dir / "md_saxs_map.json"
-        self.prior_weights_path = (
-            self.paths.project_dir / "md_prior_weights.json"
-        )
-        self.cluster_geometry_metadata_path = (
-            self.paths.cluster_geometry_metadata_file
-        )
+        self.artifact_paths = project_artifact_paths(self.settings)
+        self.component_map_path = self.artifact_paths.component_map_file
+        self.prior_weights_path = self.artifact_paths.prior_weights_file
+        self.component_dir = self.artifact_paths.component_dir
+        self.prefit_dir = self.artifact_paths.prefit_dir
         self.experimental_data = self._load_experimental_trace()
         self.solvent_data = self._load_solvent_trace()
+        self.components = self._load_components()
+        self.cluster_geometry_metadata_path = (
+            self._cluster_geometry_metadata_path_for_settings(self.settings)
+        )
+        self.cluster_geometry_table = self._load_cluster_geometry_table()
+        self._template_default_entries = (
+            self._build_default_parameter_entries()
+        )
+        self._ensure_project_parameter_presets()
+        self.parameter_entries = self.load_parameter_entries()
 
     def load_parameter_entries(self) -> list[PrefitParameterEntry]:
         best_entries = self.load_best_prefit_entries()
         if best_entries is not None:
             return self._apply_parameter_constraints(best_entries)
-        state_path = self.paths.prefit_dir / "prefit_state.json"
+        state_path = self.prefit_dir / "prefit_state.json"
         if state_path.is_file():
             payload = json.loads(state_path.read_text(encoding="utf-8"))
             entries = payload.get("parameter_entries", [])
@@ -629,6 +677,152 @@ class SAXSPrefitWorkflow:
             structure_factor_trace=structure_factor_trace,
         )
 
+    def grid_searchable_parameter_names(
+        self,
+        parameter_entries: list[PrefitParameterEntry] | None = None,
+    ) -> list[str]:
+        entries = resolve_prefit_parameter_entries(
+            parameter_entries or self.parameter_entries
+        )
+        return [
+            str(entry.name)
+            for entry in _prefit_grid_searchable_entries(entries)
+        ]
+
+    def optimization_strategy_preview(
+        self,
+        parameter_entries: list[PrefitParameterEntry] | None = None,
+        *,
+        method: str = "leastsq",
+    ) -> str:
+        varying_names = self.grid_searchable_parameter_names(parameter_entries)
+        varying_count = len(varying_names)
+        if 1 <= varying_count <= PREFIT_GRID_SWEEP_PARAMETER_LIMIT:
+            return f"coarse-to-fine grid ({varying_count}D) + lmfit {method}"
+        return f"lmfit {method}"
+
+    def _coarse_to_fine_grid_sweep(
+        self,
+        lmfit_params: Parameters,
+        objective,
+        entries: list[PrefitParameterEntry],
+    ) -> PrefitGridSweepResult | None:
+        varying_entries = _prefit_grid_searchable_entries(entries)
+        varying_count = len(varying_entries)
+        if not (1 <= varying_count <= PREFIT_GRID_SWEEP_PARAMETER_LIMIT):
+            return None
+
+        parameter_names = tuple(entry.name for entry in varying_entries)
+        base_ranges = {
+            entry.name: (float(entry.minimum), float(entry.maximum))
+            for entry in varying_entries
+        }
+        active_ranges = dict(base_ranges)
+        best_values = {
+            name: float(lmfit_params[name].value) for name in parameter_names
+        }
+        best_score = float("inf")
+        total_evaluations = 0
+        point_counts = PREFIT_GRID_SWEEP_LEVEL_POINTS[varying_count]
+
+        for point_count in point_counts:
+            axes: dict[str, np.ndarray] = {}
+            for name in parameter_names:
+                lower, upper = active_ranges[name]
+                if np.isclose(lower, upper):
+                    axes[name] = np.asarray([lower], dtype=float)
+                else:
+                    axes[name] = np.linspace(
+                        lower,
+                        upper,
+                        point_count,
+                        dtype=float,
+                    )
+
+            for coordinate in product(
+                *(axes[name] for name in parameter_names)
+            ):
+                trial_params = lmfit_params.copy()
+                for name, value in zip(
+                    parameter_names, coordinate, strict=False
+                ):
+                    trial_params[name].set(value=float(value))
+                residuals = np.asarray(objective(trial_params), dtype=float)
+                score = float(np.sum(residuals**2))
+                total_evaluations += 1
+                if score < best_score:
+                    best_score = score
+                    best_values = {
+                        name: float(value)
+                        for name, value in zip(
+                            parameter_names,
+                            coordinate,
+                            strict=False,
+                        )
+                    }
+
+            next_ranges: dict[str, tuple[float, float]] = {}
+            for name in parameter_names:
+                axis_values = axes[name]
+                base_lower, base_upper = base_ranges[name]
+                if len(axis_values) <= 1:
+                    next_ranges[name] = (base_lower, base_upper)
+                    continue
+                best_index = int(
+                    np.argmin(np.abs(axis_values - float(best_values[name])))
+                )
+                if best_index <= 0:
+                    lower = float(axis_values[0])
+                    upper = float(axis_values[min(2, len(axis_values) - 1)])
+                elif best_index >= len(axis_values) - 1:
+                    lower = float(axis_values[max(len(axis_values) - 3, 0)])
+                    upper = float(axis_values[-1])
+                else:
+                    lower = float(axis_values[best_index - 1])
+                    upper = float(axis_values[best_index + 1])
+                next_ranges[name] = (
+                    max(base_lower, lower),
+                    min(base_upper, upper),
+                )
+            active_ranges = next_ranges
+
+        return PrefitGridSweepResult(
+            parameter_names=parameter_names,
+            best_values=best_values,
+            evaluations=total_evaluations,
+            best_score=best_score,
+            levels=len(point_counts),
+        )
+
+    def _cluster_geometry_metadata_path_for_settings(
+        self,
+        settings: ProjectSettings,
+    ) -> Path:
+        artifact_paths = project_artifact_paths(settings)
+        if settings.use_predicted_structure_weights:
+            return artifact_paths.predicted_cluster_geometry_metadata_file
+        return artifact_paths.cluster_geometry_metadata_file
+
+    def _predicted_structure_cluster_bins_for_active_components(
+        self,
+    ) -> list:
+        if not self.settings.use_predicted_structure_weights:
+            return []
+        predicted_components = {
+            (
+                str(component.structure).strip(),
+                str(component.motif).strip() or "no_motif",
+            )
+            for component in self.components
+            if str(component.motif).strip().startswith("predicted_rank")
+        }
+        if not predicted_components:
+            return []
+        return self.project_manager.predicted_structure_cluster_bins(
+            self.paths.project_dir,
+            included_components=predicted_components,
+        )
+
     def run_fit(
         self,
         parameter_entries: list[PrefitParameterEntry] | None = None,
@@ -665,6 +859,8 @@ class SAXSPrefitWorkflow:
         )
         lmfit_model = self._lmfit_model_function()
         extra_inputs = self._lmfit_extra_inputs()
+        grid_sweep_result: PrefitGridSweepResult | None = None
+        optimization_strategy = f"lmfit {method}"
 
         def objective(active_params: Parameters) -> np.ndarray:
             params = active_params.valuesdict()
@@ -678,6 +874,18 @@ class SAXSPrefitWorkflow:
             return constrained_prefit_residuals(
                 experimental,
                 np.asarray(model, dtype=float),
+            )
+
+        grid_sweep_result = self._coarse_to_fine_grid_sweep(
+            lmfit_params,
+            objective,
+            entries,
+        )
+        if grid_sweep_result is not None:
+            for name, value in grid_sweep_result.best_values.items():
+                lmfit_params[name].set(value=float(value))
+            optimization_strategy = (
+                f"{grid_sweep_result.strategy_label} + lmfit {method}"
             )
 
         result = minimize(
@@ -724,15 +932,33 @@ class SAXSPrefitWorkflow:
         r_squared = (
             1.0 - chi_square / ss_total if ss_total > 0.0 else float("nan")
         )
+        report_text = fit_report(result)
+        if grid_sweep_result is not None:
+            report_text = (
+                "Coarse-to-fine grid sweep:\n"
+                f"  varying parameters: {', '.join(grid_sweep_result.parameter_names)}\n"
+                f"  levels: {grid_sweep_result.levels}\n"
+                f"  evaluations: {grid_sweep_result.evaluations}\n"
+                f"  best grid chi^2 proxy: {grid_sweep_result.best_score:.6g}\n"
+                "\n"
+                "LMFit report:\n"
+                f"{report_text}"
+            )
         fit_result = PrefitFitResult(
             parameter_entries=entries,
             evaluation=evaluation,
-            fit_report=fit_report(result),
+            fit_report=report_text,
             method=method,
             nfev=int(getattr(result, "nfev", 0) or 0),
             chi_square=chi_square,
             reduced_chi_square=reduced_chi_square,
             r_squared=r_squared,
+            optimization_strategy=optimization_strategy,
+            grid_evaluations=(
+                0
+                if grid_sweep_result is None
+                else int(grid_sweep_result.evaluations)
+            ),
         )
         self.parameter_entries = entries
         if self.settings.autosave_prefits:
@@ -760,8 +986,8 @@ class SAXSPrefitWorkflow:
         entries = parameter_entries or self.parameter_entries
         evaluation = evaluation or self.evaluate(entries)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.paths.prefit_dir.mkdir(parents=True, exist_ok=True)
-        snapshot_dir = self.paths.prefit_dir / f"prefit_{timestamp}"
+        self.prefit_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_dir = self.prefit_dir / f"prefit_{timestamp}"
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         template_runtime_inputs = self.template_runtime_inputs_payload()
         cluster_geometry_payload = (
@@ -777,6 +1003,16 @@ class SAXSPrefitWorkflow:
             "run_settings": {
                 "method": method,
                 "max_nfev": max_nfev,
+                "optimization_strategy": (
+                    None
+                    if fit_result is None
+                    else fit_result.optimization_strategy
+                ),
+                "grid_evaluations": (
+                    None
+                    if fit_result is None
+                    else int(fit_result.grid_evaluations)
+                ),
                 "autosave_prefits": (
                     self.settings.autosave_prefits
                     if autosave_prefits is None
@@ -797,7 +1033,7 @@ class SAXSPrefitWorkflow:
             "template_runtime_inputs": template_runtime_inputs,
             "cluster_geometry_metadata": cluster_geometry_payload,
         }
-        state_path = self.paths.prefit_dir / "prefit_state.json"
+        state_path = self.prefit_dir / "prefit_state.json"
         state_path.write_text(
             json.dumps(state_payload, indent=2) + "\n",
             encoding="utf-8",
@@ -856,7 +1092,7 @@ class SAXSPrefitWorkflow:
             "template_runtime_inputs": template_runtime_inputs,
             "cluster_geometry_metadata": cluster_geometry_payload,
         }
-        prefit_json_path = self.paths.prefit_dir / "pd_prefit_params.json"
+        prefit_json_path = self.prefit_dir / "pd_prefit_params.json"
         prefit_json_path.write_text(
             json.dumps(pd_prefit_payload, indent=2) + "\n",
             encoding="utf-8",
@@ -872,7 +1108,7 @@ class SAXSPrefitWorkflow:
                 self.cluster_geometry_table,
             )
 
-        curve_path = self.paths.prefit_dir / "latest_prefit_curve.txt"
+        curve_path = self.prefit_dir / "latest_prefit_curve.txt"
         if (
             evaluation.experimental_intensities is not None
             and evaluation.residuals is not None
@@ -913,6 +1149,13 @@ class SAXSPrefitWorkflow:
             self._build_report_text(entries, fit_result, evaluation),
             encoding="utf-8",
         )
+        history_path = self.sequence_history_path()
+        if history_path.is_file():
+            snapshot_history_path = snapshot_dir / history_path.name
+            snapshot_history_path.write_text(
+                history_path.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
         self.project_manager.save_project(self.settings)
         return report_path
 
@@ -939,6 +1182,99 @@ class SAXSPrefitWorkflow:
     def set_autosave(self, enabled: bool) -> None:
         self.settings.autosave_prefits = bool(enabled)
         self.project_manager.save_project(self.settings)
+
+    def set_sequence_history_enabled(self, enabled: bool) -> None:
+        self.settings.prefit_sequence_history_enabled = bool(enabled)
+        self.project_manager.save_project(self.settings)
+
+    def sequence_history_path(self) -> Path:
+        return self.prefit_dir / PREFIT_SEQUENCE_HISTORY_FILENAME
+
+    def append_sequence_history_event(
+        self,
+        event_type: str,
+        summary: str,
+        *,
+        details: dict[str, object] | None = None,
+        parameter_entries: list[PrefitParameterEntry] | None = None,
+        force: bool = False,
+    ) -> Path | None:
+        if not force and not self.settings.prefit_sequence_history_enabled:
+            return None
+        history_path = self.sequence_history_path()
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self._load_prefit_sequence_history_payload(history_path)
+        events = payload.setdefault("events", [])
+        if not isinstance(events, list):
+            events = []
+            payload["events"] = events
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        event_payload: dict[str, object] = {
+            "index": len(events) + 1,
+            "timestamp": timestamp,
+            "event_type": str(event_type).strip() or "prefit_event",
+            "summary": str(summary).strip() or "Prefit history event",
+        }
+        if details:
+            event_payload["details"] = dict(details)
+        if parameter_entries is not None:
+            event_payload["parameter_entries"] = [
+                entry.to_dict() for entry in parameter_entries
+            ]
+        events.append(event_payload)
+        payload["updated_at"] = timestamp
+        payload["template_name"] = self.template_spec.name
+        payload["distribution_id"] = distribution_id_for_settings(
+            self.settings
+        )
+        payload["sequence_logger_enabled"] = bool(
+            self.settings.prefit_sequence_history_enabled
+        )
+        history_path.write_text(
+            json.dumps(payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return history_path
+
+    def _load_prefit_sequence_history_payload(
+        self,
+        path: Path,
+    ) -> dict[str, object]:
+        if path.is_file():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                payload = self._new_prefit_sequence_history_payload()
+            else:
+                if not isinstance(payload, dict):
+                    payload = self._new_prefit_sequence_history_payload()
+        else:
+            payload = self._new_prefit_sequence_history_payload()
+        payload.setdefault("events", [])
+        payload["project_dir"] = str(self.paths.project_dir)
+        payload["template_name"] = self.template_spec.name
+        payload["distribution_id"] = distribution_id_for_settings(
+            self.settings
+        )
+        payload["sequence_logger_enabled"] = bool(
+            self.settings.prefit_sequence_history_enabled
+        )
+        return payload
+
+    def _new_prefit_sequence_history_payload(self) -> dict[str, object]:
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        return {
+            "format_version": 1,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "project_dir": str(self.paths.project_dir),
+            "template_name": self.template_spec.name,
+            "distribution_id": distribution_id_for_settings(self.settings),
+            "sequence_logger_enabled": bool(
+                self.settings.prefit_sequence_history_enabled
+            ),
+            "events": [],
+        }
 
     def load_template_reset_entries(self) -> list[PrefitParameterEntry]:
         stored_entries = self._entries_from_project_payload(
@@ -978,17 +1314,17 @@ class SAXSPrefitWorkflow:
         return self.load_best_prefit_entries() is not None
 
     def list_saved_states(self) -> list[str]:
-        if not self.paths.prefit_dir.is_dir():
+        if not self.prefit_dir.is_dir():
             return []
         state_names = [
             path.name
-            for path in self.paths.prefit_dir.iterdir()
+            for path in self.prefit_dir.iterdir()
             if path.is_dir() and (path / "prefit_state.json").is_file()
         ]
         return sorted(state_names, reverse=True)
 
     def load_saved_state(self, state_name: str) -> PrefitSavedState:
-        state_dir = self.paths.prefit_dir / state_name
+        state_dir = self.prefit_dir / state_name
         state_path = state_dir / "prefit_state.json"
         if not state_path.is_file():
             raise FileNotFoundError(
@@ -1400,6 +1736,9 @@ class SAXSPrefitWorkflow:
             )
         table = compute_cluster_geometry_metadata(
             clusters_dir,
+            extra_cluster_bins=(
+                self._predicted_structure_cluster_bins_for_active_components()
+            ),
             template_name=self.template_spec.name,
             active_radii_type=self.cluster_geometry_active_radii_type(),
             active_ionic_radius_type=(
@@ -1829,11 +2168,51 @@ class SAXSPrefitWorkflow:
 
     def _load_components(self) -> list[PrefitComponent]:
         if not self.component_map_path.is_file():
+            if self.settings.use_predicted_structure_weights:
+                predicted_state = (
+                    self.project_manager.inspect_predicted_structures(
+                        self.paths.project_dir
+                    )
+                )
+                if predicted_state.dataset_file is None:
+                    raise FileNotFoundError(
+                        "Predicted Structures mode is enabled, but no "
+                        "Cluster Dynamics ML prediction bundle was found in "
+                        "this project. Open Tools > Cluster Dynamics > Open "
+                        "Cluster Dynamics (ML), run a prediction, then "
+                        "rebuild the SAXS components."
+                    )
+                raise FileNotFoundError(
+                    "Predicted Structures mode is enabled, but the "
+                    "predicted-structure SAXS components have not been built "
+                    "for this project. Rebuild SAXS components in Project "
+                    "Setup with Use Predicted Structure Weights enabled."
+                )
             raise FileNotFoundError(
                 "No md_saxs_map.json file was found. Build the project "
                 "components from the Project Setup tab first."
             )
         if not self.prior_weights_path.is_file():
+            if self.settings.use_predicted_structure_weights:
+                predicted_state = (
+                    self.project_manager.inspect_predicted_structures(
+                        self.paths.project_dir
+                    )
+                )
+                if predicted_state.dataset_file is None:
+                    raise FileNotFoundError(
+                        "Predicted Structures mode is enabled, but no "
+                        "Cluster Dynamics ML prediction bundle was found in "
+                        "this project. Open Tools > Cluster Dynamics > Open "
+                        "Cluster Dynamics (ML), run a prediction, then "
+                        "generate the prior weights."
+                    )
+                raise FileNotFoundError(
+                    "Predicted Structures mode is enabled, but the "
+                    "predicted-structure prior weights have not been "
+                    "generated for this project. Generate Prior Weights in "
+                    "Project Setup with Use Predicted Structure Weights enabled."
+                )
             raise FileNotFoundError(
                 "No md_prior_weights.json file was found. Build the project "
                 "components from the Project Setup tab first."
@@ -1852,9 +2231,7 @@ class SAXSPrefitWorkflow:
             motif_map = saxs_map[structure]
             for motif in sorted(motif_map, key=_natural_sort_key):
                 profile_file = str(motif_map[motif])
-                profile_path = (
-                    self.paths.scattering_components_dir / profile_file
-                )
+                profile_path = self.component_dir / profile_file
                 raw_data = np.loadtxt(profile_path, comments="#")
                 q_values = np.asarray(raw_data[:, 0], dtype=float)
                 intensities = np.asarray(raw_data[:, 1], dtype=float)
@@ -1866,7 +2243,12 @@ class SAXSPrefitWorkflow:
                         weight_value=float(
                             structures.get(structure, {})
                             .get(motif, {})
-                            .get("weight", 0.0)
+                            .get(
+                                "normalized_weight",
+                                structures.get(structure, {})
+                                .get(motif, {})
+                                .get("weight", 0.0),
+                            )
                         ),
                         profile_file=profile_file,
                         q_values=q_values,
@@ -1916,7 +2298,13 @@ class SAXSPrefitWorkflow:
         return self._component_q_values_from_candidates(self.components)
 
     def _supported_component_q_range(self) -> tuple[float, float]:
-        supported = load_built_component_q_range(self.paths.project_dir)
+        supported = load_built_component_q_range(
+            self.paths.project_dir,
+            include_predicted_structures=(
+                self.settings.use_predicted_structure_weights
+            ),
+            component_dir=self.component_dir,
+        )
         if supported is None:
             components = getattr(self, "components", [])
             if self.experimental_data is not None:
@@ -2002,9 +2390,7 @@ class SAXSPrefitWorkflow:
         if candidates:
             source_q_values = np.asarray(candidates[0].q_values, dtype=float)
         else:
-            component_files = sorted(
-                self.paths.scattering_components_dir.glob("*.txt")
-            )
+            component_files = sorted(self.component_dir.glob("*.txt"))
             if not component_files:
                 if self.experimental_data is not None:
                     source_q_values = np.asarray(
@@ -2430,6 +2816,8 @@ class SAXSPrefitWorkflow:
             lines.extend(
                 [
                     f"  method: {fit_result.method}",
+                    f"  optimization_strategy: {fit_result.optimization_strategy}",
+                    f"  grid_evaluations: {fit_result.grid_evaluations}",
                     f"  nfev: {fit_result.nfev}",
                     f"  chi_square: {fit_result.chi_square:.6g}",
                     "  reduced_chi_square: "

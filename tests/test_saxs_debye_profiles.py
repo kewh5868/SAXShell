@@ -8,10 +8,13 @@ import pytest
 import saxshell.saxs.debye.profiles as profiles
 from saxshell.saxs.debye import (
     DebyeProfileBuilder,
+    b_factor_from_sigma,
     compute_debye_intensity,
+    compute_debye_intensity_with_debye_waller,
     discover_available_elements,
     load_structure_file,
     scan_structure_elements,
+    sigma_from_b_factor,
 )
 
 
@@ -108,6 +111,94 @@ def test_compute_debye_intensity_uses_legacy_f0_and_exclusion_logic(
         exclude_elements=["O"],
     )
     np.testing.assert_allclose(excluded, f_h**2)
+
+
+def test_compute_debye_intensity_with_debye_waller_damps_pair_terms(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(profiles, "xraydb", FakeXrayDB())
+
+    q_values = np.asarray([0.1, 0.3], dtype=float)
+    coordinates = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=float)
+    elements = ["H", "O"]
+    sigma = 0.25
+
+    sin_theta_over_lambda = q_values / (4.0 * np.pi)
+    f_h = 1.0 + sin_theta_over_lambda
+    f_o = 8.0 + sin_theta_over_lambda
+    damping = np.exp(-0.5 * sigma**2 * q_values**2)
+    expected = (
+        f_h**2 + f_o**2 + 2.0 * np.sinc(q_values / np.pi) * damping * f_h * f_o
+    )
+
+    sigma_result = compute_debye_intensity_with_debye_waller(
+        coordinates,
+        elements,
+        q_values,
+        pair_sigma_by_element={("O", "H"): sigma},
+    )
+    b_result = compute_debye_intensity_with_debye_waller(
+        coordinates,
+        elements,
+        q_values,
+        pair_b_by_element={("H", "O"): b_factor_from_sigma(sigma)},
+    )
+
+    assert sigma_from_b_factor(b_factor_from_sigma(sigma)) == pytest.approx(
+        sigma
+    )
+    np.testing.assert_allclose(sigma_result, expected)
+    np.testing.assert_allclose(b_result, expected)
+    assert np.all(
+        sigma_result < compute_debye_intensity(coordinates, elements, q_values)
+    )
+
+
+def test_compute_debye_intensity_with_debye_waller_only_damps_selected_local_pairs(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(profiles, "xraydb", FakeXrayDB())
+
+    q_values = np.asarray([0.1, 0.3], dtype=float)
+    coordinates = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    elements = ["H", "O", "O"]
+    sigma = 0.25
+
+    sin_theta_over_lambda = q_values / (4.0 * np.pi)
+    f_h = 1.0 + sin_theta_over_lambda
+    f_o = 8.0 + sin_theta_over_lambda
+    local_damping = np.exp(-0.5 * sigma**2 * q_values**2)
+    expected = (
+        f_h**2
+        + 2.0 * f_o**2
+        + 2.0 * np.sinc(q_values / np.pi) * local_damping * f_h * f_o
+        + 2.0 * np.sinc((3.0 * q_values) / np.pi) * f_h * f_o
+        + 2.0 * np.sinc((2.0 * q_values) / np.pi) * f_o * f_o
+    )
+
+    result = compute_debye_intensity_with_debye_waller(
+        coordinates,
+        elements,
+        q_values,
+        pair_sigma_by_element={("O", "H"): sigma},
+        included_pair_indices={(0, 1)},
+    )
+    unrestricted = compute_debye_intensity_with_debye_waller(
+        coordinates,
+        elements,
+        q_values,
+        pair_sigma_by_element={("O", "H"): sigma},
+    )
+
+    np.testing.assert_allclose(result, expected)
+    assert np.all(result > unrestricted)
 
 
 def test_discover_available_elements_collects_unique_cluster_elements(

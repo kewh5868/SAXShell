@@ -28,6 +28,7 @@ from .workflow import (
     ClusterDynamicsMLSAXSComparison,
     ClusterDynamicsMLTrainingObservation,
     ClusterStructureObservation,
+    DebyeWallerPairEstimate,
     PredictedClusterCandidate,
     SAXSComponentWeight,
     _resolved_population_weights,
@@ -77,6 +78,10 @@ def save_cluster_dynamicsai_dataset(
         "predictions": [
             _serialize_prediction_candidate(entry)
             for entry in result.predictions
+        ],
+        "debye_waller_estimates": [
+            _serialize_debye_waller_pair_estimate(entry)
+            for entry in result.debye_waller_estimates
         ],
         "saxs_comparison": _serialize_saxs_comparison(result.saxs_comparison),
         "max_observed_node_count": int(result.max_observed_node_count),
@@ -157,6 +162,11 @@ def load_cluster_dynamicsai_dataset(
         predictions=tuple(
             _deserialize_prediction_candidate(entry)
             for entry in payload.get("predictions", [])
+            if isinstance(entry, dict)
+        ),
+        debye_waller_estimates=tuple(
+            _deserialize_debye_waller_pair_estimate(entry)
+            for entry in payload.get("debye_waller_estimates", [])
             if isinstance(entry, dict)
         ),
         saxs_comparison=_deserialize_saxs_comparison(
@@ -567,6 +577,44 @@ def _deserialize_prediction_candidate(
     )
 
 
+def _serialize_debye_waller_pair_estimate(
+    estimate: DebyeWallerPairEstimate,
+) -> dict[str, object]:
+    return {
+        "source": estimate.source,
+        "method": estimate.method,
+        "label": estimate.label,
+        "node_count": int(estimate.node_count),
+        "candidate_rank": _optional_int(estimate.candidate_rank),
+        "element_a": estimate.element_a,
+        "element_b": estimate.element_b,
+        "sigma": float(estimate.sigma),
+        "b_factor": float(estimate.b_factor),
+        "support_count": int(estimate.support_count),
+        "aligned_pair_count": int(estimate.aligned_pair_count),
+        "source_label": estimate.source_label,
+    }
+
+
+def _deserialize_debye_waller_pair_estimate(
+    payload: dict[str, object],
+) -> DebyeWallerPairEstimate:
+    return DebyeWallerPairEstimate(
+        source=str(payload.get("source", "")),
+        method=str(payload.get("method", "")),
+        label=str(payload.get("label", "")),
+        node_count=int(payload.get("node_count", 0)),
+        candidate_rank=_optional_int(payload.get("candidate_rank")),
+        element_a=str(payload.get("element_a", "")),
+        element_b=str(payload.get("element_b", "")),
+        sigma=float(payload.get("sigma", 0.0)),
+        b_factor=float(payload.get("b_factor", 0.0)),
+        support_count=int(payload.get("support_count", 0)),
+        aligned_pair_count=int(payload.get("aligned_pair_count", 0)),
+        source_label=_optional_str(payload.get("source_label")),
+    )
+
+
 def _serialize_saxs_comparison(
     comparison: ClusterDynamicsMLSAXSComparison | None,
 ) -> dict[str, object] | None:
@@ -628,10 +676,10 @@ def _serialize_saxs_comparison(
             if comparison.component_output_dir is None
             else str(comparison.component_output_dir)
         ),
-        "surrogate_structure_dir": (
+        "predicted_structure_dir": (
             None
-            if comparison.surrogate_structure_dir is None
-            else str(comparison.surrogate_structure_dir)
+            if comparison.predicted_structure_dir is None
+            else str(comparison.predicted_structure_dir)
         ),
     }
 
@@ -699,8 +747,17 @@ def _deserialize_saxs_comparison(
         component_output_dir=_optional_path(
             payload.get("component_output_dir")
         ),
-        surrogate_structure_dir=_optional_path(
-            payload.get("surrogate_structure_dir")
+        predicted_structure_dir=_optional_path(
+            payload.get("predicted_structure_dir")
+            or next(
+                (
+                    value
+                    for key, value in payload.items()
+                    if key != "component_output_dir"
+                    and key.endswith("structure_dir")
+                ),
+                None,
+            )
         ),
     )
 
@@ -958,7 +1015,7 @@ def _write_histogram_csvs(
         ),
         (
             dataset_file.with_name(
-                f"{dataset_file.stem}_observed_plus_surrogate_histogram.csv"
+                f"{dataset_file.stem}_observed_plus_predicted_structures_histogram.csv"
             ),
             True,
         ),

@@ -8,6 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -451,7 +452,19 @@ class ClusterDynamicsRunPanel(QGroupBox):
         self.analyze_button.clicked.connect(
             lambda _checked=False: self.analyze_requested.emit()
         )
-        layout.addWidget(self.analyze_button)
+        analyze_row = QHBoxLayout()
+        analyze_row.setContentsMargins(0, 0, 0, 0)
+        analyze_row.setSpacing(8)
+        analyze_row.addWidget(self.analyze_button)
+        self.auto_report_checkbox = QCheckBox("Detailed report")
+        self.auto_report_checkbox.setChecked(False)
+        self.auto_report_checkbox.setVisible(False)
+        self.auto_report_checkbox.toggled.connect(
+            lambda _checked: self.settings_changed.emit()
+        )
+        analyze_row.addWidget(self.auto_report_checkbox)
+        analyze_row.addStretch(1)
+        layout.addLayout(analyze_row)
 
         self.progress_label = QLabel("Progress: idle")
         layout.addWidget(self.progress_label)
@@ -493,6 +506,45 @@ class ClusterDynamicsRunPanel(QGroupBox):
     def energy_file(self) -> Path | None:
         text = self.energy_path_edit.text().strip()
         return Path(text) if text else None
+
+    def configure_auto_report_option(
+        self,
+        *,
+        visible: bool,
+        text: str | None = None,
+        tooltip: str | None = None,
+        checked: bool | None = None,
+        emit_signal: bool = True,
+    ) -> None:
+        self.auto_report_checkbox.blockSignals(True)
+        if text is not None:
+            self.auto_report_checkbox.setText(str(text))
+        if tooltip is not None:
+            self.auto_report_checkbox.setToolTip(str(tooltip))
+        if checked is not None:
+            self.auto_report_checkbox.setChecked(bool(checked))
+        self.auto_report_checkbox.setVisible(bool(visible))
+        self.auto_report_checkbox.blockSignals(False)
+        if emit_signal:
+            self.settings_changed.emit()
+
+    def auto_report_enabled(self) -> bool:
+        return bool(
+            not self.auto_report_checkbox.isHidden()
+            and self.auto_report_checkbox.isChecked()
+        )
+
+    def set_auto_report_enabled(
+        self,
+        enabled: bool,
+        *,
+        emit_signal: bool = True,
+    ) -> None:
+        self.auto_report_checkbox.blockSignals(True)
+        self.auto_report_checkbox.setChecked(bool(enabled))
+        self.auto_report_checkbox.blockSignals(False)
+        if emit_signal:
+            self.settings_changed.emit()
 
     def set_selection_summary(self, text: str) -> None:
         self.selection_box.setPlainText(text)

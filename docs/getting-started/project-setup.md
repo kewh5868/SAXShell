@@ -18,7 +18,8 @@ application. This is where you typically:
 
 ## Typical setup order
 
-1. Open the SAXS application with `saxs ui`.
+1. Open the SAXS application with `saxshell saxs ui` or
+   `PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs ui`.
 2. Create a new project or load an existing project directory.
 3. Select the experimental dataset.
 4. Select the cluster folder you want to model.

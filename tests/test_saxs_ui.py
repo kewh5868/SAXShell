@@ -15,6 +15,7 @@ from matplotlib import colormaps
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.colors import to_hex
+from matplotlib.figure import Figure
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QTextOption
 from PySide6.QtTest import QTest
@@ -35,11 +36,16 @@ from PySide6.QtWidgets import (
 from scipy import stats
 
 import saxshell.saxs.project_manager.project as project_module
+from saxshell.clusterdynamicsml.workflow import (
+    ClusterDynamicsMLTrainingObservation,
+    PredictedClusterCandidate,
+)
 from saxshell.saxs._model_templates import (
     list_template_specs,
     load_template_module,
     load_template_spec,
 )
+from saxshell.saxs.debye.profiles import AveragedComponent, ClusterBin
 from saxshell.saxs.dream import (
     DreamParameterEntry,
     DreamRunSettings,
@@ -54,21 +60,28 @@ from saxshell.saxs.prefit import (
     SAXSPrefitWorkflow,
     compute_cluster_geometry_metadata,
 )
+from saxshell.saxs.prefit.workflow import PrefitFitResult
 from saxshell.saxs.project_manager import (
     ClusterImportResult,
     ExperimentalDataSummary,
     PowerPointExportSettings,
     ProjectSettings,
     SAXSProjectManager,
+    build_prior_histogram_export_payload,
     build_project_paths,
     load_experimental_data_file,
+    plot_md_prior_histogram,
+    project_artifact_paths,
 )
 from saxshell.saxs.solution_scattering_estimator import (
     SolutionScatteringEstimatorSettings,
     calculate_solution_scattering_estimate,
 )
 from saxshell.saxs.template_installation import install_template_candidate
-from saxshell.saxs.ui.distribution_window import DistributionSetupWindow
+from saxshell.saxs.ui.distribution_window import (
+    INTERACTIVE_PREVIEW_THROTTLE_MS,
+    DistributionSetupWindow,
+)
 from saxshell.saxs.ui.dream_tab import DreamTab
 from saxshell.saxs.ui.experimental_data_loader import (
     ExperimentalDataHeaderDialog,
@@ -187,6 +200,120 @@ def _build_minimal_saxs_project(tmp_path):
     settings.selected_model_template = template_name
     manager.save_project(settings)
     return project_dir, paths
+
+
+def _write_predicted_structure_artifacts(
+    paths,
+    *,
+    observed_weight: float = 0.75,
+    predicted_weight: float = 0.25,
+):
+    q_values = np.linspace(0.05, 0.3, 8)
+    observed = np.linspace(10.0, 17.0, 8)
+    predicted = np.linspace(4.0, 11.0, 8)
+    _write_component_file(
+        paths.predicted_scattering_components_dir / "A_no_motif.txt",
+        q_values,
+        observed,
+    )
+    _write_component_file(
+        paths.predicted_scattering_components_dir / "A2_predicted_rank01.txt",
+        q_values,
+        predicted,
+    )
+    dataset_dir = (
+        paths.exported_data_dir
+        / "clusterdynamicsml"
+        / "saved_results"
+        / "20260330_120000_demo"
+    )
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    dataset_file = dataset_dir / "20260330_120000_demo_clusterdynamicsml.json"
+    dataset_file.write_text(
+        json.dumps({"predictions": [{"label": "A2", "rank": 1}]}, indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
+    (
+        paths.project_dir / "md_prior_weights_predicted_structures.json"
+    ).write_text(
+        json.dumps(
+            {
+                "origin": "clusters_predicted_structures",
+                "total_files": 1,
+                "available_elements": ["A"],
+                "value_kind": "normalized_weight",
+                "includes_predicted_structures": True,
+                "prediction_dataset_file": str(dataset_file),
+                "structures": {
+                    "A": {
+                        "no_motif": {
+                            "count": 1,
+                            "weight": observed_weight,
+                            "normalized_weight": observed_weight,
+                            "observed_only_weight": 1.0,
+                            "representative": "frame_0001.xyz",
+                            "profile_file": "A_no_motif.txt",
+                            "source_kind": "cluster_dir",
+                        }
+                    },
+                    "A2": {
+                        "predicted_rank01": {
+                            "count": 1,
+                            "weight": predicted_weight,
+                            "normalized_weight": predicted_weight,
+                            "observed_only_weight": 0.0,
+                            "representative": "02_rank01_A2.xyz",
+                            "profile_file": "A2_predicted_rank01.txt",
+                            "source_kind": "predicted_structure",
+                        }
+                    },
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (paths.project_dir / "md_saxs_map_predicted_structures.json").write_text(
+        json.dumps(
+            {
+                "saxs_map": {
+                    "A": {"no_motif": "A_no_motif.txt"},
+                    "A2": {"predicted_rank01": "A2_predicted_rank01.txt"},
+                }
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return dataset_file
+
+
+def _write_distribution_history_artifacts(
+    artifact_paths,
+    *,
+    state_name: str,
+    run_name: str,
+):
+    prefit_state_dir = artifact_paths.prefit_dir / state_name
+    prefit_state_dir.mkdir(parents=True, exist_ok=True)
+    (prefit_state_dir / "prefit_state.json").write_text(
+        json.dumps({"saved_at": state_name, "parameter_entries": []}, indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
+    run_dir = artifact_paths.dream_runtime_dir / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    np.save(
+        run_dir / "dream_sampled_params.npy", np.zeros((2, 2), dtype=float)
+    )
+    np.save(run_dir / "dream_log_ps.npy", np.zeros((2,), dtype=float))
+    (run_dir / "pd_settings.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
 
 
 def _build_poly_lma_geometry_project(
@@ -438,6 +565,99 @@ def _write_weight_order_dream_results(tmp_path):
     return run_dir
 
 
+def _write_stoichiometry_filter_dream_results(tmp_path):
+    run_dir = tmp_path / "dream_stoichiometry_filter_test"
+    run_dir.mkdir(parents=True)
+    metadata = {
+        "settings": {"burnin_percent": 0},
+        "template_name": "template_pd_likelihood_monosq_decoupled",
+        "parameter_map": [
+            {
+                "structure": "PbI2",
+                "motif": "m1",
+                "param_type": "Both",
+                "param": "w0",
+                "value": 1.0,
+                "vary": True,
+                "distribution": "lognorm",
+                "dist_params": {"loc": 0.0, "scale": 1.0, "s": 0.1},
+            },
+            {
+                "structure": "Pb2I5",
+                "motif": "m2",
+                "param_type": "Both",
+                "param": "w1",
+                "value": 0.0,
+                "vary": True,
+                "distribution": "lognorm",
+                "dist_params": {"loc": 0.0, "scale": 1.0, "s": 0.1},
+            },
+            {
+                "structure": "",
+                "motif": "",
+                "param_type": "SAXS",
+                "param": "scale",
+                "value": 1.0,
+                "vary": False,
+                "distribution": "norm",
+                "dist_params": {"loc": 1.0, "scale": 0.1},
+            },
+        ],
+        "active_parameter_entries": [
+            {
+                "structure": "PbI2",
+                "motif": "m1",
+                "param_type": "Both",
+                "param": "w0",
+                "value": 1.0,
+                "vary": True,
+                "distribution": "lognorm",
+                "dist_params": {"loc": 0.0, "scale": 1.0, "s": 0.1},
+            },
+            {
+                "structure": "Pb2I5",
+                "motif": "m2",
+                "param_type": "Both",
+                "param": "w1",
+                "value": 0.0,
+                "vary": True,
+                "distribution": "lognorm",
+                "dist_params": {"loc": 0.0, "scale": 1.0, "s": 0.1},
+            },
+        ],
+        "active_parameter_indices": [0, 1],
+        "full_parameter_names": ["w0", "w1", "scale"],
+        "fixed_parameter_values": [1.0, 0.0, 1.0],
+        "q_values": [0.1, 0.2],
+        "experimental_intensities": [1.0, 0.8],
+        "theoretical_intensities": [[1.0, 0.9]],
+        "solvent_intensities": [0.0, 0.0],
+    }
+    (run_dir / "dream_runtime_metadata.json").write_text(
+        json.dumps(metadata, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    np.save(
+        run_dir / "dream_sampled_params.npy",
+        np.asarray(
+            [
+                [
+                    [1.0, 0.0],
+                    [0.9, 0.1],
+                    [0.2, 0.8],
+                    [0.0, 1.0],
+                ]
+            ],
+            dtype=float,
+        ),
+    )
+    np.save(
+        run_dir / "dream_log_ps.npy",
+        np.asarray([[4.0, 3.0, 2.0, 1.0]], dtype=float),
+    )
+    return run_dir
+
+
 def _write_violin_mode_split_dream_results(tmp_path):
     run_dir = tmp_path / "dream_violin_mode_split_test"
     run_dir.mkdir(parents=True)
@@ -670,6 +890,15 @@ def _wait_for_dream_refresh(qapp, delay_ms: int = 120) -> None:
     qapp.processEvents()
     QTest.qWait(delay_ms)
     qapp.processEvents()
+
+
+def _apply_dream_filter_changes(
+    window: SAXSMainWindow,
+    qapp,
+    delay_ms: int = 120,
+) -> None:
+    window.dream_tab.apply_filter_button.click()
+    _wait_for_dream_refresh(qapp, delay_ms=delay_ms)
 
 
 def test_saxs_main_window_loads_project_prefit_and_dream_tabs(qapp, tmp_path):
@@ -2554,7 +2783,7 @@ def test_prefit_layout_uses_left_parameter_panel_and_combined_output(qapp):
     assert window.prefit_tab._pane_splitter.count() == 2
     assert (
         window.prefit_tab._pane_splitter.widget(0)
-        is window.prefit_tab._left_panel
+        is window.prefit_tab._left_scroll_area
     )
     assert (
         window.prefit_tab._pane_splitter.widget(1)
@@ -2603,7 +2832,7 @@ def test_dream_layout_uses_combined_output_and_two_plot_panels(qapp):
     assert window.dream_tab._main_splitter is window.dream_tab._top_splitter
     assert window.dream_tab._main_splitter.count() == 2
     assert window.dream_tab.verbose_checkbox.isChecked()
-    assert window.dream_tab.verbose_interval_spin.value() == pytest.approx(1.0)
+    assert window.dream_tab.verbose_interval_spin.value() == pytest.approx(5.0)
 
 
 def test_dream_progress_label_wrap_does_not_resize_left_pane(qapp):
@@ -2713,6 +2942,8 @@ def test_dream_progress_label_wrap_does_not_resize_left_pane(qapp):
         >= 0
     )
     assert window.dream_tab.violin_palette_combo.currentData() == "Blues"
+    assert not window.dream_tab.color_options_panel.isVisible()
+    assert not window.dream_tab.color_options_toggle_button.isChecked()
     assert window.dream_tab.selected_violin_point_color() == to_hex(
         "tab:red",
         keep_alpha=False,
@@ -2742,8 +2973,13 @@ def test_dream_progress_label_wrap_does_not_resize_left_pane(qapp):
     assert window.dream_tab.save_model_button.parentWidget() is not None
     assert window.dream_tab.save_violin_button.parentWidget() is not None
     assert window.dream_tab.setup_actions_group.title() == "DREAM Setup"
+    assert window.dream_tab.filter_status_group.title() == "Filter Status"
     assert window.dream_tab.analysis_actions_group.title() == (
         "DREAM Analysis"
+    )
+    assert not window.dream_tab.apply_filter_button.isEnabled()
+    assert "No DREAM dataset is loaded yet" in (
+        window.dream_tab.filter_status_box.toPlainText()
     )
 
 
@@ -3326,6 +3562,124 @@ def test_distribution_window_updates_distribution_guides_after_param_edit(
     assert float(window.table.item(0, high_column).text()) == pytest.approx(
         2.2
     )
+
+
+def test_distribution_window_manual_guide_edit_updates_norm_params(qapp):
+    del qapp
+    window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="PbI2",
+                motif="motif_A",
+                param_type="SAXS",
+                param="scale",
+                value=1.0,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 1.0, "scale": 0.2},
+            )
+        ]
+    )
+
+    low_column = _table_column_index(window.table, "Guide Low")
+    high_column = _table_column_index(window.table, "Guide High")
+
+    window.table.item(0, low_column).setText("0.1")
+    QApplication.processEvents()
+
+    entry = window.current_entries()[0]
+    assert entry.value == pytest.approx(1.0)
+    assert entry.dist_params["loc"] == pytest.approx(1.0)
+    assert entry.dist_params["scale"] == pytest.approx(0.3)
+    assert float(window.table.item(0, low_column).text()) == pytest.approx(0.1)
+    assert float(window.table.item(0, high_column).text()) == pytest.approx(
+        1.9
+    )
+
+
+def test_distribution_window_manual_guide_edit_updates_lognorm_params(qapp):
+    del qapp
+    window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="PbI2",
+                motif="motif_A",
+                param_type="Both",
+                param="w0",
+                value=0.6,
+                vary=True,
+                distribution="lognorm",
+                dist_params={"loc": 0.0, "scale": 0.6, "s": 0.1},
+            )
+        ]
+    )
+
+    high_column = _table_column_index(window.table, "Guide High")
+
+    window.table.item(0, high_column).setText("0.9")
+    QApplication.processEvents()
+
+    entry = window.current_entries()[0]
+    assert entry.value == pytest.approx(0.6)
+    assert float(window.table.item(0, high_column).text()) == pytest.approx(
+        0.9
+    )
+    assert entry.dist_params["s"] != pytest.approx(0.1)
+
+
+def test_distribution_window_interactive_drag_preview_is_throttled(
+    monkeypatch,
+    qapp,
+):
+    del qapp
+    window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="PbI2",
+                motif="motif_A",
+                param_type="SAXS",
+                param="scale",
+                value=1.0,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 1.0, "scale": 0.2},
+            )
+        ]
+    )
+
+    preview_calls: list[tuple[DreamParameterEntry, int | None, bool]] = []
+
+    def _record_plot(
+        entry: DreamParameterEntry,
+        *,
+        row: int | None = None,
+        force_rescale: bool = False,
+        interactive_preview: bool = False,
+    ) -> None:
+        del force_rescale
+        preview_calls.append((entry, row, interactive_preview))
+
+    monkeypatch.setattr(window, "_plot_entry", _record_plot)
+
+    first_preview = DreamParameterEntry.from_dict(
+        window.current_entries()[0].to_dict()
+    )
+    first_preview.dist_params["scale"] = 0.25
+    second_preview = DreamParameterEntry.from_dict(first_preview.to_dict())
+    second_preview.dist_params["scale"] = 0.35
+
+    window._schedule_interactive_drag_preview(first_preview, row=0)
+    window._schedule_interactive_drag_preview(second_preview, row=0)
+
+    assert preview_calls == []
+
+    QTest.qWait(INTERACTIVE_PREVIEW_THROTTLE_MS + 30)
+
+    assert len(preview_calls) == 1
+    entry, row, interactive_preview = preview_calls[0]
+    assert row == 0
+    assert interactive_preview is True
+    assert entry.dist_params["scale"] == pytest.approx(0.35)
 
 
 def test_distribution_window_tracks_current_row_and_rescales_plot(qapp):
@@ -3963,6 +4317,11 @@ def test_distribution_window_warns_when_effective_radius_is_set_to_vary(
     monkeypatch,
 ):
     del qapp
+    monkeypatch.setattr(
+        DistributionSetupWindow,
+        "_session_skip_effective_radius_vary_warning",
+        False,
+    )
     window = DistributionSetupWindow(
         [
             DreamParameterEntry(
@@ -3978,10 +4337,21 @@ def test_distribution_window_warns_when_effective_radius_is_set_to_vary(
         ]
     )
 
-    warnings: list[tuple[str, str]] = []
+    warnings: list[tuple[str, str, str]] = []
     monkeypatch.setattr(
-        "saxshell.saxs.ui.distribution_window.QMessageBox.warning",
-        lambda _parent, title, message: warnings.append((title, message)),
+        "saxshell.saxs.ui.distribution_window.QMessageBox.exec",
+        lambda dialog: warnings.append(
+            (
+                dialog.text(),
+                dialog.informativeText(),
+                (
+                    dialog.checkBox().text()
+                    if dialog.checkBox() is not None
+                    else ""
+                ),
+            )
+        )
+        or int(QMessageBox.StandardButton.Ok),
     )
 
     vary_box = window.table.cellWidget(0, 5)
@@ -3989,11 +4359,82 @@ def test_distribution_window_warns_when_effective_radius_is_set_to_vary(
     vary_box.setChecked(True)
 
     assert warnings
-    assert warnings[-1][0] == "Effective radius variation warning"
-    assert "r_eff_w0" in warnings[-1][1]
     assert "not recommended to vary effective-radius parameters" in (
-        warnings[-1][1]
+        warnings[-1][0]
     )
+    assert "r_eff_w0" in warnings[-1][1]
+    assert (
+        warnings[-1][2]
+        == "Don't show this type of warning again during this session"
+    )
+
+
+def test_distribution_window_can_suppress_effective_radius_warning_for_session(
+    qapp,
+    monkeypatch,
+):
+    del qapp
+    monkeypatch.setattr(
+        DistributionSetupWindow,
+        "_session_skip_effective_radius_vary_warning",
+        False,
+    )
+
+    dialogs: list[tuple[str, str]] = []
+
+    def _fake_exec(dialog):
+        checkbox = dialog.checkBox()
+        assert checkbox is not None
+        checkbox.setChecked(True)
+        dialogs.append((dialog.text(), dialog.informativeText()))
+        return int(QMessageBox.StandardButton.Ok)
+
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.distribution_window.QMessageBox.exec",
+        _fake_exec,
+    )
+
+    first_window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="PbI2",
+                motif="motif_A",
+                param_type="SAXS",
+                param="r_eff_w0",
+                value=4.0,
+                vary=False,
+                distribution="norm",
+                dist_params={"loc": 4.0, "scale": 0.2},
+            )
+        ]
+    )
+    first_vary_box = first_window.table.cellWidget(0, 5)
+    assert isinstance(first_vary_box, QCheckBox)
+    first_vary_box.setChecked(True)
+
+    second_window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="PbI2",
+                motif="motif_A",
+                param_type="SAXS",
+                param="r_eff_w0",
+                value=4.0,
+                vary=False,
+                distribution="norm",
+                dist_params={"loc": 4.0, "scale": 0.2},
+            )
+        ]
+    )
+    second_vary_box = second_window.table.cellWidget(0, 5)
+    assert isinstance(second_vary_box, QCheckBox)
+    second_vary_box.setChecked(True)
+
+    assert len(dialogs) == 1
+    assert (
+        "not recommended to vary effective-radius parameters" in dialogs[0][0]
+    )
+    assert "r_eff_w0" in dialogs[0][1]
 
 
 def test_distribution_window_preview_defaults_to_weight_parameters(qapp):
@@ -5130,7 +5571,7 @@ def test_dream_model_metrics_box_updates_with_bestfit_method(qapp, tmp_path):
     first_metrics = "\n".join(text.get_text() for text in axis.texts)
 
     window.dream_tab.bestfit_method_combo.setCurrentIndex(2)
-    _wait_for_dream_refresh(qapp)
+    _apply_dream_filter_changes(window, qapp)
 
     axis = window.dream_tab.model_figure.axes[0]
     second_metrics = "\n".join(text.get_text() for text in axis.texts)
@@ -5185,7 +5626,7 @@ def test_dream_model_plot_redraw_on_log_x_avoids_nonpositive_xlim_warning(
         window.dream_tab.model_log_x_checkbox.setChecked(True)
         qapp.processEvents()
         window.dream_tab.bestfit_method_combo.setCurrentIndex(1)
-        _wait_for_dream_refresh(qapp)
+        _apply_dream_filter_changes(window, qapp)
 
     warning_messages = [str(item.message) for item in caught]
     assert not any(
@@ -5235,7 +5676,7 @@ def test_dream_violin_scale_modes_and_palette_controls(qapp, tmp_path):
         label="Point",
     )
     window.dream_tab.visualization_settings_changed.emit()
-    _wait_for_dream_refresh(qapp)
+    _apply_dream_filter_changes(window, qapp)
 
     axis = window.dream_tab.violin_figure.axes[0]
     tick_labels = [label.get_text() for label in axis.get_xticklabels()]
@@ -5260,7 +5701,7 @@ def test_dream_violin_scale_modes_and_palette_controls(qapp, tmp_path):
     )
 
     window.dream_tab.violin_value_scale_combo.setCurrentIndex(2)
-    _wait_for_dream_refresh(qapp)
+    _apply_dream_filter_changes(window, qapp)
 
     axis = window.dream_tab.violin_figure.axes[0]
     assert axis.get_ylabel() == "Normalized parameter value"
@@ -5307,7 +5748,7 @@ def test_dream_violin_custom_color_controls_apply_to_plot(
     window.dream_tab._choose_median_color()
     window.dream_tab._choose_outline_color()
     window.dream_tab.violin_outline_width_spin.setValue(1.7)
-    _wait_for_dream_refresh(qapp)
+    _apply_dream_filter_changes(window, qapp)
 
     axis = window.dream_tab.violin_figure.axes[0]
     body = next(
@@ -5353,7 +5794,7 @@ def test_dream_violin_custom_color_picker_switches_palette_and_updates_plot(
     assert window.dream_tab.violin_palette_combo.currentData() == "Blues"
 
     window.dream_tab.violin_custom_color_button.click()
-    _wait_for_dream_refresh(qapp)
+    _apply_dream_filter_changes(window, qapp)
 
     assert (
         window.dream_tab.violin_palette_combo.currentData() == "custom_solid"
@@ -5511,6 +5952,122 @@ def test_dream_results_loader_filters_posterior_samples(tmp_path):
     )
     assert violin_plot.sample_source == "map_chain_only"
     assert violin_plot.sample_count == 2
+
+
+def test_dream_results_loader_can_filter_posterior_by_stoichiometry(tmp_path):
+    run_dir = _write_stoichiometry_filter_dream_results(tmp_path)
+    loader = SAXSDreamResultsLoader(run_dir, burnin_percent=0)
+
+    summary = loader.get_summary(
+        bestfit_method="map",
+        stoichiometry_target_elements_text="Pb, I",
+        stoichiometry_target_ratio_text="1:2",
+        stoichiometry_filter_enabled=True,
+        stoichiometry_tolerance_percent=2.0,
+    )
+
+    assert summary.posterior_candidate_sample_count == 1
+    assert summary.posterior_sample_count == 1
+    assert summary.stoichiometry_target is not None
+    assert summary.stoichiometry_evaluation is not None
+    assert summary.stoichiometry_evaluation.is_valid is True
+    assert (
+        summary.stoichiometry_evaluation.max_deviation_percent
+        == pytest.approx(0.0)
+    )
+    assert np.allclose(summary.bestfit_params[:2], [1.0, 0.0])
+
+
+def test_dream_filter_changes_wait_for_apply_button(qapp, tmp_path):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    bundle = _write_minimal_dream_results(project_dir)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    window._load_dream_results_from_run_dir(bundle.run_dir)
+    QApplication.processEvents()
+
+    assert "Posterior samples kept: 8" in window.dream_tab._summary_text
+    assert not window.dream_tab.apply_filter_button.isEnabled()
+
+    filter_index = window.dream_tab.posterior_filter_combo.findData(
+        "top_n_logp"
+    )
+    assert filter_index >= 0
+    window.dream_tab.posterior_filter_combo.setCurrentIndex(filter_index)
+    window.dream_tab.posterior_top_n_spin.setValue(1)
+    QApplication.processEvents()
+
+    assert "Posterior samples kept: 8" in window.dream_tab._summary_text
+    assert window.dream_tab.apply_filter_button.isEnabled()
+    assert "Pending changes are not applied yet" in (
+        window.dream_tab.filter_status_box.toPlainText()
+    )
+
+    window.dream_tab.apply_filter_button.click()
+    QApplication.processEvents()
+
+    assert "Posterior samples kept: 1" in window.dream_tab._summary_text
+    assert not window.dream_tab.apply_filter_button.isEnabled()
+
+
+def test_prefit_stoichiometry_status_updates_with_weight_edits(qapp, tmp_path):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    entries = [
+        PrefitParameterEntry(
+            structure="PbI2",
+            motif="m1",
+            name="w0",
+            value=1.0,
+            vary=True,
+            minimum=0.0,
+            maximum=2.0,
+            category="weight",
+        ),
+        PrefitParameterEntry(
+            structure="Pb2I5",
+            motif="m2",
+            name="w1",
+            value=0.0,
+            vary=True,
+            minimum=0.0,
+            maximum=2.0,
+            category="weight",
+        ),
+        PrefitParameterEntry(
+            structure="",
+            motif="",
+            name="scale",
+            value=1.0,
+            vary=False,
+            minimum=0.0,
+            maximum=10.0,
+            category="fit",
+        ),
+    ]
+    window.prefit_tab.populate_parameter_table(entries)
+
+    window.dream_tab.stoichiometry_elements_edit.setText("Pb, I")
+    window.dream_tab.stoichiometry_ratio_edit.setText("1:2")
+    QApplication.processEvents()
+
+    before = window.prefit_tab.stoichiometry_status_label.text()
+    assert "Target: Pb:I = 1:2" in before
+    assert "Deviation from target: 0%" in before
+
+    weight_row = window.prefit_tab.find_parameter_row("w1")
+    weight_item = window.prefit_tab.parameter_table.item(weight_row, 3)
+    assert weight_item is not None
+    weight_item.setText("1.0")
+    QApplication.processEvents()
+
+    after = window.prefit_tab.stoichiometry_status_label.text()
+    assert after != before
+    assert "Observed ratio:" in after
+    assert "Deviation from target:" in after
 
 
 def test_dream_results_loader_reuses_cached_plot_data_across_interval_changes(
@@ -6124,6 +6681,35 @@ def test_dream_recycle_pushes_selected_best_fit_into_prefit(qapp, tmp_path):
     assert "Prefit preview refresh: deferred" in (
         window.prefit_tab.output_box.toPlainText()
     )
+    saved_settings = SAXSProjectManager().load_project(project_dir)
+    recycled_best_entries = {
+        str(entry["name"]): float(entry["value"])
+        for entry in saved_settings.best_prefit_parameter_entries
+    }
+    assert recycled_best_entries["scale"] == pytest.approx(
+        expected_values["scale"]
+    )
+    reset_col = _table_column_index(window.prefit_tab.parameter_table, "Reset")
+    reset_button = window.prefit_tab.parameter_table.cellWidget(
+        scale_row,
+        reset_col,
+    )
+    assert reset_button is not None
+    window.prefit_tab.set_parameter_row("scale", value=2e-3)
+    reset_button.click()
+    recycled_entries = {
+        entry.name: entry for entry in window.prefit_tab.parameter_entries()
+    }
+    assert recycled_entries["scale"].value == pytest.approx(
+        expected_values["scale"]
+    )
+    dream_entries = {
+        entry.param: entry
+        for entry in SAXSDreamWorkflow(project_dir).load_parameter_map()
+    }
+    assert dream_entries["scale"].value == pytest.approx(
+        expected_values["scale"]
+    )
     assert "Recycled the current DREAM best fit into the Prefit tab." in (
         window.dream_tab.output_box.toPlainText()
     )
@@ -6654,6 +7240,113 @@ def test_prefit_tab_reorders_controls_and_parameter_actions(qapp):
     assert tab._prefit_control_button_grid.itemAtPosition(2, 1).widget() is (
         tab.reset_best_button
     )
+    assert tab.sequence_history_checkbox.text() == "Sequence history logger"
+
+
+def test_prefit_sequence_history_logger_records_fit_actions(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert window.prefit_workflow is not None
+    monkeypatch.setattr(window, "_load_dream_workflow", lambda: None)
+    monkeypatch.setattr(window, "update_prefit_model", lambda: None)
+    monkeypatch.setattr(
+        window,
+        "_confirm_large_prefit_parameter_count",
+        lambda names: (True, False),
+    )
+    monkeypatch.setattr(
+        window.prefit_tab, "plot_evaluation", lambda value: None
+    )
+    monkeypatch.setattr(
+        window.prefit_tab, "set_summary_text", lambda text: None
+    )
+    monkeypatch.setattr(
+        window,
+        "_refresh_saved_prefit_states",
+        lambda selected_name=None: None,
+    )
+    window.prefit_tab.sequence_history_checkbox.setChecked(True)
+
+    scale_row = window.prefit_tab.find_parameter_row("scale")
+    scale_item = window.prefit_tab.parameter_table.item(scale_row, 3)
+    assert scale_item is not None
+    scale_item.setText("0.0025")
+
+    window.apply_recommended_scale_settings()
+
+    def fake_run_fit(entries, *, method="leastsq", max_nfev=10000):
+        del max_nfev
+        evaluation = window.prefit_workflow.evaluate(entries)
+        residuals = np.asarray(evaluation.residuals, dtype=float)
+        return PrefitFitResult(
+            parameter_entries=entries,
+            evaluation=evaluation,
+            fit_report="fake lmfit report",
+            method=method,
+            nfev=12,
+            chi_square=float(np.sum(residuals**2)),
+            reduced_chi_square=float(np.mean(residuals**2)),
+            r_squared=0.5,
+            optimization_strategy=f"lmfit {method}",
+            grid_evaluations=0,
+        )
+
+    monkeypatch.setattr(window.prefit_workflow, "run_fit", fake_run_fit)
+
+    window.run_prefit()
+
+    history_path = window.prefit_workflow.sequence_history_path()
+    assert history_path.is_file()
+    payload = json.loads(history_path.read_text(encoding="utf-8"))
+    assert payload["format_version"] == 1
+    assert payload["sequence_logger_enabled"] is True
+
+    event_types = [event["event_type"] for event in payload["events"]]
+    assert "sequence_history_logger_toggled" in event_types
+    assert "manual_parameter_update" in event_types
+    assert "autoscale_applied" in event_types
+    assert "prefit_run_complete" in event_types
+
+    manual_event = next(
+        event
+        for event in payload["events"]
+        if event["event_type"] == "manual_parameter_update"
+    )
+    assert manual_event["details"]["trigger"] == "apply_autoscale"
+    assert any(
+        change["parameter_name"] == "scale"
+        for change in manual_event["details"]["changed_parameters"]
+    )
+
+    autoscale_event = next(
+        event
+        for event in payload["events"]
+        if event["event_type"] == "autoscale_applied"
+    )
+    assert autoscale_event["details"]["points_used"] > 0
+    assert any(
+        entry["name"] == "scale"
+        for entry in autoscale_event["parameter_entries"]
+    )
+
+    run_event = next(
+        event
+        for event in payload["events"]
+        if event["event_type"] == "prefit_run_complete"
+    )
+    assert run_event["details"]["method"] == "leastsq"
+    assert run_event["details"]["statistics"]["nfev"] == 12
+    assert any(
+        entry["parameter_name"] == "scale"
+        for entry in run_event["details"]["varying_parameters"]
+    )
+    window.close()
 
 
 def test_solute_volume_fraction_help_text_and_labels_omit_fullrmc(qapp):
@@ -6917,10 +7610,16 @@ def test_prefit_tab_scrollable_parameter_uses_bounds_and_updates_value(qapp):
 def test_run_prefit_keeps_manual_weight_value_outside_previous_bounds(
     qapp,
     tmp_path,
+    monkeypatch,
 ):
     del qapp
     project_dir, _paths = _build_minimal_saxs_project(tmp_path)
     window = SAXSMainWindow(initial_project_dir=project_dir)
+    monkeypatch.setattr(
+        window,
+        "_confirm_large_prefit_parameter_count",
+        lambda _names: (True, False),
+    )
 
     weight_row = window.prefit_tab.find_parameter_row("w0")
     assert weight_row >= 0
@@ -6939,6 +7638,93 @@ def test_run_prefit_keeps_manual_weight_value_outside_previous_bounds(
         float(window.prefit_tab.parameter_table.item(weight_row, 6).text())
         >= 0.9
     )
+    window.close()
+
+
+def test_run_prefit_returns_to_editor_when_large_parameter_warning_is_rejected(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    for row in range(min(4, window.prefit_tab.parameter_table.rowCount())):
+        vary_item = window.prefit_tab.parameter_table.item(row, 4)
+        assert vary_item is not None
+        vary_item.setCheckState(Qt.CheckState.Checked)
+
+    warnings: list[list[str]] = []
+    monkeypatch.setattr(
+        window,
+        "_confirm_large_prefit_parameter_count",
+        lambda names: warnings.append(list(names)) or (False, False),
+    )
+    monkeypatch.setattr(
+        window.prefit_workflow,
+        "run_fit",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("run_fit should not be called")
+        ),
+    )
+
+    window.run_prefit()
+
+    assert warnings
+    assert len(warnings[0]) > 3
+    assert "Prefit canceled." in window.prefit_tab.output_box.toPlainText()
+    window.close()
+
+
+def test_run_prefit_can_suppress_large_parameter_warning_for_session(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    for row in range(min(4, window.prefit_tab.parameter_table.rowCount())):
+        vary_item = window.prefit_tab.parameter_table.item(row, 4)
+        assert vary_item is not None
+        vary_item.setCheckState(Qt.CheckState.Checked)
+
+    helper_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        window,
+        "_confirm_large_prefit_parameter_count",
+        lambda names: helper_calls.append(list(names)) or (True, True),
+    )
+
+    run_calls = {"count": 0}
+
+    def fake_run_fit(entries, *, method="leastsq", max_nfev=10000):
+        del max_nfev
+        run_calls["count"] += 1
+        evaluation = window.prefit_workflow.evaluate(entries)
+        residuals = np.asarray(evaluation.residuals, dtype=float)
+        return PrefitFitResult(
+            parameter_entries=entries,
+            evaluation=evaluation,
+            fit_report="fake lmfit report",
+            method=method,
+            nfev=0,
+            chi_square=float(np.sum(residuals**2)),
+            reduced_chi_square=float(np.mean(residuals**2)),
+            r_squared=0.0,
+            optimization_strategy=f"lmfit {method}",
+            grid_evaluations=0,
+        )
+
+    monkeypatch.setattr(window.prefit_workflow, "run_fit", fake_run_fit)
+
+    window.run_prefit()
+    window.run_prefit()
+
+    assert run_calls["count"] == 2
+    assert len(helper_calls) == 1
     window.close()
 
 
@@ -6966,6 +7752,12 @@ def test_best_prefit_preset_saves_resets_and_reloads(qapp, tmp_path):
     )
     assert settings.best_prefit_parameter_entries
     assert settings.template_reset_parameter_entries
+    dream_entries = {
+        entry.param: entry
+        for entry in SAXSDreamWorkflow(project_dir).load_parameter_map()
+    }
+    assert dream_entries["scale"].value == pytest.approx(7e-4)
+    assert dream_entries["offset"].value == pytest.approx(0.125)
 
     window.prefit_tab.set_parameter_row("scale", value=2e-3)
     window.prefit_tab.set_parameter_row("offset", value=0.333)
@@ -6993,6 +7785,42 @@ def test_best_prefit_preset_saves_resets_and_reloads(qapp, tmp_path):
     }
     assert reloaded_entries["scale"].value == pytest.approx(7e-4)
     assert reloaded_entries["offset"].value == pytest.approx(0.125)
+
+
+def test_set_best_prefit_retargets_existing_dream_prior_centers(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    dream_workflow = SAXSDreamWorkflow(project_dir)
+    parameter_map = dream_workflow.create_default_parameter_map(persist=False)
+    scale_entry = next(
+        entry for entry in parameter_map if entry.param == "scale"
+    )
+    scale_entry.vary = False
+    scale_entry.distribution = "norm"
+    scale_entry.dist_params = {"loc": 1.1e-3, "scale": 2.0e-4}
+    dream_workflow.save_parameter_map(parameter_map)
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    window.prefit_tab.set_parameter_row("scale", value=7e-4)
+    window.prefit_tab.set_parameter_row("offset", value=0.125)
+
+    window.set_best_prefit_parameters()
+
+    updated_entries = {
+        entry.param: entry
+        for entry in SAXSDreamWorkflow(project_dir).load_parameter_map()
+    }
+    updated_scale = updated_entries["scale"]
+    assert updated_scale.value == pytest.approx(7e-4)
+    assert updated_scale.vary is False
+    assert updated_scale.distribution == "norm"
+    assert updated_scale.dist_params["loc"] == pytest.approx(7e-4)
+    assert updated_scale.dist_params["scale"] == pytest.approx(2.0e-4)
+    assert window._dream_parameter_map_saved_in_session is True
+    window.close()
 
 
 def test_individual_prefit_parameter_reset_button_restores_template_default(
@@ -7387,6 +8215,52 @@ def test_prior_histogram_can_match_component_trace_colors(qapp, tmp_path):
 
     prior_window = window._prior_histogram_windows[-1]
     assert prior_window.structure_motif_colors == {"A_no_motif": trace_color}
+
+
+def test_prior_histogram_predicted_segments_match_component_trace_colors(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    _write_predicted_structure_artifacts(paths)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.use_predicted_structure_weights = True
+    manager.save_project(settings)
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    plasma_index = (
+        window.project_setup_tab.component_trace_color_scheme_combo.findData(
+            "plasma"
+        )
+    )
+    window.project_setup_tab.component_trace_color_scheme_combo.setCurrentIndex(
+        plasma_index
+    )
+    window.project_setup_tab.draw_prior_plot(
+        window.project_setup_tab.current_prior_json_path()
+    )
+
+    observed_trace_color = to_hex(
+        window.project_setup_tab._component_line_lookup[
+            "A_no_motif"
+        ].get_color()
+    )
+    predicted_trace_color = to_hex(
+        window.project_setup_tab._component_line_lookup[
+            "A2_predicted_rank01"
+        ].get_color()
+    )
+    patches = [
+        patch
+        for patch in window.project_setup_tab.prior_figure.axes[0].patches
+        if float(patch.get_height()) > 0.0
+    ]
+
+    assert len(patches) >= 2
+    assert to_hex(patches[0].get_facecolor()) == observed_trace_color
+    assert to_hex(patches[1].get_facecolor()) == predicted_trace_color
 
 
 def test_solvent_sort_prior_histogram_does_not_auto_match_component_colors(
@@ -7830,6 +8704,118 @@ def test_build_components_warns_when_q_range_is_still_default(
     assert warnings[0][0] == "Build SAXS components with default q-range?"
     assert "full experimental-data default" in warnings[0][1]
     assert not start_calls
+    window.close()
+
+
+def test_build_components_auto_refreshes_component_plot_for_built_distribution(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    external_data_dir = tmp_path / "external_data"
+    external_data_dir.mkdir(parents=True, exist_ok=True)
+    external_data_path = external_data_dir / "exp_external.txt"
+    external_data_path.write_text(
+        (paths.experimental_data_dir / "exp_demo.txt").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    clusters_dir = paths.project_dir / "clusters"
+    structure_dir = clusters_dir / "A"
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    (structure_dir / "frame_0001.xyz").write_text(
+        "1\nframe 1\nA 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    settings.clusters_dir = str(clusters_dir)
+    settings.experimental_data_path = str(external_data_path)
+    settings.copied_experimental_data_file = None
+    manager.save_project(settings)
+
+    component_trace = np.linspace(10.0, 17.0, 8)
+
+    def fake_build_profiles(
+        builder,
+        *,
+        cluster_bins,
+        progress_callback=None,
+        progress_total=None,
+        **kwargs,
+    ):
+        del progress_callback, progress_total, kwargs
+        output_path = builder.output_dir / "A_no_motif.txt"
+        _write_component_file(
+            output_path,
+            builder.q_values,
+            component_trace,
+        )
+        cluster_bin = cluster_bins[0]
+        return [
+            AveragedComponent(
+                structure=cluster_bin.structure,
+                motif=cluster_bin.motif,
+                file_count=len(cluster_bin.files),
+                representative=cluster_bin.representative,
+                source_dir=cluster_bin.source_dir,
+                q_values=np.asarray(builder.q_values, dtype=float),
+                mean_intensity=np.asarray(component_trace, dtype=float),
+                std_intensity=np.zeros_like(builder.q_values, dtype=float),
+                se_intensity=np.zeros_like(builder.q_values, dtype=float),
+                output_path=output_path,
+            )
+        ]
+
+    monkeypatch.setattr(
+        project_module.DebyeProfileBuilder,
+        "build_profiles",
+        fake_build_profiles,
+    )
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    monkeypatch.setattr(
+        window,
+        "_confirm_default_q_range_for_component_build",
+        lambda: True,
+    )
+
+    def run_task_sync(
+        task_name,
+        task_fn,
+        *,
+        start_message,
+        settings=None,
+    ):
+        del start_message, settings
+        result = task_fn(lambda *_args, **_kwargs: None)
+        window._on_task_finished(task_name, result)
+
+    monkeypatch.setattr(window, "_start_project_task", run_task_sync)
+
+    expected_distribution_id = project_module.distribution_id_for_settings(
+        window._settings_from_project_tab()
+    )
+
+    window.build_project_components()
+    QApplication.processEvents()
+
+    assert window.project_setup_tab.computed_distribution_combo.count() == 1
+    assert (
+        window.project_setup_tab.selected_distribution_id()
+        == expected_distribution_id
+    )
+    assert "A_no_motif" in window.project_setup_tab._component_line_lookup
+    np.testing.assert_allclose(
+        window.project_setup_tab._component_line_lookup[
+            "A_no_motif"
+        ].get_ydata(),
+        component_trace,
+    )
     window.close()
 
 
@@ -8821,6 +9807,846 @@ def test_model_only_q_grid_uses_configured_range_without_experimental_data(
     q_grid = manager._build_q_grid(settings, None)
 
     assert np.allclose(q_grid, np.linspace(0.05, 0.30, 8))
+
+
+def test_predicted_structure_mode_status_guides_user_when_bundle_is_missing(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.use_predicted_structure_weights = True
+    manager.save_project(settings)
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert window.project_setup_tab.use_predicted_structure_weights()
+    assert "Predicted Structures mode is on" in (
+        window.project_setup_tab.predicted_structure_status_label.text()
+    )
+    assert "Open Tools > Open Cluster Dynamics ML" in (
+        window.project_setup_tab.predicted_structure_status_label.text()
+    )
+    window.close()
+
+
+def test_predicted_structure_mode_toggles_between_predicted_and_observed_artifacts(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    _write_predicted_structure_artifacts(paths)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.use_predicted_structure_weights = True
+    manager.save_project(settings)
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert window.project_setup_tab.use_predicted_structure_weights()
+    assert (
+        window.project_setup_tab.current_prior_json_path().name
+        == "md_prior_weights_predicted_structures.json"
+    )
+    assert window.project_setup_tab.recognized_clusters_table.rowCount() == 2
+    assert (
+        window.project_setup_tab.recognized_clusters_table.item(1, 0).text()
+        == "A2"
+    )
+    assert window.prefit_workflow is not None
+    assert {
+        (component.structure, component.motif)
+        for component in window.prefit_workflow.components
+    } == {("A", "no_motif"), ("A2", "predicted_rank01")}
+    assert window.dream_workflow is not None
+    assert {
+        (component.structure, component.motif)
+        for component in window.dream_workflow.prefit_workflow.components
+    } == {("A", "no_motif"), ("A2", "predicted_rank01")}
+    assert "observed + Predicted Structures" in (
+        window.project_setup_tab.predicted_structure_status_label.text()
+    )
+
+    window.project_setup_tab.use_predicted_structure_weights_checkbox.setChecked(
+        False
+    )
+    QApplication.processEvents()
+    saved_settings = SAXSProjectManager().load_project(project_dir)
+
+    assert not saved_settings.use_predicted_structure_weights
+    assert (
+        window.project_setup_tab.current_prior_json_path().name
+        == "md_prior_weights.json"
+    )
+    assert window.project_setup_tab.recognized_clusters_table.rowCount() == 1
+    assert (
+        window.project_setup_tab.recognized_clusters_table.item(0, 0).text()
+        == "A"
+    )
+    assert window.prefit_workflow is not None
+    assert {
+        (component.structure, component.motif)
+        for component in window.prefit_workflow.components
+    } == {("A", "no_motif")}
+    dream_workflow = window._load_dream_workflow()
+    assert {
+        (component.structure, component.motif)
+        for component in dream_workflow.prefit_workflow.components
+    } == {("A", "no_motif")}
+    assert "Predicted Structures mode is off" in (
+        window.project_setup_tab.predicted_structure_status_label.text()
+    )
+    window.close()
+
+
+def test_project_setup_predicted_mode_toggles_observed_and_predicted_traces(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    _write_predicted_structure_artifacts(paths)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.use_predicted_structure_weights = True
+    manager.save_project(settings)
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    tab = window.project_setup_tab
+
+    assert not tab.component_observed_traces_button.isHidden()
+    assert not tab.component_predicted_traces_button.isHidden()
+    assert tab.component_observed_traces_button.text() == (
+        "Hide Observed Traces"
+    )
+    assert tab.component_predicted_traces_button.text() == (
+        "Hide Predicted Traces"
+    )
+    assert tab._component_line_lookup["A_no_motif"].get_visible()
+    assert tab._component_line_lookup["A2_predicted_rank01"].get_visible()
+
+    tab.component_predicted_traces_button.click()
+    QApplication.processEvents()
+
+    assert tab._component_line_lookup["A_no_motif"].get_visible()
+    assert not tab._component_line_lookup["A2_predicted_rank01"].get_visible()
+    assert tab.component_predicted_traces_button.text() == (
+        "Show Predicted Traces"
+    )
+    assert (
+        tab.recognized_clusters_table.item(0, 6).checkState()
+        == Qt.CheckState.Checked
+    )
+    assert (
+        tab.recognized_clusters_table.item(1, 6).checkState()
+        == Qt.CheckState.Unchecked
+    )
+
+    tab.component_predicted_traces_button.click()
+    QApplication.processEvents()
+
+    assert tab._component_line_lookup["A_no_motif"].get_visible()
+    assert tab._component_line_lookup["A2_predicted_rank01"].get_visible()
+
+    tab.component_observed_traces_button.click()
+    QApplication.processEvents()
+
+    assert not tab._component_line_lookup["A_no_motif"].get_visible()
+    assert tab._component_line_lookup["A2_predicted_rank01"].get_visible()
+    assert tab.component_observed_traces_button.text() == (
+        "Show Observed Traces"
+    )
+    assert (
+        tab.recognized_clusters_table.item(0, 6).checkState()
+        == Qt.CheckState.Unchecked
+    )
+    assert (
+        tab.recognized_clusters_table.item(1, 6).checkState()
+        == Qt.CheckState.Checked
+    )
+
+    tab.component_observed_traces_button.click()
+    QApplication.processEvents()
+
+    assert tab._component_line_lookup["A_no_motif"].get_visible()
+    assert tab._component_line_lookup["A2_predicted_rank01"].get_visible()
+
+    tab.use_predicted_structure_weights_checkbox.setChecked(False)
+    QApplication.processEvents()
+
+    assert tab.component_observed_traces_button.isHidden()
+    assert tab.component_predicted_traces_button.isHidden()
+    window.close()
+
+
+def test_project_setup_remove_selected_elements_updates_exclude_list(qapp):
+    del qapp
+    tab = ProjectSetupTab()
+    tab.set_project_selected(True)
+    tab.set_available_elements(["H", "O", "Pb"])
+    tab.exclude_elements_edit.setText("H O")
+
+    tab.available_elements_list.clearSelection()
+    tab.available_elements_list.item(0).setSelected(True)
+    tab._remove_selected_elements_from_exclude()
+
+    assert tab.exclude_elements() == ["O"]
+
+
+def test_project_setup_predicted_mode_updates_prefit_geometry_table(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, paths = _build_poly_lma_geometry_project(tmp_path)
+    observed_workflow = SAXSPrefitWorkflow(project_dir)
+    observed_workflow.compute_cluster_geometry_table()
+
+    _write_predicted_structure_artifacts(paths)
+    predicted_dir = tmp_path / "ui_predicted_geometry"
+    predicted_dir.mkdir(parents=True, exist_ok=True)
+    predicted_structure = predicted_dir / "02_rank01_A2.xyz"
+    predicted_structure.write_text(
+        "2\npredicted\nA 0.0 0.0 0.0\nA 1.5 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    def fake_predicted_bins(self):
+        if not self.settings.use_predicted_structure_weights:
+            return []
+        return [
+            ClusterBin(
+                structure="A2",
+                motif="predicted_rank01",
+                source_dir=predicted_structure.parent,
+                files=(predicted_structure,),
+                representative=predicted_structure.name,
+            )
+        ]
+
+    monkeypatch.setattr(
+        SAXSPrefitWorkflow,
+        "_predicted_structure_cluster_bins_for_active_components",
+        fake_predicted_bins,
+    )
+
+    manager = SAXSProjectManager()
+    predicted_settings = manager.load_project(project_dir)
+    predicted_settings.use_predicted_structure_weights = True
+    manager.save_project(predicted_settings)
+    predicted_workflow = SAXSPrefitWorkflow(project_dir)
+    predicted_workflow.compute_cluster_geometry_table()
+
+    observed_settings = manager.load_project(project_dir)
+    observed_settings.use_predicted_structure_weights = False
+    manager.save_project(observed_settings)
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert {
+        (row.structure, row.motif)
+        for row in window.prefit_workflow.cluster_geometry_table.rows
+    } == {("A", "no_motif")}
+    assert all(
+        entry.structure != "A2"
+        for entry in window.prefit_tab.parameter_entries()
+    )
+
+    window.project_setup_tab.use_predicted_structure_weights_checkbox.setChecked(
+        True
+    )
+    QApplication.processEvents()
+
+    assert {
+        (row.structure, row.motif)
+        for row in window.prefit_workflow.cluster_geometry_table.rows
+    } == {("A", "no_motif"), ("A2", "predicted_rank01")}
+    assert any(
+        entry.structure == "A2"
+        for entry in window.prefit_tab.parameter_entries()
+        if entry.category in {"weight", "geometry"}
+    )
+
+    window.project_setup_tab.use_predicted_structure_weights_checkbox.setChecked(
+        False
+    )
+    QApplication.processEvents()
+
+    assert {
+        (row.structure, row.motif)
+        for row in window.prefit_workflow.cluster_geometry_table.rows
+    } == {("A", "no_motif")}
+    assert all(
+        entry.structure != "A2"
+        for entry in window.prefit_tab.parameter_entries()
+    )
+    window.close()
+
+
+def test_project_setup_predicted_histograms_use_observed_stoichiometry_bins(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    _write_predicted_structure_artifacts(paths)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.use_predicted_structure_weights = True
+    manager.save_project(settings)
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    prior_path = window.project_setup_tab.current_prior_json_path()
+
+    structure_payload = build_prior_histogram_export_payload(
+        prior_path,
+        mode="structure_fraction",
+    )
+    atom_payload = build_prior_histogram_export_payload(
+        prior_path,
+        mode="atom_fraction",
+    )
+
+    structure_matrix = np.asarray(structure_payload["matrix"], dtype=float)
+    atom_matrix = np.asarray(atom_payload["matrix"], dtype=float)
+    structure_by_label = {
+        str(label): {
+            str(segment): float(value)
+            for segment, value in zip(
+                structure_payload["segments"],
+                structure_matrix[row_index],
+                strict=False,
+            )
+        }
+        for row_index, label in enumerate(structure_payload["labels"])
+    }
+    atom_by_label = {
+        str(label): {
+            str(segment): float(value)
+            for segment, value in zip(
+                atom_payload["segments"],
+                atom_matrix[row_index],
+                strict=False,
+            )
+        }
+        for row_index, label in enumerate(atom_payload["labels"])
+    }
+
+    assert structure_payload["labels"] == ["A", "A2"]
+    assert atom_payload["labels"] == ["A", "A2"]
+    assert float(np.sum(structure_payload["totals"])) == pytest.approx(100.0)
+    assert float(np.sum(atom_payload["totals"])) == pytest.approx(100.0)
+    assert structure_by_label["A"]["no_motif"] == pytest.approx(75.0)
+    assert structure_by_label["A2"]["predicted_rank01"] == pytest.approx(25.0)
+    assert atom_by_label["A"]["no_motif"] == pytest.approx(60.0)
+    assert atom_by_label["A2"]["predicted_rank01"] == pytest.approx(40.0)
+
+    tick_labels = {
+        tick.get_text().strip()
+        for tick in window.project_setup_tab.prior_figure.axes[
+            0
+        ].get_xticklabels()
+        if tick.get_text().strip()
+    }
+    assert tick_labels == {"A", "A$_{2}$"}
+    window.close()
+
+
+def test_project_setup_predicted_histogram_x_axis_updates_for_all_modes(
+    qapp,
+):
+    del qapp
+    payload = {
+        "includes_predicted_structures": True,
+        "available_elements": ["A", "O"],
+        "structures": {
+            "A": {
+                "no_motif": {
+                    "count": 3.0,
+                    "normalized_weight": 0.75,
+                    "source_kind": "cluster_dir",
+                    "secondary_atom_distributions": {"O": {"0": 3.0}},
+                }
+            },
+            "A2": {
+                "predicted_rank01": {
+                    "count": 1.0,
+                    "normalized_weight": 0.25,
+                    "source_kind": "predicted_structure",
+                    "secondary_atom_distributions": {"O": {"1": 1.0}},
+                }
+            },
+        },
+    }
+    figure = Figure()
+    axis = figure.add_subplot(111)
+
+    for mode, secondary in (
+        ("structure_fraction", None),
+        ("atom_fraction", None),
+        ("solvent_sort_structure_fraction", "O"),
+        ("solvent_sort_atom_fraction", "O"),
+    ):
+        plot_md_prior_histogram(
+            payload,
+            mode=mode,
+            secondary_element=secondary,
+            ax=axis,
+        )
+        tick_labels = {
+            tick.get_text().strip()
+            for tick in axis.get_xticklabels()
+            if tick.get_text().strip()
+        }
+        assert tick_labels == {"A", "A$_{2}$"}
+
+
+def test_predicted_structure_mode_switch_reuses_distribution_and_refreshes_tabs(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    clusters_dir = paths.project_dir / "clusters"
+    structure_dir = clusters_dir / "A"
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    observed_structure = structure_dir / "frame_0001.xyz"
+    observed_structure.write_text(
+        "1\nframe 1\nA 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    observed_component = np.linspace(10.0, 17.0, 8)
+    predicted_component = np.linspace(4.0, 11.0, 8)
+
+    def fake_build_profiles(
+        builder,
+        *,
+        cluster_bins,
+        progress_callback=None,
+        progress_total=None,
+        **kwargs,
+    ):
+        del progress_callback, progress_total, kwargs
+        output_path = builder.output_dir / "A_no_motif.txt"
+        _write_component_file(
+            output_path,
+            builder.q_values,
+            observed_component,
+        )
+        cluster_bin = cluster_bins[0]
+        return [
+            AveragedComponent(
+                structure=cluster_bin.structure,
+                motif=cluster_bin.motif,
+                file_count=len(cluster_bin.files),
+                representative=cluster_bin.representative,
+                source_dir=cluster_bin.source_dir,
+                q_values=np.asarray(builder.q_values, dtype=float),
+                mean_intensity=np.asarray(observed_component, dtype=float),
+                std_intensity=np.zeros_like(builder.q_values, dtype=float),
+                se_intensity=np.zeros_like(builder.q_values, dtype=float),
+                output_path=output_path,
+            )
+        ]
+
+    monkeypatch.setattr(
+        project_module.DebyeProfileBuilder,
+        "build_profiles",
+        fake_build_profiles,
+    )
+    monkeypatch.setattr(
+        project_module,
+        "compute_debye_intensity",
+        lambda coordinates, elements, q_values: np.asarray(
+            predicted_component,
+            dtype=float,
+        ),
+    )
+
+    dataset_dir = (
+        paths.exported_data_dir
+        / "clusterdynamicsml"
+        / "saved_results"
+        / "20260330_120000_demo"
+    )
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    dataset_file = dataset_dir / "20260330_120000_demo_clusterdynamicsml.json"
+    dataset_file.write_text("{}\n", encoding="utf-8")
+    predicted_dir = dataset_dir / (f"{dataset_file.stem}_predicted_structures")
+    predicted_dir.mkdir(parents=True, exist_ok=True)
+    predicted_structure = predicted_dir / "02_rank01_A2.xyz"
+    predicted_structure.write_text(
+        "2\npredicted\nA 0.0 0.0 0.0\nA 1.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    loaded_dataset = SimpleNamespace(
+        dataset_file=dataset_file,
+        result=SimpleNamespace(
+            training_observations=(
+                ClusterDynamicsMLTrainingObservation(
+                    label="A",
+                    node_count=1,
+                    cluster_size=1,
+                    element_counts={"A": 1},
+                    file_count=1,
+                    representative_path=observed_structure,
+                    structure_dir=structure_dir,
+                    motifs=("no_motif",),
+                    mean_atom_count=1.0,
+                    mean_radius_of_gyration=1.0,
+                    mean_max_radius=1.0,
+                    mean_semiaxis_a=1.0,
+                    mean_semiaxis_b=1.0,
+                    mean_semiaxis_c=1.0,
+                    total_observations=1,
+                    occupied_frames=1,
+                    mean_count_per_frame=1.0,
+                    occupancy_fraction=1.0,
+                    association_events=0,
+                    dissociation_events=0,
+                    association_rate_per_ps=0.0,
+                    dissociation_rate_per_ps=0.0,
+                    completed_lifetime_count=1,
+                    window_truncated_lifetime_count=0,
+                    mean_lifetime_fs=10.0,
+                    std_lifetime_fs=0.0,
+                ),
+            ),
+            predictions=(
+                PredictedClusterCandidate(
+                    target_node_count=2,
+                    rank=1,
+                    label="A2",
+                    element_counts={"A": 2},
+                    predicted_mean_count_per_frame=0.2,
+                    predicted_occupancy_fraction=1.0,
+                    predicted_mean_lifetime_fs=20.0,
+                    predicted_association_rate_per_ps=0.0,
+                    predicted_dissociation_rate_per_ps=0.0,
+                    predicted_mean_radius_of_gyration=1.0,
+                    predicted_mean_max_radius=1.0,
+                    predicted_mean_semiaxis_a=1.0,
+                    predicted_mean_semiaxis_b=1.0,
+                    predicted_mean_semiaxis_c=1.0,
+                    predicted_population_share=100.0,
+                    predicted_stability_score=1.0,
+                    source_label="A",
+                    notes="",
+                    generated_elements=("A", "A"),
+                    generated_coordinates=np.asarray(
+                        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                        dtype=float,
+                    ),
+                ),
+            ),
+            dynamics_result=SimpleNamespace(
+                preview=SimpleNamespace(frame_timestep_fs=1.0)
+            ),
+            saxs_comparison=None,
+        ),
+    )
+    monkeypatch.setattr(
+        SAXSProjectManager,
+        "_load_latest_predicted_structures_dataset",
+        lambda self, project_dir: loaded_dataset,
+    )
+
+    observed_settings = manager.load_project(project_dir)
+    observed_settings.clusters_dir = str(clusters_dir)
+    observed_settings.q_min = None
+    observed_settings.q_max = None
+    observed_settings.use_predicted_structure_weights = False
+    manager.save_project(observed_settings)
+    manager.build_scattering_components(observed_settings)
+    manager.generate_prior_weights(observed_settings)
+    observed_artifacts = project_artifact_paths(
+        observed_settings,
+        storage_mode="distribution",
+    )
+    _write_distribution_history_artifacts(
+        observed_artifacts,
+        state_name="prefit_observed",
+        run_name="dream_observed",
+    )
+
+    predicted_settings = manager.load_project(project_dir)
+    predicted_settings.clusters_dir = str(clusters_dir)
+    predicted_settings.q_min = None
+    predicted_settings.q_max = None
+    predicted_settings.use_predicted_structure_weights = True
+    manager.save_project(predicted_settings)
+    manager.build_scattering_components(predicted_settings)
+    manager.generate_prior_weights(predicted_settings)
+    predicted_artifacts = project_artifact_paths(
+        predicted_settings,
+        storage_mode="distribution",
+    )
+    _write_distribution_history_artifacts(
+        predicted_artifacts,
+        state_name="prefit_predicted",
+        run_name="dream_predicted",
+    )
+
+    manager.save_project(observed_settings)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert window.project_setup_tab.selected_distribution_id() == (
+        observed_artifacts.distribution_id
+    )
+    assert window.project_setup_tab.current_prior_json_path() == (
+        observed_artifacts.prior_weights_file
+    )
+    assert window.project_setup_tab.recognized_clusters_table.rowCount() == 1
+    assert window.prefit_workflow.prefit_dir == observed_artifacts.prefit_dir
+    assert window.prefit_tab.saved_state_combo.itemText(0) == (
+        "prefit_observed"
+    )
+    assert window.dream_tab.selected_saved_run_dir() == str(
+        (observed_artifacts.dream_runtime_dir / "dream_observed").resolve()
+    )
+    observed_structure_payload = build_prior_histogram_export_payload(
+        window.project_setup_tab.current_prior_json_path(),
+        mode="structure_fraction",
+    )
+    observed_atom_payload = build_prior_histogram_export_payload(
+        window.project_setup_tab.current_prior_json_path(),
+        mode="atom_fraction",
+    )
+
+    window.project_setup_tab.use_predicted_structure_weights_checkbox.setChecked(
+        True
+    )
+    QApplication.processEvents()
+
+    assert window.project_setup_tab.selected_distribution_id() == (
+        predicted_artifacts.distribution_id
+    )
+    assert window.project_setup_tab.current_prior_json_path() == (
+        predicted_artifacts.prior_weights_file
+    )
+    assert window.project_setup_tab.recognized_clusters_table.rowCount() == 2
+    assert window.prefit_workflow.prefit_dir == predicted_artifacts.prefit_dir
+    assert window.prefit_tab.saved_state_combo.itemText(0) == (
+        "prefit_predicted"
+    )
+    assert window.dream_tab.selected_saved_run_dir() == str(
+        (predicted_artifacts.dream_runtime_dir / "dream_predicted").resolve()
+    )
+    assert {
+        (component.structure, component.motif)
+        for component in window.prefit_workflow.components
+    } == {("A", "no_motif"), ("A2", "predicted_rank01")}
+    assert window.dream_workflow is not None
+    assert {
+        (component.structure, component.motif)
+        for component in window.dream_workflow.prefit_workflow.components
+    } == {("A", "no_motif"), ("A2", "predicted_rank01")}
+
+    structure_payload = build_prior_histogram_export_payload(
+        window.project_setup_tab.current_prior_json_path(),
+        mode="structure_fraction",
+    )
+    atom_payload = build_prior_histogram_export_payload(
+        window.project_setup_tab.current_prior_json_path(),
+        mode="atom_fraction",
+    )
+    structure_matrix = np.asarray(structure_payload["matrix"], dtype=float)
+    atom_matrix = np.asarray(atom_payload["matrix"], dtype=float)
+    structure_by_label = {
+        str(label): {
+            str(segment): float(value)
+            for segment, value in zip(
+                structure_payload["segments"],
+                structure_matrix[row_index],
+                strict=False,
+            )
+        }
+        for row_index, label in enumerate(structure_payload["labels"])
+    }
+    atom_by_label = {
+        str(label): {
+            str(segment): float(value)
+            for segment, value in zip(
+                atom_payload["segments"],
+                atom_matrix[row_index],
+                strict=False,
+            )
+        }
+        for row_index, label in enumerate(atom_payload["labels"])
+    }
+
+    assert structure_payload["labels"] == ["A", "A2"]
+    assert atom_payload["labels"] == ["A", "A2"]
+    assert observed_structure_payload["labels"] == ["A"]
+    assert observed_atom_payload["labels"] == ["A"]
+    assert float(np.sum(structure_payload["totals"])) == pytest.approx(100.0)
+    assert float(np.sum(atom_payload["totals"])) == pytest.approx(100.0)
+    assert structure_by_label["A2"]["predicted_rank01"] > 0.0
+    assert atom_by_label["A2"]["predicted_rank01"] > 0.0
+    assert structure_by_label["A"]["no_motif"] < 100.0
+    assert atom_by_label["A"]["no_motif"] < 100.0
+    np.testing.assert_allclose(
+        np.asarray(observed_structure_payload["matrix"], dtype=float)[0],
+        np.asarray([100.0], dtype=float),
+    )
+    np.testing.assert_allclose(
+        np.asarray(observed_atom_payload["matrix"], dtype=float)[0],
+        np.asarray([100.0], dtype=float),
+    )
+
+    window.project_setup_tab.use_predicted_structure_weights_checkbox.setChecked(
+        False
+    )
+    QApplication.processEvents()
+
+    assert window.project_setup_tab.selected_distribution_id() == (
+        observed_artifacts.distribution_id
+    )
+    assert window.project_setup_tab.current_prior_json_path() == (
+        observed_artifacts.prior_weights_file
+    )
+    assert window.project_setup_tab.recognized_clusters_table.rowCount() == 1
+    assert window.prefit_workflow.prefit_dir == observed_artifacts.prefit_dir
+    assert window.prefit_tab.saved_state_combo.itemText(0) == (
+        "prefit_observed"
+    )
+    assert window.dream_tab.selected_saved_run_dir() == str(
+        (observed_artifacts.dream_runtime_dir / "dream_observed").resolve()
+    )
+    window.close()
+
+
+def test_project_setup_can_load_saved_distribution_and_scope_prefit_and_dream(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    clusters_dir = paths.project_dir / "clusters"
+    structure_dir = clusters_dir / "A"
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    (structure_dir / "frame_0001.xyz").write_text(
+        "2\nframe 1\nA 0.0 0.0 0.0\nH 1.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    observed_component = np.linspace(10.0, 17.0, 8)
+
+    def fake_build_profiles(
+        builder,
+        *,
+        cluster_bins,
+        progress_callback=None,
+        progress_total=None,
+        **kwargs,
+    ):
+        del progress_callback, progress_total, kwargs
+        scale = 0.5 if builder.exclude_elements else 1.0
+        output_path = builder.output_dir / "A_no_motif.txt"
+        _write_component_file(
+            output_path,
+            builder.q_values,
+            observed_component * scale,
+        )
+        cluster_bin = cluster_bins[0]
+        return [
+            AveragedComponent(
+                structure=cluster_bin.structure,
+                motif=cluster_bin.motif,
+                file_count=len(cluster_bin.files),
+                representative=cluster_bin.representative,
+                source_dir=cluster_bin.source_dir,
+                q_values=np.asarray(builder.q_values, dtype=float),
+                mean_intensity=np.asarray(
+                    observed_component * scale,
+                    dtype=float,
+                ),
+                std_intensity=np.zeros_like(builder.q_values, dtype=float),
+                se_intensity=np.zeros_like(builder.q_values, dtype=float),
+                output_path=output_path,
+            )
+        ]
+
+    monkeypatch.setattr(
+        project_module.DebyeProfileBuilder,
+        "build_profiles",
+        fake_build_profiles,
+    )
+
+    observed_settings = manager.load_project(project_dir)
+    observed_settings.clusters_dir = str(clusters_dir)
+    observed_settings.exclude_elements = []
+    manager.save_project(observed_settings)
+    manager.build_scattering_components(observed_settings)
+    manager.generate_prior_weights(observed_settings)
+    observed_artifacts = project_artifact_paths(observed_settings)
+    _write_distribution_history_artifacts(
+        observed_artifacts,
+        state_name="prefit_observed",
+        run_name="dream_observed",
+    )
+
+    excluded_settings = manager.load_project(project_dir)
+    excluded_settings.clusters_dir = str(clusters_dir)
+    excluded_settings.exclude_elements = ["H"]
+    manager.save_project(excluded_settings)
+    manager.build_scattering_components(excluded_settings)
+    manager.generate_prior_weights(excluded_settings)
+    excluded_artifacts = project_artifact_paths(excluded_settings)
+    _write_distribution_history_artifacts(
+        excluded_artifacts,
+        state_name="prefit_excluded",
+        run_name="dream_excluded",
+    )
+
+    manager.save_project(observed_settings)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert window.project_setup_tab.computed_distribution_combo.count() == 2
+    assert window.project_setup_tab.current_prior_json_path() == (
+        observed_artifacts.prior_weights_file
+    )
+    assert window.prefit_workflow.prefit_dir == observed_artifacts.prefit_dir
+    assert window.prefit_tab.saved_state_combo.itemText(0) == (
+        "prefit_observed"
+    )
+    assert window.dream_tab.selected_saved_run_dir() == str(
+        (observed_artifacts.dream_runtime_dir / "dream_observed").resolve()
+    )
+
+    target_index = (
+        window.project_setup_tab.computed_distribution_combo.findData(
+            excluded_artifacts.distribution_id
+        )
+    )
+    assert target_index >= 0
+    window.project_setup_tab.computed_distribution_combo.setCurrentIndex(
+        target_index
+    )
+    window.project_setup_tab.load_distribution_button.click()
+    QApplication.processEvents()
+
+    assert window.project_setup_tab.exclude_elements() == ["H"]
+    assert window.project_setup_tab.current_prior_json_path() == (
+        excluded_artifacts.prior_weights_file
+    )
+    assert window.prefit_workflow.prefit_dir == excluded_artifacts.prefit_dir
+    assert window.prefit_tab.saved_state_combo.itemText(0) == (
+        "prefit_excluded"
+    )
+    assert window.dream_tab.selected_saved_run_dir() == str(
+        (excluded_artifacts.dream_runtime_dir / "dream_excluded").resolve()
+    )
+    window.close()
 
 
 def test_project_settings_roundtrip_preserves_powerpoint_export_settings(

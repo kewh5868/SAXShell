@@ -3,18 +3,22 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import shutil
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -77,6 +81,7 @@ from ..dataset import (
     save_cluster_dynamicsai_dataset,
 )
 from ..workflow import (
+    ClusterDynamicsMLPreview,
     ClusterDynamicsMLResult,
     ClusterDynamicsMLWorkflow,
     _resolved_population_weights,
@@ -87,6 +92,26 @@ from .plot_panel import (
 )
 
 _OPEN_WINDOWS: list["ClusterDynamicsMLMainWindow"] = []
+_ML_STATUS_PATTERN = re.compile(r"^Step (\d+)/(\d+): (.+)$")
+_RUNTIME_HISTORY_LIMIT = 200
+_UI_REFRESH_DELAY_MS = 225
+_RUNTIME_FEATURE_NAMES = (
+    "selected_frames",
+    "time_bins",
+    "structure_label_count",
+    "total_structure_files",
+    "target_count_count",
+    "node_span",
+    "candidates_per_size",
+    "q_points",
+    "has_experimental",
+)
+
+
+@dataclass(slots=True)
+class _RuntimeEstimate:
+    seconds: float | None
+    sample_count: int
 
 
 @dataclass(slots=True)
@@ -191,6 +216,23 @@ class ClusterDynamicsMLWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class ClusterDynamicsMLDatasetLoadWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, dataset_file: Path) -> None:
+        super().__init__()
+        self.dataset_file = Path(dataset_file).expanduser().resolve()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            loaded = load_cluster_dynamicsai_dataset(self.dataset_file)
+            self.finished.emit(loaded)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class ClusterDynamicsMLSettingsPanel(QGroupBox):
     settings_changed = Signal()
 
@@ -215,7 +257,7 @@ class ClusterDynamicsMLSettingsPanel(QGroupBox):
         )
         experimental_tooltip = (
             "Optional experimental SAXS data file used to fit and compare the "
-            "cluster-only surrogate SAXS trace. Leave this blank to run the "
+            "cluster-only Predicted Structures SAXS trace. Leave this blank to run the "
             "prediction workflow without an experimental comparison."
         )
         target_start_tooltip = (
@@ -242,11 +284,11 @@ class ClusterDynamicsMLSettingsPanel(QGroupBox):
             "compare prediction settings and fitted SAXS models later."
         )
         q_min_tooltip = (
-            "Fallback minimum q value for the surrogate SAXS comparison when "
+            "Fallback minimum q value for the Predicted Structures SAXS comparison when "
             "no experimental data file is loaded."
         )
         q_max_tooltip = (
-            "Fallback maximum q value for the surrogate SAXS comparison when "
+            "Fallback maximum q value for the Predicted Structures SAXS comparison when "
             "no experimental data file is loaded."
         )
         q_points_tooltip = (
@@ -610,10 +652,46 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         )
         self._run_thread: QThread | None = None
         self._run_worker: ClusterDynamicsMLWorker | None = None
+        self._dataset_load_thread: QThread | None = None
+        self._dataset_load_worker: (
+            ClusterDynamicsMLDatasetLoadWorker | None
+        ) = None
+        self._pending_dataset_load_announce = False
+        self._pending_dataset_load_action_label = "Loaded"
+        self._pending_dataset_history_reload = True
+        self._run_started_at_monotonic: float | None = None
+        self._active_runtime_estimate: _RuntimeEstimate | None = None
+        self._active_job_config: ClusterDynamicsMLJobConfig | None = None
+        self._active_job_preview: ClusterDynamicsMLPreview | None = None
+        self._auto_detected_energy_file: Path | None = None
         self._suspend_preview_refresh = False
         self._initializing = True
         self._restoring_project_dataset = False
+        self._app_event_filter_installed = False
         self._build_ui()
+        self._selection_preview_timer = QTimer(self)
+        self._selection_preview_timer.setSingleShot(True)
+        self._selection_preview_timer.setInterval(_UI_REFRESH_DELAY_MS)
+        self._selection_preview_timer.timeout.connect(
+            self._flush_scheduled_selection_preview
+        )
+        self._frames_dir_change_timer = QTimer(self)
+        self._frames_dir_change_timer.setSingleShot(True)
+        self._frames_dir_change_timer.setInterval(_UI_REFRESH_DELAY_MS)
+        self._frames_dir_change_timer.timeout.connect(
+            self._flush_scheduled_frames_dir_change
+        )
+        self._pending_frames_dir: Path | None = None
+        self._project_dir_change_timer = QTimer(self)
+        self._project_dir_change_timer.setSingleShot(True)
+        self._project_dir_change_timer.setInterval(_UI_REFRESH_DELAY_MS)
+        self._project_dir_change_timer.timeout.connect(
+            self._flush_scheduled_project_dir_change
+        )
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+            self._app_event_filter_installed = True
 
         if initial_frames_dir is not None:
             self.trajectory_panel.frames_dir_edit.setText(
@@ -639,9 +717,89 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             self._refresh_project_history_view()
             self._refresh_selection_preview()
 
+    def closeEvent(self, event) -> None:
+        app = QApplication.instance()
+        if self._app_event_filter_installed and app is not None:
+            app.removeEventFilter(self)
+            self._app_event_filter_installed = False
+        super().closeEvent(event)
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:
+        if self._handle_guarded_field_escape(watched, event):
+            return True
+        if self._should_block_guarded_field_wheel(watched, event):
+            return True
+        return super().eventFilter(watched, event)
+
+    def _guarded_field_owner(self, watched: object) -> QWidget | None:
+        widget = watched if isinstance(watched, QWidget) else None
+        while widget is not None:
+            if isinstance(widget, (QAbstractSpinBox, QComboBox, QLineEdit)):
+                for root in self._guarded_field_roots():
+                    if widget is root or root.isAncestorOf(widget):
+                        return widget
+                return None
+            widget = widget.parentWidget()
+        return None
+
+    def _guarded_field_roots(self) -> tuple[QWidget, ...]:
+        return (
+            self.trajectory_panel,
+            self.time_panel,
+            self.definitions_panel,
+            self.prediction_panel,
+            self.run_panel,
+            self.dataset_panel,
+        )
+
+    def _handle_guarded_field_escape(
+        self,
+        watched: object,
+        event: QEvent,
+    ) -> bool:
+        if event.type() != QEvent.Type.KeyPress:
+            return False
+        if getattr(event, "key", None) is None:
+            return False
+        if event.key() != Qt.Key.Key_Escape:
+            return False
+        owner = self._guarded_field_owner(watched)
+        if owner is None:
+            return False
+        if isinstance(owner, QComboBox):
+            owner.hidePopup()
+        line_edit = (
+            owner.lineEdit()
+            if isinstance(owner, (QAbstractSpinBox, QComboBox))
+            else owner
+        )
+        if isinstance(line_edit, QLineEdit):
+            line_edit.deselect()
+            line_edit.clearFocus()
+        owner.clearFocus()
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
+        event.accept()
+        return True
+
+    def _should_block_guarded_field_wheel(
+        self,
+        watched: object,
+        event: QEvent,
+    ) -> bool:
+        if event.type() != QEvent.Type.Wheel:
+            return False
+        owner = self._guarded_field_owner(watched)
+        if owner is None:
+            return False
+        if isinstance(owner, QComboBox) and owner.view().isVisible():
+            return False
+        event.ignore()
+        return True
+
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell (clusterdynamicsml)")
         self.setWindowIcon(load_saxshell_icon())
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.resize(1640, 960)
 
         central = QWidget()
@@ -665,6 +823,18 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self.run_panel.analyze_button.setText(
             "Analyze and Predict Larger Clusters"
         )
+        self.run_panel.configure_auto_report_option(
+            visible=True,
+            text="Detailed report",
+            tooltip=(
+                "Also write the detailed ClusterDynamics ML PowerPoint "
+                "report to the default report location when the analysis "
+                "finishes. When a project folder is set, the project report "
+                "is reused and appended automatically."
+            ),
+            checked=False,
+            emit_signal=False,
+        )
 
         left_layout.addWidget(self.trajectory_panel)
         left_layout.addWidget(self.time_panel)
@@ -677,10 +847,11 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(12)
+        right_layout.setSpacing(0)
 
         self.dynamics_plot_panel = ClusterDynamicsPlotPanel()
-        right_layout.addWidget(self.dynamics_plot_panel, stretch=2)
+        self.right_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.right_splitter.setChildrenCollapsible(False)
 
         self.results_tabs = QTabWidget()
         self.summary_tab = QWidget()
@@ -691,8 +862,8 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self.summary_box.setReadOnly(True)
         self.summary_box.setMinimumHeight(170)
         summary_layout.addWidget(self.summary_box, stretch=1)
-        history_group = QGroupBox("Prediction History")
-        history_layout = QVBoxLayout(history_group)
+        self.history_group = QGroupBox("Prediction History")
+        history_layout = QVBoxLayout(self.history_group)
         history_layout.setContentsMargins(8, 8, 8, 8)
         history_layout.setSpacing(8)
         self.history_status_label = QLabel(
@@ -758,7 +929,6 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         history_button_row.addWidget(self.history_refresh_button)
         history_button_row.addStretch(1)
         history_layout.addLayout(history_button_row)
-        summary_layout.addWidget(history_group, stretch=1)
         self.lifetime_table = self._build_table(
             (
                 "Type",
@@ -781,16 +951,39 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 "Notes",
             )
         )
+        self.debye_waller_table = self._build_table(
+            (
+                "Type",
+                "Method",
+                "Nodes",
+                "Candidate Rank",
+                "Label",
+                "Pair",
+                "Sigma (A)",
+                "B (A^2)",
+                "Support",
+                "Aligned pairs",
+                "Source Label",
+            )
+        )
         self.histogram_panel = ClusterDynamicsMLHistogramPanel()
         self.saxs_panel = ClusterDynamicsMLPlotPanel()
         self.observed_histogram_panel = self.histogram_panel
         self.combined_histogram_panel = self.histogram_panel
-        self.surrogate_plot_panel = self.saxs_panel
+        self.predicted_structures_plot_panel = self.saxs_panel
         self.results_tabs.addTab(self.summary_tab, "Summary")
         self.results_tabs.addTab(self.lifetime_table, "Lifetimes")
+        self.results_tabs.addTab(self.debye_waller_table, "Debye-Waller")
         self.results_tabs.addTab(self.histogram_panel, "Histograms")
         self.results_tabs.addTab(self.saxs_panel, "SAXS")
-        right_layout.addWidget(self.results_tabs, stretch=2)
+        self.right_splitter.addWidget(self.dynamics_plot_panel)
+        self.right_splitter.addWidget(self.results_tabs)
+        self.right_splitter.addWidget(self.history_group)
+        self.right_splitter.setStretchFactor(0, 3)
+        self.right_splitter.setStretchFactor(1, 4)
+        self.right_splitter.setStretchFactor(2, 2)
+        self.right_splitter.setSizes([360, 420, 240])
+        right_layout.addWidget(self.right_splitter)
 
         splitter.addWidget(self._wrap_scroll_area(left))
         splitter.addWidget(right)
@@ -803,26 +996,20 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             self.inspect_frames_folder
         )
         self.trajectory_panel.frames_dir_changed.connect(
-            self._on_frames_dir_changed
-        )
-        self.trajectory_panel.settings_changed.connect(
-            self._refresh_selection_preview
+            self._schedule_frames_dir_change
         )
         self.time_panel.settings_changed.connect(
-            self._refresh_selection_preview
+            self._schedule_selection_preview_refresh
         )
         self.definitions_panel.settings_changed.connect(
-            self._refresh_selection_preview
+            self._schedule_selection_preview_refresh
         )
         self.prediction_panel.settings_changed.connect(
-            self._refresh_selection_preview
-        )
-        self.run_panel.settings_changed.connect(
-            self._refresh_selection_preview
+            self._schedule_selection_preview_refresh
         )
         self.run_panel.analyze_requested.connect(self.run_analysis)
         self.dataset_panel.settings_changed.connect(
-            self._on_project_dir_changed
+            self._schedule_project_dir_change
         )
         self.dataset_panel.save_dataset_requested.connect(self.save_dataset)
         self.dataset_panel.load_dataset_requested.connect(self.load_dataset)
@@ -842,7 +1029,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         )
         self.run_panel.set_log(
             "Ready. clusterdynamicsml reuses the time-binned cluster analysis "
-            "from clusterdynamics, then fits an experimental surrogate to "
+            "from clusterdynamics, then fits an experimental Predicted Structures model to "
             "smaller-cluster lifetimes, populations, stoichiometries, and "
             "representative structures."
         )
@@ -861,23 +1048,44 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             if self._run_thread is not None:
                 return
             config = self._build_job_config()
+            preview = self._build_preview_workflow().preview_selection()
+            runtime_estimate = self._estimate_runtime_for_preview(
+                preview,
+                config=config,
+            )
+            self._active_runtime_estimate = runtime_estimate
+            self._active_job_config = config
+            self._active_job_preview = preview
             self.run_panel.set_log(
                 "clusterdynamicsml request received.\n"
                 f"Frames folder: {config.frames_dir}\n"
                 f"Clusters folder: {config.clusters_dir}\n"
                 f"Targets: {config.target_node_counts}\n"
                 f"Experimental data: {config.experimental_data_file}\n"
-                f"Frame timestep: {config.frame_timestep_fs:.3f} fs"
+                f"Frame timestep: {config.frame_timestep_fs:.3f} fs\n"
+                "Estimated runtime: "
+                + (
+                    "collecting previous runtimes"
+                    if runtime_estimate.seconds is None
+                    else (
+                        f"{_format_runtime_duration(runtime_estimate.seconds)} "
+                        f"from {runtime_estimate.sample_count} previous "
+                        f"{'run' if runtime_estimate.sample_count == 1 else 'runs'}"
+                    )
+                )
             )
             self.run_panel.progress_label.setText(
-                "Progress: running surrogate workflow"
+                "Progress: preparing prediction workflow"
             )
-            self.run_panel.progress_bar.setRange(0, 0)
+            self.run_panel.progress_bar.setRange(0, 1)
+            self.run_panel.progress_bar.setValue(0)
+            self.run_panel.progress_bar.setFormat("%v / %m steps")
             self.dynamics_plot_panel.set_result(None)
             self.histogram_panel.set_result(None)
             self.saxs_panel.set_result(None)
             self.summary_box.clear()
             self.lifetime_table.setRowCount(0)
+            self.debye_waller_table.setRowCount(0)
             self.statusBar().showMessage(
                 "Analyzing and predicting larger clusters..."
             )
@@ -952,13 +1160,38 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             q_points=self.prediction_panel.q_points(),
         )
 
+    def _schedule_selection_preview_refresh(self) -> None:
+        if self._suspend_preview_refresh:
+            return
+        self._selection_preview_timer.start()
+
+    def _flush_scheduled_selection_preview(self) -> None:
+        self._refresh_selection_preview()
+
+    def _schedule_frames_dir_change(
+        self,
+        frames_dir: Path | None,
+    ) -> None:
+        self._pending_frames_dir = frames_dir
+        self._frames_dir_change_timer.start()
+
+    def _flush_scheduled_frames_dir_change(self) -> None:
+        self._on_frames_dir_changed(self._pending_frames_dir)
+
+    def _schedule_project_dir_change(self) -> None:
+        self._project_dir_change_timer.start()
+
+    def _flush_scheduled_project_dir_change(self) -> None:
+        self._on_project_dir_changed()
+
     def _start_worker(self, config: ClusterDynamicsMLJobConfig) -> None:
         self._run_thread = QThread(self)
         self._run_worker = ClusterDynamicsMLWorker(config)
+        self._run_started_at_monotonic = time.monotonic()
         self._run_worker.moveToThread(self._run_thread)
 
         self._run_thread.started.connect(self._run_worker.run)
-        self._run_worker.progress.connect(self.run_panel.append_log)
+        self._run_worker.progress.connect(self._on_worker_progress)
         self._run_worker.finished.connect(self._on_run_finished)
         self._run_worker.failed.connect(self._on_run_failed)
         self._run_worker.finished.connect(self._run_thread.quit)
@@ -968,7 +1201,133 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self._run_thread.finished.connect(self._run_worker.deleteLater)
         self._run_thread.start()
 
+    def _start_dataset_load(
+        self,
+        dataset_file: str | Path,
+        *,
+        announce: bool,
+        action_label: str,
+        reload_history_entries: bool,
+    ) -> None:
+        if self._dataset_load_thread is not None:
+            return
+        resolved_dataset = Path(dataset_file).expanduser().resolve()
+        self._pending_dataset_load_announce = bool(announce)
+        self._pending_dataset_load_action_label = str(action_label)
+        self._pending_dataset_history_reload = bool(reload_history_entries)
+        self._dataset_load_thread = QThread(self)
+        self._dataset_load_worker = ClusterDynamicsMLDatasetLoadWorker(
+            resolved_dataset
+        )
+        self._dataset_load_worker.moveToThread(self._dataset_load_thread)
+        self._dataset_load_thread.started.connect(
+            self._dataset_load_worker.run
+        )
+        self._dataset_load_worker.finished.connect(
+            self._on_dataset_load_finished
+        )
+        self._dataset_load_worker.failed.connect(self._on_dataset_load_failed)
+        self._dataset_load_worker.finished.connect(
+            self._dataset_load_thread.quit
+        )
+        self._dataset_load_worker.failed.connect(
+            self._dataset_load_thread.quit
+        )
+        self._dataset_load_thread.finished.connect(
+            self._cleanup_dataset_load_thread
+        )
+        self._dataset_load_thread.finished.connect(
+            self._dataset_load_thread.deleteLater
+        )
+        self._dataset_load_thread.finished.connect(
+            self._dataset_load_worker.deleteLater
+        )
+        self.run_panel.progress_bar.setRange(0, 0)
+        self.run_panel.progress_label.setText(
+            "Progress: loading saved prediction"
+        )
+        self.history_status_label.setText(
+            f"Loading {resolved_dataset.name}..."
+        )
+        self.statusBar().showMessage(
+            f"Loading clusterdynamicsml dataset from {resolved_dataset.name}"
+        )
+        self._update_history_controls()
+        self._dataset_load_thread.start()
+
+    def _on_dataset_load_finished(
+        self,
+        loaded: LoadedClusterDynamicsMLDataset,
+    ) -> None:
+        self._apply_loaded_dataset(
+            loaded,
+            announce=self._pending_dataset_load_announce,
+            action_label=self._pending_dataset_load_action_label,
+            reload_history_entries=self._pending_dataset_history_reload,
+        )
+
+    def _on_dataset_load_failed(self, message: str) -> None:
+        self.run_panel.progress_bar.setRange(0, 1)
+        self.run_panel.progress_bar.setValue(0)
+        self.run_panel.progress_label.setText(
+            "Progress: failed to load saved prediction"
+        )
+        self.statusBar().showMessage("clusterdynamicsml dataset load failed")
+        self._update_history_controls()
+        self._handle_error("clusterdynamicsml dataset load failed", message)
+
+    def _cleanup_dataset_load_thread(self) -> None:
+        self._dataset_load_worker = None
+        self._dataset_load_thread = None
+        self._update_history_controls()
+
+    def _on_worker_progress(self, message: str) -> None:
+        text = str(message).strip()
+        if not text:
+            return
+        self.run_panel.append_log(text)
+        first_line = text.splitlines()[0]
+        match = _ML_STATUS_PATTERN.match(first_line)
+        if match is None:
+            self.statusBar().showMessage(first_line)
+            return
+        step = max(int(match.group(1)), 1)
+        total_steps = max(int(match.group(2)), step)
+        title = match.group(3).strip()
+        self.run_panel.progress_bar.setRange(0, total_steps)
+        self.run_panel.progress_bar.setValue(step)
+        self.run_panel.progress_bar.setFormat("%v / %m steps")
+        runtime_suffix = self._progress_runtime_suffix()
+        self.run_panel.progress_label.setText(
+            f"Progress: step {step}/{total_steps} - {title}{runtime_suffix}"
+        )
+        self.statusBar().showMessage(title)
+        QApplication.processEvents()
+
+    def _progress_runtime_suffix(self) -> str:
+        if (
+            self._active_runtime_estimate is None
+            or self._active_runtime_estimate.seconds is None
+        ):
+            return ""
+        if self._run_started_at_monotonic is None:
+            return (
+                f" (estimated total "
+                f"{_format_runtime_duration(self._active_runtime_estimate.seconds)})"
+            )
+        elapsed = max(time.monotonic() - self._run_started_at_monotonic, 0.0)
+        remaining = max(self._active_runtime_estimate.seconds - elapsed, 0.0)
+        return (
+            f" (~{_format_runtime_duration(remaining)} remaining, "
+            f"{_format_runtime_duration(self._active_runtime_estimate.seconds)} total)"
+        )
+
     def _on_run_finished(self, result: ClusterDynamicsMLResult) -> None:
+        elapsed_seconds = (
+            None
+            if self._run_started_at_monotonic is None
+            else max(time.monotonic() - self._run_started_at_monotonic, 0.0)
+        )
         self._last_result = result
         self.dynamics_plot_panel.set_result(result.dynamics_result)
         self.histogram_panel.set_result(result)
@@ -986,10 +1345,28 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             "clusterdynamicsml complete.\n"
             f"Observed node counts: {result.preview.observed_node_counts}\n"
             f"Predicted candidates: {len(result.predictions)}\n"
-            f"Max predicted node count: {result.max_predicted_node_count}"
+            f"Max predicted node count: {result.max_predicted_node_count}\n"
+            + (
+                ""
+                if elapsed_seconds is None
+                else (
+                    "Runtime: " f"{_format_runtime_duration(elapsed_seconds)}"
+                )
+            )
         )
         self._populate_summary_box(result)
         self._populate_lifetime_table(result)
+        self._populate_debye_waller_table(result)
+        if (
+            elapsed_seconds is not None
+            and self._active_job_config is not None
+            and self._active_job_preview is not None
+        ):
+            self._store_runtime_training_example(
+                config=self._active_job_config,
+                preview=self._active_job_preview,
+                runtime_seconds=elapsed_seconds,
+            )
         autosaved = self._autosave_project_result(result)
         if autosaved is not None:
             self._refresh_project_history_view(
@@ -1008,6 +1385,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 select_dataset=self._last_dataset_file
             )
             self.statusBar().showMessage("clusterdynamicsml analysis complete")
+        self._auto_export_powerpoint_report(result)
 
     def _on_run_failed(self, message: str) -> None:
         self.run_panel.progress_bar.setRange(0, 1)
@@ -1019,6 +1397,10 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
     def _cleanup_run_thread(self) -> None:
         self._run_worker = None
         self._run_thread = None
+        self._run_started_at_monotonic = None
+        self._active_job_config = None
+        self._active_job_preview = None
+        self._active_runtime_estimate = None
 
     def save_dataset(self) -> None:
         if self._last_result is None:
@@ -1051,6 +1433,8 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         )
 
     def load_dataset(self) -> None:
+        if self._dataset_load_thread is not None:
+            return
         default_path = (
             self._last_dataset_file
             if self._last_dataset_file is not None
@@ -1064,11 +1448,11 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         )
         if not path:
             return
-        loaded = load_cluster_dynamicsai_dataset(path)
-        self._apply_loaded_dataset(
-            loaded,
+        self._start_dataset_load(
+            path,
             announce=True,
             action_label="Loaded",
+            reload_history_entries=True,
         )
 
     def save_colormap_data(self) -> None:
@@ -1145,18 +1529,6 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             )
             return
 
-        self.dynamics_plot_panel.set_result(self._last_result.dynamics_result)
-        self.saxs_panel.set_result(self._last_result)
-        selection_summary = self.run_panel.selection_box.toPlainText().strip()
-        if not selection_summary:
-            selection_summary = self._format_preview_text(
-                self._last_result.preview
-            )
-        summary_text = self.summary_box.toPlainText().strip()
-        if not summary_text:
-            self._populate_summary_box(self._last_result)
-            summary_text = self.summary_box.toPlainText().strip()
-
         default_path = self._default_powerpoint_report_file()
         path, _selected_filter = QFileDialog.getSaveFileName(
             self,
@@ -1174,17 +1546,9 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self.run_panel.progress_bar.setValue(0)
         self.run_panel.progress_bar.setFormat("%v / %m steps")
         try:
-            export_result = export_cluster_dynamicsai_report_pptx(
-                result=self._last_result,
-                selection_summary=selection_summary,
-                result_summary=summary_text,
-                dynamics_figure=self.dynamics_plot_panel.figure,
-                surrogate_figure=self.saxs_panel.figure,
-                output_path=path,
-                settings=self._powerpoint_export_settings(),
-                project_dir=self.dataset_panel.project_dir(),
-                frames_dir=self.trajectory_panel.get_frames_dir(),
-                progress_callback=self._on_powerpoint_report_progress,
+            export_result = self._export_powerpoint_report_to_path(
+                self._last_result,
+                output_path=Path(path),
             )
         except Exception as exc:
             self.run_panel.progress_bar.setRange(0, 1)
@@ -1205,20 +1569,120 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             self.run_panel.progress_bar.maximum()
         )
         self.run_panel.progress_bar.setFormat("%v / %m steps")
-        if export_result.appended_to_existing:
-            self.run_panel.append_log(
-                "Appended clusterdynamicsml report slides to "
-                f"{export_result.report_path}\n"
-                f"Slides added: {export_result.added_slide_count}"
-            )
-        else:
-            self.run_panel.append_log(
-                "Saved clusterdynamicsml PowerPoint report to "
-                f"{export_result.report_path}\n"
-                f"Slides written: {export_result.added_slide_count}"
-            )
+        self._log_powerpoint_export_result(export_result)
         self.statusBar().showMessage(
             f"Saved PowerPoint report to {export_result.report_path}"
+        )
+
+    def _powerpoint_report_export_content(
+        self,
+        result: ClusterDynamicsMLResult,
+    ) -> tuple[str, str]:
+        self.dynamics_plot_panel.set_result(result.dynamics_result)
+        self.saxs_panel.set_result(result)
+        selection_summary = self.run_panel.selection_box.toPlainText().strip()
+        if not selection_summary:
+            selection_summary = self._format_preview_text(result.preview)
+        summary_text = self.summary_box.toPlainText().strip()
+        if not summary_text:
+            self._populate_summary_box(result)
+            summary_text = self.summary_box.toPlainText().strip()
+        return selection_summary, summary_text
+
+    def _export_powerpoint_report_to_path(
+        self,
+        result: ClusterDynamicsMLResult,
+        *,
+        output_path: Path,
+    ):
+        selection_summary, summary_text = (
+            self._powerpoint_report_export_content(result)
+        )
+        return export_cluster_dynamicsai_report_pptx(
+            result=result,
+            selection_summary=selection_summary,
+            result_summary=summary_text,
+            dynamics_figure=self.dynamics_plot_panel.figure,
+            predicted_structures_figure=self.saxs_panel.figure,
+            output_path=output_path,
+            settings=self._powerpoint_export_settings(),
+            project_dir=self.dataset_panel.project_dir(),
+            frames_dir=self.trajectory_panel.get_frames_dir(),
+            progress_callback=self._on_powerpoint_report_progress,
+        )
+
+    def _log_powerpoint_export_result(
+        self,
+        export_result,
+        *,
+        auto_generated: bool = False,
+    ) -> None:
+        if export_result.appended_to_existing:
+            action = (
+                "Updated detailed clusterdynamicsml report at "
+                if auto_generated
+                else "Appended clusterdynamicsml report slides to "
+            )
+            count_label = "Slides added"
+        else:
+            action = (
+                "Saved detailed clusterdynamicsml report to "
+                if auto_generated
+                else "Saved clusterdynamicsml PowerPoint report to "
+            )
+            count_label = "Slides written"
+        self.run_panel.append_log(
+            f"{action}{export_result.report_path}\n"
+            f"{count_label}: {export_result.added_slide_count}"
+        )
+
+    def _auto_export_powerpoint_report(
+        self,
+        result: ClusterDynamicsMLResult,
+    ) -> None:
+        if not self.run_panel.auto_report_enabled():
+            return
+        output_path = self._default_powerpoint_report_file()
+        self.run_panel.append_log(
+            "Generating detailed clusterdynamicsml report.\n"
+            f"Output: {output_path}"
+        )
+        try:
+            export_result = self._export_powerpoint_report_to_path(
+                result,
+                output_path=output_path,
+            )
+        except Exception as exc:
+            self.run_panel.progress_bar.setRange(
+                0, max(result.dynamics_result.analyzed_frames, 1)
+            )
+            self.run_panel.progress_bar.setValue(
+                result.dynamics_result.analyzed_frames
+            )
+            self.run_panel.progress_bar.setFormat("%v / %m frames")
+            self.run_panel.progress_label.setText(
+                f"Progress: completed {result.dynamics_result.analyzed_frames} frames"
+            )
+            self.run_panel.append_log(
+                "Detailed report export failed.\n" f"{exc}"
+            )
+            self.statusBar().showMessage(
+                "clusterdynamicsml analysis complete; detailed report export failed"
+            )
+            return
+        self.run_panel.progress_label.setText(
+            "Progress: detailed report saved"
+        )
+        self.run_panel.progress_bar.setValue(
+            self.run_panel.progress_bar.maximum()
+        )
+        self.run_panel.progress_bar.setFormat("%v / %m steps")
+        self._log_powerpoint_export_result(
+            export_result,
+            auto_generated=True,
+        )
+        self.statusBar().showMessage(
+            f"Saved detailed report to {export_result.report_path}"
         )
 
     def _inspect_frames_dir(self, frames_dir: Path, *, announce: bool) -> None:
@@ -1251,6 +1715,8 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self._refresh_selection_preview()
 
     def _on_frames_dir_changed(self, frames_dir: Path | None) -> None:
+        self._frames_dir_change_timer.stop()
+        self._pending_frames_dir = frames_dir
         if self._suspend_preview_refresh:
             return
         self._last_summary = None
@@ -1260,7 +1726,9 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self.saxs_panel.set_result(None)
         self.summary_box.clear()
         self.lifetime_table.setRowCount(0)
+        self.debye_waller_table.setRowCount(0)
         self.time_panel.set_folder_start_time_fs(None, emit_signal=False)
+        self._apply_predicted_energy_file(frames_dir)
         if frames_dir is None:
             self._sync_box_dimensions_from_summary(None)
             self._set_frame_format(None)
@@ -1270,6 +1738,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self._inspect_frames_dir(frames_dir, announce=False)
 
     def _on_project_dir_changed(self) -> None:
+        self._project_dir_change_timer.stop()
         if self._restoring_project_dataset:
             return
         self._sync_project_defaults()
@@ -1303,7 +1772,65 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 emit_signal=False,
             )
 
+    @staticmethod
+    def _predict_energy_file_for_frames_dir(
+        frames_dir: Path | None,
+    ) -> Path | None:
+        if frames_dir is None:
+            return None
+        search_root = Path(frames_dir).expanduser().resolve().parent
+        candidates = sorted(
+            path.resolve()
+            for path in search_root.glob("*.ener")
+            if path.is_file()
+        )
+        if not candidates:
+            return None
+        preferred_names = (
+            "traj.ener",
+            f"{Path(frames_dir).name}.ener",
+            f"{search_root.name}.ener",
+        )
+        lowered = {name.lower() for name in preferred_names}
+        for candidate in candidates:
+            if candidate.name.lower() in lowered:
+                return candidate
+        return candidates[0]
+
+    def _apply_predicted_energy_file(
+        self,
+        frames_dir: Path | None,
+    ) -> None:
+        current_energy = self.run_panel.energy_file()
+        resolved_current = (
+            None
+            if current_energy is None
+            else Path(current_energy).expanduser().resolve()
+        )
+        predicted_energy = self._predict_energy_file_for_frames_dir(frames_dir)
+        can_replace = resolved_current is None or (
+            self._auto_detected_energy_file is not None
+            and resolved_current == self._auto_detected_energy_file
+        )
+        if predicted_energy is None:
+            if (
+                self._auto_detected_energy_file is not None
+                and resolved_current == self._auto_detected_energy_file
+            ):
+                self.run_panel.energy_path_edit.blockSignals(True)
+                self.run_panel.energy_path_edit.clear()
+                self.run_panel.energy_path_edit.blockSignals(False)
+            self._auto_detected_energy_file = None
+            return
+        if not can_replace:
+            return
+        self.run_panel.energy_path_edit.blockSignals(True)
+        self.run_panel.energy_path_edit.setText(str(predicted_energy))
+        self.run_panel.energy_path_edit.blockSignals(False)
+        self._auto_detected_energy_file = predicted_energy
+
     def _refresh_selection_preview(self) -> None:
+        self._selection_preview_timer.stop()
         if self._suspend_preview_refresh:
             return
         frames_dir = self.trajectory_panel.get_frames_dir()
@@ -1314,7 +1841,8 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             )
             return
         try:
-            preview = self._build_preview_workflow().preview_selection()
+            preview_workflow = self._build_preview_workflow()
+            preview = preview_workflow.preview_selection()
             if (
                 self.time_panel.folder_start_time_fs() is None
                 and preview.dynamics_preview.folder_start_time_fs is not None
@@ -1325,7 +1853,14 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                     preview.dynamics_preview.folder_start_time_fs,
                     emit_signal=False,
                 )
-            text = self._format_preview_text(preview)
+            runtime_estimate = self._estimate_runtime_for_preview(
+                preview,
+                workflow=preview_workflow,
+            )
+            text = self._format_preview_text(
+                preview,
+                runtime_estimate=runtime_estimate,
+            )
         except Exception as exc:
             text = (
                 "Adjust the current settings to preview the extrapolation "
@@ -1379,7 +1914,12 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             q_points=self.prediction_panel.q_points(),
         )
 
-    def _format_preview_text(self, preview) -> str:
+    def _format_preview_text(
+        self,
+        preview,
+        *,
+        runtime_estimate: _RuntimeEstimate | None = None,
+    ) -> str:
         dynamics_preview = preview.dynamics_preview
         lines = [
             f"Mode: {frame_folder_label(dynamics_preview.frame_format)}",
@@ -1422,6 +1962,21 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 )
             ),
         ]
+        if (
+            runtime_estimate is not None
+            and runtime_estimate.seconds is not None
+            and runtime_estimate.seconds > 0.0
+        ):
+            lines.append(
+                "Estimated compute time: "
+                f"{_format_runtime_duration(runtime_estimate.seconds)} "
+                f"(learned from {runtime_estimate.sample_count} previous "
+                f"{'run' if runtime_estimate.sample_count == 1 else 'runs'})"
+            )
+        else:
+            lines.append(
+                "Estimated compute time: collecting previous runtimes"
+            )
         if dynamics_preview.first_selected_frame is not None:
             lines.append(
                 "Frame file range: "
@@ -1436,6 +1991,254 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         if preview.warnings:
             lines.extend(f"Warning: {message}" for message in preview.warnings)
         return "\n".join(lines)
+
+    def _runtime_history_file(
+        self,
+        *,
+        project_dir: Path | None = None,
+        frames_dir: Path | None = None,
+        ensure_parent: bool = False,
+    ) -> Path | None:
+        resolved_project_dir = (
+            self.dataset_panel.project_dir()
+            if project_dir is None
+            else Path(project_dir).expanduser().resolve()
+        )
+        resolved_frames_dir = (
+            self.trajectory_panel.get_frames_dir()
+            if frames_dir is None
+            else Path(frames_dir).expanduser().resolve()
+        )
+        if resolved_project_dir is not None:
+            history_path = (
+                build_project_paths(resolved_project_dir).exported_data_dir
+                / "clusterdynamicsml"
+                / "runtime_history.json"
+            )
+        elif resolved_frames_dir is not None:
+            history_path = (
+                resolved_frames_dir.parent
+                / f"{resolved_frames_dir.name}_clusterdynamicsml"
+                / "runtime_history.json"
+            )
+        else:
+            return None
+        if ensure_parent:
+            history_path.parent.mkdir(parents=True, exist_ok=True)
+        return history_path
+
+    def _runtime_feature_payload(
+        self,
+        preview: ClusterDynamicsMLPreview,
+        *,
+        workflow: ClusterDynamicsMLWorkflow | None = None,
+        config: ClusterDynamicsMLJobConfig | None = None,
+    ) -> dict[str, float]:
+        resolved_targets = (
+            tuple(config.target_node_counts)
+            if config is not None
+            else (
+                tuple(workflow.target_node_counts or ())
+                if workflow is not None
+                and workflow.target_node_counts is not None
+                else tuple(preview.target_node_counts)
+            )
+        )
+        candidates_per_size = (
+            config.candidates_per_size
+            if config is not None
+            else (
+                int(workflow.candidates_per_size)
+                if workflow is not None
+                else self.prediction_panel.candidates_per_size()
+            )
+        )
+        q_points = (
+            config.q_points
+            if config is not None
+            else (
+                int(workflow.q_points)
+                if workflow is not None
+                else self.prediction_panel.q_points()
+            )
+        )
+        has_experimental = (
+            config.experimental_data_file is not None
+            if config is not None
+            else (
+                workflow.experimental_data_file is not None
+                if workflow is not None
+                else self.prediction_panel.experimental_data_file() is not None
+            )
+        )
+        dynamics_preview = preview.dynamics_preview
+        node_span = 0
+        if resolved_targets:
+            node_span = max(resolved_targets) - min(resolved_targets) + 1
+        return {
+            "selected_frames": float(
+                max(int(dynamics_preview.selected_frames), 0)
+            ),
+            "time_bins": float(max(int(dynamics_preview.bin_count), 0)),
+            "structure_label_count": float(
+                max(preview.structure_label_count, 0)
+            ),
+            "total_structure_files": float(
+                max(preview.total_structure_files, 0)
+            ),
+            "target_count_count": float(max(len(resolved_targets), 0)),
+            "node_span": float(max(node_span, 0)),
+            "candidates_per_size": float(max(int(candidates_per_size), 1)),
+            "q_points": float(max(int(q_points), 1)),
+            "has_experimental": 1.0 if has_experimental else 0.0,
+        }
+
+    def _load_runtime_training_rows(
+        self,
+        history_path: Path | None,
+    ) -> list[dict[str, object]]:
+        if history_path is None or not history_path.is_file():
+            return []
+        try:
+            payload = json.loads(history_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        rows = payload.get("runs", [])
+        return [dict(row) for row in rows if isinstance(row, dict)]
+
+    def _estimate_runtime_for_preview(
+        self,
+        preview: ClusterDynamicsMLPreview,
+        *,
+        workflow: ClusterDynamicsMLWorkflow | None = None,
+        config: ClusterDynamicsMLJobConfig | None = None,
+    ) -> _RuntimeEstimate:
+        history_path = self._runtime_history_file(
+            project_dir=(None if config is None else config.project_dir),
+            frames_dir=(None if config is None else config.frames_dir),
+        )
+        rows = [
+            row
+            for row in self._load_runtime_training_rows(history_path)
+            if float(row.get("runtime_seconds", 0.0) or 0.0) > 0.0
+        ]
+        if not rows:
+            return _RuntimeEstimate(seconds=None, sample_count=0)
+
+        target_features = self._runtime_feature_payload(
+            preview,
+            workflow=workflow,
+            config=config,
+        )
+        target_vector = np.asarray(
+            [
+                1.0,
+                *[
+                    float(target_features[name])
+                    for name in _RUNTIME_FEATURE_NAMES
+                ],
+            ],
+            dtype=float,
+        )
+        y_values = np.asarray(
+            [float(row.get("runtime_seconds", 0.0)) for row in rows],
+            dtype=float,
+        )
+        feature_matrix = np.asarray(
+            [
+                [
+                    1.0,
+                    *[
+                        float(row.get("features", {}).get(name, 0.0))
+                        for name in _RUNTIME_FEATURE_NAMES
+                    ],
+                ]
+                for row in rows
+            ],
+            dtype=float,
+        )
+        if len(rows) == 1:
+            base_features = dict(rows[0].get("features", {}))
+            scale_terms = []
+            for name in (
+                "selected_frames",
+                "structure_label_count",
+                "total_structure_files",
+                "target_count_count",
+                "candidates_per_size",
+                "q_points",
+            ):
+                previous = max(float(base_features.get(name, 1.0) or 1.0), 1.0)
+                current = max(float(target_features.get(name, 1.0)), 1.0)
+                scale_terms.append(current / previous)
+            estimate_seconds = float(y_values[0] * np.mean(scale_terms))
+        else:
+            ridge = np.eye(feature_matrix.shape[1], dtype=float) * 1e-6
+            try:
+                coefficients = np.linalg.solve(
+                    feature_matrix.T @ feature_matrix + ridge,
+                    feature_matrix.T @ y_values,
+                )
+            except np.linalg.LinAlgError:
+                coefficients = np.linalg.pinv(
+                    feature_matrix.T @ feature_matrix + ridge
+                ) @ (feature_matrix.T @ y_values)
+            model_estimate = float(target_vector @ coefficients)
+            distances = np.sum(
+                np.abs(feature_matrix[:, 1:] - target_vector[1:]),
+                axis=1,
+            )
+            nearest_indices = np.argsort(distances)[: min(3, len(rows))]
+            neighbor_estimate = float(np.median(y_values[nearest_indices]))
+            estimate_seconds = 0.65 * model_estimate + 0.35 * neighbor_estimate
+        clipped = float(
+            np.clip(
+                estimate_seconds,
+                1.0,
+                max(float(np.max(y_values) * 3.0), 10.0),
+            )
+        )
+        return _RuntimeEstimate(seconds=clipped, sample_count=len(rows))
+
+    def _store_runtime_training_example(
+        self,
+        *,
+        config: ClusterDynamicsMLJobConfig,
+        preview: ClusterDynamicsMLPreview,
+        runtime_seconds: float,
+    ) -> None:
+        history_path = self._runtime_history_file(
+            project_dir=config.project_dir,
+            frames_dir=config.frames_dir,
+            ensure_parent=True,
+        )
+        if history_path is None:
+            return
+        rows = self._load_runtime_training_rows(history_path)
+        rows.append(
+            {
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "runtime_seconds": float(max(runtime_seconds, 0.0)),
+                "frames_dir": str(config.frames_dir),
+                "project_dir": (
+                    None
+                    if config.project_dir is None
+                    else str(config.project_dir)
+                ),
+                "features": self._runtime_feature_payload(
+                    preview,
+                    config=config,
+                ),
+            }
+        )
+        payload = {
+            "version": 1,
+            "runs": rows[-_RUNTIME_HISTORY_LIMIT:],
+        }
+        history_path.write_text(
+            json.dumps(payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     def _populate_summary_box(self, result: ClusterDynamicsMLResult) -> None:
         lines = [
@@ -1484,16 +2287,21 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                     "SAXS component files: "
                     f"{result.saxs_comparison.component_output_dir}"
                 )
-            if result.saxs_comparison.surrogate_structure_dir is not None:
+            if result.saxs_comparison.predicted_structure_dir is not None:
                 lines.append(
-                    "Surrogate XYZ files: "
-                    f"{result.saxs_comparison.surrogate_structure_dir}"
+                    "Predicted Structure XYZ files: "
+                    f"{result.saxs_comparison.predicted_structure_dir}"
                 )
             if result.saxs_comparison.rmse is not None:
                 lines.append(
-                    f"Cluster-only surrogate SAXS RMSE: "
+                    f"Cluster-only Predicted Structures SAXS RMSE: "
                     f"{result.saxs_comparison.rmse:.6g}"
                 )
+        if result.debye_waller_estimates:
+            lines.append(
+                "Debye-Waller pair estimates: "
+                f"{len(result.debye_waller_estimates)}"
+            )
         self.summary_box.setPlainText("\n".join(lines))
 
     def _populate_lifetime_table(
@@ -1534,15 +2342,46 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self.lifetime_table.resizeColumnsToContents()
         self.lifetime_table.setSortingEnabled(True)
 
+    def _populate_debye_waller_table(
+        self, result: ClusterDynamicsMLResult
+    ) -> None:
+        self.debye_waller_table.setSortingEnabled(False)
+        rows = list(result.debye_waller_estimates)
+        self.debye_waller_table.setRowCount(len(rows))
+        for row_index, entry in enumerate(rows):
+            values = (
+                "Observed" if entry.source == "observed" else "Predicted",
+                "Ensemble" if entry.method == "ensemble" else "Ridge",
+                str(entry.node_count),
+                _format_optional_int(entry.candidate_rank),
+                entry.label,
+                f"{entry.element_a}-{entry.element_b}",
+                f"{float(entry.sigma):.5f}",
+                f"{float(entry.b_factor):.5f}",
+                str(int(entry.support_count)),
+                str(int(entry.aligned_pair_count)),
+                "" if entry.source_label is None else str(entry.source_label),
+            )
+            for column, value in enumerate(values):
+                self.debye_waller_table.setItem(
+                    row_index,
+                    column,
+                    QTableWidgetItem(value),
+                )
+        self.debye_waller_table.resizeColumnsToContents()
+        self.debye_waller_table.setSortingEnabled(True)
+
     def _refresh_project_history_view(
         self,
         *,
         select_dataset: Path | None = None,
+        reload_entries: bool = True,
     ) -> None:
         project_dir = self.dataset_panel.project_dir()
-        self._project_history_entries = (
-            self._project_history_entries_for_project(project_dir)
-        )
+        if reload_entries:
+            self._project_history_entries = (
+                self._project_history_entries_for_project(project_dir)
+            )
         selected_dataset = (
             None
             if select_dataset is None
@@ -1631,8 +2470,17 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
     def _update_history_controls(self) -> None:
         selected_dataset = self._selected_history_dataset_file()
         has_history = bool(self._project_history_entries)
-        self.history_table.setEnabled(has_history)
-        self.history_load_button.setEnabled(selected_dataset is not None)
+        is_loading = self._dataset_load_thread is not None
+        self.history_table.setEnabled(has_history and not is_loading)
+        self.history_load_button.setEnabled(
+            selected_dataset is not None and not is_loading
+        )
+        self.history_refresh_button.setEnabled(not is_loading)
+        if is_loading:
+            self.history_status_label.setText(
+                "Loading the selected prediction history entry..."
+            )
+            return
         if not has_history:
             project_dir = self.dataset_panel.project_dir()
             if project_dir is None:
@@ -1663,21 +2511,16 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         )
 
     def _load_selected_history_entry(self) -> None:
+        if self._dataset_load_thread is not None:
+            return
         dataset_file = self._selected_history_dataset_file()
         if dataset_file is None:
             return
-        try:
-            loaded = load_cluster_dynamicsai_dataset(dataset_file)
-        except Exception as exc:
-            self._handle_error(
-                "clusterdynamicsml history load failed",
-                f"Could not load {dataset_file}: {exc}",
-            )
-            return
-        self._apply_loaded_dataset(
-            loaded,
+        self._start_dataset_load(
+            dataset_file,
             announce=True,
             action_label="Loaded history entry",
+            reload_history_entries=False,
         )
 
     @staticmethod
@@ -1866,6 +2709,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         *,
         announce: bool,
         action_label: str,
+        reload_history_entries: bool = True,
     ) -> None:
         self._restoring_project_dataset = True
         try:
@@ -1880,6 +2724,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             )
             self._populate_summary_box(loaded.result)
             self._populate_lifetime_table(loaded.result)
+            self._populate_debye_waller_table(loaded.result)
             analyzed_frames = max(
                 loaded.result.dynamics_result.analyzed_frames, 1
             )
@@ -1890,7 +2735,10 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             )
         finally:
             self._restoring_project_dataset = False
-        self._refresh_project_history_view(select_dataset=loaded.dataset_file)
+        self._refresh_project_history_view(
+            select_dataset=loaded.dataset_file,
+            reload_entries=reload_history_entries,
+        )
         if announce:
             self.run_panel.append_log(
                 f"{action_label} clusterdynamicsml dataset from "
@@ -2001,6 +2849,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             "store_prediction_history": (
                 self.prediction_panel.store_prediction_history()
             ),
+            "auto_detailed_report": self.run_panel.auto_report_enabled(),
             "q_min": self.prediction_panel.q_min(),
             "q_max": self.prediction_panel.q_max(),
             "q_points": self.prediction_panel.q_points(),
@@ -2027,6 +2876,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 if _optional_path(payload.get("energy_file")) is None
                 else str(_optional_path(payload.get("energy_file")))
             )
+            self._auto_detected_energy_file = None
             self.dataset_panel.set_project_dir(
                 _optional_path(payload.get("project_dir"))
             )
@@ -2143,6 +2993,10 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 bool(payload.get("store_prediction_history", True)),
                 emit_signal=False,
             )
+            self.run_panel.set_auto_report_enabled(
+                bool(payload.get("auto_detailed_report", False)),
+                emit_signal=False,
+            )
             self.prediction_panel.set_q_settings(
                 q_min=float(payload.get("q_min", 0.02)),
                 q_max=float(payload.get("q_max", 1.20)),
@@ -2229,6 +3083,17 @@ def _format_optional_percent(value: object) -> str:
 
 def _format_optional_int(value: object) -> str:
     return "n/a" if value is None else str(int(value))
+
+
+def _format_runtime_duration(seconds: float) -> str:
+    total_seconds = max(int(round(float(seconds))), 0)
+    minutes, remaining_seconds = divmod(total_seconds, 60)
+    hours, remaining_minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours}h {remaining_minutes}m {remaining_seconds}s"
+    if minutes > 0:
+        return f"{minutes}m {remaining_seconds}s"
+    return f"{remaining_seconds}s"
 
 
 def _optional_path(value: object) -> Path | None:
@@ -2561,7 +3426,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clusterdynamicsml",
         description=(
-            "Predict larger-cluster surrogate stoichiometries, representative "
+            "Predict larger-cluster stoichiometries, representative "
             "structures, and cluster-only SAXS traces from smaller-cluster "
             "cluster-dynamics and structure data."
         ),

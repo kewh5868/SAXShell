@@ -47,11 +47,14 @@ bondanalysis run clusters_splitxyz0001
 ## Build the SAXS project
 
 ```bash
-saxs ui
+saxshell saxs ui
 ```
 
 There is currently no one-shot CLI that replaces the full Project Setup tab, so
 the usual next step is interactive project configuration in the SAXS UI.
+
+From a source checkout, use
+`PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs ui`.
 
 ## Prefit and DREAM
 

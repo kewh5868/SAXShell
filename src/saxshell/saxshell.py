@@ -56,6 +56,19 @@ def main(argv: list[str] | None = None) -> int:
         nargs=argparse.REMAINDER,
         help="Arguments passed through to the bondanalysis command.",
     )
+    blenderxyz_parser = subparsers.add_parser(
+        "blenderxyz",
+        help=(
+            "Launch a small Blender XYZ renderer window for selecting an "
+            "XYZ file, setting a title, and saving the PNG to Desktop by "
+            "default."
+        ),
+    )
+    blenderxyz_parser.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="Arguments passed through to the blenderxyz command.",
+    )
     clusterdynamics_parser = subparsers.add_parser(
         "clusterdynamics",
         help=(
@@ -91,6 +104,18 @@ def main(argv: list[str] | None = None) -> int:
         "args",
         nargs=argparse.REMAINDER,
         help="Arguments passed through to the xyz2pdb command.",
+    )
+    pdfsetup_parser = subparsers.add_parser(
+        "pdfsetup",
+        help=(
+            "Run Debyer-backed PDF and partial-PDF averaging, or launch the "
+            "PDF calculation UI."
+        ),
+    )
+    pdfsetup_parser.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="Arguments passed through to the pdfsetup command.",
     )
     saxs_parser = subparsers.add_parser(
         "saxs",
@@ -143,6 +168,14 @@ def main(argv: list[str] | None = None) -> int:
             forwarded_args = forwarded_args[1:]
         return bondanalysis_main(forwarded_args)
 
+    if args.command == "blenderxyz":
+        from saxshell.toolbox.blender.cli import main as blenderxyz_main
+
+        forwarded_args = list(args.args)
+        if forwarded_args[:1] == ["--"]:
+            forwarded_args = forwarded_args[1:]
+        return blenderxyz_main(forwarded_args)
+
     if args.command == "clusterdynamics":
         from saxshell.clusterdynamics.cli import main as clusterdynamics_main
 
@@ -168,6 +201,14 @@ def main(argv: list[str] | None = None) -> int:
         if forwarded_args[:1] == ["--"]:
             forwarded_args = forwarded_args[1:]
         return xyz2pdb_main(forwarded_args)
+
+    if args.command == "pdfsetup":
+        from saxshell.pdfsetup import main as pdfsetup_main
+
+        forwarded_args = list(args.args)
+        if forwarded_args[:1] == ["--"]:
+            forwarded_args = forwarded_args[1:]
+        return pdfsetup_main(forwarded_args)
 
     if args.command == "saxs":
         from saxshell.saxs.cli import main as saxs_main

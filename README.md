@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/kewh5868/SAXSShell/main/docs/source/img/saxshell_icon.png" alt="SAXSShell icon" width="180">
+</p>
+
 # SAXSShell
 
 SAXSShell is a Python toolkit for simulation-driven scattering workflows. It
@@ -27,14 +31,28 @@ best starting points are:
 
 Use Python 3.12 for the smoothest experience with the current Qt stack.
 
+If you want an isolated environment first:
+
 ```bash
-python -m pip install saxshell
+conda create -n saxshell-py312 python=3.12
+```
+
+```bash
+conda run --no-capture-output -n saxshell-py312 python -m pip install saxshell
 ```
 
 For editable local development:
 
 ```bash
-python -m pip install -e .
+conda run --no-capture-output -n saxshell-py312 python -m pip install -e .
+```
+
+You can also launch the code directly from a source checkout without installing
+entry points:
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs --help
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs ui
 ```
 
 ## Docs Local Preview
@@ -51,17 +69,36 @@ Then open `http://127.0.0.1:8000/`.
 
 ## CLI Entry Points
 
-The umbrella entry point is:
+The installed umbrella entry point is:
 
 ```bash
-saxshell --help
+conda run --no-capture-output -n saxshell-py312 saxshell --help
+conda run --no-capture-output -n saxshell-py312 saxshell saxs --help
 ```
 
-Common sub-tools also install directly:
+Standalone tools that install directly include:
 
-- `mdtrajectory`
-- `clusters`
 - `bondanalysis`
+- `blenderxyz`
+- `clusterdynamics`
+- `clusterdynamicsml`
+- `clusters`
+- `mdtrajectory`
+- `pdfsetup`
+- `saxshell`
 - `xyz2pdb`
-- `saxs`
-- `fullrmc`
+
+The SAXS and fullrmc interfaces are currently reached through the umbrella
+command:
+
+```bash
+saxshell saxs ui
+saxshell fullrmc ui /path/to/project
+```
+
+From a source checkout, the equivalent module launches are:
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs ui
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.fullrmc ui /path/to/project
+```

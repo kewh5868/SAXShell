@@ -39,6 +39,7 @@ Issues = "https://github.com/kewh5868/SAXSShell/issues/"
 
 [project.scripts]
 bondanalysis = "saxshell.bondanalysis.cli:main"
+blenderxyz = "saxshell.toolbox.blender.cli:main"
 clusterdynamics = "saxshell.clusterdynamics.cli:main"
 clusterdynamicsml = "saxshell.clusterdynamicsml.cli:main"
 clusters = "saxshell.cluster.cli:main"

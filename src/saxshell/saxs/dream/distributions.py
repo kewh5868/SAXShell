@@ -144,6 +144,21 @@ def build_default_parameter_map_from_prefit_entries(
     return build_default_parameter_map(payload)
 
 
+def recentered_parameter_entry(
+    entry: DreamParameterEntry,
+    value: float,
+) -> DreamParameterEntry:
+    updated = DreamParameterEntry.from_dict(entry.to_dict())
+    target_value = float(value)
+    updated.value = target_value
+    updated.dist_params = recentered_distribution_params(
+        updated.distribution,
+        updated.dist_params,
+        target_value,
+    )
+    return updated
+
+
 def load_parameter_map(path: str | Path) -> list[DreamParameterEntry]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     return [
@@ -187,6 +202,46 @@ def normalize_distribution_params(
     for key in list(params):
         if key in raw_params:
             params[key] = float(raw_params[key])
+    return params
+
+
+def recentered_distribution_params(
+    distribution: str,
+    dist_params: dict[str, float] | None,
+    value: float,
+) -> dict[str, float]:
+    normalized_distribution = str(distribution).strip() or "lognorm"
+    target_value = float(value)
+    epsilon = 1e-9
+    params = normalize_distribution_params(
+        normalized_distribution,
+        dist_params,
+        target_value,
+    )
+    if normalized_distribution == "norm":
+        params["loc"] = target_value
+        params["scale"] = max(
+            float(params.get("scale", epsilon)),
+            epsilon,
+        )
+        return params
+    if normalized_distribution == "uniform":
+        width = max(float(params.get("scale", epsilon)), epsilon)
+        params["scale"] = width
+        params["loc"] = target_value - width / 2.0
+        return params
+    if normalized_distribution == "lognorm":
+        scale_value = max(
+            float(params.get("scale", epsilon)),
+            epsilon,
+        )
+        params["scale"] = scale_value
+        params["s"] = max(
+            float(params.get("s", epsilon)),
+            epsilon,
+        )
+        params["loc"] = target_value - scale_value
+        return params
     return params
 
 
@@ -236,5 +291,7 @@ __all__ = [
     "build_default_parameter_map_from_prefit_entries",
     "load_parameter_map",
     "normalize_distribution_params",
+    "recentered_distribution_params",
+    "recentered_parameter_entry",
     "save_parameter_map",
 ]

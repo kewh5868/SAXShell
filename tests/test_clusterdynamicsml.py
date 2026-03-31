@@ -3,10 +3,17 @@ from __future__ import annotations
 import csv
 import json
 import os
+import time
 from pathlib import Path
+from threading import Event
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from matplotlib import rcParams
+from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtGui import QWheelEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 import saxshell.clusterdynamicsml.cli as clusterdynamicsml_cli_module
@@ -18,6 +25,7 @@ from saxshell.clusterdynamicsml import (
     save_cluster_dynamicsai_dataset,
 )
 from saxshell.clusterdynamicsml.ui.main_window import (
+    _UI_REFRESH_DELAY_MS,
     ClusterDynamicsMLMainWindow,
     ClusterDynamicsMLSettingsPanel,
     _combined_model_weight_rows,
@@ -25,6 +33,10 @@ from saxshell.clusterdynamicsml.ui.main_window import (
 from saxshell.clusterdynamicsml.ui.plot_panel import (
     _build_population_histogram_payload,
     _distribution_entries,
+)
+from saxshell.saxs.debye import (
+    compute_debye_intensity,
+    compute_debye_intensity_with_debye_waller,
 )
 from saxshell.saxs.project_manager import (
     SAXSProjectManager,
@@ -152,6 +164,38 @@ def _build_clusters_dir(tmp_path: Path) -> Path:
     return clusters_dir
 
 
+def _wait_for(
+    qapp,
+    predicate,
+    *,
+    timeout: float = 5.0,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        if predicate():
+            return
+        time.sleep(0.01)
+    qapp.processEvents()
+    assert predicate()
+
+
+def _make_wheel_event(widget) -> QWheelEvent:
+    center = widget.rect().center()
+    local_pos = QPointF(center)
+    global_pos = QPointF(widget.mapToGlobal(center))
+    return QWheelEvent(
+        local_pos,
+        global_pos,
+        QPoint(0, 0),
+        QPoint(0, 120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+
+
 def _build_node_only_label_clusters_dir(tmp_path: Path) -> Path:
     clusters_dir = tmp_path / "clusters_training_node_only_labels"
     (clusters_dir / "Pb").mkdir(parents=True)
@@ -241,6 +285,17 @@ def _write_experimental_data_file(tmp_path: Path) -> Path:
         for q_value, intensity in zip(q_values, intensities, strict=False):
             handle.write(f"{q_value:.6f} {intensity:.8f}\n")
     return output
+
+
+def _write_energy_file(tmp_path: Path, name: str = "traj.ener") -> Path:
+    energy_path = tmp_path / name
+    energy_path.write_text(
+        "# step time kinetic temperature potential\n"
+        "1 0.0 1.0 300.0 -10.0\n"
+        "2 5.0 1.1 301.0 -10.1\n",
+        encoding="utf-8",
+    )
+    return energy_path
 
 
 def _build_project_dir(
@@ -419,6 +474,156 @@ def test_clusterdynamicsml_workflow_predicts_larger_clusters(tmp_path):
     )
     assert result.saxs_comparison.rmse is not None
     assert len(result.saxs_comparison.component_weights) >= 3
+
+
+def test_clusterdynamicsml_estimates_debye_waller_pairs_and_uses_them_for_predicted_traces(
+    tmp_path,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    clusters_dir = _build_clusters_dir(tmp_path)
+    experimental_data_file = _write_experimental_data_file(tmp_path)
+
+    result = ClusterDynamicsMLWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        clusters_dir=clusters_dir,
+        experimental_data_file=experimental_data_file,
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=1,
+        target_node_counts=(4,),
+    ).analyze()
+
+    observed_rows = [
+        row
+        for row in result.debye_waller_estimates
+        if row.source == "observed"
+    ]
+    predicted_rows = [
+        row
+        for row in result.debye_waller_estimates
+        if row.source == "predicted"
+    ]
+    assert result.saxs_comparison is not None
+    target_prediction = max(
+        result.predictions,
+        key=lambda entry: entry.predicted_population_share,
+    )
+    prediction_sigma_lookup = {
+        (row.element_a, row.element_b): row.sigma
+        for row in predicted_rows
+        if row.label == target_prediction.label
+    }
+    included_pair_indices = (
+        clusterdynamicsml_workflow_module._first_shell_pair_indices(
+            target_prediction.generated_coordinates,
+            list(target_prediction.generated_elements),
+            node_elements={"Pb"},
+            pair_cutoff_definitions=PAIR_CUTOFFS,
+        )
+    )
+    classic_trace = compute_debye_intensity(
+        target_prediction.generated_coordinates,
+        list(target_prediction.generated_elements),
+        result.saxs_comparison.q_values,
+    )
+    debye_waller_trace = compute_debye_intensity_with_debye_waller(
+        target_prediction.generated_coordinates,
+        list(target_prediction.generated_elements),
+        result.saxs_comparison.q_values,
+        pair_sigma_by_element=prediction_sigma_lookup,
+        included_pair_indices=included_pair_indices,
+    )
+    predicted_component = next(
+        entry
+        for entry in result.saxs_comparison.component_weights
+        if entry.label == target_prediction.label
+        and entry.source == "predicted"
+    )
+    assert predicted_component.profile_path is not None
+    saved_profile = np.loadtxt(predicted_component.profile_path, comments="#")
+
+    assert any(
+        row.label == "Pb3I2"
+        and row.method == "ensemble"
+        and (row.element_a, row.element_b) == ("Pb", "Pb")
+        and row.sigma > 0.0
+        for row in observed_rows
+    )
+    assert predicted_rows
+    assert prediction_sigma_lookup
+    assert np.any(debye_waller_trace < classic_trace)
+    np.testing.assert_allclose(saved_profile[:, 1], debye_waller_trace)
+
+
+def test_clusterdynamicsml_estimates_debye_waller_from_first_shell_pairs_only(
+    tmp_path,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    clusters_dir = tmp_path / "clusters_local_debye_waller"
+    structure_dir = clusters_dir / "PbI2"
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    structure_a = structure_dir / "pbi2_0001.xyz"
+    structure_b = structure_dir / "pbi2_0002.xyz"
+    structure_a.write_text(
+        "3\npbi2_a\nPb 0.0 0.0 0.0\nI 1.0 0.0 0.0\nI 3.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    structure_b.write_text(
+        "3\npbi2_b\nPb 0.0 0.0 0.0\nI 1.1 0.0 0.0\nI 5.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    workflow = ClusterDynamicsMLWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        clusters_dir=clusters_dir,
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=1,
+        target_node_counts=(2,),
+    )
+    observation = (
+        clusterdynamicsml_workflow_module.ClusterDynamicsMLTrainingObservation(
+            label="PbI2",
+            node_count=1,
+            cluster_size=1,
+            element_counts={"Pb": 1, "I": 2},
+            file_count=2,
+            representative_path=structure_a,
+            structure_dir=structure_dir,
+            motifs=("no_motif",),
+            mean_atom_count=3.0,
+            mean_radius_of_gyration=1.0,
+            mean_max_radius=1.0,
+            mean_semiaxis_a=1.0,
+            mean_semiaxis_b=1.0,
+            mean_semiaxis_c=1.0,
+            total_observations=2,
+            occupied_frames=2,
+            mean_count_per_frame=1.0,
+            occupancy_fraction=1.0,
+            association_events=0,
+            dissociation_events=0,
+            association_rate_per_ps=0.0,
+            dissociation_rate_per_ps=0.0,
+            completed_lifetime_count=2,
+            window_truncated_lifetime_count=0,
+            mean_lifetime_fs=10.0,
+            std_lifetime_fs=0.0,
+        )
+    )
+
+    estimates = workflow._estimate_observed_debye_waller_pairs([observation])
+    pair_row = next(
+        row
+        for row in estimates
+        if row.label == "PbI2"
+        and (row.element_a, row.element_b) == ("I", "Pb")
+    )
+
+    assert pair_row.aligned_pair_count == 1
+    assert pair_row.sigma == pytest.approx(0.05, abs=1e-6)
 
 
 def test_clusterdynamicsml_structure_observations_use_reference_atom_counts(
@@ -1215,7 +1420,7 @@ def test_clusterdynamicsml_caps_predicted_weight_takeover_from_extreme_shares(
     assert float(np.max(predicted_weights) / combined_total) < 0.5
 
 
-def test_clusterdynamicsml_writes_surrogate_xyz_and_component_profiles(
+def test_clusterdynamicsml_writes_predicted_structure_xyz_and_component_profiles(
     tmp_path,
 ):
     frames_dir = _build_frames_dir(tmp_path)
@@ -1235,9 +1440,9 @@ def test_clusterdynamicsml_writes_surrogate_xyz_and_component_profiles(
 
     assert result.saxs_comparison is not None
     assert result.saxs_comparison.component_output_dir is not None
-    assert result.saxs_comparison.surrogate_structure_dir is not None
+    assert result.saxs_comparison.predicted_structure_dir is not None
     assert result.saxs_comparison.component_output_dir.is_dir()
-    assert result.saxs_comparison.surrogate_structure_dir.is_dir()
+    assert result.saxs_comparison.predicted_structure_dir.is_dir()
 
     observed_entries = [
         entry
@@ -1311,9 +1516,9 @@ def test_clusterdynamicsml_writes_xyz_for_every_prediction(
     ).analyze()
 
     assert result.saxs_comparison is not None
-    assert result.saxs_comparison.surrogate_structure_dir is not None
+    assert result.saxs_comparison.predicted_structure_dir is not None
     written_paths = sorted(
-        result.saxs_comparison.surrogate_structure_dir.glob("*.xyz")
+        result.saxs_comparison.predicted_structure_dir.glob("*.xyz")
     )
 
     assert len(result.predictions) > len(
@@ -1368,7 +1573,7 @@ def test_clusterdynamicsml_dataset_round_trip(tmp_path):
         for path in saved.written_files
     )
     assert any(
-        path.name.endswith("_observed_plus_surrogate_histogram.csv")
+        path.name.endswith("_observed_plus_predicted_structures_histogram.csv")
         for path in saved.written_files
     )
     assert any(path.suffix == ".xyz" for path in saved.written_files)
@@ -1396,6 +1601,78 @@ def test_clusterdynamicsml_dataset_round_trip(tmp_path):
         loaded.result.saxs_comparison.component_output_dir
         == result.saxs_comparison.component_output_dir
     )
+    assert [
+        (
+            entry.source,
+            entry.method,
+            entry.label,
+            entry.element_a,
+            entry.element_b,
+        )
+        for entry in loaded.result.debye_waller_estimates
+    ] == [
+        (
+            entry.source,
+            entry.method,
+            entry.label,
+            entry.element_a,
+            entry.element_b,
+        )
+        for entry in result.debye_waller_estimates
+    ]
+
+
+def test_clusterdynamicsml_window_stores_runtime_training_history_and_updates_preview(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    frames_dir = _build_frames_dir(tmp_path)
+    clusters_dir = _build_clusters_dir(tmp_path)
+    experimental_data_file = _write_experimental_data_file(tmp_path)
+    project_dir = _build_project_dir(
+        tmp_path,
+        clusters_dir=clusters_dir,
+        experimental_data_file=experimental_data_file,
+    )
+
+    window = ClusterDynamicsMLMainWindow(
+        initial_frames_dir=frames_dir,
+        initial_project_dir=project_dir,
+        initial_clusters_dir=clusters_dir,
+        initial_experimental_data_file=experimental_data_file,
+    )
+    config = window._build_job_config()
+    preview = window._build_preview_workflow().preview_selection()
+
+    window._store_runtime_training_example(
+        config=config,
+        preview=preview,
+        runtime_seconds=18.0,
+    )
+    window._refresh_selection_preview()
+    estimate = window._estimate_runtime_for_preview(preview, config=config)
+    history_path = window._runtime_history_file(
+        project_dir=project_dir,
+        frames_dir=frames_dir,
+    )
+
+    assert history_path is not None
+    assert history_path.is_file()
+    assert estimate.seconds is not None
+    assert estimate.sample_count == 1
+    assert (
+        "Estimated compute time:"
+        in window.run_panel.selection_box.toPlainText()
+    )
+    assert (
+        "learned from 1 previous run"
+        in window.run_panel.selection_box.toPlainText()
+    )
+    payload = json.loads(history_path.read_text(encoding="utf-8"))
+    assert len(payload["runs"]) == 1
+    assert payload["runs"][0]["runtime_seconds"] == pytest.approx(18.0)
+    window.close()
 
 
 def test_clusterdynamicsml_window_autosaves_and_restores_project_result_bundle(
@@ -1446,7 +1723,7 @@ def test_clusterdynamicsml_window_autosaves_and_restores_project_result_bundle(
     assert f"{cached_dataset.stem}_saxs.csv" in bundle_files
     assert f"{cached_dataset.stem}_observed_histogram.csv" in bundle_files
     assert (
-        f"{cached_dataset.stem}_observed_plus_surrogate_histogram.csv"
+        f"{cached_dataset.stem}_observed_plus_predicted_structures_histogram.csv"
         in bundle_files
     )
     assert (bundle_dir / f"{cached_dataset.stem}_saxs_components").is_dir()
@@ -1473,7 +1750,6 @@ def test_clusterdynamicsml_window_compares_prediction_history_and_defaults_to_la
     qapp,
     tmp_path,
 ):
-    del qapp
     frames_dir = _build_frames_dir(tmp_path)
     clusters_dir = _build_clusters_dir(tmp_path)
     experimental_data_file = _write_experimental_data_file(tmp_path)
@@ -1535,6 +1811,7 @@ def test_clusterdynamicsml_window_compares_prediction_history_and_defaults_to_la
     )
     window.history_table.selectRow(older_row)
     window._load_selected_history_entry()
+    _wait_for(qapp, lambda: window._dataset_load_thread is None)
 
     assert window._last_dataset_file == first_dataset
     assert window._selected_history_dataset_file() == first_dataset
@@ -1549,6 +1826,258 @@ def test_clusterdynamicsml_window_compares_prediction_history_and_defaults_to_la
     assert reopened._selected_history_dataset_file() == second_dataset
     assert reopened._last_result.preview.target_node_counts == (4, 5)
     reopened.close()
+
+
+def test_clusterdynamicsml_window_loads_history_entries_off_ui_thread(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    clusters_dir = _build_clusters_dir(tmp_path)
+    experimental_data_file = _write_experimental_data_file(tmp_path)
+    project_dir = _build_project_dir(
+        tmp_path,
+        clusters_dir=clusters_dir,
+        experimental_data_file=experimental_data_file,
+    )
+
+    result_one = ClusterDynamicsMLWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        project_dir=project_dir,
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=1,
+        target_node_counts=(4,),
+        prediction_population_share_threshold=0.01,
+    ).analyze()
+    result_two = ClusterDynamicsMLWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        project_dir=project_dir,
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=1,
+        target_node_counts=(4, 5),
+        prediction_population_share_threshold=0.05,
+    ).analyze()
+
+    window = ClusterDynamicsMLMainWindow(
+        initial_frames_dir=frames_dir,
+        initial_project_dir=project_dir,
+    )
+    window.time_panel.set_frame_timestep_fs(10.0)
+    window.time_panel.set_frames_per_colormap_timestep(1)
+    window.prediction_panel.set_target_node_counts((4,))
+    window.prediction_panel.set_prediction_population_share_threshold(0.01)
+    window._on_run_finished(result_one)
+    first_dataset = window._last_dataset_file
+
+    window.prediction_panel.set_target_node_counts((4, 5))
+    window.prediction_panel.set_prediction_population_share_threshold(0.05)
+    window._on_run_finished(result_two)
+
+    assert first_dataset is not None
+    older_row = next(
+        row
+        for row in range(window.history_table.rowCount())
+        if window._history_dataset_file_for_row(row) == first_dataset
+    )
+    gate = Event()
+    original_loader = (
+        "saxshell.clusterdynamicsml.ui.main_window."
+        "load_cluster_dynamicsai_dataset"
+    )
+
+    def delayed_loader(dataset_file):
+        gate.wait(timeout=2.0)
+        return load_cluster_dynamicsai_dataset(dataset_file)
+
+    monkeypatch.setattr(original_loader, delayed_loader)
+    window.history_table.selectRow(older_row)
+    window._load_selected_history_entry()
+    qapp.processEvents()
+
+    assert window._dataset_load_thread is not None
+    assert not window.history_load_button.isEnabled()
+    assert not window.history_table.isEnabled()
+    assert "loading" in (window.history_status_label.text().lower())
+
+    gate.set()
+    _wait_for(qapp, lambda: window._dataset_load_thread is None)
+
+    assert window._last_dataset_file == first_dataset
+    assert window._last_result is not None
+    assert window._last_result.preview.target_node_counts == (4,)
+    assert window.history_load_button.isEnabled()
+    assert window.history_table.isEnabled()
+    window.close()
+
+
+def test_clusterdynamicsml_window_blocks_accidental_field_scroll_and_escape(
+    qapp,
+):
+    window = ClusterDynamicsMLMainWindow()
+    window.show()
+    qapp.processEvents()
+
+    candidates_spin = window.prediction_panel.candidates_spin
+    original_value = candidates_spin.value()
+    candidates_spin.setFocus()
+    qapp.processEvents()
+    QApplication.sendEvent(candidates_spin, _make_wheel_event(candidates_spin))
+    qapp.processEvents()
+
+    assert candidates_spin.value() == original_value
+
+    clusters_edit = window.prediction_panel.clusters_dir_edit
+    clusters_edit.setFocus()
+    qapp.processEvents()
+    assert clusters_edit.hasFocus()
+    QTest.keyClick(clusters_edit, Qt.Key.Key_Escape)
+    qapp.processEvents()
+
+    assert not clusters_edit.hasFocus()
+
+    candidates_spin.lineEdit().setFocus()
+    qapp.processEvents()
+    assert candidates_spin.lineEdit().hasFocus()
+    QTest.keyClick(candidates_spin.lineEdit(), Qt.Key.Key_Escape)
+    qapp.processEvents()
+
+    assert not candidates_spin.hasFocus()
+    assert not candidates_spin.lineEdit().hasFocus()
+    window.close()
+
+
+def test_clusterdynamicsml_window_debounces_preview_refresh_while_typing(
+    qapp,
+    monkeypatch,
+):
+    window = ClusterDynamicsMLMainWindow()
+    window.show()
+    qapp.processEvents()
+    QTest.qWait(_UI_REFRESH_DELAY_MS + 50)
+
+    refresh_calls: list[str] = []
+
+    def record_refresh():
+        refresh_calls.append(window.prediction_panel.clusters_dir_edit.text())
+
+    monkeypatch.setattr(window, "_refresh_selection_preview", record_refresh)
+
+    window.prediction_panel.clusters_dir_edit.setText("/tmp/a")
+    window.prediction_panel.clusters_dir_edit.setText("/tmp/ab")
+    window.prediction_panel.clusters_dir_edit.setText("/tmp/abc")
+    qapp.processEvents()
+
+    assert refresh_calls == []
+
+    QTest.qWait(_UI_REFRESH_DELAY_MS + 50)
+
+    assert refresh_calls == ["/tmp/abc"]
+    window.close()
+
+
+def test_clusterdynamicsml_window_debounces_frames_dir_changes_while_typing(
+    qapp,
+    monkeypatch,
+):
+    window = ClusterDynamicsMLMainWindow()
+    window.show()
+    qapp.processEvents()
+    QTest.qWait(_UI_REFRESH_DELAY_MS + 50)
+
+    observed_frames_dirs: list[Path | None] = []
+
+    def record_frames_dir_change(frames_dir: Path | None) -> None:
+        observed_frames_dirs.append(frames_dir)
+
+    monkeypatch.setattr(
+        window, "_on_frames_dir_changed", record_frames_dir_change
+    )
+
+    window.trajectory_panel.frames_dir_edit.setText("/tmp/f")
+    window.trajectory_panel.frames_dir_edit.setText("/tmp/fr")
+    window.trajectory_panel.frames_dir_edit.setText("/tmp/frames")
+    qapp.processEvents()
+
+    assert observed_frames_dirs == []
+
+    QTest.qWait(_UI_REFRESH_DELAY_MS + 50)
+
+    assert observed_frames_dirs == [Path("/tmp/frames")]
+    window.close()
+
+
+def test_clusterdynamicsml_window_detailed_report_toggle_skips_preview_refresh(
+    qapp,
+    monkeypatch,
+):
+    window = ClusterDynamicsMLMainWindow()
+    window.show()
+    qapp.processEvents()
+    QTest.qWait(_UI_REFRESH_DELAY_MS + 50)
+
+    refresh_calls: list[bool] = []
+
+    def record_refresh():
+        refresh_calls.append(True)
+
+    monkeypatch.setattr(window, "_refresh_selection_preview", record_refresh)
+
+    window.run_panel.auto_report_checkbox.click()
+    qapp.processEvents()
+    QTest.qWait(_UI_REFRESH_DELAY_MS + 50)
+
+    assert refresh_calls == []
+    window.close()
+
+
+def test_clusterdynamicsml_window_autofills_sibling_energy_file(
+    qapp,
+    tmp_path,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    energy_path = _write_energy_file(tmp_path)
+
+    window = ClusterDynamicsMLMainWindow()
+    window.show()
+    qapp.processEvents()
+
+    window.trajectory_panel.frames_dir_edit.setText(str(frames_dir))
+    _wait_for(
+        qapp,
+        lambda: window.run_panel.energy_file() == energy_path.resolve(),
+        timeout=2.0,
+    )
+
+    assert window.run_panel.energy_file() == energy_path.resolve()
+    window.close()
+
+
+def test_clusterdynamicsml_window_keeps_manual_energy_file_when_frames_change(
+    qapp,
+    tmp_path,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    _write_energy_file(tmp_path)
+    manual_dir = tmp_path / "manual_energy"
+    manual_dir.mkdir()
+    manual_energy = _write_energy_file(manual_dir, name="manual.ener")
+
+    window = ClusterDynamicsMLMainWindow()
+    window.show()
+    qapp.processEvents()
+
+    window.run_panel.energy_path_edit.setText(str(manual_energy))
+    window.trajectory_panel.frames_dir_edit.setText(str(frames_dir))
+    QTest.qWait(_UI_REFRESH_DELAY_MS + 75)
+    qapp.processEvents()
+
+    assert window.run_panel.energy_file() == manual_energy.resolve()
+    window.close()
 
 
 def test_clusterdynamicsml_window_inherits_project_defaults(
@@ -1684,15 +2213,55 @@ def test_clusterdynamicsml_window_shows_observed_lifetime_tab(
         for row in range(window.lifetime_table.rowCount())
         if window.lifetime_table.item(row, 0).text() == "Observed"
     ]
+    debye_pairs = [
+        window.debye_waller_table.item(row, 5).text()
+        for row in range(window.debye_waller_table.rowCount())
+    ]
 
-    assert tab_titles == ["Summary", "Lifetimes", "Histograms", "SAXS"]
+    assert tab_titles == [
+        "Summary",
+        "Lifetimes",
+        "Debye-Waller",
+        "Histograms",
+        "SAXS",
+    ]
     assert window.lifetime_table.rowCount() == (
         len(result.training_observations) + len(result.predictions)
     )
+    assert window.debye_waller_table.rowCount() == len(
+        result.debye_waller_estimates
+    )
     assert "Pb3I2" in lifetime_labels
+    assert "Pb-Pb" in debye_pairs
     assert "Predicted" in lifetime_types
     assert all(weight != "n/a" for weight in observed_only_weights)
     assert window.lifetime_table.item(0, 8) is not None
+    window.close()
+
+
+def test_clusterdynamicsml_window_progress_messages_show_current_ml_step(
+    qapp,
+):
+    del qapp
+    window = ClusterDynamicsMLMainWindow()
+    window._active_runtime_estimate = SimpleNamespace(
+        seconds=90.0, sample_count=2
+    )
+    window._run_started_at_monotonic = time.monotonic() - 15.0
+
+    window._on_worker_progress(
+        "Step 4/7: Computing bond-length, bond-angle, and coordination distributions.\n"
+        "Learning node, linker, shell, and non-node contact statistics."
+    )
+
+    assert "step 4/7" in window.run_panel.progress_label.text().lower()
+    assert "remaining" in window.run_panel.progress_label.text().lower()
+    assert window.run_panel.progress_bar.maximum() == 7
+    assert window.run_panel.progress_bar.value() == 4
+    assert (
+        "Computing bond-length, bond-angle, and coordination distributions."
+        in (window.run_panel.log_box.toPlainText())
+    )
     window.close()
 
 
@@ -1743,7 +2312,33 @@ def test_clusterdynamicsml_window_shows_histogram_tabs_and_saxs_model_overlay(
         for axis in window.saxs_panel.figure.axes
         for line in axis.lines
     }
-    surrogate_axes = window.saxs_panel.figure.axes
+    component_lines = [
+        line
+        for axis in window.saxs_panel.figure.axes
+        for line in axis.lines
+        if "component:" in str(line.get_gid() or "")
+    ]
+    initial_component_visibility = {
+        line.get_label(): line.get_visible() for line in component_lines
+    }
+    component_colors = [str(line.get_color()) for line in component_lines]
+    initial_axes = [
+        {
+            "xscale": axis.get_xscale(),
+            "yscale": axis.get_yscale(),
+            "ylabel": axis.get_ylabel(),
+        }
+        for axis in window.saxs_panel.figure.axes
+    ]
+    legend_line_colors = {
+        key: str(handle.get_color())
+        for key, handle in window.saxs_panel._legend_handle_lookup.items()
+        if hasattr(handle, "get_color")
+    }
+    trace_line_colors = {
+        key: str(line.get_color())
+        for key, line in window.saxs_panel._trace_line_lookup.items()
+    }
     prediction_size_ranks: dict[int, set[int]] = {}
     for row in range(window.lifetime_table.rowCount()):
         if window.lifetime_table.item(row, 0).text() != "Predicted":
@@ -1757,21 +2352,75 @@ def test_clusterdynamicsml_window_shows_histogram_tabs_and_saxs_model_overlay(
         for row in range(window.lifetime_table.rowCount())
     ]
     window.saxs_panel._toggle_all_component_traces()
-    component_line_visibility = {
+    toggled_component_visibility = {
         line.get_label(): line.get_visible()
         for axis in window.saxs_panel.figure.axes
         for line in axis.lines
         if "component:" in str(line.get_gid() or "")
     }
+    observed_trace_visibility = {
+        line.get_label(): line.get_visible()
+        for axis in window.saxs_panel.figure.axes
+        for line in axis.lines
+        if line.get_label() == "observed-only model"
+        or line.get_label().startswith("observed component:")
+    }
+    predicted_trace_visibility = {
+        line.get_label(): line.get_visible()
+        for axis in window.saxs_panel.figure.axes
+        for line in axis.lines
+        if line.get_label() == "observed + predicted structures model"
+        or line.get_label().startswith("predicted structure component:")
+    }
+    window.saxs_panel._toggle_observed_traces()
+    hidden_observed_visibility = {
+        line.get_label(): line.get_visible()
+        for axis in window.saxs_panel.figure.axes
+        for line in axis.lines
+        if line.get_label() == "observed-only model"
+        or line.get_label().startswith("observed component:")
+    }
+    window.saxs_panel._toggle_predicted_traces()
+    hidden_predicted_visibility = {
+        line.get_label(): line.get_visible()
+        for axis in window.saxs_panel.figure.axes
+        for line in axis.lines
+        if line.get_label() == "observed + predicted structures model"
+        or line.get_label().startswith("predicted structure component:")
+    }
+    window.saxs_panel._toggle_observed_traces()
+    window.saxs_panel._toggle_predicted_traces()
+    window.saxs_panel.model_range_button.setChecked(True)
+    autoscaled_axes = window.saxs_panel.figure.axes
+    model_lines = [
+        line for line in autoscaled_axes[1].lines if line.get_visible()
+    ]
+    model_q_values = np.concatenate(
+        [
+            np.asarray(line.get_xdata(orig=False), dtype=float)
+            for line in model_lines
+        ]
+    )
 
-    assert tab_titles == ["Summary", "Lifetimes", "Histograms", "SAXS"]
+    assert tab_titles == [
+        "Summary",
+        "Lifetimes",
+        "Debye-Waller",
+        "Histograms",
+        "SAXS",
+    ]
     assert observed_hist_patches > 0
     assert combined_hist_patches > 0
     assert observed_weight_sum == pytest.approx(1.0)
     assert combined_weight_sum == pytest.approx(1.0)
-    assert len(surrogate_axes) == 1
-    assert surrogate_axes[0].get_xscale() == "log"
-    assert surrogate_axes[0].get_yscale() == "log"
+    assert len(initial_axes) == 2
+    assert initial_axes[0]["xscale"] == "log"
+    assert initial_axes[0]["yscale"] == "log"
+    assert initial_axes[1]["yscale"] == "log"
+    assert initial_axes[0]["ylabel"] == "Intensity (arb. units)"
+    assert initial_axes[1]["ylabel"] == "Model Intensity (arb. units)"
+    assert window.right_splitter.orientation() == Qt.Orientation.Vertical
+    assert window.right_splitter.count() == 3
     assert prediction_size_ranks == {4: {2}, 5: {1}}
     assert window.lifetime_table.rowCount() == (
         len(result.training_observations) + len(result.predictions)
@@ -1781,10 +2430,48 @@ def test_clusterdynamicsml_window_shows_histogram_tabs_and_saxs_model_overlay(
     ) == pytest.approx(1.0)
     assert sum(combined_weight_percents) == pytest.approx(100.0, abs=0.2)
     assert "observed-only model" in line_labels
-    assert "observed + surrogate model" in line_labels
-    assert any("surrogate component:" in label for label in line_labels)
-    assert component_line_visibility
-    assert not any(component_line_visibility.values())
+    assert "observed + predicted structures model" in line_labels
+    assert any(
+        "predicted structure component:" in label for label in line_labels
+    )
+    assert trace_line_colors
+    assert legend_line_colors
+    assert legend_line_colors.items() <= trace_line_colors.items()
+    assert initial_component_visibility
+    assert not any(initial_component_visibility.values())
+    default_cycle = list(
+        rcParams["axes.prop_cycle"].by_key().get("color", ["#1f77b4"])
+    )
+    assert component_colors == [
+        default_cycle[index % len(default_cycle)]
+        for index in range(len(component_colors))
+    ]
+    assert toggled_component_visibility
+    assert all(toggled_component_visibility.values())
+    assert observed_trace_visibility
+    assert predicted_trace_visibility
+    assert any(observed_trace_visibility.values())
+    assert any(predicted_trace_visibility.values())
+    assert hidden_observed_visibility
+    assert not any(hidden_observed_visibility.values())
+    assert hidden_predicted_visibility
+    assert not any(hidden_predicted_visibility.values())
+    assert window.saxs_panel.observed_traces_button.text() == (
+        "Hide Observed Traces"
+    )
+    assert window.saxs_panel.predicted_traces_button.text() == (
+        "Hide Predicted Traces"
+    )
+    assert window.saxs_panel.component_traces_button.text() == (
+        "Hide Component Traces"
+    )
+    assert window.saxs_panel.model_range_button.isChecked()
+    assert autoscaled_axes[0].get_xlim() == pytest.approx(
+        (
+            float(np.nanmin(model_q_values)),
+            float(np.nanmax(model_q_values)),
+        )
+    )
     window.close()
 
 
@@ -1907,7 +2594,7 @@ def test_clusterdynamicsml_window_appends_powerpoint_report_to_existing_project_
     )
     window._last_result = result
     window.dynamics_plot_panel.set_result(result.dynamics_result)
-    window.surrogate_plot_panel.set_result(result)
+    window.predicted_structures_plot_panel.set_result(result)
     window.run_panel.set_selection_summary(
         window._format_preview_text(result.preview)
     )
@@ -1936,6 +2623,68 @@ def test_clusterdynamicsml_window_appends_powerpoint_report_to_existing_project_
     assert "Predicted Larger Clusters" in _presentation_text(
         updated_presentation
     )
+    window.close()
+
+
+def test_clusterdynamicsml_window_auto_exports_detailed_report_after_run(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    frames_dir = _build_frames_dir(tmp_path)
+    clusters_dir = _build_clusters_dir(tmp_path)
+
+    result = ClusterDynamicsMLWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        clusters_dir=clusters_dir,
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=1,
+        target_node_counts=(4, 5),
+    ).analyze()
+
+    window = ClusterDynamicsMLMainWindow(initial_frames_dir=frames_dir)
+    output_path = tmp_path / "auto_cluster_dynamics_ml_report.pptx"
+    captured: dict[str, object] = {}
+
+    def fake_export_cluster_dynamicsai_report_pptx(**kwargs):
+        captured["output_path"] = Path(kwargs["output_path"])
+        captured["selection_summary"] = str(kwargs["selection_summary"])
+        captured["result_summary"] = str(kwargs["result_summary"])
+        captured["project_dir"] = kwargs["project_dir"]
+        captured["frames_dir"] = kwargs["frames_dir"]
+        return SimpleNamespace(
+            appended_to_existing=False,
+            report_path=Path(kwargs["output_path"]),
+            added_slide_count=5,
+        )
+
+    monkeypatch.setattr(
+        "saxshell.clusterdynamicsml.ui.main_window.export_cluster_dynamicsai_report_pptx",
+        fake_export_cluster_dynamicsai_report_pptx,
+    )
+    monkeypatch.setattr(
+        ClusterDynamicsMLMainWindow,
+        "_default_powerpoint_report_file",
+        lambda self: output_path,
+    )
+
+    assert not window.run_panel.auto_report_checkbox.isHidden()
+    assert not window.run_panel.auto_report_enabled()
+
+    window.run_panel.set_auto_report_enabled(True)
+    window._on_run_finished(result)
+
+    assert captured["output_path"] == output_path
+    assert captured["frames_dir"] == frames_dir
+    assert "Target node counts" in str(captured["selection_summary"])
+    assert "Predicted candidates:" in str(captured["result_summary"])
+    assert window.run_panel.progress_label.text() == (
+        "Progress: detailed report saved"
+    )
+    assert str(output_path) in window.run_panel.log_box.toPlainText()
     window.close()
 
 

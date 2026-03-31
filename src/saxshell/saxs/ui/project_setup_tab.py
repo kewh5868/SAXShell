@@ -80,12 +80,14 @@ class ProjectSetupTab(QWidget):
     build_components_requested = Signal()
     build_prior_weights_requested = Signal()
     install_model_requested = Signal()
+    load_distribution_requested = Signal(str)
     generate_prior_plot_requested = Signal()
     save_prior_png_requested = Signal()
     save_component_plot_data_requested = Signal()
     save_prior_plot_data_requested = Signal()
     show_deprecated_templates_changed = Signal(bool)
     model_only_mode_changed = Signal(bool)
+    predicted_structure_weights_changed = Signal(bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -111,6 +113,9 @@ class ProjectSetupTab(QWidget):
         self._component_color_overrides: dict[str, str] = {}
         self._component_visibility: dict[str, bool] = {}
         self._component_row_lookup: dict[str, int] = {}
+        self._component_source_kind_lookup: dict[str, str] = {}
+        self._observed_component_keys: list[str] = []
+        self._predicted_component_keys: list[str] = []
         self._updating_cluster_table = False
         self._build_ui()
         self._update_data_trace_control_state()
@@ -245,6 +250,31 @@ class ProjectSetupTab(QWidget):
             self._on_model_only_mode_toggled
         )
         layout.addRow("", self.model_only_mode_checkbox)
+
+        self.use_predicted_structure_weights_checkbox = QCheckBox(
+            "Use Predicted Structure Weights"
+        )
+        self.use_predicted_structure_weights_checkbox.setChecked(False)
+        self.use_predicted_structure_weights_checkbox.setToolTip(
+            "Include Cluster Dynamics ML Predicted Structures in the SAXS "
+            "component build, prior weights, Prefit, and DREAM workflows. "
+            "When disabled, the project uses observed structures only."
+        )
+        self.use_predicted_structure_weights_checkbox.toggled.connect(
+            self._on_predicted_structure_weights_toggled
+        )
+        layout.addRow("", self.use_predicted_structure_weights_checkbox)
+
+        self.predicted_structure_status_label = QLabel(
+            self._default_predicted_structure_status_text()
+        )
+        self.predicted_structure_status_label.setWordWrap(True)
+        self.predicted_structure_status_label.setMinimumHeight(58)
+        self.predicted_structure_status_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.MinimumExpanding,
+        )
+        layout.addRow("", self.predicted_structure_status_label)
 
         self.experimental_data_edit = QLineEdit()
         self.experimental_data_edit.setReadOnly(True)
@@ -394,6 +424,18 @@ class ProjectSetupTab(QWidget):
         self.install_model_button.clicked.connect(
             self.install_model_requested.emit
         )
+        self.computed_distribution_combo = QComboBox()
+        self.computed_distribution_combo.setMinimumWidth(420)
+        self.computed_distribution_combo.setEnabled(False)
+        self.load_distribution_button = QPushButton("Load Distribution")
+        self.load_distribution_button.setEnabled(False)
+        self.load_distribution_button.clicked.connect(
+            self._emit_load_distribution_requested
+        )
+        header_layout.addRow(
+            "Computed distribution",
+            self._distribution_row(),
+        )
         button_layout.addWidget(self.build_prior_weights_button)
         button_layout.addWidget(self.build_components_button)
         button_layout.addWidget(self.install_model_button)
@@ -470,6 +512,14 @@ class ProjectSetupTab(QWidget):
         layout.addWidget(self.show_deprecated_templates_checkbox)
         return row
 
+    def _distribution_row(self) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.computed_distribution_combo, stretch=1)
+        layout.addWidget(self.load_distribution_button)
+        return row
+
     def _build_activity_group(self) -> QGroupBox:
         group = QGroupBox("Project Activity")
         layout = QVBoxLayout(group)
@@ -526,6 +576,18 @@ class ProjectSetupTab(QWidget):
         self.component_all_traces_button.clicked.connect(
             self._toggle_all_component_traces
         )
+        self.component_observed_traces_button = QPushButton(
+            "Hide Observed Traces"
+        )
+        self.component_observed_traces_button.clicked.connect(
+            self._toggle_observed_component_traces
+        )
+        self.component_predicted_traces_button = QPushButton(
+            "Hide Predicted Traces"
+        )
+        self.component_predicted_traces_button.clicked.connect(
+            self._toggle_predicted_component_traces
+        )
         self.component_trace_color_scheme_combo = QComboBox()
         self.component_trace_color_scheme_combo.addItem(
             "Current",
@@ -548,6 +610,8 @@ class ProjectSetupTab(QWidget):
         controls.addWidget(self.component_legend_toggle_button)
         controls.addWidget(self.component_model_range_button)
         controls.addWidget(self.component_all_traces_button)
+        controls.addWidget(self.component_observed_traces_button)
+        controls.addWidget(self.component_predicted_traces_button)
         controls.addWidget(QLabel("Trace Colors"))
         controls.addWidget(self.component_trace_color_scheme_combo)
         controls.addWidget(self.save_component_plot_data_button)
@@ -682,6 +746,15 @@ class ProjectSetupTab(QWidget):
     def set_project_selected(self, selected: bool) -> None:
         self.forward_model_group.setEnabled(selected)
         self.model_group.setEnabled(selected)
+        self.use_predicted_structure_weights_checkbox.setEnabled(selected)
+        self.computed_distribution_combo.setEnabled(
+            selected and self.computed_distribution_combo.count() > 0
+        )
+        self.load_distribution_button.setEnabled(
+            selected
+            and self.computed_distribution_combo.count() > 0
+            and self.selected_distribution_id() is not None
+        )
         self.prior_mode_combo.setEnabled(selected)
         self.generate_prior_plot_button.setEnabled(selected)
         self.save_prior_png_button.setEnabled(selected)
@@ -705,6 +778,9 @@ class ProjectSetupTab(QWidget):
         self.project_dir_edit.setText(str(resolved_project_dir.parent))
         self.open_project_dir_edit.setText(settings.project_dir)
         self.clusters_dir_edit.setText(settings.clusters_dir or "")
+        self.set_use_predicted_structure_weights(
+            settings.use_predicted_structure_weights
+        )
         displayed_data_path = settings.experimental_data_path or (
             settings.copied_experimental_data_file or ""
         )
@@ -885,6 +961,47 @@ class ProjectSetupTab(QWidget):
             return None
         return str(self.template_combo.currentData() or "").strip() or None
 
+    def set_available_distributions(
+        self,
+        distributions: list[tuple[str, str]],
+        *,
+        selected_distribution_id: str | None = None,
+    ) -> None:
+        current_id = (
+            selected_distribution_id or self.selected_distribution_id()
+        )
+        self.computed_distribution_combo.blockSignals(True)
+        self.computed_distribution_combo.clear()
+        for label, distribution_id in distributions:
+            self.computed_distribution_combo.addItem(
+                str(label),
+                userData=str(distribution_id),
+            )
+        if current_id:
+            for index in range(self.computed_distribution_combo.count()):
+                if str(
+                    self.computed_distribution_combo.itemData(index) or ""
+                ) == str(current_id):
+                    self.computed_distribution_combo.setCurrentIndex(index)
+                    break
+        self.computed_distribution_combo.blockSignals(False)
+        self.computed_distribution_combo.setEnabled(
+            self.model_group.isEnabled()
+            and self.computed_distribution_combo.count() > 0
+        )
+        self.load_distribution_button.setEnabled(
+            self.model_group.isEnabled()
+            and self.selected_distribution_id() is not None
+        )
+
+    def selected_distribution_id(self) -> str | None:
+        if self.computed_distribution_combo.count() <= 0:
+            return None
+        return (
+            str(self.computed_distribution_combo.currentData() or "").strip()
+            or None
+        )
+
     def show_deprecated_templates(self) -> bool:
         return self.show_deprecated_templates_checkbox.isChecked()
 
@@ -918,6 +1035,28 @@ class ProjectSetupTab(QWidget):
         if enabled and self.use_experimental_grid_checkbox.isChecked():
             self.use_experimental_grid_checkbox.setChecked(False)
         self._apply_model_only_mode_state()
+
+    def use_predicted_structure_weights(self) -> bool:
+        return bool(self.use_predicted_structure_weights_checkbox.isChecked())
+
+    def set_use_predicted_structure_weights(self, enabled: bool) -> None:
+        self.use_predicted_structure_weights_checkbox.blockSignals(True)
+        self.use_predicted_structure_weights_checkbox.setChecked(bool(enabled))
+        self.use_predicted_structure_weights_checkbox.blockSignals(False)
+        self._update_component_trace_control_state()
+
+    def _default_predicted_structure_status_text(self) -> str:
+        return (
+            "Predicted Structures mode is off.\n"
+            "SAXS components, prior weights, Prefit, and DREAM will use "
+            "observed structures only until this option is enabled."
+        )
+
+    def set_predicted_structure_status_text(self, text: str) -> None:
+        normalized = str(text).strip()
+        self.predicted_structure_status_label.setText(
+            normalized or self._default_predicted_structure_status_text()
+        )
 
     def open_project_dir(self) -> Path | None:
         text = self.open_project_dir_edit.text().strip()
@@ -1357,11 +1496,19 @@ class ProjectSetupTab(QWidget):
         self.activity_progress_bar.setFormat("%v / %m items")
 
     def _redraw_saxs_preview(self) -> None:
+        for axis in list(self.component_figure.axes):
+            try:
+                axis.set_xscale("linear")
+                axis.set_yscale("linear")
+            except Exception:
+                continue
         self.component_figure.clear()
         self._legend_line_map.clear()
         self._component_legend_lookup.clear()
         self._component_line_lookup.clear()
         self._component_color_lookup.clear()
+        self._observed_component_keys = []
+        self._predicted_component_keys = []
         show_data_preview = not self.model_only_mode()
         has_data_preview = show_data_preview and (
             self._experimental_summary is not None
@@ -1570,6 +1717,7 @@ class ProjectSetupTab(QWidget):
         self._updating_cluster_table = True
         self.recognized_clusters_table.blockSignals(True)
         self._component_row_lookup = {}
+        self._component_source_kind_lookup = {}
         self.recognized_clusters_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             component_key = self._component_key(
@@ -1577,6 +1725,12 @@ class ProjectSetupTab(QWidget):
                 str(row["motif"]),
             )
             self._component_row_lookup[component_key] = row_index
+            self._component_source_kind_lookup[component_key] = str(
+                row.get(
+                    "source_kind",
+                    self._infer_component_source_kind(component_key),
+                )
+            )
             values = [
                 str(row["structure"]),
                 str(row["motif"]),
@@ -2193,6 +2347,15 @@ class ProjectSetupTab(QWidget):
             else "disabled Model Only Mode"
         )
 
+    def _on_predicted_structure_weights_toggled(self, enabled: bool) -> None:
+        self._update_component_trace_control_state()
+        self.predicted_structure_weights_changed.emit(bool(enabled))
+        self.autosave_project_requested.emit(
+            "enabled Use Predicted Structure Weights"
+            if enabled
+            else "disabled Use Predicted Structure Weights"
+        )
+
     def _update_resample_grid_state(self) -> None:
         self.resample_points_spin.setEnabled(
             not self.use_experimental_grid_checkbox.isChecked()
@@ -2397,6 +2560,7 @@ class ProjectSetupTab(QWidget):
             q_values = np.asarray(data[:, 0], dtype=float)
             intensities = np.asarray(data[:, 1], dtype=float)
             component_key = component_path.stem
+            source_kind = self._component_source_kind(component_key)
             visible = self._component_visibility.get(component_key, True)
             color_override = self._component_color_overrides.get(component_key)
             line_color = color_override or scheme_colors.get(component_key)
@@ -2412,6 +2576,10 @@ class ProjectSetupTab(QWidget):
             self._component_visibility.setdefault(component_key, visible)
             self._component_line_lookup[component_key] = line
             self._component_color_lookup[component_key] = str(line.get_color())
+            if source_kind == "predicted_structure":
+                self._predicted_component_keys.append(component_key)
+            else:
+                self._observed_component_keys.append(component_key)
             lines.append(line)
         self._apply_saxs_axis_style(axis, is_component_axis=True)
         return lines
@@ -2628,6 +2796,34 @@ class ProjectSetupTab(QWidget):
         if not self._component_paths:
             return
         component_keys = [path.stem for path in self._component_paths]
+        self._toggle_component_trace_group(component_keys)
+        self._update_component_table_visuals()
+        self._update_component_trace_control_state()
+        self._refresh_component_axes()
+        self.component_canvas.draw_idle()
+
+    def _toggle_observed_component_traces(self) -> None:
+        if not self._observed_component_keys:
+            return
+        self._toggle_component_trace_group(self._observed_component_keys)
+        self._update_component_table_visuals()
+        self._update_component_trace_control_state()
+        self._refresh_component_axes()
+        self.component_canvas.draw_idle()
+
+    def _toggle_predicted_component_traces(self) -> None:
+        if not self._predicted_component_keys:
+            return
+        self._toggle_component_trace_group(self._predicted_component_keys)
+        self._update_component_table_visuals()
+        self._update_component_trace_control_state()
+        self._refresh_component_axes()
+        self.component_canvas.draw_idle()
+
+    def _toggle_component_trace_group(
+        self,
+        component_keys: list[str],
+    ) -> None:
         any_visible = any(
             self._component_visibility.get(component_key, True)
             for component_key in component_keys
@@ -2641,10 +2837,6 @@ class ProjectSetupTab(QWidget):
             legend_line = self._component_legend_lookup.get(component_key)
             if legend_line is not None and hasattr(legend_line, "set_alpha"):
                 legend_line.set_alpha(1.0 if target_visible else 0.25)
-        self._update_component_table_visuals()
-        self._update_component_trace_control_state()
-        self._refresh_component_axes()
-        self.component_canvas.draw_idle()
 
     def _update_component_trace_control_state(self) -> None:
         has_components = bool(self._component_paths)
@@ -2657,12 +2849,58 @@ class ProjectSetupTab(QWidget):
             self._component_visibility.get(component_key, True)
             for component_key in component_keys
         )
+        predicted_mode = self.use_predicted_structure_weights()
+        has_observed_components = bool(self._observed_component_keys)
+        observed_visible = any(
+            self._component_visibility.get(component_key, True)
+            for component_key in self._observed_component_keys
+        )
+        has_predicted_components = bool(self._predicted_component_keys)
+        predicted_visible = any(
+            self._component_visibility.get(component_key, True)
+            for component_key in self._predicted_component_keys
+        )
         self.component_all_traces_button.setEnabled(has_components)
         self.component_trace_color_scheme_combo.setEnabled(has_components)
         self.component_all_traces_button.setText(
             "Hide Computed Traces" if any_visible else "Show Computed Traces"
         )
+        self.component_observed_traces_button.setVisible(predicted_mode)
+        self.component_predicted_traces_button.setVisible(predicted_mode)
+        self.component_observed_traces_button.setEnabled(
+            predicted_mode and has_observed_components
+        )
+        self.component_predicted_traces_button.setEnabled(
+            predicted_mode and has_predicted_components
+        )
+        self.component_observed_traces_button.setText(
+            "Hide Observed Traces"
+            if observed_visible
+            else "Show Observed Traces"
+        )
+        self.component_predicted_traces_button.setText(
+            "Hide Predicted Traces"
+            if predicted_visible
+            else "Show Predicted Traces"
+        )
         self._update_prior_control_state()
+
+    def _component_source_kind(self, component_key: str) -> str:
+        return str(
+            self._component_source_kind_lookup.get(
+                component_key,
+                self._infer_component_source_kind(component_key),
+            )
+        )
+
+    def _infer_component_source_kind(self, component_key: str) -> str:
+        normalized = str(component_key).strip().lower()
+        if (
+            self.use_predicted_structure_weights()
+            and "_predicted_rank" in normalized
+        ):
+            return "predicted_structure"
+        return "cluster_dir"
 
     def _build_visibility_table_item(
         self,
@@ -2977,6 +3215,11 @@ class ProjectSetupTab(QWidget):
         for item in self.available_elements_list.selectedItems():
             updated.discard(item.text().strip())
         self.exclude_elements_edit.setText(" ".join(sorted(updated)))
+
+    def _emit_load_distribution_requested(self) -> None:
+        distribution_id = self.selected_distribution_id()
+        if distribution_id is not None:
+            self.load_distribution_requested.emit(distribution_id)
 
     def _sync_available_element_selection(self) -> None:
         excluded = set(self.exclude_elements())

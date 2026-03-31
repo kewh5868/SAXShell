@@ -12,7 +12,7 @@ class DreamRunSettings:
     burnin_percent: int = 20
     restart: bool = False
     verbose: bool = True
-    verbose_output_interval_seconds: float = 1.0
+    verbose_output_interval_seconds: float = 5.0
     parallel: bool = True
     nseedchains: int = 40
     adapt_crossover: bool = True
@@ -37,6 +37,10 @@ class DreamRunSettings:
     violin_sample_source: str = "filtered_posterior"
     violin_weight_order: str = "weight_index"
     violin_value_scale_mode: str = "parameter_value"
+    stoichiometry_target_elements_text: str = ""
+    stoichiometry_target_ratio_text: str = ""
+    stoichiometry_filter_enabled: bool = False
+    stoichiometry_tolerance_percent: float = 5.0
     violin_palette: str = "Blues"
     violin_custom_color: str = "#4c72b0"
     violin_point_color: str = "tab:red"
@@ -82,7 +86,7 @@ class DreamRunSettings:
                         "verbose_output_interval_seconds",
                         "verbose_output_interval_s",
                         "Verbose Output Interval (s)",
-                        default=1.0,
+                        default=5.0,
                     )
                 ),
                 0.1,
@@ -215,6 +219,40 @@ class DreamRunSettings:
                     payload,
                     "violin_value_scale_mode",
                     default="parameter_value",
+                )
+            ),
+            stoichiometry_target_elements_text=(
+                _optional_str(
+                    _get_first(
+                        payload,
+                        "stoichiometry_target_elements_text",
+                        default="",
+                    )
+                )
+                or ""
+            ),
+            stoichiometry_target_ratio_text=(
+                _optional_str(
+                    _get_first(
+                        payload,
+                        "stoichiometry_target_ratio_text",
+                        default="",
+                    )
+                )
+                or ""
+            ),
+            stoichiometry_filter_enabled=_coerce_bool(
+                _get_first(
+                    payload,
+                    "stoichiometry_filter_enabled",
+                    default=False,
+                )
+            ),
+            stoichiometry_tolerance_percent=float(
+                _get_first(
+                    payload,
+                    "stoichiometry_tolerance_percent",
+                    default=5.0,
                 )
             ),
             violin_palette=str(
