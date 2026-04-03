@@ -4,6 +4,7 @@ import json
 import re
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from inspect import Parameter, signature
 from itertools import product
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from saxshell.saxs.project_manager import (
     SAXSProjectManager,
     build_project_paths,
     distribution_id_for_settings,
+    effective_q_range_for_settings,
     load_built_component_q_range,
     project_artifact_paths,
 )
@@ -538,13 +540,87 @@ class SAXSPrefitWorkflow:
             self.has_experimental_data() and not self.settings.model_only_mode
         )
 
+    def _save_project_settings(self) -> Path:
+        # Prefit interactions update project metadata frequently; avoid
+        # rescanning registered input folders/files on each internal save.
+        save_project = self.project_manager.save_project
+        try:
+            save_signature = signature(save_project)
+        except (TypeError, ValueError):
+            save_signature = None
+        if save_signature is not None:
+            supports_refresh_flag = (
+                "refresh_registered_paths" in save_signature.parameters
+                or any(
+                    parameter.kind == Parameter.VAR_KEYWORD
+                    for parameter in save_signature.parameters.values()
+                )
+            )
+            if not supports_refresh_flag:
+                return save_project(self.settings)
+        return save_project(
+            self.settings,
+            refresh_registered_paths=False,
+        )
+
+    @staticmethod
+    def _evaluation_statistics(
+        entries: list[PrefitParameterEntry],
+        evaluation: PrefitEvaluation,
+    ) -> dict[str, float]:
+        if (
+            evaluation.residuals is None
+            or evaluation.experimental_intensities is None
+        ):
+            return {}
+        chi_square = float(np.sum(evaluation.residuals**2))
+        dof = max(
+            len(evaluation.q_values)
+            - sum(1 for entry in entries if entry.vary),
+            1,
+        )
+        reduced_chi_square = chi_square / dof
+        ss_total = float(
+            np.sum(
+                (
+                    evaluation.experimental_intensities
+                    - np.mean(evaluation.experimental_intensities)
+                )
+                ** 2
+            )
+        )
+        r_squared = (
+            1.0 - chi_square / ss_total if ss_total > 0.0 else float("nan")
+        )
+        return {
+            "chi_square": chi_square,
+            "reduced_chi_square": reduced_chi_square,
+            "r_squared": r_squared,
+        }
+
+    @staticmethod
+    def _saved_state_display_label(
+        state_name: str,
+        payload: dict[str, object],
+    ) -> str:
+        statistics = payload.get("statistics", {})
+        if not isinstance(statistics, dict):
+            return state_name
+        try:
+            r_squared = float(statistics.get("r_squared"))
+        except (TypeError, ValueError):
+            return state_name
+        if not np.isfinite(r_squared):
+            return state_name
+        return f"{state_name} (R^2={r_squared:.6g})"
+
     def set_model_only_mode(self, enabled: bool) -> None:
         self.settings.model_only_mode = bool(enabled)
         if self.settings.model_only_mode:
             self.settings.use_experimental_grid = False
             if self.settings.q_points is None or self.settings.q_points <= 1:
                 self.settings.q_points = 500
-        self.project_manager.save_project(self.settings)
+        self._save_project_settings()
         self.experimental_data = self._load_experimental_trace()
         self.solvent_data = self._load_solvent_trace()
 
@@ -913,25 +989,7 @@ class SAXSPrefitWorkflow:
             raise ValueError(
                 "Prefit fit statistics are unavailable without experimental SAXS data."
             )
-        chi_square = float(np.sum(evaluation.residuals**2))
-        dof = max(
-            len(evaluation.q_values)
-            - sum(1 for entry in entries if entry.vary),
-            1,
-        )
-        reduced_chi_square = chi_square / dof
-        ss_total = float(
-            np.sum(
-                (
-                    evaluation.experimental_intensities
-                    - np.mean(evaluation.experimental_intensities)
-                )
-                ** 2
-            )
-        )
-        r_squared = (
-            1.0 - chi_square / ss_total if ss_total > 0.0 else float("nan")
-        )
+        statistics = self._evaluation_statistics(entries, evaluation)
         report_text = fit_report(result)
         if grid_sweep_result is not None:
             report_text = (
@@ -950,9 +1008,9 @@ class SAXSPrefitWorkflow:
             fit_report=report_text,
             method=method,
             nfev=int(getattr(result, "nfev", 0) or 0),
-            chi_square=chi_square,
-            reduced_chi_square=reduced_chi_square,
-            r_squared=r_squared,
+            chi_square=statistics["chi_square"],
+            reduced_chi_square=statistics["reduced_chi_square"],
+            r_squared=statistics["r_squared"],
             optimization_strategy=optimization_strategy,
             grid_evaluations=(
                 0
@@ -995,6 +1053,11 @@ class SAXSPrefitWorkflow:
             if self.cluster_geometry_table is None
             else self.cluster_geometry_table.to_dict()
         )
+        evaluation_statistics = (
+            {}
+            if fit_result is not None
+            else self._evaluation_statistics(entries, evaluation)
+        )
 
         state_payload = {
             "saved_at": timestamp,
@@ -1028,7 +1091,7 @@ class SAXSPrefitWorkflow:
                     "r_squared": fit_result.r_squared,
                 }
                 if fit_result is not None
-                else {}
+                else evaluation_statistics
             ),
             "template_runtime_inputs": template_runtime_inputs,
             "cluster_geometry_metadata": cluster_geometry_payload,
@@ -1156,7 +1219,7 @@ class SAXSPrefitWorkflow:
                 history_path.read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
-        self.project_manager.save_project(self.settings)
+        self._save_project_settings()
         return report_path
 
     def set_template(self, template_name: str) -> None:
@@ -1176,16 +1239,16 @@ class SAXSPrefitWorkflow:
         ]
         self.settings.best_prefit_template = None
         self.settings.best_prefit_parameter_entries = []
-        self.project_manager.save_project(self.settings)
+        self._save_project_settings()
         self.parameter_entries = self.load_template_reset_entries()
 
     def set_autosave(self, enabled: bool) -> None:
         self.settings.autosave_prefits = bool(enabled)
-        self.project_manager.save_project(self.settings)
+        self._save_project_settings()
 
     def set_sequence_history_enabled(self, enabled: bool) -> None:
         self.settings.prefit_sequence_history_enabled = bool(enabled)
-        self.project_manager.save_project(self.settings)
+        self._save_project_settings()
 
     def sequence_history_path(self) -> Path:
         return self.prefit_dir / PREFIT_SEQUENCE_HISTORY_FILENAME
@@ -1308,7 +1371,7 @@ class SAXSPrefitWorkflow:
         self.settings.best_prefit_parameter_entries = [
             entry.to_dict() for entry in copied_entries
         ]
-        self.project_manager.save_project(self.settings)
+        self._save_project_settings()
 
     def has_best_prefit_entries(self) -> bool:
         return self.load_best_prefit_entries() is not None
@@ -1322,6 +1385,27 @@ class SAXSPrefitWorkflow:
             if path.is_dir() and (path / "prefit_state.json").is_file()
         ]
         return sorted(state_names, reverse=True)
+
+    def list_saved_state_options(self) -> list[tuple[str, str]]:
+        options: list[tuple[str, str]] = []
+        for state_name in self.list_saved_states():
+            payload: dict[str, object] = {}
+            state_path = self.prefit_dir / state_name / "prefit_state.json"
+            try:
+                loaded_payload = json.loads(
+                    state_path.read_text(encoding="utf-8")
+                )
+                if isinstance(loaded_payload, dict):
+                    payload = loaded_payload
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            options.append(
+                (
+                    self._saved_state_display_label(state_name, payload),
+                    state_name,
+                )
+            )
+        return options
 
     def load_saved_state(self, state_name: str) -> PrefitSavedState:
         state_dir = self.prefit_dir / state_name
@@ -1634,47 +1718,17 @@ class SAXSPrefitWorkflow:
         )
 
     def set_cluster_geometry_active_radii_type(self, radii_type: str) -> None:
-        if self.cluster_geometry_table is None:
-            self.cluster_geometry_table = ClusterGeometryMetadataTable(
-                source_clusters_dir=(
-                    str(self.settings.resolved_clusters_dir)
-                    if self.settings.resolved_clusters_dir is not None
-                    else None
-                ),
-                template_name=self.template_spec.name,
-            )
-        working_table = ClusterGeometryMetadataTable.from_dict(
-            self.cluster_geometry_table.to_dict()
-        )
+        working_table = self._working_cluster_geometry_table()
         working_table.active_radii_type = radii_type
-        self._synchronize_cluster_geometry_table(working_table)
-        validate_positive_cluster_geometry_table(working_table)
-        self.cluster_geometry_table = working_table
-        self._save_cluster_geometry_table()
-        self._refresh_dynamic_cluster_geometry_parameter_entries()
+        self._apply_cluster_geometry_table(working_table)
 
     def set_cluster_geometry_active_ionic_radius_type(
         self,
         ionic_radius_type: str,
     ) -> None:
-        if self.cluster_geometry_table is None:
-            self.cluster_geometry_table = ClusterGeometryMetadataTable(
-                source_clusters_dir=(
-                    str(self.settings.resolved_clusters_dir)
-                    if self.settings.resolved_clusters_dir is not None
-                    else None
-                ),
-                template_name=self.template_spec.name,
-            )
-        working_table = ClusterGeometryMetadataTable.from_dict(
-            self.cluster_geometry_table.to_dict()
-        )
+        working_table = self._working_cluster_geometry_table()
         working_table.active_ionic_radius_type = ionic_radius_type
-        self._synchronize_cluster_geometry_table(working_table)
-        validate_positive_cluster_geometry_table(working_table)
-        self.cluster_geometry_table = working_table
-        self._save_cluster_geometry_table()
-        self._refresh_dynamic_cluster_geometry_parameter_entries()
+        self._apply_cluster_geometry_table(working_table)
 
     def cluster_geometry_mapping_options(self) -> list[tuple[str, str]]:
         return [
@@ -1759,31 +1813,32 @@ class SAXSPrefitWorkflow:
     def set_cluster_geometry_rows(
         self,
         rows: list[ClusterGeometryMetadataRow],
+        *,
+        preserve_geometry_entries: bool = False,
     ) -> None:
-        if self.cluster_geometry_table is None:
-            working_table = ClusterGeometryMetadataTable(
-                source_clusters_dir=(
-                    str(self.settings.resolved_clusters_dir)
-                    if self.settings.resolved_clusters_dir is not None
-                    else None
-                ),
-                template_name=self.template_spec.name,
-            )
-        else:
-            working_table = ClusterGeometryMetadataTable.from_dict(
-                self.cluster_geometry_table.to_dict()
-            )
+        working_table = self._working_cluster_geometry_table()
         working_table.rows = copy_cluster_geometry_rows(rows)
-        working_table.template_name = self.template_spec.name
-        self._synchronize_cluster_geometry_table(working_table)
-        apply_default_component_mapping(
-            working_table.rows,
-            self.components,
+        self._apply_cluster_geometry_table(
+            working_table,
+            preserve_geometry_entries=preserve_geometry_entries,
         )
-        validate_positive_cluster_geometry_table(working_table)
-        self.cluster_geometry_table = working_table
-        self._save_cluster_geometry_table()
-        self._refresh_dynamic_cluster_geometry_parameter_entries()
+
+    def set_cluster_geometry_state(
+        self,
+        *,
+        rows: list[ClusterGeometryMetadataRow],
+        active_radii_type: str,
+        active_ionic_radius_type: str,
+        preserve_geometry_entries: bool = False,
+    ) -> None:
+        working_table = self._working_cluster_geometry_table()
+        working_table.active_radii_type = active_radii_type
+        working_table.active_ionic_radius_type = active_ionic_radius_type
+        working_table.rows = copy_cluster_geometry_rows(rows)
+        self._apply_cluster_geometry_table(
+            working_table,
+            preserve_geometry_entries=preserve_geometry_entries,
+        )
 
     def restore_cluster_geometry_table(
         self,
@@ -1795,14 +1850,7 @@ class SAXSPrefitWorkflow:
                 self.cluster_geometry_metadata_path.unlink()
             self._refresh_dynamic_cluster_geometry_parameter_entries()
             return
-        restored = ClusterGeometryMetadataTable.from_dict(table.to_dict())
-        restored.template_name = self.template_spec.name
-        self._synchronize_cluster_geometry_table(restored)
-        apply_default_component_mapping(restored.rows, self.components)
-        validate_positive_cluster_geometry_table(restored)
-        self.cluster_geometry_table = restored
-        self._save_cluster_geometry_table()
-        self._refresh_dynamic_cluster_geometry_parameter_entries()
+        self._apply_cluster_geometry_table(table)
 
     def template_runtime_inputs(self) -> dict[str, np.ndarray]:
         required_names = {
@@ -1988,11 +2036,16 @@ class SAXSPrefitWorkflow:
             entry.minimum = lower
             entry.maximum = upper
 
-    def _refresh_dynamic_cluster_geometry_parameter_entries(self) -> None:
+    def _refresh_dynamic_cluster_geometry_parameter_entries(
+        self,
+        *,
+        preserve_geometry_entries: bool = False,
+    ) -> None:
         refreshed_defaults = self._build_default_parameter_entries()
         self.parameter_entries = self._merge_parameter_entries(
             self.parameter_entries,
             refreshed_defaults,
+            preserve_geometry_entries=preserve_geometry_entries,
         )
         self._template_default_entries = refreshed_defaults
         self.settings.template_reset_template = self.template_spec.name
@@ -2010,12 +2063,14 @@ class SAXSPrefitWorkflow:
             if not self._has_matching_entry_signature(best_entries):
                 self.settings.best_prefit_template = None
                 self.settings.best_prefit_parameter_entries = []
-        self.project_manager.save_project(self.settings)
+        self._save_project_settings()
 
     @staticmethod
     def _merge_parameter_entries(
         existing_entries: list[PrefitParameterEntry],
         default_entries: list[PrefitParameterEntry],
+        *,
+        preserve_geometry_entries: bool = False,
     ) -> list[PrefitParameterEntry]:
         existing_by_name = {
             entry.name: entry for entry in existing_entries if entry.name
@@ -2023,7 +2078,11 @@ class SAXSPrefitWorkflow:
         merged_entries: list[PrefitParameterEntry] = []
         for default_entry in default_entries:
             existing_entry = existing_by_name.get(default_entry.name)
-            if existing_entry is None or default_entry.category == "geometry":
+            preserve_existing_entry = existing_entry is not None and (
+                default_entry.category != "geometry"
+                or preserve_geometry_entries
+            )
+            if not preserve_existing_entry:
                 merged_entries.append(
                     PrefitParameterEntry.from_dict(default_entry.to_dict())
                 )
@@ -2083,7 +2142,7 @@ class SAXSPrefitWorkflow:
             self.settings.best_prefit_parameter_entries = []
             dirty = True
         if dirty:
-            self.project_manager.save_project(self.settings)
+            self._save_project_settings()
 
     def _entries_from_project_payload(
         self,
@@ -2334,22 +2393,14 @@ class SAXSPrefitWorkflow:
         self,
         source_q_values: np.ndarray,
     ) -> tuple[float, float]:
-        q_values = np.asarray(source_q_values, dtype=float)
+        q_values = (
+            np.asarray(self.experimental_data.q_values, dtype=float)
+            if self.experimental_data is not None
+            else np.asarray(source_q_values, dtype=float)
+        )
         if q_values.size == 0:
             raise ValueError("No SAXS component q-values are available.")
-        q_min = (
-            float(self.settings.q_min)
-            if self.settings.q_min is not None
-            else float(np.min(q_values))
-        )
-        q_max = (
-            float(self.settings.q_max)
-            if self.settings.q_max is not None
-            else float(np.max(q_values))
-        )
-        if q_min > q_max:
-            raise ValueError("q min must be less than or equal to q max.")
-        return q_min, q_max
+        return effective_q_range_for_settings(self.settings, q_values)
 
     def _ensure_requested_q_range_supported(
         self,
@@ -2517,8 +2568,44 @@ class SAXSPrefitWorkflow:
             or self._default_template_name()
         )
         self.settings.selected_model_template = selected
-        self.project_manager.save_project(self.settings)
+        self._save_project_settings()
         return load_template_spec(selected, self.template_dir)
+
+    def _working_cluster_geometry_table(
+        self,
+    ) -> ClusterGeometryMetadataTable:
+        if self.cluster_geometry_table is None:
+            return ClusterGeometryMetadataTable(
+                source_clusters_dir=(
+                    str(self.settings.resolved_clusters_dir)
+                    if self.settings.resolved_clusters_dir is not None
+                    else None
+                ),
+                template_name=self.template_spec.name,
+            )
+        return ClusterGeometryMetadataTable.from_dict(
+            self.cluster_geometry_table.to_dict()
+        )
+
+    def _apply_cluster_geometry_table(
+        self,
+        table: ClusterGeometryMetadataTable,
+        *,
+        preserve_geometry_entries: bool = False,
+    ) -> None:
+        working_table = ClusterGeometryMetadataTable.from_dict(table.to_dict())
+        working_table.template_name = self.template_spec.name
+        self._synchronize_cluster_geometry_table(working_table)
+        apply_default_component_mapping(
+            working_table.rows,
+            self.components,
+        )
+        validate_positive_cluster_geometry_table(working_table)
+        self.cluster_geometry_table = working_table
+        self._save_cluster_geometry_table()
+        self._refresh_dynamic_cluster_geometry_parameter_entries(
+            preserve_geometry_entries=preserve_geometry_entries,
+        )
 
     def _default_template_name(self) -> str:
         templates = self.available_templates()

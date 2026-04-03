@@ -4,6 +4,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QLabel,
     QProgressBar,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -31,6 +32,12 @@ class SAXSProgressDialog(QDialog):
         self.progress_bar.setFormat("%v / %m items")
         layout.addWidget(self.progress_bar)
 
+        self.output_box = QTextEdit()
+        self.output_box.setReadOnly(True)
+        self.output_box.setMinimumHeight(140)
+        self.output_box.hide()
+        layout.addWidget(self.output_box)
+
     def begin(
         self,
         total: int,
@@ -46,6 +53,7 @@ class SAXSProgressDialog(QDialog):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat(f"%v / %m {unit_label}")
         self.message_label.setText(message)
+        self.clear_output()
         self.show()
         self.raise_()
 
@@ -61,6 +69,7 @@ class SAXSProgressDialog(QDialog):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("")
         self.message_label.setText(message)
+        self.clear_output()
         self.show()
         self.raise_()
 
@@ -78,6 +87,25 @@ class SAXSProgressDialog(QDialog):
         self.progress_bar.setValue(processed)
         self.progress_bar.setFormat(f"%v / %m {unit_label}")
         self.message_label.setText(message)
+
+    def clear_output(self) -> None:
+        self.output_box.clear()
+        self.output_box.hide()
+        self.resize(max(self.width(), 560), 120)
+
+    def append_output(self, message: str) -> None:
+        stripped = str(message).strip()
+        if not stripped:
+            return
+        if self.output_box.toPlainText().strip():
+            self.output_box.append(stripped)
+        else:
+            self.output_box.setPlainText(stripped)
+        if not self.output_box.isVisible():
+            self.output_box.show()
+            self.resize(max(self.width(), 560), max(self.height(), 280))
+        scrollbar = self.output_box.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
 
 __all__ = ["SAXSProgressDialog"]

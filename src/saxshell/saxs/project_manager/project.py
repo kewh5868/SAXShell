@@ -11,6 +11,27 @@ from pathlib import Path
 
 import numpy as np
 
+from saxshell.saxs.contrast.debye import (
+    ContrastDebyeBuildResult,
+    build_contrast_component_profiles,
+)
+from saxshell.saxs.contrast.electron_density import (
+    CONTRAST_SOLVENT_METHOD_NEAT,
+    ContrastGeometryDensityResult,
+    ContrastGeometryDensitySettings,
+    ContrastSolventDensitySettings,
+    compute_contrast_geometry_and_electron_density,
+)
+from saxshell.saxs.contrast.representatives import (
+    ContrastRepresentativeSelectionResult,
+    analyze_contrast_representatives,
+)
+from saxshell.saxs.contrast.settings import (
+    COMPONENT_BUILD_MODE_CONTRAST,
+    COMPONENT_BUILD_MODE_NO_CONTRAST,
+    component_build_mode_label,
+    normalize_component_build_mode,
+)
 from saxshell.saxs.debye import (
     ClusterBin,
     DebyeProfileBuilder,
@@ -179,6 +200,7 @@ class ProjectArtifactPaths:
     plots_dir: Path
     component_dir: Path
     component_map_file: Path
+    contrast_dir: Path
     prior_weights_file: Path
     prior_plot_data_file: Path
     prefit_dir: Path
@@ -208,6 +230,8 @@ class SavedDistributionRecord:
     metadata_path: Path
     created_at: str | None = None
     updated_at: str | None = None
+    template_name: str | None = None
+    component_build_mode: str = COMPONENT_BUILD_MODE_NO_CONTRAST
     use_predicted_structure_weights: bool = False
     exclude_elements: tuple[str, ...] = ()
     clusters_dir: str | None = None
@@ -415,13 +439,84 @@ class PowerPointExportSettings:
         )
 
 
+@dataclass(slots=True, frozen=True)
+class RegisteredFolderSnapshot:
+    version: int = 1
+    signature: str = ""
+    file_count: int = 0
+    directory_count: int = 0
+    total_size_bytes: int = 0
+    latest_mtime_ns: int = 0
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+    ) -> "RegisteredFolderSnapshot | None":
+        if not isinstance(payload, dict):
+            return None
+        signature = _optional_str(payload.get("signature"))
+        if signature is None:
+            return None
+        return cls(
+            version=max(int(payload.get("version", 1)), 1),
+            signature=signature,
+            file_count=max(int(payload.get("file_count", 0)), 0),
+            directory_count=max(int(payload.get("directory_count", 0)), 0),
+            total_size_bytes=max(int(payload.get("total_size_bytes", 0)), 0),
+            latest_mtime_ns=max(int(payload.get("latest_mtime_ns", 0)), 0),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class RegisteredFileSnapshot:
+    version: int = 1
+    signature: str = ""
+    size_bytes: int = 0
+    mtime_ns: int = 0
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+    ) -> "RegisteredFileSnapshot | None":
+        if not isinstance(payload, dict):
+            return None
+        signature = _optional_str(payload.get("signature"))
+        if signature is None:
+            return None
+        return cls(
+            version=max(int(payload.get("version", 1)), 1),
+            signature=signature,
+            size_bytes=max(int(payload.get("size_bytes", 0)), 0),
+            mtime_ns=max(int(payload.get("mtime_ns", 0)), 0),
+        )
+
+
 @dataclass(slots=True)
 class ProjectSettings:
     project_name: str
     project_dir: str
     model_only_mode: bool = False
     use_predicted_structure_weights: bool = False
+    frames_dir: str | None = None
+    pdb_frames_dir: str | None = None
     clusters_dir: str | None = None
+    frames_dir_snapshot: RegisteredFolderSnapshot | None = None
+    pdb_frames_dir_snapshot: RegisteredFolderSnapshot | None = None
+    clusters_dir_snapshot: RegisteredFolderSnapshot | None = None
+    trajectory_file: str | None = None
+    topology_file: str | None = None
+    energy_file: str | None = None
+    trajectory_file_snapshot: RegisteredFileSnapshot | None = None
+    topology_file_snapshot: RegisteredFileSnapshot | None = None
+    energy_file_snapshot: RegisteredFileSnapshot | None = None
     experimental_data_path: str | None = None
     copied_experimental_data_file: str | None = None
     solvent_data_path: str | None = None
@@ -465,6 +560,7 @@ class ProjectSettings:
         default_factory=list
     )
     selected_model_template: str | None = None
+    component_build_mode: str = COMPONENT_BUILD_MODE_NO_CONTRAST
     autosave_prefits: bool = False
     powerpoint_export_settings: PowerPointExportSettings = field(
         default_factory=PowerPointExportSettings
@@ -475,10 +571,40 @@ class ProjectSettings:
         return Path(self.project_dir).expanduser().resolve()
 
     @property
+    def resolved_frames_dir(self) -> Path | None:
+        if self.frames_dir is None or not self.frames_dir.strip():
+            return None
+        return Path(self.frames_dir).expanduser().resolve()
+
+    @property
+    def resolved_pdb_frames_dir(self) -> Path | None:
+        if self.pdb_frames_dir is None or not self.pdb_frames_dir.strip():
+            return None
+        return Path(self.pdb_frames_dir).expanduser().resolve()
+
+    @property
     def resolved_clusters_dir(self) -> Path | None:
         if self.clusters_dir is None or not self.clusters_dir.strip():
             return None
         return Path(self.clusters_dir).expanduser().resolve()
+
+    @property
+    def resolved_trajectory_file(self) -> Path | None:
+        if self.trajectory_file is None or not self.trajectory_file.strip():
+            return None
+        return Path(self.trajectory_file).expanduser().resolve()
+
+    @property
+    def resolved_topology_file(self) -> Path | None:
+        if self.topology_file is None or not self.topology_file.strip():
+            return None
+        return Path(self.topology_file).expanduser().resolve()
+
+    @property
+    def resolved_energy_file(self) -> Path | None:
+        if self.energy_file is None or not self.energy_file.strip():
+            return None
+        return Path(self.energy_file).expanduser().resolve()
 
     @property
     def resolved_experimental_data_path(self) -> Path | None:
@@ -543,8 +669,41 @@ class ProjectSettings:
         payload["dream_favorite_history"] = [
             entry.to_dict() for entry in self.dream_favorite_history
         ]
+        payload["frames_dir_snapshot"] = (
+            None
+            if self.frames_dir_snapshot is None
+            else self.frames_dir_snapshot.to_dict()
+        )
+        payload["pdb_frames_dir_snapshot"] = (
+            None
+            if self.pdb_frames_dir_snapshot is None
+            else self.pdb_frames_dir_snapshot.to_dict()
+        )
+        payload["clusters_dir_snapshot"] = (
+            None
+            if self.clusters_dir_snapshot is None
+            else self.clusters_dir_snapshot.to_dict()
+        )
+        payload["trajectory_file_snapshot"] = (
+            None
+            if self.trajectory_file_snapshot is None
+            else self.trajectory_file_snapshot.to_dict()
+        )
+        payload["topology_file_snapshot"] = (
+            None
+            if self.topology_file_snapshot is None
+            else self.topology_file_snapshot.to_dict()
+        )
+        payload["energy_file_snapshot"] = (
+            None
+            if self.energy_file_snapshot is None
+            else self.energy_file_snapshot.to_dict()
+        )
         payload["powerpoint_export_settings"] = (
             self.powerpoint_export_settings.to_dict()
+        )
+        payload["component_build_mode"] = normalize_component_build_mode(
+            payload.get("component_build_mode")
         )
         return payload
 
@@ -557,7 +716,30 @@ class ProjectSettings:
             use_predicted_structure_weights=bool(
                 payload.get("use_predicted_structure_weights", False)
             ),
+            frames_dir=_optional_str(payload.get("frames_dir")),
+            pdb_frames_dir=_optional_str(payload.get("pdb_frames_dir")),
             clusters_dir=_optional_str(payload.get("clusters_dir")),
+            frames_dir_snapshot=RegisteredFolderSnapshot.from_dict(
+                payload.get("frames_dir_snapshot")
+            ),
+            pdb_frames_dir_snapshot=RegisteredFolderSnapshot.from_dict(
+                payload.get("pdb_frames_dir_snapshot")
+            ),
+            clusters_dir_snapshot=RegisteredFolderSnapshot.from_dict(
+                payload.get("clusters_dir_snapshot")
+            ),
+            trajectory_file=_optional_str(payload.get("trajectory_file")),
+            topology_file=_optional_str(payload.get("topology_file")),
+            energy_file=_optional_str(payload.get("energy_file")),
+            trajectory_file_snapshot=RegisteredFileSnapshot.from_dict(
+                payload.get("trajectory_file_snapshot")
+            ),
+            topology_file_snapshot=RegisteredFileSnapshot.from_dict(
+                payload.get("topology_file_snapshot")
+            ),
+            energy_file_snapshot=RegisteredFileSnapshot.from_dict(
+                payload.get("energy_file_snapshot")
+            ),
             experimental_data_path=_optional_str(
                 payload.get("experimental_data_path")
             ),
@@ -661,6 +843,9 @@ class ProjectSettings:
             selected_model_template=_optional_str(
                 payload.get("selected_model_template")
             ),
+            component_build_mode=normalize_component_build_mode(
+                payload.get("component_build_mode")
+            ),
             autosave_prefits=bool(payload.get("autosave_prefits", False)),
             powerpoint_export_settings=PowerPointExportSettings.from_dict(
                 payload.get("powerpoint_export_settings", {})
@@ -668,8 +853,17 @@ class ProjectSettings:
         )
 
 
-def distribution_id_for_settings(settings: ProjectSettings) -> str:
-    payload = _distribution_signature_payload(settings)
+def _distribution_id_for_settings(
+    settings: ProjectSettings,
+    *,
+    include_template: bool,
+    include_build_mode: bool = True,
+) -> str:
+    payload = _distribution_signature_payload(
+        settings,
+        include_template=include_template,
+        include_build_mode=include_build_mode,
+    )
     signature = json.dumps(
         payload,
         sort_keys=True,
@@ -689,11 +883,22 @@ def distribution_id_for_settings(settings: ProjectSettings) -> str:
     return f"{mode}__{excluded}__{digest}"
 
 
+def distribution_id_for_settings(settings: ProjectSettings) -> str:
+    return _distribution_id_for_settings(
+        settings,
+        include_template=True,
+    )
+
+
 def distribution_label_for_settings(settings: ProjectSettings) -> str:
     mode = (
         "Observed + Predicted Structures"
         if settings.use_predicted_structure_weights
         else "Observed Only"
+    )
+    build_mode = component_build_mode_label(settings.component_build_mode)
+    template_name = (
+        str(settings.selected_model_template or "").strip() or "Unspecified"
     )
     excluded = ", ".join(sorted(set(settings.exclude_elements))) or "None"
     if settings.q_min is None or settings.q_max is None:
@@ -706,15 +911,41 @@ def distribution_label_for_settings(settings: ProjectSettings) -> str:
         else f"resample {int(settings.q_points or 0)}"
     )
     return (
-        f"{mode} | Excluded: {excluded} | q-range: {q_range} | "
-        f"Grid: {grid}"
+        f"{mode} | Build: {build_mode} | Template: {template_name} | "
+        f"Excluded: {excluded} | q-range: {q_range} | Grid: {grid}"
     )
+
+
+def _distribution_id_candidates_for_settings(
+    settings: ProjectSettings,
+) -> tuple[str, ...]:
+    candidates = [
+        _distribution_id_for_settings(
+            settings,
+            include_template=True,
+            include_build_mode=True,
+        )
+    ]
+    if (
+        normalize_component_build_mode(settings.component_build_mode)
+        == COMPONENT_BUILD_MODE_NO_CONTRAST
+    ):
+        for include_template in (True, False):
+            candidate = _distribution_id_for_settings(
+                settings,
+                include_template=include_template,
+                include_build_mode=False,
+            )
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return tuple(candidates)
 
 
 def project_artifact_paths(
     settings: ProjectSettings,
     *,
     storage_mode: str = "auto",
+    allow_legacy_fallback: bool = True,
 ) -> ProjectArtifactPaths:
     paths = build_project_paths(settings.project_dir)
     normalized_mode = str(storage_mode).strip().lower() or "auto"
@@ -727,8 +958,21 @@ def project_artifact_paths(
     distribution_metadata_file: Path | None = None
     uses_distribution_storage = False
     if use_distribution_storage:
-        distribution_id = distribution_id_for_settings(settings)
-        root_dir = paths.saved_distributions_dir / distribution_id
+        distribution_id_candidates = _distribution_id_candidates_for_settings(
+            settings
+        )
+        desired_distribution_id = distribution_id_candidates[0]
+        distribution_id = desired_distribution_id
+        root_dir = paths.saved_distributions_dir / desired_distribution_id
+        if allow_legacy_fallback and not root_dir.exists():
+            for legacy_distribution_id in distribution_id_candidates[1:]:
+                legacy_root_dir = (
+                    paths.saved_distributions_dir / legacy_distribution_id
+                )
+                if legacy_root_dir.exists():
+                    distribution_id = legacy_distribution_id
+                    root_dir = legacy_root_dir
+                    break
         distribution_metadata_file = root_dir / "distribution.json"
         uses_distribution_storage = True
     includes_predicted_structures = bool(
@@ -757,6 +1001,7 @@ def project_artifact_paths(
         plots_dir=root_dir / "plots",
         component_dir=component_dir,
         component_map_file=component_map_file,
+        contrast_dir=root_dir / "contrast",
         prior_weights_file=prior_weights_file,
         prior_plot_data_file=prior_plot_data_file,
         prefit_dir=prefit_dir,
@@ -777,10 +1022,13 @@ def project_artifact_paths(
 
 def _distribution_signature_payload(
     settings: ProjectSettings,
+    *,
+    include_template: bool = True,
+    include_build_mode: bool = True,
 ) -> dict[str, object]:
     experimental_source = _distribution_experimental_data_path(settings)
     q_min, q_max = _distribution_signature_q_range(settings)
-    return {
+    payload = {
         "clusters_dir": (
             None
             if settings.resolved_clusters_dir is None
@@ -809,6 +1057,15 @@ def _distribution_signature_payload(
             )
         ),
     }
+    if include_build_mode:
+        payload["component_build_mode"] = normalize_component_build_mode(
+            settings.component_build_mode
+        )
+    if include_template:
+        payload["selected_model_template"] = _optional_str(
+            settings.selected_model_template
+        )
+    return payload
 
 
 def _distribution_experimental_data_path(
@@ -888,6 +1145,17 @@ def _distribution_q_range_tolerance(
     )
 
 
+def effective_q_range_for_settings(
+    settings: ProjectSettings,
+    source_q_values: np.ndarray,
+) -> tuple[float, float]:
+    effective_q = _requested_q_values_on_source_grid(
+        settings,
+        source_q_values,
+    )
+    return float(np.min(effective_q)), float(np.max(effective_q))
+
+
 def _project_has_saved_distributions(project_dir: str | Path) -> bool:
     saved_dir = build_project_paths(project_dir).saved_distributions_dir
     if not saved_dir.is_dir():
@@ -914,6 +1182,10 @@ def _distribution_metadata_from_payload(
         metadata_path=metadata_path,
         created_at=_optional_str(payload.get("created_at")),
         updated_at=_optional_str(payload.get("updated_at")),
+        template_name=_optional_str(payload.get("template_name")),
+        component_build_mode=normalize_component_build_mode(
+            payload.get("component_build_mode")
+        ),
         use_predicted_structure_weights=bool(
             payload.get("use_predicted_structure_weights", False)
         ),
@@ -1068,6 +1340,245 @@ def _normalized_dream_bestfit_history(
     return history
 
 
+def _registered_folder_snapshot(
+    folder_path: str | Path | None,
+) -> RegisteredFolderSnapshot | None:
+    if folder_path is None:
+        return None
+    try:
+        resolved_dir = Path(folder_path).expanduser().resolve()
+    except Exception:
+        return None
+    if not resolved_dir.is_dir():
+        return None
+
+    digest = hashlib.sha1()
+    file_count = 0
+    directory_count = 0
+    total_size_bytes = 0
+    latest_mtime_ns = 0
+
+    try:
+        root_stat = resolved_dir.stat()
+        root_mtime_ns = int(
+            getattr(
+                root_stat,
+                "st_mtime_ns",
+                int(float(root_stat.st_mtime) * 1_000_000_000),
+            )
+        )
+        latest_mtime_ns = max(latest_mtime_ns, root_mtime_ns)
+        digest.update(
+            f"root\0{resolved_dir.name}\0{root_mtime_ns}\n".encode("utf-8")
+        )
+        for path in sorted(resolved_dir.rglob("*")):
+            try:
+                path_stat = path.stat()
+            except OSError:
+                return None
+            relative_path = path.relative_to(resolved_dir).as_posix()
+            is_directory = path.is_dir()
+            entry_type = "d" if is_directory else "f"
+            entry_size = 0 if is_directory else int(path_stat.st_size)
+            entry_mtime_ns = int(
+                getattr(
+                    path_stat,
+                    "st_mtime_ns",
+                    int(float(path_stat.st_mtime) * 1_000_000_000),
+                )
+            )
+            digest.update(
+                (
+                    f"{entry_type}\0{relative_path}\0{entry_size}\0"
+                    f"{entry_mtime_ns}\n"
+                ).encode("utf-8")
+            )
+            latest_mtime_ns = max(latest_mtime_ns, entry_mtime_ns)
+            if is_directory:
+                directory_count += 1
+            else:
+                file_count += 1
+                total_size_bytes += entry_size
+    except OSError:
+        return None
+
+    return RegisteredFolderSnapshot(
+        signature=digest.hexdigest(),
+        file_count=file_count,
+        directory_count=directory_count,
+        total_size_bytes=total_size_bytes,
+        latest_mtime_ns=latest_mtime_ns,
+    )
+
+
+def _registered_file_snapshot(
+    file_path: str | Path | None,
+) -> RegisteredFileSnapshot | None:
+    if file_path is None:
+        return None
+    try:
+        resolved_file = Path(file_path).expanduser().resolve()
+    except Exception:
+        return None
+    if not resolved_file.is_file():
+        return None
+
+    try:
+        file_stat = resolved_file.stat()
+    except OSError:
+        return None
+
+    size_bytes = int(file_stat.st_size)
+    mtime_ns = int(
+        getattr(
+            file_stat,
+            "st_mtime_ns",
+            int(float(file_stat.st_mtime) * 1_000_000_000),
+        )
+    )
+    digest = hashlib.sha1()
+    digest.update(f"size\0{size_bytes}\0mtime\0{mtime_ns}\n".encode("utf-8"))
+    try:
+        with resolved_file.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except OSError:
+        return None
+
+    return RegisteredFileSnapshot(
+        signature=digest.hexdigest(),
+        size_bytes=size_bytes,
+        mtime_ns=mtime_ns,
+    )
+
+
+def _refresh_registered_folder_snapshots(
+    settings: ProjectSettings,
+) -> None:
+    settings.frames_dir_snapshot = _registered_folder_snapshot(
+        settings.frames_dir
+    )
+    settings.pdb_frames_dir_snapshot = _registered_folder_snapshot(
+        settings.pdb_frames_dir
+    )
+    settings.clusters_dir_snapshot = _registered_folder_snapshot(
+        settings.clusters_dir
+    )
+
+
+def _refresh_registered_file_snapshots(
+    settings: ProjectSettings,
+) -> None:
+    settings.trajectory_file_snapshot = _registered_file_snapshot(
+        settings.trajectory_file
+    )
+    settings.topology_file_snapshot = _registered_file_snapshot(
+        settings.topology_file
+    )
+    settings.energy_file_snapshot = _registered_file_snapshot(
+        settings.energy_file
+    )
+
+
+def _registered_folder_validation_messages(
+    *,
+    label: str,
+    path_text: str | None,
+    saved_snapshot: RegisteredFolderSnapshot | None,
+) -> list[str]:
+    if path_text is None or not str(path_text).strip():
+        return []
+    try:
+        resolved_dir = Path(path_text).expanduser().resolve()
+    except Exception:
+        return [f"Registered {label} folder path is invalid: {path_text}"]
+    if not resolved_dir.exists():
+        return [f"Registered {label} folder is missing: {resolved_dir}"]
+    if not resolved_dir.is_dir():
+        return [
+            f"Registered {label} folder is no longer a directory: {resolved_dir}"
+        ]
+    if saved_snapshot is None:
+        return []
+
+    current_snapshot = _registered_folder_snapshot(resolved_dir)
+    if current_snapshot is None:
+        return [
+            f"Registered {label} folder could not be scanned: {resolved_dir}"
+        ]
+    if current_snapshot.signature == saved_snapshot.signature:
+        return []
+
+    details: list[str] = []
+    if current_snapshot.file_count != saved_snapshot.file_count:
+        details.append(
+            f"files {saved_snapshot.file_count} -> {current_snapshot.file_count}"
+        )
+    if current_snapshot.directory_count != saved_snapshot.directory_count:
+        details.append(
+            "subfolders "
+            f"{saved_snapshot.directory_count} -> {current_snapshot.directory_count}"
+        )
+    if current_snapshot.total_size_bytes != saved_snapshot.total_size_bytes:
+        details.append(
+            "bytes "
+            f"{saved_snapshot.total_size_bytes} -> {current_snapshot.total_size_bytes}"
+        )
+    if not details:
+        details.append("file metadata changed in place")
+    return [
+        "Registered "
+        f"{label} folder contents changed since the project was last saved: "
+        f"{resolved_dir} ({'; '.join(details)})"
+    ]
+
+
+def _registered_file_validation_messages(
+    *,
+    label: str,
+    path_text: str | None,
+    saved_snapshot: RegisteredFileSnapshot | None,
+) -> list[str]:
+    if path_text is None or not str(path_text).strip():
+        return []
+    try:
+        resolved_file = Path(path_text).expanduser().resolve()
+    except Exception:
+        return [f"Registered {label} file path is invalid: {path_text}"]
+    if not resolved_file.exists():
+        return [f"Registered {label} file is missing: {resolved_file}"]
+    if not resolved_file.is_file():
+        return [
+            f"Registered {label} path is no longer a file: {resolved_file}"
+        ]
+    if saved_snapshot is None:
+        return []
+
+    current_snapshot = _registered_file_snapshot(resolved_file)
+    if current_snapshot is None:
+        return [f"Registered {label} file could not be read: {resolved_file}"]
+    if current_snapshot.signature == saved_snapshot.signature:
+        return []
+
+    details: list[str] = []
+    if current_snapshot.size_bytes != saved_snapshot.size_bytes:
+        details.append(
+            f"bytes {saved_snapshot.size_bytes} -> {current_snapshot.size_bytes}"
+        )
+    if current_snapshot.mtime_ns != saved_snapshot.mtime_ns:
+        details.append("modified timestamp changed")
+    if not details:
+        details.append("file contents changed in place")
+    return [
+        "Registered "
+        f"{label} file changed since the project was last saved: "
+        f"{resolved_file} ({'; '.join(details)})"
+    ]
+
+
 class SAXSProjectManager:
     """Persist project settings and build SAXS component files inside
     one project directory."""
@@ -1087,7 +1598,10 @@ class SAXSProjectManager:
             project_name=project_name or paths.project_dir.name,
             project_dir=str(paths.project_dir),
         )
-        self.save_project(settings)
+        self.save_project(
+            settings,
+            refresh_registered_paths=False,
+        )
         return settings
 
     def load_project(
@@ -1105,9 +1619,66 @@ class SAXSProjectManager:
         self.ensure_project_dirs(build_project_paths(settings.project_dir))
         return settings
 
-    def save_project(self, settings: ProjectSettings) -> Path:
+    def registered_folder_warnings(
+        self,
+        settings: ProjectSettings,
+    ) -> tuple[str, ...]:
+        messages: list[str] = []
+        messages.extend(
+            _registered_folder_validation_messages(
+                label="frames",
+                path_text=settings.frames_dir,
+                saved_snapshot=settings.frames_dir_snapshot,
+            )
+        )
+        messages.extend(
+            _registered_folder_validation_messages(
+                label="PDB structure",
+                path_text=settings.pdb_frames_dir,
+                saved_snapshot=settings.pdb_frames_dir_snapshot,
+            )
+        )
+        messages.extend(
+            _registered_folder_validation_messages(
+                label="clusters",
+                path_text=settings.clusters_dir,
+                saved_snapshot=settings.clusters_dir_snapshot,
+            )
+        )
+        messages.extend(
+            _registered_file_validation_messages(
+                label="trajectory",
+                path_text=settings.trajectory_file,
+                saved_snapshot=settings.trajectory_file_snapshot,
+            )
+        )
+        messages.extend(
+            _registered_file_validation_messages(
+                label="topology",
+                path_text=settings.topology_file,
+                saved_snapshot=settings.topology_file_snapshot,
+            )
+        )
+        messages.extend(
+            _registered_file_validation_messages(
+                label="energy",
+                path_text=settings.energy_file,
+                saved_snapshot=settings.energy_file_snapshot,
+            )
+        )
+        return tuple(messages)
+
+    def save_project(
+        self,
+        settings: ProjectSettings,
+        *,
+        refresh_registered_paths: bool = True,
+    ) -> Path:
         paths = build_project_paths(settings.project_dir)
         self.ensure_project_dirs(paths)
+        if refresh_registered_paths:
+            _refresh_registered_folder_snapshots(settings)
+            _refresh_registered_file_snapshots(settings)
         paths.project_file.write_text(
             json.dumps(settings.to_dict(), indent=2) + "\n",
             encoding="utf-8",
@@ -1140,6 +1711,7 @@ class SAXSProjectManager:
             artifact_paths.root_dir,
             artifact_paths.plots_dir,
             artifact_paths.component_dir,
+            artifact_paths.contrast_dir,
             artifact_paths.prefit_dir,
             artifact_paths.dream_dir,
             artifact_paths.dream_runtime_dir,
@@ -1317,6 +1889,95 @@ class SAXSProjectManager:
             )
         return record
 
+    def settings_for_saved_distribution(
+        self,
+        project_dir: str | Path,
+        distribution_id: str,
+        *,
+        base_settings: ProjectSettings | None = None,
+    ) -> ProjectSettings:
+        record = self.load_saved_distribution(project_dir, distribution_id)
+        working_settings = ProjectSettings.from_dict(
+            (
+                base_settings.to_dict()
+                if base_settings is not None
+                else self.load_project(project_dir).to_dict()
+            )
+        )
+        working_settings.use_predicted_structure_weights = bool(
+            record.use_predicted_structure_weights
+        )
+        working_settings.exclude_elements = list(record.exclude_elements)
+        working_settings.clusters_dir = record.clusters_dir
+        working_settings.q_min = record.q_min
+        working_settings.q_max = record.q_max
+        working_settings.use_experimental_grid = bool(
+            record.use_experimental_grid
+        )
+        working_settings.q_points = record.q_points
+        working_settings.component_build_mode = record.component_build_mode
+        if record.template_name is not None:
+            working_settings.selected_model_template = record.template_name
+        return working_settings
+
+    def clone_distribution_for_template(
+        self,
+        project_dir: str | Path,
+        source_distribution_id: str,
+        template_name: str,
+        *,
+        base_settings: ProjectSettings | None = None,
+    ) -> SavedDistributionRecord:
+        normalized_template = _optional_str(template_name)
+        if normalized_template is None:
+            raise ValueError("Select a template before changing it.")
+        source_record = self.load_saved_distribution(
+            project_dir,
+            source_distribution_id,
+        )
+        target_settings = self.settings_for_saved_distribution(
+            project_dir,
+            source_distribution_id,
+            base_settings=base_settings,
+        )
+        target_settings.selected_model_template = normalized_template
+        target_artifact_paths = project_artifact_paths(
+            target_settings,
+            storage_mode="distribution",
+            allow_legacy_fallback=False,
+        )
+        if target_artifact_paths.distribution_id is None:
+            raise ValueError(
+                "The template-scoped distribution path could not be resolved."
+            )
+        if target_artifact_paths.distribution_metadata_file is None:
+            raise ValueError(
+                "The template-scoped distribution metadata path is unavailable."
+            )
+        if target_artifact_paths.distribution_metadata_file.is_file():
+            return self.load_saved_distribution(
+                project_dir,
+                target_artifact_paths.distribution_id,
+            )
+
+        self.ensure_project_dirs(build_project_paths(project_dir))
+        self.ensure_artifact_dirs(target_artifact_paths)
+        self._copy_distribution_artifacts(
+            source_root=source_record.distribution_dir,
+            target_artifact_paths=target_artifact_paths,
+            include_predicted_structures=bool(
+                source_record.use_predicted_structure_weights
+            ),
+        )
+        self._write_distribution_metadata(
+            target_settings,
+            artifact_paths=target_artifact_paths,
+        )
+        return self.load_saved_distribution(
+            project_dir,
+            target_artifact_paths.distribution_id,
+        )
+
     def predicted_structure_cluster_bins(
         self,
         project_dir: str | Path,
@@ -1390,6 +2051,108 @@ class SAXSProjectManager:
                 )
         return cluster_bins
 
+    def contrast_cluster_inventory(
+        self,
+        settings: ProjectSettings,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> tuple[_ClusterInventory, Path | None, int]:
+        clusters_dir = settings.resolved_clusters_dir
+        if clusters_dir is None:
+            raise ValueError(
+                "Select a clusters directory before building contrast models."
+            )
+        observed_inventory = self._collect_cluster_inventory(
+            clusters_dir,
+            progress_callback=progress_callback,
+        )
+        if not settings.use_predicted_structure_weights:
+            return observed_inventory, None, 0
+        (
+            loaded_dataset,
+            observed_motif_weights,
+            predicted_payloads,
+            predicted_available_elements,
+        ) = self._predicted_structure_weight_payload(
+            settings,
+            cluster_inventory=observed_inventory,
+        )
+        predicted_cluster_bins = (
+            self._predicted_structure_cluster_bins_from_payloads(
+                predicted_payloads
+            )
+        )
+        merged_cluster_bins = sorted(
+            [
+                *observed_inventory.cluster_bins,
+                *predicted_cluster_bins,
+            ],
+            key=lambda cluster_bin: (
+                _natural_sort_key(cluster_bin.structure),
+                _natural_sort_key(cluster_bin.motif),
+            ),
+        )
+        merged_available_elements = sorted(
+            {
+                *observed_inventory.available_elements,
+                *predicted_available_elements,
+            },
+            key=_natural_sort_key,
+        )
+        cluster_rows = self._combined_cluster_rows(
+            cluster_inventory=observed_inventory,
+            observed_motif_weights=observed_motif_weights,
+            predicted_payloads=predicted_payloads,
+        )
+        return (
+            _ClusterInventory(
+                cluster_bins=merged_cluster_bins,
+                available_elements=merged_available_elements,
+                cluster_rows=cluster_rows,
+                total_files=sum(
+                    len(cluster_bin.files)
+                    for cluster_bin in merged_cluster_bins
+                ),
+            ),
+            loaded_dataset.dataset_file,
+            len(predicted_payloads),
+        )
+
+    def _predicted_structure_cluster_bins_from_payloads(
+        self,
+        predicted_payloads: list[dict[str, object]],
+    ) -> list[ClusterBin]:
+        cluster_bins: list[ClusterBin] = []
+        for payload in predicted_payloads:
+            prediction = payload.get("prediction")
+            structure = str(getattr(prediction, "label", "")).strip()
+            motif = (
+                str(payload.get("motif") or "no_motif").strip() or "no_motif"
+            )
+            if not structure:
+                continue
+            source_path_value = payload.get("source_path")
+            source_path = (
+                None
+                if source_path_value is None
+                else Path(source_path_value).expanduser().resolve()
+            )
+            if source_path is None or not source_path.is_file():
+                raise FileNotFoundError(
+                    "Predicted Structures mode is enabled, but the XYZ/PDB file "
+                    f"for predicted structure {structure}/{motif} could not be found."
+                )
+            cluster_bins.append(
+                ClusterBin(
+                    structure=structure,
+                    motif=motif,
+                    source_dir=source_path.parent,
+                    files=(source_path,),
+                    representative=source_path.name,
+                )
+            )
+        return cluster_bins
+
     def build_scattering_project(
         self,
         settings: ProjectSettings,
@@ -1415,12 +2178,7 @@ class SAXSProjectManager:
         progress_callback: ProgressCallback | None = None,
     ) -> ProjectBuildResult:
         paths = build_project_paths(settings.project_dir)
-        artifact_paths = project_artifact_paths(
-            settings,
-            storage_mode="distribution",
-        )
         self.ensure_project_dirs(paths)
-        self.ensure_artifact_dirs(artifact_paths)
         staged_data_path: Path | None = None
         experimental_data: ExperimentalDataSummary | None = None
         if not settings.model_only_mode:
@@ -1428,55 +2186,92 @@ class SAXSProjectManager:
             self.stage_solvent_data(settings)
             experimental_data = self.load_experimental_data(settings)
         q_values = self._build_q_grid(settings, experimental_data)
+        self._store_effective_q_range(
+            settings,
+            q_values=q_values,
+            experimental_data=experimental_data,
+        )
+        artifact_paths = project_artifact_paths(
+            settings,
+            storage_mode="distribution",
+        )
+        self.ensure_artifact_dirs(artifact_paths)
         clusters_dir = settings.resolved_clusters_dir
         if clusters_dir is None:
             raise ValueError(
                 "Select a clusters directory before building models."
             )
-        cluster_inventory = self._collect_cluster_inventory(
-            clusters_dir,
-            progress_callback=progress_callback,
-        )
-        settings.available_elements = cluster_inventory.available_elements
-        settings.cluster_inventory_rows = cluster_inventory.cluster_rows
-        component_entries = self._component_entries_from_cluster_bins(
-            cluster_inventory.cluster_bins
-        )
-        reused_observed_components = (
-            settings.use_predicted_structure_weights
-            and self._reuse_observed_component_artifacts(
-                settings,
-                artifact_paths=artifact_paths,
-                component_entries=component_entries,
-                progress_callback=progress_callback,
-            )
-        )
-        if not reused_observed_components:
-            builder = DebyeProfileBuilder(
-                q_values=q_values,
-                exclude_elements=settings.exclude_elements or None,
-                output_dir=artifact_paths.component_dir,
-            )
-            averaged_components = builder.build_profiles(
-                cluster_bins=cluster_inventory.cluster_bins,
-                progress_callback=progress_callback,
-                progress_total=max(cluster_inventory.total_files, 1),
-            )
-            component_entries = [
-                ProjectComponentEntry(
-                    structure=component.structure,
-                    motif=component.motif,
-                    file_count=component.file_count,
-                    representative=component.representative,
-                    profile_file=component.output_path.name,
-                    source_dir=str(component.source_dir),
-                )
-                for component in averaged_components
-            ]
-        cluster_rows = list(cluster_inventory.cluster_rows)
         predicted_dataset_file: Path | None = None
         predicted_component_count = 0
-        if settings.use_predicted_structure_weights:
+        if (
+            normalize_component_build_mode(settings.component_build_mode)
+            == COMPONENT_BUILD_MODE_CONTRAST
+        ):
+            (
+                cluster_inventory,
+                predicted_dataset_file,
+                predicted_component_count,
+            ) = self.contrast_cluster_inventory(
+                settings,
+                progress_callback=progress_callback,
+            )
+            settings.available_elements = cluster_inventory.available_elements
+            settings.cluster_inventory_rows = cluster_inventory.cluster_rows
+            cluster_rows = list(cluster_inventory.cluster_rows)
+            component_entries = self._build_contrast_scattering_components(
+                settings,
+                artifact_paths=artifact_paths,
+                q_values=q_values,
+                cluster_inventory=cluster_inventory,
+                progress_callback=progress_callback,
+            )
+        else:
+            cluster_inventory = self._collect_cluster_inventory(
+                clusters_dir,
+                progress_callback=progress_callback,
+            )
+            settings.available_elements = cluster_inventory.available_elements
+            settings.cluster_inventory_rows = cluster_inventory.cluster_rows
+            cluster_rows = list(cluster_inventory.cluster_rows)
+            component_entries = self._component_entries_from_cluster_bins(
+                cluster_inventory.cluster_bins
+            )
+            reused_observed_components = (
+                settings.use_predicted_structure_weights
+                and self._reuse_observed_component_artifacts(
+                    settings,
+                    artifact_paths=artifact_paths,
+                    component_entries=component_entries,
+                    progress_callback=progress_callback,
+                )
+            )
+            if not reused_observed_components:
+                builder = DebyeProfileBuilder(
+                    q_values=q_values,
+                    exclude_elements=settings.exclude_elements or None,
+                    output_dir=artifact_paths.component_dir,
+                )
+                averaged_components = builder.build_profiles(
+                    cluster_bins=cluster_inventory.cluster_bins,
+                    progress_callback=progress_callback,
+                    progress_total=max(cluster_inventory.total_files, 1),
+                )
+                component_entries = [
+                    ProjectComponentEntry(
+                        structure=component.structure,
+                        motif=component.motif,
+                        file_count=component.file_count,
+                        representative=component.representative,
+                        profile_file=component.output_path.name,
+                        source_dir=str(component.source_dir),
+                    )
+                    for component in averaged_components
+                ]
+        if (
+            normalize_component_build_mode(settings.component_build_mode)
+            != COMPONENT_BUILD_MODE_CONTRAST
+            and settings.use_predicted_structure_weights
+        ):
             (
                 component_entries,
                 cluster_rows,
@@ -1505,7 +2300,10 @@ class SAXSProjectManager:
             settings,
             artifact_paths=artifact_paths,
         )
-        self.save_project(settings)
+        self.save_project(
+            settings,
+            refresh_registered_paths=False,
+        )
 
         return ProjectBuildResult(
             q_values=q_values,
@@ -1520,19 +2318,31 @@ class SAXSProjectManager:
             predicted_component_count=predicted_component_count,
         )
 
-    def generate_prior_weights(
+    def _default_contrast_density_settings(
+        self,
+        *,
+        exclude_elements: list[str] | tuple[str, ...] | None = None,
+    ) -> ContrastGeometryDensitySettings:
+        return ContrastGeometryDensitySettings(
+            solvent=ContrastSolventDensitySettings.from_values(
+                method=CONTRAST_SOLVENT_METHOD_NEAT,
+                solvent_formula="H2O",
+                solvent_density_g_per_ml=1.0,
+            ),
+            exclude_elements=tuple(
+                _normalized_elements(exclude_elements or [])
+            ),
+        )
+
+    def build_contrast_scattering_components_from_results(
         self,
         settings: ProjectSettings,
         *,
+        representative_result: ContrastRepresentativeSelectionResult,
+        density_result: ContrastGeometryDensityResult,
         progress_callback: ProgressCallback | None = None,
+        log_callback: Callable[[str], None] | None = None,
     ) -> ProjectBuildResult:
-        paths = build_project_paths(settings.project_dir)
-        artifact_paths = project_artifact_paths(
-            settings,
-            storage_mode="distribution",
-        )
-        self.ensure_project_dirs(paths)
-        self.ensure_artifact_dirs(artifact_paths)
         staged_data_path: Path | None = None
         experimental_data: ExperimentalDataSummary | None = None
         if not settings.model_only_mode:
@@ -1540,6 +2350,214 @@ class SAXSProjectManager:
             self.stage_solvent_data(settings)
             experimental_data = self.load_experimental_data(settings)
         q_values = self._build_q_grid(settings, experimental_data)
+        self._store_effective_q_range(
+            settings,
+            q_values=q_values,
+            experimental_data=experimental_data,
+        )
+        artifact_paths = project_artifact_paths(
+            settings,
+            storage_mode="distribution",
+        )
+        self.ensure_artifact_dirs(artifact_paths)
+        clusters_dir = settings.resolved_clusters_dir
+        if clusters_dir is None:
+            raise ValueError(
+                "Select a clusters directory before building models."
+            )
+        if (
+            normalize_component_build_mode(settings.component_build_mode)
+            != COMPONENT_BUILD_MODE_CONTRAST
+        ):
+            raise ValueError(
+                "build_contrast_scattering_components_from_results requires "
+                "Contrast Mode settings."
+            )
+        (
+            cluster_inventory,
+            predicted_dataset_file,
+            predicted_component_count,
+        ) = self.contrast_cluster_inventory(settings)
+        settings.available_elements = cluster_inventory.available_elements
+        settings.cluster_inventory_rows = cluster_inventory.cluster_rows
+        component_entries = (
+            self._build_contrast_scattering_components_from_results(
+                artifact_paths=artifact_paths,
+                q_values=q_values,
+                representative_result=representative_result,
+                density_result=density_result,
+                exclude_elements=settings.exclude_elements or None,
+                progress_callback=progress_callback,
+                log_callback=log_callback,
+            )
+        )
+        model_map_path = artifact_paths.component_map_file
+        self._write_component_map(model_map_path, component_entries)
+        self._write_distribution_metadata(
+            settings,
+            artifact_paths=artifact_paths,
+        )
+        self.save_project(
+            settings,
+            refresh_registered_paths=False,
+        )
+        return ProjectBuildResult(
+            q_values=q_values,
+            component_entries=component_entries,
+            cluster_rows=list(cluster_inventory.cluster_rows),
+            staged_experimental_data_path=staged_data_path,
+            model_map_path=model_map_path,
+            used_predicted_structure_weights=(
+                settings.use_predicted_structure_weights
+            ),
+            predicted_dataset_file=predicted_dataset_file,
+            predicted_component_count=predicted_component_count,
+        )
+
+    def _build_contrast_scattering_components(
+        self,
+        settings: ProjectSettings,
+        *,
+        artifact_paths: ProjectArtifactPaths,
+        q_values: np.ndarray,
+        cluster_inventory: _ClusterInventory | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> list[ProjectComponentEntry]:
+        clusters_dir = settings.resolved_clusters_dir
+        if clusters_dir is None:
+            raise ValueError(
+                "Contrast Mode requires a clusters directory before SAXS "
+                "components can be built."
+            )
+        if cluster_inventory is None:
+            cluster_inventory, _dataset_file, _predicted_count = (
+                self.contrast_cluster_inventory(
+                    settings,
+                    progress_callback=progress_callback,
+                )
+            )
+        representative_result = analyze_contrast_representatives(
+            settings.project_dir,
+            clusters_dir,
+            cluster_bins=tuple(cluster_inventory.cluster_bins),
+            progress_callback=progress_callback,
+        )
+        density_result = compute_contrast_geometry_and_electron_density(
+            representative_result,
+            self._default_contrast_density_settings(
+                exclude_elements=settings.exclude_elements,
+            ),
+            progress_callback=progress_callback,
+        )
+        return self._build_contrast_scattering_components_from_results(
+            artifact_paths=artifact_paths,
+            q_values=q_values,
+            representative_result=representative_result,
+            density_result=density_result,
+            exclude_elements=settings.exclude_elements or None,
+            progress_callback=progress_callback,
+        )
+
+    def _build_contrast_scattering_components_from_results(
+        self,
+        *,
+        artifact_paths: ProjectArtifactPaths,
+        q_values: np.ndarray,
+        representative_result: ContrastRepresentativeSelectionResult,
+        density_result: ContrastGeometryDensityResult,
+        exclude_elements: list[str] | tuple[str, ...] | None = None,
+        progress_callback: ProgressCallback | None = None,
+        log_callback: Callable[[str], None] | None = None,
+    ) -> list[ProjectComponentEntry]:
+        contrast_metadata_dir = artifact_paths.contrast_dir / "debye"
+        contrast_build_result = build_contrast_component_profiles(
+            representative_result,
+            density_result,
+            q_values=q_values,
+            output_dir=artifact_paths.component_dir,
+            metadata_dir=contrast_metadata_dir,
+            component_map_path=artifact_paths.component_map_file,
+            exclude_elements=exclude_elements,
+            progress_callback=progress_callback,
+            log_callback=log_callback,
+        )
+        self._persist_contrast_distribution_artifacts(
+            artifact_paths=artifact_paths,
+            representative_result=representative_result,
+            density_result=density_result,
+            contrast_build_result=contrast_build_result,
+        )
+        return [
+            ProjectComponentEntry(
+                structure=trace_result.structure,
+                motif=trace_result.motif,
+                file_count=trace_result.file_count,
+                representative=trace_result.representative_file.name,
+                profile_file=trace_result.profile_file,
+                source_dir=str(trace_result.representative_file.parent),
+            )
+            for trace_result in contrast_build_result.trace_results
+        ]
+
+    def _persist_contrast_distribution_artifacts(
+        self,
+        *,
+        artifact_paths: ProjectArtifactPaths,
+        representative_result: ContrastRepresentativeSelectionResult,
+        density_result: ContrastGeometryDensityResult,
+        contrast_build_result: ContrastDebyeBuildResult,
+    ) -> None:
+        contrast_dir = artifact_paths.contrast_dir
+        contrast_dir.mkdir(parents=True, exist_ok=True)
+        representative_root = representative_result.output_dir
+        if representative_root.is_dir():
+            for child in representative_root.iterdir():
+                destination = contrast_dir / child.name
+                if child.is_dir():
+                    shutil.copytree(child, destination, dirs_exist_ok=True)
+                else:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(child, destination)
+        debye_root = contrast_build_result.metadata_dir
+        if debye_root.is_dir():
+            destination = contrast_dir / "debye"
+            if debye_root.resolve() != destination.resolve():
+                shutil.copytree(debye_root, destination, dirs_exist_ok=True)
+        for density_path in (
+            density_result.summary_json_path,
+            density_result.summary_table_path,
+            density_result.summary_text_path,
+        ):
+            if density_path.is_file():
+                destination = contrast_dir / density_path.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(density_path, destination)
+
+    def generate_prior_weights(
+        self,
+        settings: ProjectSettings,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> ProjectBuildResult:
+        paths = build_project_paths(settings.project_dir)
+        self.ensure_project_dirs(paths)
+        staged_data_path: Path | None = None
+        experimental_data: ExperimentalDataSummary | None = None
+        if not settings.model_only_mode:
+            staged_data_path = self.stage_experimental_data(settings)
+            self.stage_solvent_data(settings)
+            experimental_data = self.load_experimental_data(settings)
+        q_values = self._build_q_grid(settings, experimental_data)
+        self._store_effective_q_range(
+            settings,
+            q_values=q_values,
+            experimental_data=experimental_data,
+        )
+        artifact_paths = project_artifact_paths(
+            settings,
+            storage_mode="distribution",
+        )
+        self.ensure_artifact_dirs(artifact_paths)
         clusters_dir = settings.resolved_clusters_dir
         if clusters_dir is None:
             raise ValueError(
@@ -1551,8 +2569,10 @@ class SAXSProjectManager:
         )
         settings.available_elements = cluster_inventory.available_elements
         settings.cluster_inventory_rows = cluster_inventory.cluster_rows
-        component_entries = self._component_entries_from_cluster_bins(
-            cluster_inventory.cluster_bins
+        component_entries = self._component_entries_for_prior_weights(
+            settings,
+            artifact_paths=artifact_paths,
+            cluster_bins=cluster_inventory.cluster_bins,
         )
         md_prior_weights_path = artifact_paths.prior_weights_file
         prior_plot_data_path = artifact_paths.prior_plot_data_file
@@ -1612,7 +2632,10 @@ class SAXSProjectManager:
             settings,
             artifact_paths=artifact_paths,
         )
-        self.save_project(settings)
+        self.save_project(
+            settings,
+            refresh_registered_paths=False,
+        )
         if progress_callback is not None:
             progress_callback(
                 max(len(component_entries), 1),
@@ -1664,6 +2687,10 @@ class SAXSProjectManager:
             "label": distribution_label_for_settings(settings),
             "created_at": created_at,
             "updated_at": now,
+            "template_name": _optional_str(settings.selected_model_template),
+            "component_build_mode": normalize_component_build_mode(
+                settings.component_build_mode
+            ),
             "use_predicted_structure_weights": bool(
                 settings.use_predicted_structure_weights
             ),
@@ -1689,6 +2716,67 @@ class SAXSProjectManager:
             json.dumps(payload, indent=2) + "\n",
             encoding="utf-8",
         )
+
+    def _copy_distribution_artifacts(
+        self,
+        *,
+        source_root: Path,
+        target_artifact_paths: ProjectArtifactPaths,
+        include_predicted_structures: bool,
+    ) -> None:
+        if include_predicted_structures:
+            source_component_dir = (
+                source_root / "scattering_components_predicted_structures"
+            )
+            source_component_map = (
+                source_root / "md_saxs_map_predicted_structures.json"
+            )
+            source_prior_weights = (
+                source_root / "md_prior_weights_predicted_structures.json"
+            )
+        else:
+            source_component_dir = source_root / "scattering_components"
+            source_component_map = source_root / "md_saxs_map.json"
+            source_prior_weights = source_root / "md_prior_weights.json"
+        source_plots_dir = source_root / "plots"
+        source_contrast_dir = source_root / "contrast"
+
+        if source_component_dir.is_dir():
+            shutil.copytree(
+                source_component_dir,
+                target_artifact_paths.component_dir,
+                dirs_exist_ok=True,
+            )
+        if source_component_map.is_file():
+            target_artifact_paths.component_map_file.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            shutil.copy2(
+                source_component_map,
+                target_artifact_paths.component_map_file,
+            )
+        if source_prior_weights.is_file():
+            target_artifact_paths.prior_weights_file.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            shutil.copy2(
+                source_prior_weights,
+                target_artifact_paths.prior_weights_file,
+            )
+        if source_plots_dir.is_dir():
+            shutil.copytree(
+                source_plots_dir,
+                target_artifact_paths.plots_dir,
+                dirs_exist_ok=True,
+            )
+        if source_contrast_dir.is_dir():
+            shutil.copytree(
+                source_contrast_dir,
+                target_artifact_paths.contrast_dir,
+                dirs_exist_ok=True,
+            )
 
     def _resolve_experimental_source(self, settings: ProjectSettings) -> Path:
         source = settings.resolved_experimental_data_path
@@ -1751,29 +2839,10 @@ class SAXSProjectManager:
         if experimental_data is None:
             return self._build_model_only_q_grid(settings)
 
-        q_values = experimental_data.q_values
-        q_min = (
-            settings.q_min
-            if settings.q_min is not None
-            else float(q_values.min())
+        filtered_q = _requested_q_values_on_source_grid(
+            settings,
+            experimental_data.q_values,
         )
-        q_max = (
-            settings.q_max
-            if settings.q_max is not None
-            else float(q_values.max())
-        )
-        if q_min > q_max:
-            raise ValueError("q min must be less than or equal to q max.")
-
-        if settings.use_experimental_grid:
-            filtered_q = _nearest_cropped_q_values(q_values, q_min, q_max)
-        else:
-            mask = (q_values >= q_min) & (q_values <= q_max)
-            filtered_q = q_values[mask]
-            if filtered_q.size == 0:
-                raise ValueError(
-                    "The requested q-range does not overlap the experimental data."
-                )
         if (
             not settings.use_experimental_grid
             and settings.q_points is not None
@@ -1785,6 +2854,40 @@ class SAXSProjectManager:
                 settings.q_points,
             )
         return filtered_q
+
+    def _store_effective_q_range(
+        self,
+        settings: ProjectSettings,
+        *,
+        q_values: np.ndarray,
+        experimental_data: ExperimentalDataSummary | None,
+    ) -> None:
+        q_values = np.asarray(q_values, dtype=float)
+        if q_values.size == 0:
+            return
+        effective_min = float(np.min(q_values))
+        effective_max = float(np.max(q_values))
+        if experimental_data is not None and settings.use_experimental_grid:
+            experimental_q = np.asarray(
+                experimental_data.q_values,
+                dtype=float,
+            )
+            if experimental_q.size != 0:
+                default_min = float(np.min(experimental_q))
+                default_max = float(np.max(experimental_q))
+                tolerance = _distribution_q_range_tolerance(
+                    default_min,
+                    default_max,
+                )
+                if (
+                    abs(effective_min - default_min) <= tolerance
+                    and abs(effective_max - default_max) <= tolerance
+                ):
+                    settings.q_min = None
+                    settings.q_max = None
+                    return
+        settings.q_min = effective_min
+        settings.q_max = effective_max
 
     def _build_model_only_q_grid(
         self,
@@ -1853,6 +2956,23 @@ class SAXSProjectManager:
             discover_cluster_bins(clusters_dir)
         )
 
+    def _component_entries_for_prior_weights(
+        self,
+        settings: ProjectSettings,
+        *,
+        artifact_paths: ProjectArtifactPaths,
+        cluster_bins: list[ClusterBin],
+    ) -> list[ProjectComponentEntry]:
+        if (
+            normalize_component_build_mode(settings.component_build_mode)
+            != COMPONENT_BUILD_MODE_CONTRAST
+        ):
+            return self._component_entries_from_cluster_bins(cluster_bins)
+        return self._contrast_component_entries_from_distribution_artifacts(
+            artifact_paths=artifact_paths,
+            cluster_bins=cluster_bins,
+        )
+
     def _component_entries_from_cluster_bins(
         self,
         cluster_bins: list[ClusterBin],
@@ -1871,6 +2991,136 @@ class SAXSProjectManager:
             )
             for cluster_bin in cluster_bins
         ]
+
+    def _contrast_component_entries_from_distribution_artifacts(
+        self,
+        *,
+        artifact_paths: ProjectArtifactPaths,
+        cluster_bins: list[ClusterBin],
+    ) -> list[ProjectComponentEntry]:
+        summary_path = (
+            artifact_paths.contrast_dir / "debye" / "component_summary.json"
+        )
+        if not summary_path.is_file():
+            raise ValueError(
+                "Contrast Mode prior weights require existing contrast SAXS "
+                "component artifacts. Build contrast SAXS components before "
+                "generating prior weights."
+            )
+        try:
+            summary_payload = json.loads(
+                summary_path.read_text(encoding="utf-8")
+            )
+        except Exception as exc:
+            raise ValueError(
+                "Could not read the saved contrast component summary for the "
+                "active computed distribution."
+            ) from exc
+        raw_trace_results = summary_payload.get("trace_results")
+        if not isinstance(raw_trace_results, list) or not raw_trace_results:
+            raise ValueError(
+                "The saved contrast component summary does not contain any "
+                "representative trace records."
+            )
+
+        trace_by_key: dict[tuple[str, str], dict[str, object]] = {}
+        for raw_trace in raw_trace_results:
+            if not isinstance(raw_trace, dict):
+                continue
+            structure = _optional_str(raw_trace.get("structure"))
+            if structure is None:
+                continue
+            motif = _normalized_nonempty_text(
+                raw_trace.get("motif"),
+                default="no_motif",
+            )
+            trace_by_key[(structure, motif)] = raw_trace
+
+        missing_traces = [
+            f"{cluster_bin.structure}/{cluster_bin.motif}"
+            for cluster_bin in cluster_bins
+            if (cluster_bin.structure, cluster_bin.motif) not in trace_by_key
+        ]
+        if missing_traces:
+            raise ValueError(
+                "The saved contrast component summary is missing representative "
+                "traces for: "
+                + ", ".join(sorted(missing_traces))
+                + ". Rebuild contrast SAXS components for this computed "
+                "distribution before generating prior weights."
+            )
+
+        component_entries: list[ProjectComponentEntry] = []
+        missing_profiles: list[str] = []
+        for cluster_bin in cluster_bins:
+            trace_payload = trace_by_key[
+                (cluster_bin.structure, cluster_bin.motif)
+            ]
+            profile_file = _optional_str(trace_payload.get("profile_file"))
+            if profile_file is None:
+                profile_file = self._component_profile_filename(
+                    cluster_bin.structure,
+                    cluster_bin.motif,
+                )
+            if not (artifact_paths.component_dir / profile_file).is_file():
+                missing_profiles.append(profile_file)
+
+            representative_file = self._contrast_representative_file_for_trace(
+                artifact_paths=artifact_paths,
+                trace_payload=trace_payload,
+            )
+            source_dir = (
+                representative_file.parent
+                if representative_file is not None
+                else cluster_bin.source_dir
+            )
+            component_entries.append(
+                ProjectComponentEntry(
+                    structure=cluster_bin.structure,
+                    motif=cluster_bin.motif,
+                    file_count=len(cluster_bin.files),
+                    representative=(
+                        None
+                        if representative_file is None
+                        else representative_file.name
+                    ),
+                    profile_file=profile_file,
+                    source_dir=str(source_dir.resolve()),
+                )
+            )
+
+        if missing_profiles:
+            raise ValueError(
+                "The saved contrast SAXS component directory is missing trace "
+                "files for: "
+                + ", ".join(sorted(set(missing_profiles)))
+                + ". Rebuild contrast SAXS components for this computed "
+                "distribution before generating prior weights."
+            )
+        return component_entries
+
+    def _contrast_representative_file_for_trace(
+        self,
+        *,
+        artifact_paths: ProjectArtifactPaths,
+        trace_payload: dict[str, object],
+    ) -> Path | None:
+        representative_text = _optional_str(
+            trace_payload.get("representative_file")
+        )
+        if representative_text is None:
+            return None
+        representative_name = Path(representative_text).name
+        if not representative_name:
+            return None
+        distribution_snapshot_path = (
+            artifact_paths.contrast_dir
+            / "representative_structures"
+            / representative_name
+        ).resolve()
+        if distribution_snapshot_path.is_file():
+            return distribution_snapshot_path
+        return distribution_snapshot_path
 
     def _collect_cluster_inventory(
         self,
@@ -2716,6 +3966,38 @@ def _nearest_cropped_q_values(
             "The requested q-range does not overlap the experimental data."
         )
     return cropped_q
+
+
+def _requested_q_values_on_source_grid(
+    settings: ProjectSettings,
+    source_q_values: np.ndarray,
+) -> np.ndarray:
+    q_values = np.asarray(source_q_values, dtype=float)
+    if q_values.size == 0:
+        raise ValueError(
+            "The experimental data does not contain any q-values."
+        )
+    q_min = (
+        float(settings.q_min)
+        if settings.q_min is not None
+        else float(np.min(q_values))
+    )
+    q_max = (
+        float(settings.q_max)
+        if settings.q_max is not None
+        else float(np.max(q_values))
+    )
+    if q_min > q_max:
+        raise ValueError("q min must be less than or equal to q max.")
+    if settings.use_experimental_grid:
+        return _nearest_cropped_q_values(q_values, q_min, q_max)
+    mask = (q_values >= q_min) & (q_values <= q_max)
+    filtered_q = np.asarray(q_values[mask], dtype=float)
+    if filtered_q.size == 0:
+        raise ValueError(
+            "The requested q-range does not overlap the experimental data."
+        )
+    return filtered_q
 
 
 def _predicted_structure_motif(rank: int) -> str:

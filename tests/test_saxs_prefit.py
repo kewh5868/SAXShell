@@ -317,6 +317,93 @@ def _build_poly_lma_geometry_project(
     return project_dir, paths, effective_radius
 
 
+def test_saxs_project_manager_save_project_can_skip_registered_snapshots(
+    tmp_path,
+    monkeypatch,
+):
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "saxs_project"
+    settings = manager.create_project(project_dir)
+
+    snapshot_calls = {"folders": 0, "files": 0}
+
+    def record_folder_snapshots(_settings):
+        snapshot_calls["folders"] += 1
+
+    def record_file_snapshots(_settings):
+        snapshot_calls["files"] += 1
+
+    monkeypatch.setattr(
+        project_module,
+        "_refresh_registered_folder_snapshots",
+        record_folder_snapshots,
+    )
+    monkeypatch.setattr(
+        project_module,
+        "_refresh_registered_file_snapshots",
+        record_file_snapshots,
+    )
+
+    manager.save_project(settings, refresh_registered_paths=False)
+
+    assert snapshot_calls == {"folders": 0, "files": 0}
+
+    manager.save_project(settings)
+
+    assert snapshot_calls == {"folders": 1, "files": 1}
+
+
+def test_prefit_internal_project_save_falls_back_for_legacy_save_project_signature(
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    workflow = SAXSPrefitWorkflow(project_dir)
+    save_calls: list[str] = []
+
+    monkeypatch.setattr(
+        workflow.project_manager,
+        "save_project",
+        lambda settings: save_calls.append(settings.project_dir)
+        or build_project_paths(settings.project_dir).project_file,
+    )
+
+    workflow.set_autosave(True)
+
+    assert save_calls == [str(project_dir.resolve())]
+
+
+def test_project_build_steps_skip_registered_path_refresh(
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, _paths, _effective_radius = _build_poly_lma_geometry_project(
+        tmp_path
+    )
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    save_calls: list[bool] = []
+    original_save_project = manager.save_project
+
+    def record_save_project(settings, *, refresh_registered_paths=True):
+        save_calls.append(bool(refresh_registered_paths))
+        return original_save_project(
+            settings,
+            refresh_registered_paths=refresh_registered_paths,
+        )
+
+    monkeypatch.setattr(
+        manager,
+        "save_project",
+        record_save_project,
+    )
+
+    manager.build_scattering_components(settings)
+    manager.generate_prior_weights(settings)
+
+    assert save_calls == [False, False]
+
+
 def test_saxs_prefit_workflow_evaluates_and_autosaves_when_enabled(tmp_path):
     project_dir, paths = _build_minimal_saxs_project(tmp_path)
     workflow = SAXSPrefitWorkflow(project_dir)
@@ -1847,6 +1934,32 @@ def test_saxs_prefit_workflow_loads_saved_snapshot_state(tmp_path):
     assert saved_state.autosave_prefits is True
     assert loaded_entries["scale"].value == pytest.approx(7e-4)
     assert loaded_entries["offset"].value == pytest.approx(0.125)
+
+
+def test_saxs_prefit_saved_state_options_include_r_squared_for_manual_save(
+    tmp_path,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    workflow = SAXSPrefitWorkflow(project_dir)
+
+    report_path = workflow.save_fit(
+        workflow.load_parameter_entries(),
+        method="powell",
+        max_nfev=4321,
+        autosave_prefits=True,
+    )
+
+    payload = json.loads(
+        (report_path.parent / "prefit_state.json").read_text(encoding="utf-8")
+    )
+    r_squared = float(payload["statistics"]["r_squared"])
+    assert np.isfinite(r_squared)
+    assert workflow.list_saved_state_options() == [
+        (
+            f"{report_path.parent.name} (R^2={r_squared:.6g})",
+            report_path.parent.name,
+        )
+    ]
 
 
 def test_poly_lma_saved_snapshot_preserves_cluster_geometry_state(tmp_path):

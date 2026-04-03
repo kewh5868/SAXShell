@@ -4,6 +4,8 @@ import json
 import multiprocessing as mp
 import os
 import pickle
+import shutil
+import threading
 import time
 import warnings
 from pathlib import Path
@@ -16,7 +18,7 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.colors import to_hex
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, QRect, Qt, Signal
 from PySide6.QtGui import QColor, QTextOption
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -25,17 +27,21 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
     QFileDialog,
+    QFormLayout,
     QHeaderView,
     QInputDialog,
     QLabel,
     QMessageBox,
+    QPushButton,
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QWidget,
 )
 from scipy import stats
 
 import saxshell.saxs.project_manager.project as project_module
+import saxshell.saxs.ui.prefit_tab as prefit_tab_module
 from saxshell.clusterdynamicsml.workflow import (
     ClusterDynamicsMLTrainingObservation,
     PredictedClusterCandidate,
@@ -45,6 +51,23 @@ from saxshell.saxs._model_templates import (
     load_template_module,
     load_template_spec,
 )
+from saxshell.saxs.contrast.debye import build_contrast_component_profiles
+from saxshell.saxs.contrast.electron_density import (
+    CONTRAST_SOLVENT_METHOD_DIRECT,
+    CONTRAST_SOLVENT_METHOD_NEAT,
+    ContrastGeometryDensitySettings,
+    ContrastSolventDensitySettings,
+    compute_contrast_geometry_and_electron_density,
+)
+from saxshell.saxs.contrast.representatives import (
+    analyze_contrast_representatives,
+)
+from saxshell.saxs.contrast.settings import (
+    COMPONENT_BUILD_MODE_CONTRAST,
+    COMPONENT_BUILD_MODE_NO_CONTRAST,
+    ContrastRepresentativeSamplerSettings,
+)
+from saxshell.saxs.contrast.ui.main_window import ContrastModeMainWindow
 from saxshell.saxs.debye.profiles import AveragedComponent, ClusterBin
 from saxshell.saxs.dream import (
     DreamParameterEntry,
@@ -87,6 +110,7 @@ from saxshell.saxs.ui.experimental_data_loader import (
     ExperimentalDataHeaderDialog,
 )
 from saxshell.saxs.ui.main_window import (
+    PROJECT_LOAD_TOTAL_STEPS,
     InstallModelDialog,
     RuntimeBundleOpener,
     SAXSMainWindow,
@@ -136,7 +160,73 @@ def _write_component_file(path, q_values, intensities):
     )
 
 
-def _build_minimal_saxs_project(tmp_path):
+def _build_saved_contrast_distribution_project(tmp_path):
+    pytest.importorskip("xraydb")
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "saved_contrast_project"
+    settings = manager.create_project(project_dir)
+    paths = build_project_paths(project_dir)
+
+    clusters_dir = paths.project_dir / "clusters"
+    cluster_bin_dir = clusters_dir / "PbI2"
+    cluster_bin_dir.mkdir(parents=True, exist_ok=True)
+    (cluster_bin_dir / "frame_0001.xyz").write_text(
+        "\n".join(
+            [
+                "5",
+                "frame_0001",
+                "Pb 0.0 0.0 0.0",
+                "I 3.0 0.0 0.0",
+                "I 0.7 1.8 0.0",
+                "O 0.0 0.0 2.6",
+                "O 0.0 0.0 5.1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (cluster_bin_dir / "frame_0002.xyz").write_text(
+        "\n".join(
+            [
+                "5",
+                "frame_0002",
+                "Pb 0.0 0.0 0.0",
+                "I 2.1 0.0 0.0",
+                "I 0.0 2.1 0.0",
+                "O 0.0 0.0 2.8",
+                "O 0.0 0.0 5.2",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    settings.model_only_mode = True
+    settings.clusters_dir = str(clusters_dir.resolve())
+    settings.use_experimental_grid = False
+    settings.q_min = 0.05
+    settings.q_max = 0.30
+    settings.q_points = 8
+    settings.component_build_mode = COMPONENT_BUILD_MODE_CONTRAST
+    settings.selected_model_template = (
+        "template_pd_likelihood_monosq_decoupled"
+    )
+    manager.save_project(settings)
+    build_result = manager.build_scattering_components(settings)
+    artifact_paths = project_artifact_paths(
+        settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+    return project_dir, settings, artifact_paths, build_result
+
+
+def _build_minimal_saxs_project(
+    tmp_path,
+    *,
+    frames_dir: Path | None = None,
+    pdb_frames_dir: Path | None = None,
+):
     manager = SAXSProjectManager()
     project_dir = tmp_path / "saxs_project"
     settings = manager.create_project(project_dir)
@@ -198,6 +288,10 @@ def _build_minimal_saxs_project(tmp_path):
     settings.experimental_data_path = str(experimental_path)
     settings.copied_experimental_data_file = str(experimental_path)
     settings.selected_model_template = template_name
+    if frames_dir is not None:
+        settings.frames_dir = str(frames_dir)
+    if pdb_frames_dir is not None:
+        settings.pdb_frames_dir = str(pdb_frames_dir)
     manager.save_project(settings)
     return project_dir, paths
 
@@ -314,6 +408,52 @@ def _write_distribution_history_artifacts(
         "{}\n",
         encoding="utf-8",
     )
+
+
+def _seed_saved_distribution_from_root(
+    project_dir: Path,
+    *,
+    include_cluster_geometry: bool = False,
+    component_build_mode: str | None = None,
+):
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    if component_build_mode is not None:
+        settings.component_build_mode = component_build_mode
+    paths = build_project_paths(project_dir)
+    artifact_paths = project_artifact_paths(
+        settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+    manager.ensure_project_dirs(paths)
+    manager.ensure_artifact_dirs(artifact_paths)
+    shutil.copytree(
+        paths.scattering_components_dir,
+        artifact_paths.component_dir,
+        dirs_exist_ok=True,
+    )
+    shutil.copy2(
+        paths.project_dir / "md_saxs_map.json",
+        artifact_paths.component_map_file,
+    )
+    shutil.copy2(
+        paths.project_dir / "md_prior_weights.json",
+        artifact_paths.prior_weights_file,
+    )
+    manager._write_distribution_metadata(
+        settings, artifact_paths=artifact_paths
+    )
+    if include_cluster_geometry:
+        artifact_paths.cluster_geometry_metadata_file.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        artifact_paths.cluster_geometry_metadata_file.write_text(
+            json.dumps({"rows": []}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    return settings, artifact_paths
 
 
 def _build_poly_lma_geometry_project(
@@ -913,7 +1053,16 @@ def test_saxs_main_window_loads_project_prefit_and_dream_tabs(qapp, tmp_path):
     brand_labels = [
         label.text() for label in brand_widget.findChildren(QLabel)
     ]
+    brand_icon_labels = [
+        label
+        for label in brand_widget.findChildren(QLabel)
+        if label.pixmap() is not None and not label.pixmap().isNull()
+    ]
     assert "SAXSShell" in brand_labels
+    assert len(brand_icon_labels) == 1
+    assert brand_icon_labels[0].height() >= 34
+    assert brand_icon_labels[0].width() > brand_icon_labels[0].height()
+    assert brand_widget.height() <= 40
     assert window.project_setup_tab.forward_model_group.isEnabled()
     assert window.project_setup_tab.model_group.isEnabled()
     assert window.project_setup_tab.template_combo.count() >= 1
@@ -1791,6 +1940,266 @@ def test_update_model_uses_regenerated_mixed_geometry_parameters(
     window.close()
 
 
+def test_update_model_preserves_manual_geometry_parameter_edits_when_cluster_geometry_is_unchanged(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    window.compute_prefit_cluster_geometry()
+
+    parameter_name = "a_eff_w0"
+    parameter_row = window.prefit_tab.find_parameter_row(parameter_name)
+    assert parameter_row >= 0
+
+    original_value = float(
+        window.prefit_tab.parameter_table.item(parameter_row, 3).text()
+    )
+    custom_value = original_value + 0.75
+    custom_minimum = max(original_value * 0.5, 1e-6)
+    custom_maximum = original_value + 2.0
+
+    window.prefit_tab.set_parameter_row(
+        parameter_name,
+        value=custom_value,
+        minimum=custom_minimum,
+        maximum=custom_maximum,
+        vary=True,
+    )
+
+    window.update_prefit_model()
+
+    assert float(
+        window.prefit_tab.parameter_table.item(parameter_row, 3).text()
+    ) == pytest.approx(custom_value)
+    assert float(
+        window.prefit_tab.parameter_table.item(parameter_row, 5).text()
+    ) == pytest.approx(custom_minimum)
+    assert float(
+        window.prefit_tab.parameter_table.item(parameter_row, 6).text()
+    ) == pytest.approx(custom_maximum)
+    assert (
+        window.prefit_tab.parameter_table.item(parameter_row, 4).checkState()
+        == Qt.CheckState.Checked
+    )
+    window.close()
+
+
+def test_update_prefit_model_batches_cluster_geometry_project_save(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    window.compute_prefit_cluster_geometry()
+
+    save_calls: list[bool] = []
+    original_save_project = window.prefit_workflow.project_manager.save_project
+
+    def record_save_project(settings, *, refresh_registered_paths=True):
+        save_calls.append(bool(refresh_registered_paths))
+        return original_save_project(
+            settings,
+            refresh_registered_paths=refresh_registered_paths,
+        )
+
+    monkeypatch.setattr(
+        window.prefit_workflow.project_manager,
+        "save_project",
+        record_save_project,
+    )
+
+    window.update_prefit_model()
+
+    assert save_calls == [False]
+    window.close()
+
+
+def test_loading_experimental_data_autosave_skips_registered_path_refresh(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    (frames_dir / "frame_0000.xyz").write_text(
+        "1\nframe\nPb 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    project_dir, _paths = _build_minimal_saxs_project(
+        tmp_path,
+        frames_dir=frames_dir,
+    )
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    experimental_path = tmp_path / "replacement_exp.txt"
+    q_values = np.asarray([0.05, 0.08, 0.12, 0.18], dtype=float)
+    np.savetxt(
+        experimental_path,
+        np.column_stack(
+            [q_values, np.asarray([100.0, 80.0, 55.0, 30.0], dtype=float)]
+        ),
+    )
+    summary = load_experimental_data_file(experimental_path)
+
+    save_calls: list[bool] = []
+    original_save_project = window.project_manager.save_project
+
+    def record_save_project(settings, *, refresh_registered_paths=True):
+        save_calls.append(bool(refresh_registered_paths))
+        return original_save_project(
+            settings,
+            refresh_registered_paths=refresh_registered_paths,
+        )
+
+    monkeypatch.setattr(
+        window.project_manager,
+        "save_project",
+        record_save_project,
+    )
+
+    window.project_setup_tab._apply_experimental_file(
+        experimental_path,
+        summary,
+    )
+
+    assert save_calls == [False]
+    window.close()
+
+
+def test_loading_solvent_data_autosave_skips_registered_path_refresh(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    (frames_dir / "frame_0000.xyz").write_text(
+        "1\nframe\nPb 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    project_dir, _paths = _build_minimal_saxs_project(
+        tmp_path,
+        frames_dir=frames_dir,
+    )
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    solvent_path = tmp_path / "replacement_solvent.txt"
+    q_values = np.asarray([0.05, 0.08, 0.12, 0.18], dtype=float)
+    np.savetxt(
+        solvent_path,
+        np.column_stack(
+            [q_values, np.asarray([12.0, 11.0, 10.0, 9.0], dtype=float)]
+        ),
+    )
+    summary = load_experimental_data_file(solvent_path)
+
+    save_calls: list[bool] = []
+    original_save_project = window.project_manager.save_project
+
+    def record_save_project(settings, *, refresh_registered_paths=True):
+        save_calls.append(bool(refresh_registered_paths))
+        return original_save_project(
+            settings,
+            refresh_registered_paths=refresh_registered_paths,
+        )
+
+    monkeypatch.setattr(
+        window.project_manager,
+        "save_project",
+        record_save_project,
+    )
+
+    window.project_setup_tab._apply_solvent_file(solvent_path, summary)
+
+    assert save_calls == [False]
+    window.close()
+
+
+def test_model_only_mode_autosave_skips_registered_path_refresh(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    (frames_dir / "frame_0000.xyz").write_text(
+        "1\nframe\nPb 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    project_dir, _paths = _build_minimal_saxs_project(
+        tmp_path,
+        frames_dir=frames_dir,
+    )
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    save_calls: list[bool] = []
+    original_save_project = window.project_manager.save_project
+
+    def record_save_project(settings, *, refresh_registered_paths=True):
+        save_calls.append(bool(refresh_registered_paths))
+        return original_save_project(
+            settings,
+            refresh_registered_paths=refresh_registered_paths,
+        )
+
+    monkeypatch.setattr(
+        window.project_manager,
+        "save_project",
+        record_save_project,
+    )
+
+    window.project_setup_tab.model_only_mode_checkbox.setChecked(True)
+
+    assert save_calls == [False]
+    window.close()
+
+
+def test_updating_frames_folder_reference_skips_registered_path_refresh(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    frames_dir = tmp_path / "updated_frames"
+    frames_dir.mkdir()
+    (frames_dir / "frame_0000.xyz").write_text(
+        "1\nframe\nPb 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    save_calls: list[bool] = []
+    original_save_project = window.project_manager.save_project
+
+    def record_save_project(settings, *, refresh_registered_paths=True):
+        save_calls.append(bool(refresh_registered_paths))
+        return original_save_project(
+            settings,
+            refresh_registered_paths=refresh_registered_paths,
+        )
+
+    monkeypatch.setattr(
+        window.project_manager,
+        "save_project",
+        record_save_project,
+    )
+
+    window.project_setup_tab.frames_dir_edit.setText(str(frames_dir))
+    window.project_setup_tab._on_frames_dir_edited()
+
+    assert save_calls == [False]
+    saved_settings = SAXSProjectManager().load_project(project_dir)
+    assert saved_settings.frames_dir == str(frames_dir)
+    assert saved_settings.frames_dir_snapshot is None
+    window.close()
+
+
 def test_prefit_mixed_shape_switch_logs_when_equivalent_sphere_curve_is_unchanged(
     qapp,
     tmp_path,
@@ -2286,15 +2695,31 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert window.save_project_action.text() == "Save Project"
     assert window.save_project_action.shortcuts()
     assert window.save_project_as_action.text() == "Save Project As..."
+    assert all(
+        button.text() != "Save Project State"
+        for button in window.project_setup_tab.project_group.findChildren(
+            QPushButton
+        )
+    )
 
     assert window.tools_menu.title() == "Tools"
-    assert window.mdtrajectory_action.text() == "Open mdtrajectory"
+    assert window.mdtrajectory_action.text() == "Open MD Trajectory Extraction"
+    assert window.xyz2pdb_action.text() == "Open XYZ -> PDB Conversion"
     assert window.cluster_action.text() == "Open Cluster Extraction"
-    assert window.xyz2pdb_action.text() == "Open xyz2pdb Conversion"
     assert window.bondanalysis_action.text() == "Open Bond Analysis"
-    assert window.clusterdynamics_action.text() == "Open Cluster Dynamics"
-    assert window.clusterdynamicsml_action.text() == "Open Cluster Dynamics ML"
+    assert [action.text() for action in window.tools_menu.actions()[:3]] == [
+        "Open MD Trajectory Extraction",
+        "Open XYZ -> PDB Conversion",
+        "Open Cluster Extraction",
+    ]
+    assert (
+        window.clusterdynamics_action.text() == "Open Cluster Dynamics (only)"
+    )
+    assert (
+        window.clusterdynamicsml_action.text() == "Open Cluster Dynamics (ML)"
+    )
     assert window.fullrmc_action.text() == "Open fullrmc Setup"
+    assert window.contrast_mode_action.text() == "Open SAXS Contrast Mode"
     assert (
         window.volume_fraction_action.text() == "Open Volume Fraction Estimate"
     )
@@ -2307,6 +2732,48 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
         window.console_autoscroll_action.text() == "Autoscroll Console Output"
     )
     assert window.dream_output_settings_action.text() == "Main UI Settings..."
+    assert window.window_presets_menu.title() == "Window Presets"
+    assert window.auto_fit_window_action.text() == "Auto Fit Current Screen"
+    preset_labels = [
+        action.text()
+        for action in window.window_presets_menu.actions()
+        if action.text()
+    ]
+    assert "13-inch Laptop (Compact)" in preset_labels
+    assert "14-inch Laptop / MacBook Pro" in preset_labels
+    assert "15-inch / 16-inch Laptop" in preset_labels
+    assert "External Display (1080p)" in preset_labels
+    assert "External Display (1440p / QHD)" in preset_labels
+
+
+def test_project_setup_shows_prep_help_tooltips(qapp):
+    del qapp
+    window = SAXSMainWindow()
+
+    tooltip = window.project_setup_tab.open_mdtrajectory_help_button.toolTip()
+
+    assert (
+        window.project_setup_tab.open_mdtrajectory_button.text()
+        == "Open MD Trajectory Extraction"
+    )
+    assert (
+        window.project_setup_tab.open_xyz2pdb_button.text()
+        == "Open XYZ -> PDB Conversion"
+    )
+    assert (
+        window.project_setup_tab.open_cluster_button.text()
+        == "Open Cluster Extraction"
+    )
+    assert "first extract frames" in tooltip.lower()
+    assert "optionally convert" in tooltip.lower()
+    assert "cluster extraction" in tooltip.lower()
+    assert (
+        window.project_setup_tab.open_cluster_help_button.toolTip() == tooltip
+    )
+    assert (
+        window.project_setup_tab.open_xyz2pdb_help_button.toolTip() == tooltip
+    )
+    window.close()
 
     assert window.help_menu.title() == "Help"
     assert window.version_info_action.text() == "Version Information"
@@ -2319,6 +2786,27 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert "GitHub repository:" in version_text
     assert "Developer contact:" in version_text
     assert "keith.white@colorado.edu" in version_text
+
+
+def test_project_setup_prep_buttons_span_form_row(qapp):
+    del qapp
+    window = SAXSMainWindow()
+    window.show()
+    QTest.qWait(0)
+
+    layout = window.project_setup_tab.forward_model_group.layout()
+    prep_row = layout.itemAt(0, QFormLayout.ItemRole.SpanningRole).widget()
+    frames_row = layout.itemAt(1, QFormLayout.ItemRole.FieldRole).widget()
+
+    assert isinstance(layout, QFormLayout)
+    assert (
+        prep_row
+        is window.project_setup_tab.open_mdtrajectory_button.parentWidget()
+    )
+    assert frames_row is not None
+    assert prep_row.x() < frames_row.x()
+
+    window.close()
 
 
 def test_console_autoscroll_setting_controls_tab_output_scroll(
@@ -2582,11 +3070,18 @@ def test_bondanalysis_tool_uses_active_project_clusters_dir(
     del qapp
     project_dir, _paths = _build_minimal_saxs_project(tmp_path)
     window = SAXSMainWindow(initial_project_dir=project_dir)
+    clusters_dir = tmp_path / "clusters"
+    clusters_dir.mkdir()
+    window.current_settings.clusters_dir = str(clusters_dir)
+    window.project_manager.save_project(window.current_settings)
     launched: dict[str, object] = {}
 
     class FakeBondAnalysisWindow:
-        def __init__(self, initial_clusters_dir=None):
+        def __init__(
+            self, initial_clusters_dir=None, initial_project_dir=None
+        ):
             launched["clusters_dir"] = initial_clusters_dir
+            launched["project_dir"] = initial_project_dir
             launched["instance"] = self
 
         def show(self):
@@ -2602,10 +3097,318 @@ def test_bondanalysis_tool_uses_active_project_clusters_dir(
 
     window._open_bondanalysis_tool()
 
-    assert launched["clusters_dir"] == window.current_settings.clusters_dir
+    assert launched["clusters_dir"] == str(clusters_dir.resolve())
+    assert launched["project_dir"] == Path(project_dir).resolve()
     assert launched["shown"] is True
     assert launched["raised"] is True
     assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
+def test_mdtrajectory_tool_uses_active_project_references(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    trajectory_file = tmp_path / "traj.xyz"
+    topology_file = tmp_path / "topology.pdb"
+    energy_file = tmp_path / "traj.ener"
+    trajectory_file.write_text("1\nframe\nPb 0.0 0.0 0.0\n", encoding="utf-8")
+    topology_file.write_text("MODEL        1\nENDMDL\n", encoding="utf-8")
+    energy_file.write_text(
+        "# step time kinetic temperature potential\n"
+        "1 0.0 1.0 300.0 -10.0\n",
+        encoding="utf-8",
+    )
+    window.current_settings.trajectory_file = str(trajectory_file)
+    window.current_settings.topology_file = str(topology_file)
+    window.current_settings.energy_file = str(energy_file)
+    window.project_manager.save_project(window.current_settings)
+    launched: dict[str, object] = {}
+
+    class FakeMDTrajectoryWindow:
+        pass
+
+    def fake_launch_mdtrajectory_app(**kwargs):
+        launched.update(kwargs)
+        launched["instance"] = FakeMDTrajectoryWindow()
+        return launched["instance"]
+
+    monkeypatch.setattr(
+        "saxshell.mdtrajectory.ui.main_window.launch_mdtrajectory_app",
+        fake_launch_mdtrajectory_app,
+    )
+
+    window._open_mdtrajectory_tool()
+
+    assert launched["project_dir"] == Path(project_dir).resolve()
+    assert launched["trajectory_file"] == trajectory_file.resolve()
+    assert launched["topology_file"] == topology_file.resolve()
+    assert launched["energy_file"] == energy_file.resolve()
+    assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
+def test_cluster_tool_uses_active_project_frames_dir_and_project_dir(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    frames_dir = tmp_path / "splitxyz_f0fs"
+    frames_dir.mkdir()
+    window.current_settings.frames_dir = str(frames_dir)
+    window.project_manager.save_project(window.current_settings)
+    launched: dict[str, object] = {}
+
+    class FakeClusterWindow:
+        def __init__(self, initial_frames_dir=None, initial_project_dir=None):
+            launched["frames_dir"] = initial_frames_dir
+            launched["project_dir"] = initial_project_dir
+            launched["instance"] = self
+
+        def show(self):
+            launched["shown"] = True
+
+        def raise_(self):
+            launched["raised"] = True
+
+    monkeypatch.setattr(
+        "saxshell.cluster.ui.main_window.ClusterMainWindow",
+        FakeClusterWindow,
+    )
+
+    window._open_cluster_tool()
+
+    assert launched["frames_dir"] == frames_dir.resolve()
+    assert launched["project_dir"] == Path(project_dir).resolve()
+    assert launched["shown"] is True
+    assert launched["raised"] is True
+    assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
+def test_xyz2pdb_tool_uses_active_project_frames_dir_and_project_dir(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    frames_dir = tmp_path / "splitxyz_f0fs"
+    frames_dir.mkdir()
+    window.current_settings.frames_dir = str(frames_dir)
+    window.project_manager.save_project(window.current_settings)
+    launched: dict[str, object] = {}
+
+    class FakeXYZToPDBWindow:
+        pass
+
+    def fake_launch_xyz2pdb_ui(**kwargs):
+        launched.update(kwargs)
+        launched["instance"] = FakeXYZToPDBWindow()
+        return launched["instance"]
+
+    monkeypatch.setattr(
+        "saxshell.xyz2pdb.ui.main_window.launch_xyz2pdb_ui",
+        fake_launch_xyz2pdb_ui,
+    )
+
+    window._open_xyz2pdb_tool()
+
+    assert launched["input_path"] == frames_dir.resolve()
+    assert launched["project_dir"] == Path(project_dir).resolve()
+    assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
+def test_mdtrajectory_tool_updates_main_project_frames_dir_from_child(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    exported_frames_dir = tmp_path / "splitxyz_f5fs"
+    exported_frames_dir.mkdir()
+
+    saved_settings = window.project_manager.load_project(project_dir)
+    saved_settings.frames_dir = str(exported_frames_dir.resolve())
+    window.project_manager.save_project(saved_settings)
+
+    class FakeMDTrajectoryWindow(QObject):
+        project_paths_registered = Signal(object)
+
+    fake_window = FakeMDTrajectoryWindow()
+
+    def fake_launch_mdtrajectory_app(**kwargs):
+        del kwargs
+        return fake_window
+
+    monkeypatch.setattr(
+        "saxshell.mdtrajectory.ui.main_window.launch_mdtrajectory_app",
+        fake_launch_mdtrajectory_app,
+    )
+
+    window._open_mdtrajectory_tool()
+    fake_window.project_paths_registered.emit(
+        {
+            "project_dir": Path(project_dir).resolve(),
+            "frames_dir": exported_frames_dir.resolve(),
+        }
+    )
+    qapp.processEvents()
+
+    assert (
+        window.project_setup_tab.frames_dir() == exported_frames_dir.resolve()
+    )
+    assert window.current_settings is not None
+    assert window.current_settings.resolved_frames_dir == (
+        exported_frames_dir.resolve()
+    )
+    assert "linked tool" in window.project_setup_tab.summary_box.toPlainText()
+    window.close()
+
+
+def test_xyz2pdb_tool_updates_main_project_pdb_folder_from_child(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    pdb_frames_dir = tmp_path / "xyz2pdb_splitxyz_f5fs"
+    pdb_frames_dir.mkdir()
+    saved_settings = window.project_manager.load_project(project_dir)
+    saved_settings.pdb_frames_dir = str(pdb_frames_dir.resolve())
+    window.project_manager.save_project(saved_settings)
+
+    class FakeXYZToPDBWindow(QObject):
+        project_paths_registered = Signal(object)
+
+    fake_window = FakeXYZToPDBWindow()
+
+    def fake_launch_xyz2pdb_ui(**kwargs):
+        del kwargs
+        return fake_window
+
+    monkeypatch.setattr(
+        "saxshell.xyz2pdb.ui.main_window.launch_xyz2pdb_ui",
+        fake_launch_xyz2pdb_ui,
+    )
+
+    window._open_xyz2pdb_tool()
+    fake_window.project_paths_registered.emit(
+        {
+            "project_dir": Path(project_dir).resolve(),
+            "pdb_frames_dir": pdb_frames_dir.resolve(),
+        }
+    )
+    qapp.processEvents()
+
+    assert (
+        window.project_setup_tab.pdb_frames_dir() == pdb_frames_dir.resolve()
+    )
+    assert window.current_settings is not None
+    assert window.current_settings.resolved_pdb_frames_dir == (
+        pdb_frames_dir.resolve()
+    )
+    window.close()
+
+
+def test_cluster_tool_updates_main_project_folder_refs_from_child(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    frames_dir = tmp_path / "splitxyz_f10fs"
+    frames_dir.mkdir()
+    clusters_dir = tmp_path / "clusters_splitxyz_f10fs"
+    clusters_dir.mkdir()
+
+    saved_settings = window.project_manager.load_project(project_dir)
+    saved_settings.frames_dir = str(frames_dir.resolve())
+    saved_settings.clusters_dir = str(clusters_dir.resolve())
+    window.project_manager.save_project(saved_settings)
+
+    scan_calls: list[bool] = []
+    window.project_setup_tab.request_cluster_scan = lambda: scan_calls.append(
+        True
+    )
+
+    class FakeClusterWindow(QWidget):
+        project_paths_registered = Signal(object)
+
+        def __init__(self, initial_frames_dir=None, initial_project_dir=None):
+            super().__init__()
+            self.initial_frames_dir = initial_frames_dir
+            self.initial_project_dir = initial_project_dir
+
+        def show(self):
+            return None
+
+        def raise_(self):
+            return None
+
+    fake_window: FakeClusterWindow | None = None
+
+    def fake_cluster_window(*args, **kwargs):
+        nonlocal fake_window
+        fake_window = FakeClusterWindow(*args, **kwargs)
+        return fake_window
+
+    monkeypatch.setattr(
+        "saxshell.cluster.ui.main_window.ClusterMainWindow",
+        fake_cluster_window,
+    )
+
+    window._open_cluster_tool()
+    assert fake_window is not None
+    fake_window.project_paths_registered.emit(
+        {
+            "project_dir": Path(project_dir).resolve(),
+            "frames_dir": frames_dir.resolve(),
+            "clusters_dir": clusters_dir.resolve(),
+        }
+    )
+    qapp.processEvents()
+
+    assert window.project_setup_tab.frames_dir() == frames_dir.resolve()
+    assert window.project_setup_tab.clusters_dir() == clusters_dir.resolve()
+    assert window.current_settings is not None
+    assert window.current_settings.resolved_frames_dir == frames_dir.resolve()
+    assert window.current_settings.resolved_clusters_dir == (
+        clusters_dir.resolve()
+    )
+    assert scan_calls == [True]
+    window.close()
+
+
+def test_main_window_refuses_close_when_child_tool_refuses_close(
+    qapp,
+    tmp_path,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    window.show()
+
+    class BusyChild(QWidget):
+        def close(self):
+            return False
+
+    child = BusyChild()
+    window._track_child_tool_window(child)
+    qapp.processEvents()
+
+    assert not window.close()
+    assert window.isVisible()
+    assert (
+        "linked tool is still busy"
+        in window.statusBar().currentMessage().lower()
+    )
+    window.hide()
 
 
 def test_fullrmc_tool_uses_active_project_dir(qapp, tmp_path, monkeypatch):
@@ -2644,6 +3447,17 @@ def test_cluster_dynamics_tool_uses_active_project_dir(
     del qapp
     project_dir, _paths = _build_minimal_saxs_project(tmp_path)
     window = SAXSMainWindow(initial_project_dir=project_dir)
+    frames_dir = tmp_path / "splitxyz_f0fs"
+    frames_dir.mkdir()
+    energy_file = tmp_path / "traj.ener"
+    energy_file.write_text(
+        "# step time kinetic temperature potential\n"
+        "1 0.0 1.0 300.0 -10.0\n",
+        encoding="utf-8",
+    )
+    window.current_settings.frames_dir = str(frames_dir)
+    window.current_settings.energy_file = str(energy_file)
+    window.project_manager.save_project(window.current_settings)
     launched: dict[str, object] = {}
 
     class FakeClusterDynamicsWindow:
@@ -2671,6 +3485,8 @@ def test_cluster_dynamics_tool_uses_active_project_dir(
 
     window._open_clusterdynamics_tool()
 
+    assert launched["frames_dir"] == frames_dir.resolve()
+    assert launched["energy_file"] == energy_file.resolve()
     assert (
         launched["project_dir"]
         == Path(window.current_settings.project_dir).resolve()
@@ -2678,6 +3494,7 @@ def test_cluster_dynamics_tool_uses_active_project_dir(
     assert launched["shown"] is True
     assert launched["raised"] is True
     assert launched["instance"] in window._child_tool_windows
+    window.close()
 
 
 def test_cluster_dynamics_ml_tool_uses_active_project_dir(
@@ -2686,6 +3503,20 @@ def test_cluster_dynamics_ml_tool_uses_active_project_dir(
     del qapp
     project_dir, _paths = _build_minimal_saxs_project(tmp_path)
     window = SAXSMainWindow(initial_project_dir=project_dir)
+    frames_dir = tmp_path / "splitxyz_f0fs"
+    frames_dir.mkdir()
+    clusters_dir = tmp_path / "clusters"
+    clusters_dir.mkdir()
+    energy_file = tmp_path / "traj.ener"
+    energy_file.write_text(
+        "# step time kinetic temperature potential\n"
+        "1 0.0 1.0 300.0 -10.0\n",
+        encoding="utf-8",
+    )
+    window.current_settings.frames_dir = str(frames_dir)
+    window.current_settings.clusters_dir = str(clusters_dir)
+    window.current_settings.energy_file = str(energy_file)
+    window.project_manager.save_project(window.current_settings)
     launched: dict[str, object] = {}
 
     class FakeClusterDynamicsMLWindow:
@@ -2717,6 +3548,13 @@ def test_cluster_dynamics_ml_tool_uses_active_project_dir(
 
     window._open_clusterdynamicsml_tool()
 
+    assert launched["frames_dir"] == frames_dir.resolve()
+    assert launched["energy_file"] == energy_file.resolve()
+    assert launched["clusters_dir"] == clusters_dir.resolve()
+    assert (
+        launched["experimental_data_file"]
+        == window.current_settings.resolved_experimental_data_path
+    )
     assert (
         launched["project_dir"]
         == Path(window.current_settings.project_dir).resolve()
@@ -2724,6 +3562,1420 @@ def test_cluster_dynamics_ml_tool_uses_active_project_dir(
     assert launched["shown"] is True
     assert launched["raised"] is True
     assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
+def test_contrast_mode_scaffold_window_populates_launch_context(
+    qapp, tmp_path
+):
+    del qapp
+    project_dir = tmp_path / "contrast_project"
+    project_dir.mkdir()
+    clusters_dir = tmp_path / "clusters"
+    clusters_dir.mkdir()
+    experimental_data_file = tmp_path / "exp_data.dat"
+    experimental_data_file.write_text(
+        "0.05 1.0\n0.08 0.8\n0.12 0.5\n",
+        encoding="utf-8",
+    )
+    cluster_bin_dir = clusters_dir / "A2"
+    cluster_bin_dir.mkdir()
+    (cluster_bin_dir / "frame_0001.xyz").write_text(
+        "2\nframe\nA 0.0 0.0 0.0\nA 1.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    window = ContrastModeMainWindow(
+        initial_project_dir=project_dir.resolve(),
+        initial_clusters_dir=clusters_dir.resolve(),
+        initial_experimental_data_file=experimental_data_file.resolve(),
+        initial_q_min=0.05,
+        initial_q_max=0.8,
+        initial_template_name="template_demo",
+    )
+    _flush_contrast_window_launch_preview(window)
+
+    assert window.windowTitle() == "SAXSShell (Contrast Debye Workflow)"
+    assert window.mode_edit.text() == "Contrast Mode"
+    assert window.project_dir_edit.text() == str(project_dir.resolve())
+    assert window.clusters_dir_edit.text() == str(clusters_dir.resolve())
+    assert window.experimental_data_edit.text() == str(
+        experimental_data_file.resolve()
+    )
+    assert window.q_range_edit.text() == "0.05 to 0.8"
+    assert window.q_min_spin.value() == pytest.approx(0.05)
+    assert window.q_max_spin.value() == pytest.approx(0.8)
+    assert window.template_edit.text() == "template_demo"
+    assert (
+        "Contrast-mode SAXS workspace"
+        in window.workflow_summary_box.toPlainText()
+    )
+    assert window.output_path_edit.text() == str(
+        (project_dir / "contrast_workflow").resolve()
+    )
+    assert window.representatives_output_edit.text() == str(
+        (project_dir / "contrast_workflow" / "representatives").resolve()
+    )
+    assert window.screening_output_edit.text() == str(
+        (
+            project_dir / "contrast_workflow" / "representatives" / "screening"
+        ).resolve()
+    )
+    assert window.summary_output_edit.text() == str(
+        (
+            project_dir
+            / "contrast_workflow"
+            / "representatives"
+            / "selection_summary.json"
+        ).resolve()
+    )
+    assert window.recognized_clusters_table.columnCount() == 7
+    assert window.recognized_clusters_table.rowCount() == 1
+    assert window.representative_table.columnCount() == 9
+    assert window.representative_table.rowCount() == 0
+    assert (
+        window.add_representative_button.text()
+        == "Add Representative (Custom)…"
+    )
+    assert window.solvent_preset_combo.findData("DMF") >= 0
+    assert window.solvent_preset_combo.findData("DMSO") >= 0
+    assert window.main_splitter.count() == 2
+    assert window.left_scroll_area.widget() is not None
+    assert window.right_scroll_area.widget() is not None
+    assert window.right_splitter.count() == 2
+    assert window.trace_figure.axes
+    assert (
+        window.trace_figure.axes[0].lines[0].get_label() == "Experimental data"
+    )
+    window.close()
+
+
+def _flush_contrast_window_launch_preview(
+    window: ContrastModeMainWindow,
+) -> None:
+    qapp = QApplication.instance()
+    assert qapp is not None
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        if not window._preview_refresh_timer.isActive():
+            qapp.processEvents()
+            return
+        QTest.qWait(10)
+    raise AssertionError(
+        "Contrast window launch preview did not finish in time."
+    )
+
+
+def test_contrast_mode_window_defers_preview_rebuild_until_event_loop(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    clusters_dir = tmp_path / "clusters"
+    clusters_dir.mkdir()
+    cluster_bin_dir = clusters_dir / "A2"
+    cluster_bin_dir.mkdir()
+    (cluster_bin_dir / "frame_0001.xyz").write_text(
+        "2\nframe\nA 0.0 0.0 0.0\nA 1.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    rebuild_calls: list[dict[str, object]] = []
+
+    def fake_rebuild_preview(self, *, log_to_console, status_message):
+        rebuild_calls.append(
+            {
+                "log_to_console": log_to_console,
+                "status_message": status_message,
+            }
+        )
+
+    monkeypatch.setattr(
+        ContrastModeMainWindow,
+        "_rebuild_preview",
+        fake_rebuild_preview,
+    )
+
+    window = ContrastModeMainWindow(
+        initial_clusters_dir=clusters_dir.resolve(),
+    )
+
+    assert rebuild_calls == []
+    assert window._preview_refresh_timer.isActive() is True
+    window.close()
+
+
+def test_contrast_mode_workspace_marks_selected_q_range_on_experimental_preview(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir = tmp_path / "contrast_project"
+    project_dir.mkdir()
+    clusters_dir = tmp_path / "clusters"
+    clusters_dir.mkdir()
+    experimental_data_file = tmp_path / "exp_data.dat"
+    experimental_data_file.write_text(
+        "0.05 1.0\n0.08 0.8\n0.12 0.5\n",
+        encoding="utf-8",
+    )
+
+    window = ContrastModeMainWindow(
+        initial_project_dir=project_dir.resolve(),
+        initial_clusters_dir=clusters_dir.resolve(),
+        initial_experimental_data_file=experimental_data_file.resolve(),
+        initial_q_min=0.06,
+        initial_q_max=0.10,
+    )
+    _flush_contrast_window_launch_preview(window)
+
+    axis = window.trace_figure.axes[0]
+    labels = [line.get_label() for line in axis.lines]
+    assert labels == ["Experimental data", "Selected q-range"]
+    assert axis.lines[0].get_alpha() == pytest.approx(0.35)
+    np.testing.assert_allclose(
+        np.asarray(axis.lines[1].get_xdata(), dtype=float),
+        np.asarray([0.08], dtype=float),
+    )
+    window.close()
+
+
+def test_contrast_mode_tool_uses_active_project_context(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    clusters_dir = tmp_path / "contrast_clusters"
+    clusters_dir.mkdir()
+    experimental_data_file = tmp_path / "contrast_exp.dat"
+    experimental_data_file.write_text("0.06 2.0\n", encoding="utf-8")
+    window.current_settings.clusters_dir = str(clusters_dir.resolve())
+    window.current_settings.experimental_data_path = str(
+        experimental_data_file.resolve()
+    )
+    window.current_settings.q_min = 0.06
+    window.current_settings.q_max = 0.75
+    window.current_settings.selected_model_template = POLY_LMA_HS_TEMPLATE
+    window.project_manager.save_project(window.current_settings)
+    launched: dict[str, object] = {}
+
+    class FakeContrastModeWindow(QWidget):
+        def __init__(self):
+            super().__init__()
+            launched["instance"] = self
+
+        def raise_(self):
+            launched["raised"] = True
+
+        def activateWindow(self):
+            launched["activated"] = True
+
+    def fake_launch_contrast_mode_ui(**kwargs):
+        launched.update(kwargs)
+        return FakeContrastModeWindow()
+
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast.ui.main_window.launch_contrast_mode_ui",
+        fake_launch_contrast_mode_ui,
+    )
+
+    window._open_contrast_mode_tool()
+    saved_settings = window.project_manager.load_project(project_dir)
+
+    assert launched["initial_project_dir"] == Path(project_dir).resolve()
+    assert launched["initial_clusters_dir"] == clusters_dir.resolve()
+    assert (
+        launched["initial_experimental_data_file"]
+        == saved_settings.resolved_experimental_data_path
+    )
+    assert launched["initial_q_min"] == pytest.approx(0.06)
+    assert launched["initial_q_max"] == pytest.approx(0.75)
+    assert launched["initial_template_name"] == POLY_LMA_HS_TEMPLATE
+    assert launched["instance"] in window._child_tool_windows
+    assert window._contrast_mode_tool_window is launched["instance"]
+    window.close()
+
+
+def test_contrast_mode_workspace_loads_predicted_structure_bins_from_project_settings(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "contrast_predicted_project"
+    settings = manager.create_project(project_dir)
+    clusters_dir = project_dir / "clusters"
+    structure_dir = clusters_dir / "PbI2"
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    (structure_dir / "frame_0001.xyz").write_text(
+        "\n".join(
+            [
+                "3",
+                "frame_0001",
+                "Pb 0.0 0.0 0.0",
+                "I 2.8 0.0 0.0",
+                "I 0.0 2.8 0.0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    predicted_dir = tmp_path / "predicted_structures"
+    predicted_dir.mkdir(parents=True, exist_ok=True)
+    predicted_structure = predicted_dir / "04_rank01_PbI4.xyz"
+    predicted_structure.write_text(
+        "\n".join(
+            [
+                "5",
+                "predicted_rank01",
+                "Pb 0.0 0.0 0.0",
+                "I 2.6 0.0 0.0",
+                "I -2.6 0.0 0.0",
+                "I 0.0 2.6 0.0",
+                "I 0.0 0.0 2.6",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    settings.model_only_mode = True
+    settings.clusters_dir = str(clusters_dir.resolve())
+    settings.use_predicted_structure_weights = True
+    settings.use_experimental_grid = False
+    settings.q_min = 0.05
+    settings.q_max = 0.30
+    settings.q_points = 8
+    settings.selected_model_template = POLY_LMA_HS_TEMPLATE
+    manager.save_project(settings)
+
+    def fake_predicted_payload(self, settings, *, cluster_inventory):
+        del self, settings
+        observed_weight = 0.75 / max(len(cluster_inventory.cluster_bins), 1)
+        return (
+            SimpleNamespace(dataset_file=project_dir / "mock_predicted.json"),
+            {
+                (cluster_bin.structure, cluster_bin.motif): observed_weight
+                for cluster_bin in cluster_inventory.cluster_bins
+            },
+            [
+                {
+                    "prediction": SimpleNamespace(label="PbI4"),
+                    "motif": "predicted_rank01",
+                    "weight": 0.25,
+                    "source_path": predicted_structure,
+                }
+            ],
+            ["Pb", "I"],
+        )
+
+    monkeypatch.setattr(
+        SAXSProjectManager,
+        "_predicted_structure_weight_payload",
+        fake_predicted_payload,
+    )
+
+    window = ContrastModeMainWindow(
+        initial_project_dir=project_dir.resolve(),
+        initial_clusters_dir=clusters_dir.resolve(),
+        initial_q_min=settings.q_min,
+        initial_q_max=settings.q_max,
+        initial_template_name=settings.selected_model_template,
+    )
+    _flush_contrast_window_launch_preview(window)
+
+    loaded_components = {
+        window.recognized_clusters_table.item(row, 0).text()
+        for row in range(window.recognized_clusters_table.rowCount())
+    }
+    predicted_rows = [
+        row
+        for row in range(window.recognized_clusters_table.rowCount())
+        if window.recognized_clusters_table.item(row, 1).text() == "PbI4"
+    ]
+
+    assert window.recognized_clusters_table.rowCount() == 2
+    assert loaded_components == {"PbI2", "PbI4 / predicted_rank01"}
+    assert len(predicted_rows) == 1
+    assert (
+        window.recognized_clusters_table.item(predicted_rows[0], 2).text()
+        == "Predicted structure"
+    )
+    assert (
+        window.recognized_clusters_table.item(predicted_rows[0], 6).text()
+        == predicted_structure.name
+    )
+    assert any(
+        cluster_bin.structure == "PbI4"
+        and cluster_bin.motif == "predicted_rank01"
+        and cluster_bin.representative == predicted_structure.name
+        for cluster_bin in window._recognized_cluster_bins
+    )
+    assert "predicted structure bin" in (
+        window.cluster_table_status_label.text().lower()
+    )
+    window.close()
+
+
+def test_project_setup_view_contrast_button_opens_active_distribution_context(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _settings, artifact_paths, _build_result = (
+        _build_saved_contrast_distribution_project(tmp_path)
+    )
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    launched: dict[str, object] = {}
+
+    class FakeContrastModeWindow(QWidget):
+        def __init__(self):
+            super().__init__()
+            launched["instance"] = self
+
+        def raise_(self):
+            launched["raised"] = True
+
+        def activateWindow(self):
+            launched["activated"] = True
+
+    def fake_launch_contrast_mode_ui(**kwargs):
+        launched.update(kwargs)
+        return FakeContrastModeWindow()
+
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast.ui.main_window.launch_contrast_mode_ui",
+        fake_launch_contrast_mode_ui,
+    )
+
+    assert (
+        window.project_setup_tab.view_contrast_distribution_button.isEnabled()
+    )
+    window.project_setup_tab.view_contrast_distribution_button.click()
+
+    assert (
+        launched["initial_distribution_id"] == artifact_paths.distribution_id
+    )
+    assert launched["initial_distribution_root_dir"] == artifact_paths.root_dir
+    assert (
+        launched["initial_contrast_artifact_dir"]
+        == artifact_paths.contrast_dir
+    )
+    assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
+def test_contrast_mode_tool_open_starts_clean_even_with_saved_distribution(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _settings, _artifact_paths, _build_result = (
+        _build_saved_contrast_distribution_project(tmp_path)
+    )
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    launched: dict[str, object] = {}
+
+    class FakeContrastModeWindow(QWidget):
+        def __init__(self):
+            super().__init__()
+            launched["instance"] = self
+
+        def raise_(self):
+            launched["raised"] = True
+
+        def activateWindow(self):
+            launched["activated"] = True
+
+    def fake_launch_contrast_mode_ui(**kwargs):
+        launched.update(kwargs)
+        return FakeContrastModeWindow()
+
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast.ui.main_window.launch_contrast_mode_ui",
+        fake_launch_contrast_mode_ui,
+    )
+
+    window._open_contrast_mode_tool()
+
+    assert launched["initial_distribution_id"] is None
+    assert launched["initial_distribution_root_dir"] is None
+    assert launched["initial_contrast_artifact_dir"] is None
+    window.close()
+
+
+def test_open_contrast_mode_tool_does_not_auto_start_build(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    launched: dict[str, object] = {"start_calls": 0}
+
+    class FakeContrastModeWindow(QWidget):
+        def __init__(self):
+            super().__init__()
+            launched["instance"] = self
+
+        def start_contrast_component_build(self):
+            launched["start_calls"] += 1
+
+        def raise_(self):
+            launched["raised"] = True
+
+        def activateWindow(self):
+            launched["activated"] = True
+
+    def fake_launch_contrast_mode_ui(**kwargs):
+        launched.update(kwargs)
+        return FakeContrastModeWindow()
+
+    monkeypatch.setattr(
+        window,
+        "_confirm_default_q_range_for_component_build",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast.ui.main_window.launch_contrast_mode_ui",
+        fake_launch_contrast_mode_ui,
+    )
+
+    window.project_setup_tab.set_component_build_mode(
+        COMPONENT_BUILD_MODE_CONTRAST
+    )
+    window.build_project_components()
+
+    assert launched["instance"] in window._child_tool_windows
+    assert launched["start_calls"] == 0
+    window.close()
+
+
+def test_contrast_mode_window_can_close_while_workflow_thread_is_running(
+    qapp,
+    monkeypatch,
+):
+    del qapp
+    window = ContrastModeMainWindow()
+
+    class FakeRunningThread:
+        def isRunning(self) -> bool:
+            return True
+
+    warnings: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast.ui.main_window.QMessageBox.warning",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+    window._workflow_thread = FakeRunningThread()
+
+    assert window.close() is True
+    assert warnings == []
+
+
+def test_main_window_loads_contrast_distribution_after_tool_build_signal(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _settings, artifact_paths, _build_result = (
+        _build_saved_contrast_distribution_project(tmp_path)
+    )
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    loaded_distribution_ids: list[str] = []
+
+    monkeypatch.setattr(
+        window,
+        "_load_saved_distribution",
+        lambda distribution_id: loaded_distribution_ids.append(
+            distribution_id
+        ),
+    )
+
+    window._on_contrast_components_built(
+        {
+            "project_dir": str(project_dir.resolve()),
+            "distribution_id": artifact_paths.distribution_id,
+            "distribution_dir": str(artifact_paths.root_dir),
+            "component_dir": str(artifact_paths.component_dir),
+            "component_map_path": str(artifact_paths.component_map_file),
+        }
+    )
+
+    assert loaded_distribution_ids == [artifact_paths.distribution_id]
+    assert "built and loaded" in window.statusBar().currentMessage().lower()
+    window.close()
+
+
+def test_contrast_mode_workspace_tracks_manual_representative_selection(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    representative_path = tmp_path / "representative_A2.pdb"
+    representative_path.write_text(
+        "ATOM      1  PB  RES A   1       0.000   0.000   0.000  1.00  0.00          Pb\n"
+        "END\n",
+        encoding="utf-8",
+    )
+    window = ContrastModeMainWindow()
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileNames",
+        lambda *args, **kwargs: (
+            [str(representative_path)],
+            "Structure files (*.pdb *.xyz)",
+        ),
+    )
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast.ui.main_window.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    window.add_representative_button.click()
+
+    assert window.representative_table.rowCount() == 1
+    assert (
+        window.representative_table.item(0, 2).text()
+        == representative_path.name
+    )
+    assert window.representative_table.item(0, 3).text().startswith("#")
+    assert window.structure_viewer.current_preview is not None
+    assert (
+        window.structure_viewer.current_preview.file_path
+        == representative_path.resolve()
+    )
+    assert window.structure_viewer.current_preview.atom_count == 1
+    assert "Previewing" in window.visualizer_status_label.text()
+    assert (
+        str(representative_path.resolve())
+        in window.visualizer_details_box.toPlainText()
+    )
+
+    window.remove_representative_button.click()
+
+    assert window.representative_table.rowCount() == 0
+    assert window.structure_viewer.current_preview is None
+    assert (
+        "Selected representative: none"
+        in window.visualizer_details_box.toPlainText()
+    )
+    window.close()
+
+
+def test_contrast_mode_workspace_can_choose_representative_trace_color(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    representative_path = tmp_path / "representative_A2.pdb"
+    representative_path.write_text(
+        "ATOM      1  PB  RES A   1       0.000   0.000   0.000  1.00  0.00          Pb\n"
+        "END\n",
+        encoding="utf-8",
+    )
+    window = ContrastModeMainWindow()
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileNames",
+        lambda *args, **kwargs: (
+            [str(representative_path)],
+            "Structure files (*.pdb *.xyz)",
+        ),
+    )
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast.ui.main_window.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast.ui.main_window.QColorDialog.getColor",
+        lambda *args, **kwargs: QColor("#ff8800"),
+    )
+
+    window.add_representative_button.click()
+    display_label = window._representative_row_metadata(0)["display_label"]
+    window._generated_trace_profiles = [
+        (
+            str(display_label),
+            np.asarray([0.08, 0.12], dtype=float),
+            np.asarray([4.0, 2.0], dtype=float),
+        )
+    ]
+    window._generated_traces_visible = True
+    window._redraw_trace_plot()
+
+    window._on_representative_table_cell_clicked(0, 3)
+
+    metadata = window._representative_row_metadata(0)
+    assert metadata["trace_color"] == "#ff8800"
+    assert metadata["custom_trace_color"] is True
+    assert window.representative_table.item(0, 3).text() == "#FF8800"
+    assert (
+        window.representative_table.item(0, 3).background().color().name()
+        == "#ff8800"
+    )
+    assert (
+        to_hex(window.trace_figure.axes[0].lines[0].get_color()).lower()
+        == "#ff8800"
+    )
+    window.close()
+
+
+def test_contrast_mode_workspace_warns_before_custom_representative_edits(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    representative_path = tmp_path / "representative_A2.pdb"
+    representative_path.write_text(
+        "ATOM      1  PB  RES A   1       0.000   0.000   0.000  1.00  0.00          Pb\n"
+        "END\n",
+        encoding="utf-8",
+    )
+    window = ContrastModeMainWindow()
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileNames",
+        lambda *args, **kwargs: (
+            [str(representative_path)],
+            "Structure files (*.pdb *.xyz)",
+        ),
+    )
+    prompts: list[str] = []
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast.ui.main_window.QMessageBox.question",
+        lambda *args, **kwargs: (
+            prompts.append(
+                str(args[2] if len(args) > 2 else kwargs.get("text", ""))
+            )
+            or QMessageBox.StandardButton.No
+        ),
+    )
+
+    window.add_representative_button.click()
+
+    assert window.representative_table.rowCount() == 0
+    assert prompts
+    assert "prior weights" in prompts[0].lower()
+
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast.ui.main_window.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    window.add_representative_button.click()
+    assert window.representative_table.rowCount() == 1
+
+    window.remove_representative_button.click()
+    assert window.representative_table.rowCount() == 0
+    window.close()
+
+
+def test_contrast_mode_workspace_can_analyze_representative_structures(
+    qapp, tmp_path
+):
+    del qapp
+    project_dir = tmp_path / "contrast_project"
+    project_dir.mkdir()
+    clusters_dir = tmp_path / "clusters"
+    clusters_dir.mkdir()
+    cluster_bin_dir = clusters_dir / "PbI2"
+    cluster_bin_dir.mkdir()
+    (cluster_bin_dir / "frame_0001.xyz").write_text(
+        "\n".join(
+            [
+                "5",
+                "frame_0001",
+                "Pb 0.0 0.0 0.0",
+                "I 3.0 0.0 0.0",
+                "I 0.7 1.8 0.0",
+                "O 0.0 0.0 2.6",
+                "O 0.0 0.0 5.1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (cluster_bin_dir / "frame_0002.xyz").write_text(
+        "\n".join(
+            [
+                "5",
+                "frame_0002",
+                "Pb 0.0 0.0 0.0",
+                "I 2.1 0.0 0.0",
+                "I 0.0 2.1 0.0",
+                "O 0.0 0.0 2.8",
+                "O 0.0 0.0 5.2",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (cluster_bin_dir / "frame_0003.xyz").write_text(
+        "\n".join(
+            [
+                "4",
+                "frame_0003",
+                "Pb 0.0 0.0 0.0",
+                "I 1.5 0.0 0.0",
+                "I -1.4 1.6 0.0",
+                "O 0.0 0.0 3.1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    window = ContrastModeMainWindow(
+        initial_project_dir=project_dir.resolve(),
+        initial_clusters_dir=clusters_dir.resolve(),
+    )
+    _flush_contrast_window_launch_preview(window)
+
+    assert window.representative_table.rowCount() == 0
+    window.analyze_representatives_button.click()
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        QApplication.processEvents()
+        if (
+            window.representative_table.rowCount() == 1
+            and window.analyze_representatives_button.isEnabled()
+        ):
+            break
+        QTest.qWait(25)
+    else:
+        raise AssertionError(
+            "Representative analysis did not finish within 10 seconds."
+        )
+
+    output_dir = (
+        project_dir / "contrast_workflow" / "representatives"
+    ).resolve()
+    assert window.representative_table.rowCount() == 1
+    assert window.representative_table.item(0, 1).text() == "Auto"
+    assert (
+        window.representative_table.item(0, 2).text() == "PbI2__frame_0002.xyz"
+    )
+    assert window.representative_table.item(0, 3).text().startswith("#")
+    assert window.representative_table.item(0, 4).text() == "Direct 1; Outer 1"
+    assert "Score" in window.representative_table.item(0, 8).text()
+    assert "PbI2.json" in window.representative_table.item(0, 8).text()
+    assert window.output_path_edit.text() == str(
+        (project_dir / "contrast_workflow").resolve()
+    )
+    assert window.representatives_output_edit.text() == str(output_dir)
+    assert window.screening_output_edit.text() == str(output_dir / "screening")
+    assert window.summary_output_edit.text() == str(
+        output_dir / "selection_summary.json"
+    )
+    assert output_dir.joinpath("selection_summary.json").is_file()
+    assert output_dir.joinpath("selection_summary.tsv").is_file()
+    assert output_dir.joinpath("screening", "PbI2.json").is_file()
+    assert (
+        "Contrast representative selection complete"
+        in window.console_box.toPlainText()
+    )
+    assert (
+        "Selected frame_0002.xyz for PbI2" in window.console_box.toPlainText()
+    )
+    assert (
+        "representative analysis complete"
+        in window.workflow_progress_label.text().lower()
+    )
+    assert "2/5 workflow stages" in window.workflow_progress_label.text()
+    assert "1 bin(s) selected" in window.workflow_progress_label.text()
+    assert window.workflow_progress_bar.value() == 2
+    assert window.workflow_progress_bar.maximum() == 5
+    window.close()
+
+
+def test_contrast_mode_workspace_sampler_settings_are_collapsible_and_propagated(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir = tmp_path / "contrast_project"
+    project_dir.mkdir()
+    clusters_dir = tmp_path / "clusters"
+    clusters_dir.mkdir()
+    cluster_bin_dir = clusters_dir / "PbI2"
+    cluster_bin_dir.mkdir()
+    (cluster_bin_dir / "frame_0001.xyz").write_text(
+        "\n".join(
+            [
+                "4",
+                "frame_0001",
+                "Pb 0.0 0.0 0.0",
+                "I 2.1 0.0 0.0",
+                "I 0.0 2.1 0.0",
+                "O 0.0 0.0 2.8",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    window = ContrastModeMainWindow(
+        initial_project_dir=project_dir.resolve(),
+        initial_clusters_dir=clusters_dir.resolve(),
+    )
+
+    assert window.sampler_settings_widget.isHidden()
+    window.sampler_settings_toggle_button.click()
+    assert not window.sampler_settings_widget.isHidden()
+
+    window.sampler_enabled_checkbox.setChecked(True)
+    window.sampler_full_scan_threshold_spin.setValue(9)
+    window.sampler_distribution_samples_spin.setValue(21)
+    window.sampler_minimum_samples_spin.setValue(3)
+    window.sampler_max_samples_spin.setValue(11)
+    window.sampler_batch_size_spin.setValue(2)
+    window.sampler_stratify_checkbox.setChecked(False)
+    window.sampler_seed_spin.setValue(77)
+    window.sampler_patience_spin.setValue(5)
+    window.sampler_tolerance_spin.setValue(0.0125)
+
+    sampler_settings = window._representative_sampler_settings()
+    assert (
+        sampler_settings
+        == ContrastRepresentativeSamplerSettings.from_values(
+            enabled=True,
+            full_scan_threshold=9,
+            target_distribution_samples=21,
+            minimum_candidate_samples=3,
+            max_candidate_samples=11,
+            candidate_batch_size=2,
+            random_seed=77,
+            convergence_patience=5,
+            improvement_tolerance=0.0125,
+            stratify_sampling=False,
+        )
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_analyze(*args, sampler_settings=None, **kwargs):
+        del args, kwargs
+        captured["sampler_settings"] = sampler_settings
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast.ui.main_window.analyze_contrast_representatives",
+        fake_analyze,
+    )
+
+    settings = window._contrast_project_settings()
+    window._run_representative_analysis_task(
+        settings,
+        sampler_settings,
+        progress_callback=lambda *args: None,
+        log_callback=lambda *args: None,
+    )
+
+    assert captured["sampler_settings"] == sampler_settings
+    window.sampler_settings_toggle_button.click()
+    assert window.sampler_settings_widget.isHidden()
+    window.close()
+
+
+def test_contrast_mode_workspace_loads_builtin_and_custom_solvent_presets(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    preset_path = tmp_path / "contrast_solvents.json"
+    monkeypatch.setenv(
+        "SAXSHELL_CONTRAST_SOLVENTS_PATH",
+        str(preset_path),
+    )
+
+    window = ContrastModeMainWindow()
+
+    dmf_index = window.solvent_preset_combo.findData("DMF")
+    assert dmf_index >= 0
+    window.solvent_preset_combo.setCurrentIndex(dmf_index)
+    assert window.solvent_formula_edit.text() == "C3H7NO"
+    assert window.solvent_density_spin.value() == pytest.approx(0.944)
+    vacuum_index = window.solvent_preset_combo.findData("Vacuum")
+    assert vacuum_index >= 0
+    window.solvent_preset_combo.setCurrentIndex(vacuum_index)
+    assert window.solvent_formula_edit.text() == "Vacuum"
+    assert window.solvent_density_spin.value() == pytest.approx(0.0)
+
+    reference_index = window.solvent_method_combo.findData(
+        "reference_structure"
+    )
+    assert reference_index >= 0
+    window.solvent_method_combo.setCurrentIndex(reference_index)
+    assert window.reference_solvent_file_edit.isEnabled()
+    assert not window.solvent_formula_edit.isEnabled()
+    assert not window.direct_density_spin.isEnabled()
+
+    neat_index = window.solvent_method_combo.findData("neat_solvent_estimate")
+    assert neat_index >= 0
+    window.solvent_method_combo.setCurrentIndex(neat_index)
+    assert window.solvent_formula_edit.isEnabled()
+    assert not window.reference_solvent_file_edit.isEnabled()
+    assert not window.direct_density_spin.isEnabled()
+    window.solvent_formula_edit.setText("C4H10O")
+    window.solvent_density_spin.setValue(0.88)
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast.ui.main_window.QInputDialog.getText",
+        lambda *args, **kwargs: ("My Solvent", True),
+    )
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast.ui.main_window.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    window.save_custom_solvent_button.click()
+
+    assert preset_path.is_file()
+    assert window.solvent_preset_combo.findData("My Solvent") >= 0
+    direct_index = window.solvent_method_combo.findData(
+        CONTRAST_SOLVENT_METHOD_DIRECT
+    )
+    assert direct_index >= 0
+    window.solvent_method_combo.setCurrentIndex(direct_index)
+    window.direct_density_spin.setValue(0.287)
+    direct_settings = window._current_density_settings()
+    assert direct_settings.solvent.method == CONTRAST_SOLVENT_METHOD_DIRECT
+    assert (
+        direct_settings.solvent.direct_electron_density_e_per_a3
+        == pytest.approx(0.287)
+    )
+    assert window.direct_density_spin.isEnabled()
+    assert not window.solvent_formula_edit.isEnabled()
+    assert not window.reference_solvent_file_edit.isEnabled()
+    window.close()
+
+    reloaded = ContrastModeMainWindow()
+    my_index = reloaded.solvent_preset_combo.findData("My Solvent")
+    assert my_index >= 0
+    reloaded.solvent_preset_combo.setCurrentIndex(my_index)
+    assert reloaded.solvent_formula_edit.text() == "C4H10O"
+    assert reloaded.solvent_density_spin.value() == pytest.approx(0.88)
+
+    reloaded.delete_custom_solvent_button.click()
+    assert reloaded.solvent_preset_combo.findData("My Solvent") == -1
+    reloaded.close()
+
+
+def test_contrast_mode_workspace_hydrogen_exclusion_feeds_density_settings(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = ContrastModeMainWindow(
+        initial_project_dir=Path(project_dir).resolve(),
+    )
+
+    assert window.exclude_hydrogen_checkbox.isChecked() is False
+    window.exclude_hydrogen_checkbox.setChecked(True)
+    density_settings = window._current_density_settings()
+    project_settings = window._contrast_project_settings()
+
+    assert density_settings.exclude_elements == ("H",)
+    assert "H" in project_settings.exclude_elements
+    window.close()
+
+
+def test_contrast_mode_workspace_viewer_loads_saved_mesh_and_density_metadata(
+    qapp, tmp_path
+):
+    del qapp
+    project_dir = tmp_path / "contrast_project"
+    project_dir.mkdir()
+    clusters_dir = tmp_path / "clusters"
+    clusters_dir.mkdir()
+    cluster_bin_dir = clusters_dir / "PbI2"
+    cluster_bin_dir.mkdir()
+    (cluster_bin_dir / "frame_0001.xyz").write_text(
+        "\n".join(
+            [
+                "5",
+                "frame_0001",
+                "Pb 0.0 0.0 0.0",
+                "I 3.0 0.0 0.0",
+                "I 0.7 1.8 0.0",
+                "O 0.0 0.0 2.6",
+                "O 0.0 0.0 5.1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (cluster_bin_dir / "frame_0002.xyz").write_text(
+        "\n".join(
+            [
+                "5",
+                "frame_0002",
+                "Pb 0.0 0.0 0.0",
+                "I 2.1 0.0 0.0",
+                "I 0.0 2.1 0.0",
+                "O 0.0 0.0 2.8",
+                "O 0.0 0.0 5.2",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    representative_result = analyze_contrast_representatives(
+        project_dir,
+        clusters_dir,
+    )
+    compute_contrast_geometry_and_electron_density(
+        representative_result,
+        ContrastGeometryDensitySettings(
+            solvent=ContrastSolventDensitySettings.from_values(
+                method=CONTRAST_SOLVENT_METHOD_NEAT,
+                solvent_formula="H2O",
+                solvent_density_g_per_ml=1.0,
+            )
+        ),
+    )
+
+    window = ContrastModeMainWindow(
+        initial_project_dir=project_dir.resolve(),
+        initial_clusters_dir=clusters_dir.resolve(),
+    )
+    window._representative_analysis_result = representative_result
+    window._populate_representative_analysis_result(representative_result)
+
+    assert window.representative_table.rowCount() == 1
+    assert window.representative_table.item(0, 3).text().startswith("#")
+    assert window.representative_table.item(0, 5).text().endswith("A^3")
+    assert window.representative_table.item(0, 6).text().startswith("Δρ ")
+    assert window.representative_table.item(0, 7).text() == "Density ready"
+    assert window.structure_viewer.current_preview is not None
+    assert window.structure_viewer.current_preview.has_mesh
+    assert window.structure_viewer.current_preview.mesh_json_path is not None
+    assert (
+        window.structure_viewer.current_preview.density_json_path is not None
+    )
+    assert window.structure_viewer.minimumHeight() >= 430
+    assert window.structure_viewer.canvas.minimumHeight() >= 420
+    assert window.visualizer_details_box.maximumHeight() <= 112
+    assert (
+        "Contrast density term:" in window.visualizer_details_box.toPlainText()
+    )
+
+    axis = window.structure_viewer.figure.axes[0]
+    initial_azimuth = float(axis.azim)
+    initial_x_span = float(axis.get_xlim3d()[1] - axis.get_xlim3d()[0])
+    window.rotate_left_button.click()
+    assert float(axis.azim) != pytest.approx(initial_azimuth)
+    window.zoom_in_button.click()
+    assert float(axis.get_xlim3d()[1] - axis.get_xlim3d()[0]) < initial_x_span
+    assert axis.get_legend() is not None
+    assert axis.get_legend()._loc == 1
+    assert any(
+        collection.__class__.__name__ == "Poly3DCollection"
+        for collection in axis.collections
+    )
+    window.close()
+
+
+def test_contrast_mode_workspace_recomputes_displayed_trace_contrast_after_density_update(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir = tmp_path / "contrast_project"
+    project_dir.mkdir()
+    clusters_dir = tmp_path / "clusters"
+    clusters_dir.mkdir()
+    cluster_bin_dir = clusters_dir / "PbI2"
+    cluster_bin_dir.mkdir()
+    (cluster_bin_dir / "frame_0001.xyz").write_text(
+        "\n".join(
+            [
+                "5",
+                "frame_0001",
+                "Pb 0.0 0.0 0.0",
+                "I 3.0 0.0 0.0",
+                "I 0.7 1.8 0.0",
+                "O 0.0 0.0 2.6",
+                "O 0.0 0.0 5.1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (cluster_bin_dir / "frame_0002.xyz").write_text(
+        "\n".join(
+            [
+                "5",
+                "frame_0002",
+                "Pb 0.0 0.0 0.0",
+                "I 2.1 0.0 0.0",
+                "I 0.0 2.1 0.0",
+                "O 0.0 0.0 2.8",
+                "O 0.0 0.0 5.2",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    representative_result = analyze_contrast_representatives(
+        project_dir,
+        clusters_dir,
+    )
+    density_result_a = compute_contrast_geometry_and_electron_density(
+        representative_result,
+        ContrastGeometryDensitySettings(
+            solvent=ContrastSolventDensitySettings.from_values(
+                method=CONTRAST_SOLVENT_METHOD_NEAT,
+                solvent_formula="H2O",
+                solvent_density_g_per_ml=1.0,
+            )
+        ),
+    )
+    q_values = np.linspace(0.05, 0.30, 8)
+    build_result_a = build_contrast_component_profiles(
+        representative_result,
+        density_result_a,
+        q_values=q_values,
+        output_dir=project_dir / "contrast_workflow" / "scattering_components",
+        metadata_dir=project_dir / "contrast_workflow" / "debye",
+        component_map_path=project_dir / "md_saxs_map.json",
+    )
+
+    window = ContrastModeMainWindow(
+        initial_project_dir=project_dir.resolve(),
+        initial_clusters_dir=clusters_dir.resolve(),
+    )
+    window._representative_analysis_result = representative_result
+    window._populate_representative_analysis_result(representative_result)
+    window._density_result = density_result_a
+    window._load_generated_trace_profiles_from_trace_payloads(
+        [
+            trace_result.to_dict()
+            for trace_result in build_result_a.trace_results
+        ],
+        default_component_dir=build_result_a.output_dir,
+    )
+    window._apply_saved_trace_metadata(
+        [
+            trace_result.to_dict()
+            for trace_result in build_result_a.trace_results
+        ]
+    )
+
+    first_status = window.representative_table.item(0, 7).text()
+    first_scale = float(
+        window._representative_row_metadata(0)["contrast_scale_factor"]
+    )
+    assert first_status.startswith("Trace ready (scale ")
+    assert window._generated_trace_profiles
+
+    density_result_b = compute_contrast_geometry_and_electron_density(
+        representative_result,
+        ContrastGeometryDensitySettings(
+            solvent=ContrastSolventDensitySettings.from_values(
+                method=CONTRAST_SOLVENT_METHOD_DIRECT,
+                direct_electron_density_e_per_a3=0.05,
+            )
+        ),
+    )
+    window._on_density_finished(density_result_b)
+
+    assert window.representative_table.item(0, 7).text() == "Density ready"
+    assert window._generated_trace_profiles == []
+    assert "contrast_scale_factor" not in window._representative_row_metadata(
+        0
+    )
+
+    build_result_b = build_contrast_component_profiles(
+        representative_result,
+        density_result_b,
+        q_values=q_values,
+        output_dir=project_dir / "contrast_workflow" / "scattering_components",
+        metadata_dir=project_dir / "contrast_workflow" / "debye",
+        component_map_path=project_dir / "md_saxs_map.json",
+    )
+    window._load_generated_trace_profiles_from_trace_payloads(
+        [
+            trace_result.to_dict()
+            for trace_result in build_result_b.trace_results
+        ],
+        default_component_dir=build_result_b.output_dir,
+    )
+    window._apply_saved_trace_metadata(
+        [
+            trace_result.to_dict()
+            for trace_result in build_result_b.trace_results
+        ]
+    )
+
+    second_status = window.representative_table.item(0, 7).text()
+    second_scale = float(
+        window._representative_row_metadata(0)["contrast_scale_factor"]
+    )
+    assert second_status.startswith("Trace ready (scale ")
+    assert second_scale != pytest.approx(first_scale)
+    assert second_status != first_status
+    window.close()
+
+
+def test_contrast_mode_workspace_reloads_saved_distribution_artifacts(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, settings, artifact_paths, _build_result = (
+        _build_saved_contrast_distribution_project(tmp_path)
+    )
+
+    window = ContrastModeMainWindow(
+        initial_project_dir=project_dir.resolve(),
+        initial_clusters_dir=settings.resolved_clusters_dir,
+        initial_q_min=settings.q_min,
+        initial_q_max=settings.q_max,
+        initial_template_name=settings.selected_model_template,
+        initial_distribution_id=artifact_paths.distribution_id,
+        initial_distribution_root_dir=artifact_paths.root_dir,
+        initial_contrast_artifact_dir=artifact_paths.contrast_dir,
+    )
+    _flush_contrast_window_launch_preview(window)
+
+    assert window.output_path_edit.text() == str(artifact_paths.root_dir)
+    assert window.representatives_output_edit.text() == str(
+        artifact_paths.contrast_dir
+    )
+    assert window.summary_output_edit.text() == str(
+        artifact_paths.contrast_dir / "selection_summary.json"
+    )
+    assert window.representative_table.rowCount() == 1
+    assert window.representative_table.item(0, 1).text() == "Auto"
+    assert window.representative_table.item(0, 3).text().startswith("#")
+    assert window.representative_table.item(0, 5).text().endswith("A^3")
+    assert "Δρ" in window.representative_table.item(0, 6).text()
+    assert (
+        window.representative_table.item(0, 7)
+        .text()
+        .startswith("Trace ready (scale ")
+    )
+    assert window.structure_viewer.current_preview is not None
+    assert window.structure_viewer.current_preview.has_mesh is True
+    assert len(window._generated_trace_profiles) == 1
+    assert window.trace_q_range_button.text() == "Autoscale to Model Range"
+    assert (
+        window.trace_generated_toggle_button.text() == "Hide Computed Traces"
+    )
+    assert window.trace_generated_toggle_button.isEnabled() is True
+    assert "saved contrast distribution loaded" in (
+        window.workflow_progress_label.text().lower()
+    )
+    assert "5/5 workflow stages" in window.workflow_progress_label.text()
+    assert window.workflow_progress_bar.value() == 5
+    assert window.workflow_progress_bar.maximum() == 5
+    experimental_path = tmp_path / "contrast_saved_preview.txt"
+    np.savetxt(
+        experimental_path,
+        np.column_stack(
+            [
+                np.asarray([0.05, 0.08, 0.12, 0.18], dtype=float),
+                np.asarray([100.0, 82.0, 58.0, 31.0], dtype=float),
+            ]
+        ),
+    )
+    window.experimental_data_edit.setText(str(experimental_path))
+    assert window._load_experimental_preview(log_to_console=False) is True
+    window._redraw_trace_plot()
+
+    assert "generated contrast trace" in (
+        window.trace_plot_status_label.text().lower()
+    )
+    assert len(window.trace_figure.axes) == 2
+    experimental_axis, component_axis = window.trace_figure.axes
+    assert (
+        experimental_axis.get_title()
+        == "Experimental Data and Contrast Traces"
+    )
+    assert experimental_axis.get_xlabel() == "q (Å⁻¹)"
+    assert (
+        experimental_axis.get_ylabel() == "Experimental Intensity (arb. units)"
+    )
+    assert component_axis.get_ylabel() == "Model Intensity (arb. units)"
+
+    window.trace_generated_toggle_button.click()
+
+    assert (
+        window.trace_generated_toggle_button.text() == "Show Computed Traces"
+    )
+    assert all(
+        not line.get_visible()
+        for line in window.trace_figure.axes[1].get_lines()
+    )
+
+    window.trace_generated_toggle_button.click()
+
+    assert (
+        window.trace_generated_toggle_button.text() == "Hide Computed Traces"
+    )
+    assert any(
+        line.get_visible() for line in window.trace_figure.axes[1].get_lines()
+    )
+    window.close()
+
+
+def test_contrast_mode_workspace_reloaded_distribution_can_recompute_density(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, settings, artifact_paths, _build_result = (
+        _build_saved_contrast_distribution_project(tmp_path)
+    )
+
+    window = ContrastModeMainWindow(
+        initial_project_dir=project_dir.resolve(),
+        initial_clusters_dir=settings.resolved_clusters_dir,
+        initial_q_min=settings.q_min,
+        initial_q_max=settings.q_max,
+        initial_template_name=settings.selected_model_template,
+        initial_distribution_id=artifact_paths.distribution_id,
+        initial_distribution_root_dir=artifact_paths.root_dir,
+        initial_contrast_artifact_dir=artifact_paths.contrast_dir,
+    )
+    _flush_contrast_window_launch_preview(window)
+
+    started: dict[str, object] = {}
+
+    def fake_start_workflow_task(**kwargs):
+        started.update(kwargs)
+        return True
+
+    monkeypatch.setattr(
+        window, "_start_workflow_task", fake_start_workflow_task
+    )
+
+    assert window._representative_analysis_result is not None
+
+    window._compute_electron_density()
+
+    assert started.get("task_name") == "compute_density"
+    assert callable(started.get("task"))
+    window.close()
 
 
 def test_save_project_as_copies_project_and_rewrites_internal_paths(
@@ -3136,6 +5388,28 @@ def test_main_window_ui_scale_updates_fonts_and_minimum_sizes(qapp):
     assert window.font().pointSizeF() == pytest.approx(base_font_size)
     assert window.prefit_tab.output_box.minimumHeight() == base_output_height
     assert window.dream_tab._top_splitter.handleWidth() == base_handle_width
+
+
+def test_main_window_window_preset_resizes_and_scales_ui(qapp, monkeypatch):
+    del qapp
+    window = SAXSMainWindow()
+    monkeypatch.setattr(
+        window,
+        "_current_available_geometry",
+        lambda: QRect(0, 0, 1728, 1117),
+    )
+
+    window._apply_window_layout_preset("laptop_13")
+
+    assert window.width() == 1180
+    assert window.height() == 760
+    assert window._ui_scale == pytest.approx(0.95)
+
+    window._apply_window_layout_preset("display_1440p")
+
+    assert window.width() == 1680
+    assert window.height() == 980
+    assert window._ui_scale == pytest.approx(1.1)
 
 
 def test_dream_blink_highlight_does_not_override_button_stylesheet(qapp):
@@ -4565,6 +6839,49 @@ def test_template_dropdowns_use_display_names_and_tooltips(qapp):
     assert tab.selected_template_name() == basic_spec.name
 
 
+def test_project_setup_component_build_mode_defaults_and_round_trips(qapp):
+    del qapp
+    tab = ProjectSetupTab()
+    settings = ProjectSettings(
+        project_name="demo",
+        project_dir="/tmp/demo",
+        component_build_mode=COMPONENT_BUILD_MODE_CONTRAST,
+    )
+
+    assert tab.component_build_mode() == COMPONENT_BUILD_MODE_NO_CONTRAST
+    assert tab.component_build_mode_combo.currentText() == "No Contrast Mode"
+
+    tab.set_component_build_mode(COMPONENT_BUILD_MODE_CONTRAST)
+    assert tab.component_build_mode() == COMPONENT_BUILD_MODE_CONTRAST
+    assert tab.component_build_mode_combo.currentText() == "Contrast Mode"
+
+    tab.set_project_settings(settings, [])
+    assert tab.component_build_mode() == COMPONENT_BUILD_MODE_CONTRAST
+    assert "Contrast Mode" in tab.component_build_mode_label.text()
+
+
+def test_distribution_identity_and_label_include_component_build_mode(
+    tmp_path,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    no_contrast_settings = manager.load_project(project_dir)
+    contrast_settings = ProjectSettings.from_dict(
+        no_contrast_settings.to_dict()
+    )
+    contrast_settings.component_build_mode = COMPONENT_BUILD_MODE_CONTRAST
+
+    assert project_module.distribution_id_for_settings(
+        no_contrast_settings
+    ) != project_module.distribution_id_for_settings(contrast_settings)
+    assert "Build: No Contrast Mode" in (
+        project_module.distribution_label_for_settings(no_contrast_settings)
+    )
+    assert "Build: Contrast Mode" in (
+        project_module.distribution_label_for_settings(contrast_settings)
+    )
+
+
 def test_template_dropdowns_hide_deprecated_by_default_but_load_selected_deprecated(
     qapp,
     tmp_path,
@@ -5559,6 +7876,96 @@ def test_dream_analysis_saved_run_dropdown_loads_selected_run_state(
     assert (
         str(older_bundle.run_dir) in window.dream_tab.output_box.toPlainText()
     )
+
+
+def test_dream_analysis_saved_run_preview_is_non_destructive(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    workflow = SAXSDreamWorkflow(project_dir)
+
+    preview_entries = workflow.create_default_parameter_map()
+    preview_entries[0] = DreamParameterEntry(
+        structure=preview_entries[0].structure,
+        motif=preview_entries[0].motif,
+        param_type=preview_entries[0].param_type,
+        param=preview_entries[0].param,
+        value=0.42,
+        vary=preview_entries[0].vary,
+        distribution=preview_entries[0].distribution,
+        dist_params=dict(preview_entries[0].dist_params),
+        smart_preset_status=preview_entries[0].smart_preset_status,
+    )
+    preview_settings = DreamRunSettings(
+        nchains=7,
+        niterations=2468,
+        burnin_percent=13,
+        parallel=False,
+        adapt_crossover=False,
+        restart=True,
+        verbose=False,
+        history_file="saved_history.npy",
+        model_name="preview_model",
+        run_label="preview",
+        search_filter_preset="less_aggressive",
+        bestfit_method="median",
+        posterior_filter_mode="top_n_logp",
+        posterior_top_percent=8.0,
+        posterior_top_n=321,
+        stoichiometry_target_elements_text="Pb, I",
+        stoichiometry_target_ratio_text="1:2",
+        stoichiometry_filter_enabled=True,
+        stoichiometry_tolerance_percent=3.5,
+    )
+    preview_bundle = _write_minimal_dream_results(
+        project_dir,
+        settings=preview_settings,
+        entries=preview_entries,
+    )
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    original_chains = window.dream_tab.chains_spin.value()
+    original_iterations = window.dream_tab.iterations_spin.value()
+
+    preview_index = window.dream_tab.saved_runs_combo.findData(
+        str(preview_bundle.run_dir)
+    )
+    assert preview_index >= 0
+    window.dream_tab.saved_runs_combo.setCurrentIndex(preview_index)
+    QApplication.processEvents()
+
+    window.preview_selected_dream_run()
+    QApplication.processEvents()
+
+    dialog = window._dream_saved_run_preview_dialog
+    assert dialog is not None
+    assert dialog.isVisible()
+    assert window._last_results_loader is None
+    assert window.dream_tab.chains_spin.value() == original_chains
+    assert window.dream_tab.iterations_spin.value() == original_iterations
+
+    preview_text = dialog.summary_box.toPlainText()
+    assert "preview_model" in preview_text
+    assert "Chains: 7" in preview_text
+    assert "Iterations: 2468" in preview_text
+    assert "Best-fit method: Median" in preview_text
+    assert "Saved prior parameter map:" in preview_text
+
+    assert dialog.parameter_map_table.rowCount() == len(preview_entries)
+    assert (
+        dialog.parameter_map_table.item(0, 3).text()
+        == preview_entries[0].param
+    )
+    assert float(
+        dialog.parameter_map_table.item(0, 4).text()
+    ) == pytest.approx(preview_entries[0].value)
+
+    dialog.close()
+    window.close()
 
 
 def test_dream_model_metrics_box_updates_with_bestfit_method(qapp, tmp_path):
@@ -6952,8 +9359,9 @@ def test_dream_run_finish_auto_applies_recommended_filter(
     )
 
 
-def test_prefit_template_change_warning_can_be_cancelled(
-    qapp, tmp_path, monkeypatch
+def test_prefit_template_selection_stays_pending_until_change_requested(
+    qapp,
+    tmp_path,
 ):
     del qapp
     project_dir, _paths = _build_minimal_saxs_project(tmp_path)
@@ -6969,20 +9377,20 @@ def test_prefit_template_change_warning_can_be_cancelled(
         != original_template
     )
 
-    monkeypatch.setattr(
-        window,
-        "_confirm_prefit_template_change",
-        lambda current, new: (False, False),
-    )
-
     window.prefit_tab.set_selected_template(alternative, emit_signal=True)
 
     assert window.prefit_workflow.template_spec.name == original_template
-    assert window.prefit_tab.selected_template_name() == original_template
+    assert window.prefit_tab.active_template_name() == original_template
+    assert window.project_setup_tab.active_template_name() == original_template
+    assert window.prefit_tab.selected_template_name() == alternative
+    assert window.project_setup_tab.selected_template_name() == alternative
+    assert window.prefit_tab.change_template_button.isEnabled()
+    assert window.project_setup_tab.change_template_button.isEnabled()
+    window.close()
 
 
-def test_prefit_template_change_can_switch_back_to_original(
-    qapp, tmp_path, monkeypatch
+def test_settings_from_project_tab_uses_active_template_when_selection_differs(
+    qapp, tmp_path
 ):
     del qapp
     project_dir, _paths = _build_minimal_saxs_project(tmp_path)
@@ -6995,6 +9403,37 @@ def test_prefit_template_change_can_switch_back_to_original(
         str(window.prefit_tab.template_combo.itemData(index) or "")
         for index in range(window.prefit_tab.template_combo.count())
         if str(window.prefit_tab.template_combo.itemData(index) or "")
+        != original_template
+    )
+
+    window.prefit_tab.set_selected_template(alternative, emit_signal=True)
+
+    captured_settings = window._settings_from_project_tab()
+
+    assert captured_settings.selected_model_template == original_template
+    assert window.project_setup_tab.selected_template_name() == alternative
+    assert window.project_setup_tab.active_template_name() == original_template
+    window.close()
+
+
+def test_change_template_creates_template_scoped_distribution_copy(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    _settings, original_artifacts = _seed_saved_distribution_from_root(
+        project_dir,
+        include_cluster_geometry=True,
+    )
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    if window.project_setup_tab.template_combo.count() < 2:
+        pytest.skip("Need at least two templates to test template switching.")
+
+    original_template = window.current_settings.selected_model_template
+    alternative = next(
+        str(window.project_setup_tab.template_combo.itemData(index) or "")
+        for index in range(window.project_setup_tab.template_combo.count())
+        if str(window.project_setup_tab.template_combo.itemData(index) or "")
         != original_template
     )
 
@@ -7004,15 +9443,30 @@ def test_prefit_template_change_can_switch_back_to_original(
         lambda current, new: (True, False),
     )
 
-    window.prefit_tab.set_selected_template(alternative, emit_signal=True)
-    assert window.prefit_workflow.template_spec.name == alternative
-
-    window.prefit_tab.set_selected_template(
-        original_template, emit_signal=True
+    window.project_setup_tab.set_selected_template(
+        alternative, emit_signal=True
     )
+    window.project_setup_tab.change_template_button.click()
+    QApplication.processEvents()
 
-    assert window.prefit_workflow.template_spec.name == original_template
-    assert window.prefit_tab.selected_template_name() == original_template
+    current_artifacts = project_artifact_paths(window.current_settings)
+
+    assert window.current_settings.selected_model_template == alternative
+    assert window.project_setup_tab.active_template_name() == alternative
+    assert window.prefit_tab.active_template_name() == alternative
+    assert (
+        current_artifacts.distribution_id != original_artifacts.distribution_id
+    )
+    assert current_artifacts.component_map_file.is_file()
+    assert current_artifacts.prior_weights_file.is_file()
+    assert not current_artifacts.cluster_geometry_metadata_file.exists()
+    assert window.project_setup_tab.computed_distribution_combo.count() == 2
+    assert (
+        window.project_setup_tab.selected_distribution_id()
+        == current_artifacts.distribution_id
+    )
+    assert original_artifacts.cluster_geometry_metadata_file.is_file()
+    window.close()
 
 
 def test_project_setup_inputs_stay_locked_until_project_selected(
@@ -7135,6 +9589,75 @@ def test_open_project_uses_existing_project_field(qapp, tmp_path):
     assert window.current_settings is not None
     assert window.current_settings.project_dir == str(project_dir.resolve())
     assert window.project_setup_tab.project_name_edit.text() == "saxs_project"
+
+
+def test_open_project_reports_loader_progress_and_output(qapp, tmp_path):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow()
+
+    window.project_setup_tab.open_project_dir_edit.setText(str(project_dir))
+    window.open_project_from_dialog()
+
+    assert (
+        window.project_setup_tab.activity_progress_bar.maximum()
+        == PROJECT_LOAD_TOTAL_STEPS
+    )
+    assert (
+        window.project_setup_tab.activity_progress_bar.value()
+        == PROJECT_LOAD_TOTAL_STEPS
+    )
+    assert (
+        window.project_setup_tab.activity_progress_label.text()
+        == "Project load complete."
+    )
+
+    summary_text = window.project_setup_tab.summary_box.toPlainText()
+    assert "Loading project settings from" in summary_text
+    assert "Experimental data preview:" in summary_text
+    assert "Loaded 1 SAXS component trace." in summary_text
+    assert "Loaded project saxs_project" in summary_text
+
+    assert window._progress_dialog is not None
+    assert not window._progress_dialog.isVisible()
+    dialog_output = window._progress_dialog.output_box.toPlainText()
+    assert "Loading project settings from" in dialog_output
+    assert "Loading Prefit workflow and preview." in dialog_output
+
+
+def test_open_project_prepares_loader_payload_off_main_thread(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow()
+    main_thread_id = threading.get_ident()
+    build_thread_id: int | None = None
+    payload_flags: tuple[bool, bool] | None = None
+    original_build = window._build_project_load_payload
+    original_apply = window._apply_project_settings
+
+    def wrapped_build(*args, **kwargs):
+        nonlocal build_thread_id
+        build_thread_id = threading.get_ident()
+        return original_build(*args, **kwargs)
+
+    def wrapped_apply(settings, **kwargs):
+        nonlocal payload_flags
+        payload_flags = (
+            kwargs.get("prefit_payload") is not None,
+            kwargs.get("dream_payload") is not None,
+        )
+        return original_apply(settings, **kwargs)
+
+    monkeypatch.setattr(window, "_build_project_load_payload", wrapped_build)
+    monkeypatch.setattr(window, "_apply_project_settings", wrapped_apply)
+
+    window.load_project(project_dir)
+
+    assert build_thread_id is not None
+    assert build_thread_id != main_thread_id
+    assert payload_flags == (True, True)
 
 
 def test_loaded_project_prefers_original_experimental_reference_in_ui(
@@ -7490,6 +10013,67 @@ def test_prefit_tab_supports_dependent_parameter_expressions_with_vary_off(
     assert vary_item.flags() & Qt.ItemFlag.ItemIsUserCheckable
 
 
+def test_prefit_tab_caches_resolved_parameter_entries_until_table_changes(
+    qapp,
+    monkeypatch,
+):
+    del qapp
+    tab = PrefitTab()
+    tab.populate_parameter_table(
+        [
+            PrefitParameterEntry(
+                structure="A",
+                motif="motif",
+                name="scale",
+                value=2.5,
+                vary=True,
+                minimum=0.1,
+                maximum=10.0,
+                category="fit",
+            ),
+            PrefitParameterEntry(
+                structure="A",
+                motif="motif",
+                name="offset",
+                value=0.0,
+                vary=False,
+                minimum=-10.0,
+                maximum=10.0,
+                category="fit",
+            ),
+        ]
+    )
+
+    resolve_calls = {"count": 0}
+    original_resolve = prefit_tab_module.resolve_prefit_parameter_entries
+
+    def record_resolve(entries):
+        resolve_calls["count"] += 1
+        return original_resolve(entries)
+
+    monkeypatch.setattr(
+        prefit_tab_module,
+        "resolve_prefit_parameter_entries",
+        record_resolve,
+    )
+
+    first_entries = {entry.name: entry for entry in tab.parameter_entries()}
+    second_entries = {entry.name: entry for entry in tab.parameter_entries()}
+
+    assert resolve_calls["count"] == 0
+    assert first_entries["scale"].value == pytest.approx(2.5)
+    assert second_entries["offset"].value == pytest.approx(0.0)
+
+    tab.parameter_table.item(tab.find_parameter_row("offset"), 3).setText(
+        "*scale"
+    )
+    updated_entries = {entry.name: entry for entry in tab.parameter_entries()}
+
+    assert resolve_calls["count"] == 1
+    assert updated_entries["offset"].value_expression == "*scale"
+    assert updated_entries["offset"].value == pytest.approx(2.5)
+
+
 def test_prefit_tab_scrollable_parameter_supports_expression_seed_ranges(qapp):
     del qapp
     tab = PrefitTab()
@@ -7605,6 +10189,52 @@ def test_prefit_tab_scrollable_parameter_uses_bounds_and_updates_value(qapp):
     tab.parameter_table.setCurrentCell(offset_row, 3)
     qapp.processEvents()
     assert tab.parameter_scroll_mode_label.text() == "Linear scroll"
+
+
+def test_scrollable_parameter_preserves_manual_geometry_bounds(
+    qapp,
+    tmp_path,
+):
+    poly_project_dir, _poly_paths = _build_poly_lma_geometry_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=poly_project_dir)
+    window.compute_prefit_cluster_geometry()
+
+    parameter_name = "a_eff_w0"
+    parameter_row = window.prefit_tab.find_parameter_row(parameter_name)
+    assert parameter_row >= 0
+
+    original_value = float(
+        window.prefit_tab.parameter_table.item(parameter_row, 3).text()
+    )
+    custom_minimum = max(original_value * 0.5, 1e-6)
+    custom_maximum = original_value + 2.0
+
+    window.prefit_tab.set_parameter_row(
+        parameter_name,
+        minimum=custom_minimum,
+        maximum=custom_maximum,
+        vary=True,
+    )
+    window.prefit_tab.auto_update_checkbox.setChecked(True)
+    window.prefit_tab.scrollable_parameter_checkbox.setChecked(True)
+    window.prefit_tab.parameter_table.setCurrentCell(parameter_row, 3)
+
+    qapp.processEvents()
+    window.prefit_tab.parameter_scroll_bar.setValue(
+        window.prefit_tab.PARAMETER_SCROLL_RESOLUTION
+    )
+    qapp.processEvents()
+
+    assert float(
+        window.prefit_tab.parameter_table.item(parameter_row, 5).text()
+    ) == pytest.approx(custom_minimum)
+    assert float(
+        window.prefit_tab.parameter_table.item(parameter_row, 6).text()
+    ) == pytest.approx(custom_maximum)
+    assert float(
+        window.prefit_tab.parameter_table.item(parameter_row, 3).text()
+    ) == pytest.approx(custom_maximum)
+    window.close()
 
 
 def test_run_prefit_keeps_manual_weight_value_outside_previous_bounds(
@@ -7886,6 +10516,7 @@ def test_restore_prefit_state_recovers_saved_parameters_and_run_config(
     saved_state_name = window.prefit_tab.selected_saved_state_name()
     assert saved_state_name is not None
     assert saved_state_name.startswith("prefit_")
+    assert "R^2=" in window.prefit_tab.saved_state_combo.currentText()
 
     window.prefit_tab.set_parameter_row("scale", value=2e-3)
     window.prefit_tab.set_parameter_row("offset", value=0.333)
@@ -8364,6 +10995,134 @@ def test_selecting_clusters_directory_triggers_project_autosave(
     assert saved_clusters[-1] == str(clusters_dir)
 
 
+def test_selecting_frames_directory_triggers_project_autosave(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    window = SAXSMainWindow()
+    window.project_setup_tab.project_name_edit.setText("demo_project")
+    window.project_setup_tab.project_dir_edit.setText(str(tmp_path))
+    window.create_project_from_tab()
+
+    frames_dir = tmp_path / "splitxyz_f0fs"
+    frames_dir.mkdir()
+    (frames_dir / "frame_0000.xyz").write_text(
+        "1\nframe\nPb 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.project_setup_tab.QFileDialog.getExistingDirectory",
+        lambda *args, **kwargs: str(frames_dir),
+    )
+    saved_frames: list[str | None] = []
+    monkeypatch.setattr(
+        window.project_manager,
+        "save_project",
+        lambda settings: saved_frames.append(settings.frames_dir)
+        or build_project_paths(settings.project_dir).project_file,
+    )
+
+    window.project_setup_tab._choose_frames_directory()
+
+    assert saved_frames[-1] == str(frames_dir)
+
+
+def test_selecting_pdb_frames_directory_triggers_project_autosave(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    window = SAXSMainWindow()
+    window.project_setup_tab.project_name_edit.setText("demo_project")
+    window.project_setup_tab.project_dir_edit.setText(str(tmp_path))
+    window.create_project_from_tab()
+
+    pdb_frames_dir = tmp_path / "xyz2pdb_splitxyz_f0fs"
+    pdb_frames_dir.mkdir()
+
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.project_setup_tab.QFileDialog.getExistingDirectory",
+        lambda *args, **kwargs: str(pdb_frames_dir),
+    )
+    saved_pdb_frames: list[str | None] = []
+    monkeypatch.setattr(
+        window.project_manager,
+        "save_project",
+        lambda settings: saved_pdb_frames.append(settings.pdb_frames_dir)
+        or build_project_paths(settings.project_dir).project_file,
+    )
+
+    window.project_setup_tab._choose_pdb_frames_directory()
+
+    assert saved_pdb_frames[-1] == str(pdb_frames_dir)
+
+
+def test_loading_project_reports_registered_folder_warnings(qapp, tmp_path):
+    del qapp
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "saxs_project"
+    settings = manager.create_project(project_dir)
+    frames_dir = tmp_path / "splitxyz_f0fs"
+    frames_dir.mkdir()
+    (frames_dir / "frame_0000.xyz").write_text(
+        "1\nframe\nPb 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    clusters_dir = tmp_path / "clusters"
+    (clusters_dir / "PbI2").mkdir(parents=True)
+    (clusters_dir / "PbI2" / "frame_0001.xyz").write_text(
+        "2\ncomment\nPb 0.0 0.0 0.0\nI 1.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    settings.frames_dir = str(frames_dir)
+    settings.clusters_dir = str(clusters_dir)
+    trajectory_file = tmp_path / "traj.xyz"
+    topology_file = tmp_path / "topology.pdb"
+    energy_file = tmp_path / "traj.ener"
+    trajectory_file.write_text(
+        "1\nframe\nPb 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    topology_file.write_text("MODEL        1\nENDMDL\n", encoding="utf-8")
+    energy_file.write_text(
+        "# step time kinetic temperature potential\n"
+        "1 0.0 1.0 300.0 -10.0\n",
+        encoding="utf-8",
+    )
+    settings.trajectory_file = str(trajectory_file)
+    settings.topology_file = str(topology_file)
+    settings.energy_file = str(energy_file)
+    manager.save_project(settings)
+
+    (frames_dir / "frame_0001.xyz").write_text(
+        "1\nframe\nI 1.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    (clusters_dir / "PbI2" / "frame_0001.xyz").unlink()
+    (clusters_dir / "PbI2").rmdir()
+    clusters_dir.rmdir()
+    trajectory_file.write_text(
+        "1\nframe\nI 1.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    topology_file.unlink()
+    energy_file.write_text(
+        "# step time kinetic temperature potential\n" "1 0.0 1.2 305.0 -9.5\n",
+        encoding="utf-8",
+    )
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    summary_text = window.project_setup_tab.summary_box.toPlainText()
+
+    assert "Loaded project saxs_project" in summary_text
+    assert "Registered frames folder contents changed" in summary_text
+    assert "Registered clusters folder is missing" in summary_text
+    assert "Registered trajectory file changed" in summary_text
+    assert "Registered topology file is missing" in summary_text
+    assert "Registered energy file changed" in summary_text
+    window.close()
+
+
 def test_selecting_experimental_file_triggers_project_autosave(
     qapp, tmp_path, monkeypatch
 ):
@@ -8815,6 +11574,147 @@ def test_build_components_auto_refreshes_component_plot_for_built_distribution(
             "A_no_motif"
         ].get_ydata(),
         component_trace,
+    )
+    window.close()
+
+
+def test_build_components_in_contrast_mode_launches_scaffold_instead_of_builder_task(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    start_calls: list[str] = []
+    launched: list[str] = []
+
+    monkeypatch.setattr(
+        window,
+        "_confirm_default_q_range_for_component_build",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        window,
+        "_start_project_task",
+        lambda task_name, *args, **kwargs: start_calls.append(task_name),
+    )
+    monkeypatch.setattr(
+        window,
+        "_open_contrast_mode_tool",
+        lambda: launched.append("contrast"),
+    )
+
+    window.project_setup_tab.set_component_build_mode(
+        COMPONENT_BUILD_MODE_CONTRAST
+    )
+    window.build_project_components()
+
+    saved_settings = SAXSProjectManager().load_project(project_dir)
+    assert not start_calls
+    assert launched == ["contrast"]
+    assert saved_settings.component_build_mode == COMPONENT_BUILD_MODE_CONTRAST
+    assert window.current_settings is not None
+    assert (
+        window.current_settings.component_build_mode
+        == COMPONENT_BUILD_MODE_CONTRAST
+    )
+    assert (
+        "Contrast Mode" in window.project_setup_tab.summary_box.toPlainText()
+    )
+    window.close()
+
+
+def test_saved_distributions_can_coexist_and_load_by_component_build_mode(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    _no_contrast_settings, no_contrast_artifacts = (
+        _seed_saved_distribution_from_root(
+            project_dir,
+            component_build_mode=COMPONENT_BUILD_MODE_NO_CONTRAST,
+        )
+    )
+    contrast_settings, contrast_artifacts = _seed_saved_distribution_from_root(
+        project_dir,
+        component_build_mode=COMPONENT_BUILD_MODE_CONTRAST,
+    )
+
+    records = {
+        record.distribution_id: record
+        for record in manager.list_saved_distributions(project_dir)
+    }
+    contrast_metadata = json.loads(
+        contrast_artifacts.distribution_metadata_file.read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert (
+        no_contrast_artifacts.distribution_id
+        != contrast_artifacts.distribution_id
+    )
+    assert set(records) == {
+        no_contrast_artifacts.distribution_id,
+        contrast_artifacts.distribution_id,
+    }
+    assert (
+        records[no_contrast_artifacts.distribution_id].component_build_mode
+        == COMPONENT_BUILD_MODE_NO_CONTRAST
+    )
+    assert (
+        records[contrast_artifacts.distribution_id].component_build_mode
+        == COMPONENT_BUILD_MODE_CONTRAST
+    )
+    assert "Build: No Contrast Mode" in (
+        records[no_contrast_artifacts.distribution_id].label
+    )
+    assert "Build: Contrast Mode" in (
+        records[contrast_artifacts.distribution_id].label
+    )
+    assert (
+        contrast_metadata["component_build_mode"]
+        == COMPONENT_BUILD_MODE_CONTRAST
+    )
+    assert contrast_metadata["label"] == (
+        project_module.distribution_label_for_settings(contrast_settings)
+    )
+
+    loaded_settings = manager.settings_for_saved_distribution(
+        project_dir,
+        contrast_artifacts.distribution_id,
+    )
+    assert (
+        loaded_settings.component_build_mode == COMPONENT_BUILD_MODE_CONTRAST
+    )
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    target_index = (
+        window.project_setup_tab.computed_distribution_combo.findData(
+            contrast_artifacts.distribution_id
+        )
+    )
+    assert target_index >= 0
+    window.project_setup_tab.computed_distribution_combo.setCurrentIndex(
+        target_index
+    )
+    window.project_setup_tab.load_distribution_button.click()
+    QApplication.processEvents()
+
+    assert window.project_setup_tab.selected_distribution_id() == (
+        contrast_artifacts.distribution_id
+    )
+    assert (
+        window.project_setup_tab.component_build_mode()
+        == COMPONENT_BUILD_MODE_CONTRAST
+    )
+    assert window.current_settings is not None
+    assert (
+        window.current_settings.component_build_mode
+        == COMPONENT_BUILD_MODE_CONTRAST
     )
     window.close()
 
@@ -9679,6 +12579,42 @@ def test_project_setup_uses_scrollable_resizable_side_panes(qapp):
     assert tab.prior_group.parentWidget() is tab._right_scroll_area.widget()
 
 
+def test_project_setup_plot_previews_expand_with_the_right_pane(qapp):
+    del qapp
+    tab = ProjectSetupTab()
+
+    assert tab.component_canvas.parentWidget() is tab.component_group
+    assert tab.prior_canvas.parentWidget() is tab.prior_group
+    assert not bool(tab.component_canvas.property("_saxs_skip_scale"))
+    assert not bool(tab.prior_canvas.property("_saxs_skip_scale"))
+    assert (
+        tab.component_group.sizePolicy().verticalPolicy()
+        == QSizePolicy.Policy.Expanding
+    )
+    assert (
+        tab.prior_group.sizePolicy().verticalPolicy()
+        == QSizePolicy.Policy.Expanding
+    )
+    assert (
+        tab.component_canvas.sizePolicy().horizontalPolicy()
+        == QSizePolicy.Policy.Expanding
+    )
+    assert (
+        tab.component_canvas.sizePolicy().verticalPolicy()
+        == QSizePolicy.Policy.Expanding
+    )
+    assert (
+        tab.prior_canvas.sizePolicy().horizontalPolicy()
+        == QSizePolicy.Policy.Expanding
+    )
+    assert (
+        tab.prior_canvas.sizePolicy().verticalPolicy()
+        == QSizePolicy.Policy.Expanding
+    )
+    assert tab.component_canvas.minimumHeight() >= 320
+    assert tab.prior_canvas.minimumHeight() >= 240
+
+
 def test_project_setup_activity_progress_updates(qapp):
     del qapp
     tab = ProjectSetupTab()
@@ -9788,6 +12724,66 @@ def test_use_experimental_grid_crops_to_nearest_available_q_values(tmp_path):
     q_grid = manager._build_q_grid(settings, summary)
 
     assert np.allclose(q_grid, [0.08, 0.12, 0.18])
+
+
+def test_build_components_persists_effective_q_range_after_grid_crop(
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    clusters_dir = paths.project_dir / "clusters"
+    structure_dir = clusters_dir / "A"
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    (structure_dir / "frame_0001.xyz").write_text(
+        "2\nframe 1\nA 0.0 0.0 0.0\nH 1.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    def fake_build_profiles(
+        builder,
+        *,
+        cluster_bins,
+        progress_callback=None,
+        progress_total=None,
+        **kwargs,
+    ):
+        del progress_callback, progress_total, kwargs
+        values = np.linspace(10.0, 17.0, len(builder.q_values))
+        output_path = builder.output_dir / "A_no_motif.txt"
+        _write_component_file(output_path, builder.q_values, values)
+        cluster_bin = cluster_bins[0]
+        return [
+            AveragedComponent(
+                structure=cluster_bin.structure,
+                motif=cluster_bin.motif,
+                file_count=len(cluster_bin.files),
+                representative=cluster_bin.representative,
+                source_dir=cluster_bin.source_dir,
+                q_values=np.asarray(builder.q_values, dtype=float),
+                mean_intensity=np.asarray(values, dtype=float),
+                std_intensity=np.zeros_like(builder.q_values, dtype=float),
+                se_intensity=np.zeros_like(builder.q_values, dtype=float),
+                output_path=output_path,
+            )
+        ]
+
+    monkeypatch.setattr(
+        project_module.DebyeProfileBuilder,
+        "build_profiles",
+        fake_build_profiles,
+    )
+
+    settings = manager.load_project(project_dir)
+    settings.clusters_dir = str(clusters_dir)
+    settings.q_min = 0.12
+    settings.q_max = 0.19
+
+    manager.build_scattering_components(settings)
+
+    saved_settings = manager.load_project(project_dir)
+    assert saved_settings.q_min == pytest.approx(0.12142857142857144)
+    assert saved_settings.q_max == pytest.approx(0.19285714285714284)
 
 
 def test_model_only_q_grid_uses_configured_range_without_experimental_data(
@@ -9994,6 +12990,14 @@ def test_project_setup_remove_selected_elements_updates_exclude_list(qapp):
     tab._remove_selected_elements_from_exclude()
 
     assert tab.exclude_elements() == ["O"]
+
+
+def test_project_setup_exclude_buttons_use_clear_labels(qapp):
+    del qapp
+    tab = ProjectSetupTab()
+
+    assert tab.exclude_selected_elements_button.text() == "Exclude Selected"
+    assert tab.include_selected_elements_button.text() == "Include Selected"
 
 
 def test_project_setup_predicted_mode_updates_prefit_geometry_table(
@@ -10645,6 +13649,237 @@ def test_project_setup_can_load_saved_distribution_and_scope_prefit_and_dream(
     )
     assert window.dream_tab.selected_saved_run_dir() == str(
         (excluded_artifacts.dream_runtime_dir / "dream_excluded").resolve()
+    )
+    window.close()
+
+
+def test_no_contrast_distribution_paths_preserve_legacy_loading_without_build_mode(
+    tmp_path,
+):
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    template_legacy_distribution_id = (
+        project_module._distribution_id_for_settings(
+            settings,
+            include_template=True,
+            include_build_mode=False,
+        )
+    )
+    oldest_legacy_distribution_id = (
+        project_module._distribution_id_for_settings(
+            settings,
+            include_template=False,
+            include_build_mode=False,
+        )
+    )
+
+    def write_legacy_distribution(
+        distribution_id: str,
+        *,
+        include_template_name: bool,
+    ) -> Path:
+        distribution_dir = (
+            build_project_paths(project_dir).saved_distributions_dir
+            / distribution_id
+        )
+        component_dir = distribution_dir / "scattering_components"
+        component_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(
+            paths.scattering_components_dir,
+            component_dir,
+            dirs_exist_ok=True,
+        )
+        shutil.copy2(
+            paths.project_dir / "md_saxs_map.json",
+            distribution_dir / "md_saxs_map.json",
+        )
+        shutil.copy2(
+            paths.project_dir / "md_prior_weights.json",
+            distribution_dir / "md_prior_weights.json",
+        )
+        payload = {
+            "schema_version": 1,
+            "distribution_id": distribution_id,
+            "label": (
+                "Observed Only | Template: "
+                f"{settings.selected_model_template} | Excluded: None | "
+                "q-range: default | Grid: experimental grid"
+                if include_template_name
+                else "Observed Only | Excluded: None | q-range: default | "
+                "Grid: experimental grid"
+            ),
+            "use_predicted_structure_weights": False,
+            "exclude_elements": [],
+            "clusters_dir": None,
+            "q_min": None,
+            "q_max": None,
+            "use_experimental_grid": True,
+            "q_points": None,
+            "component_artifacts_ready": True,
+            "prior_artifacts_ready": True,
+        }
+        if include_template_name:
+            payload["template_name"] = settings.selected_model_template
+        (distribution_dir / "distribution.json").write_text(
+            json.dumps(payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return distribution_dir
+
+    template_legacy_dir = write_legacy_distribution(
+        template_legacy_distribution_id,
+        include_template_name=True,
+    )
+    oldest_legacy_dir = write_legacy_distribution(
+        oldest_legacy_distribution_id,
+        include_template_name=False,
+    )
+
+    resolved_template_legacy = project_artifact_paths(
+        settings,
+        storage_mode="distribution",
+    )
+    assert resolved_template_legacy.distribution_id == (
+        template_legacy_distribution_id
+    )
+    assert resolved_template_legacy.root_dir == template_legacy_dir
+
+    shutil.rmtree(template_legacy_dir)
+    resolved_oldest_legacy = project_artifact_paths(
+        settings,
+        storage_mode="distribution",
+    )
+    assert resolved_oldest_legacy.distribution_id == (
+        oldest_legacy_distribution_id
+    )
+    assert resolved_oldest_legacy.root_dir == oldest_legacy_dir
+
+    contrast_settings = ProjectSettings.from_dict(settings.to_dict())
+    contrast_settings.component_build_mode = COMPONENT_BUILD_MODE_CONTRAST
+    contrast_paths = project_artifact_paths(
+        contrast_settings,
+        storage_mode="distribution",
+    )
+    assert contrast_paths.distribution_id not in {
+        template_legacy_distribution_id,
+        oldest_legacy_distribution_id,
+    }
+
+    loaded_settings = manager.settings_for_saved_distribution(
+        project_dir,
+        oldest_legacy_distribution_id,
+        base_settings=contrast_settings,
+    )
+    assert (
+        loaded_settings.component_build_mode
+        == COMPONENT_BUILD_MODE_NO_CONTRAST
+    )
+    assert loaded_settings.selected_model_template == (
+        contrast_settings.selected_model_template
+    )
+
+
+def test_project_setup_loads_saved_distribution_with_cropped_q_range(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    clusters_dir = paths.project_dir / "clusters"
+    structure_dir = clusters_dir / "A"
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    (structure_dir / "frame_0001.xyz").write_text(
+        "2\nframe 1\nA 0.0 0.0 0.0\nH 1.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    def fake_build_profiles(
+        builder,
+        *,
+        cluster_bins,
+        progress_callback=None,
+        progress_total=None,
+        **kwargs,
+    ):
+        del progress_callback, progress_total, kwargs
+        values = np.linspace(10.0, 17.0, len(builder.q_values))
+        output_path = builder.output_dir / "A_no_motif.txt"
+        _write_component_file(output_path, builder.q_values, values)
+        cluster_bin = cluster_bins[0]
+        return [
+            AveragedComponent(
+                structure=cluster_bin.structure,
+                motif=cluster_bin.motif,
+                file_count=len(cluster_bin.files),
+                representative=cluster_bin.representative,
+                source_dir=cluster_bin.source_dir,
+                q_values=np.asarray(builder.q_values, dtype=float),
+                mean_intensity=np.asarray(values, dtype=float),
+                std_intensity=np.zeros_like(builder.q_values, dtype=float),
+                se_intensity=np.zeros_like(builder.q_values, dtype=float),
+                output_path=output_path,
+            )
+        ]
+
+    monkeypatch.setattr(
+        project_module.DebyeProfileBuilder,
+        "build_profiles",
+        fake_build_profiles,
+    )
+
+    original_settings = manager.load_project(project_dir)
+    original_settings.clusters_dir = str(clusters_dir)
+    original_settings.q_min = None
+    original_settings.q_max = None
+    manager.save_project(original_settings)
+    manager.build_scattering_components(original_settings)
+    manager.generate_prior_weights(original_settings)
+    original_artifacts = project_artifact_paths(original_settings)
+
+    reduced_settings = manager.load_project(project_dir)
+    reduced_settings.clusters_dir = str(clusters_dir)
+    reduced_settings.q_min = 0.12
+    reduced_settings.q_max = 0.19
+    manager.save_project(reduced_settings)
+    manager.build_scattering_components(reduced_settings)
+    manager.generate_prior_weights(reduced_settings)
+    reduced_artifacts = project_artifact_paths(reduced_settings)
+
+    manager.save_project(original_settings)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    target_index = (
+        window.project_setup_tab.computed_distribution_combo.findData(
+            reduced_artifacts.distribution_id
+        )
+    )
+    assert target_index >= 0
+    window.project_setup_tab.computed_distribution_combo.setCurrentIndex(
+        target_index
+    )
+    window.project_setup_tab.load_distribution_button.click()
+    QApplication.processEvents()
+
+    expected_q = np.asarray(
+        [0.12142857142857144, 0.15714285714285714, 0.19285714285714284],
+        dtype=float,
+    )
+    assert window.project_setup_tab.selected_distribution_id() == (
+        reduced_artifacts.distribution_id
+    )
+    assert window.prefit_workflow is not None
+    assert window.prefit_workflow.prefit_dir == reduced_artifacts.prefit_dir
+    assert np.allclose(
+        window.prefit_workflow.evaluate().q_values,
+        expected_q,
+    )
+    assert window.dream_workflow is not None
+    assert np.allclose(
+        window.dream_workflow.prefit_workflow.evaluate().q_values,
+        expected_q,
     )
     window.close()
 

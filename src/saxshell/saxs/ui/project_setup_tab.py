@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from contextlib import contextmanager
 from pathlib import Path
 from textwrap import fill
 
@@ -43,6 +44,12 @@ from PySide6.QtWidgets import (
 )
 
 from saxshell.saxs._model_templates import TemplateSpec
+from saxshell.saxs.contrast.settings import (
+    COMPONENT_BUILD_MODE_NO_CONTRAST,
+    component_build_mode_choices,
+    component_build_mode_label,
+    normalize_component_build_mode,
+)
 from saxshell.saxs.debye import discover_cluster_bins
 from saxshell.saxs.project_manager import (
     ExperimentalDataSummary,
@@ -69,18 +76,25 @@ HISTOGRAM_COLORMAP_NAMES = [
     "Blues",
     "magma",
 ]
+COMPONENT_PLOT_MIN_HEIGHT = 320
+PRIOR_PLOT_MIN_HEIGHT = 240
 
 
 class ProjectSetupTab(QWidget):
     create_project_requested = Signal()
     open_project_requested = Signal()
-    save_project_requested = Signal()
     autosave_project_requested = Signal(str)
+    open_mdtrajectory_requested = Signal()
+    open_xyz2pdb_requested = Signal()
+    open_cluster_requested = Signal()
     scan_clusters_requested = Signal()
     build_components_requested = Signal()
     build_prior_weights_requested = Signal()
     install_model_requested = Signal()
     load_distribution_requested = Signal(str)
+    view_active_contrast_distribution_requested = Signal()
+    template_selection_changed = Signal(str)
+    change_template_requested = Signal(str)
     generate_prior_plot_requested = Signal()
     save_prior_png_requested = Signal()
     save_component_plot_data_requested = Signal()
@@ -103,6 +117,7 @@ class ProjectSetupTab(QWidget):
         self._solvent_intensity_column: int | None = None
         self._solvent_error_column: int | None = None
         self._solvent_summary: ExperimentalDataSummary | None = None
+        self._active_contrast_view_available = False
         self._component_paths: list[Path] | None = None
         self._current_prior_json_path: Path | None = None
         self._recognized_cluster_rows: list[dict[str, object]] = []
@@ -117,6 +132,11 @@ class ProjectSetupTab(QWidget):
         self._observed_component_keys: list[str] = []
         self._predicted_component_keys: list[str] = []
         self._updating_cluster_table = False
+        self._preview_update_suspend_depth = 0
+        self._pending_saxs_preview_redraw = False
+        self._pending_prior_preview_redraw = False
+        self._active_template_name: str | None = None
+        self._suspend_template_selection_signal = False
         self._build_ui()
         self._update_data_trace_control_state()
         self._update_component_trace_control_state()
@@ -146,9 +166,8 @@ class ProjectSetupTab(QWidget):
         right_layout.setSpacing(12)
         self.component_group = self._build_component_group()
         self.prior_group = self._build_prior_group()
-        right_layout.addWidget(self.component_group)
-        right_layout.addWidget(self.prior_group)
-        right_layout.addStretch(1)
+        right_layout.addWidget(self.component_group, stretch=3)
+        right_layout.addWidget(self.prior_group, stretch=2)
 
         self._left_scroll_area = self._wrap_pane_in_scroll_area(left)
         self._right_scroll_area = self._wrap_pane_in_scroll_area(right)
@@ -159,7 +178,7 @@ class ProjectSetupTab(QWidget):
         self._pane_splitter.addWidget(self._right_scroll_area)
         self._pane_splitter.setStretchFactor(0, 6)
         self._pane_splitter.setStretchFactor(1, 7)
-        self._pane_splitter.setSizes([720, 840])
+        self._pane_splitter.setSizes([780, 680])
         root.addWidget(self._pane_splitter)
 
     @staticmethod
@@ -219,25 +238,27 @@ class ProjectSetupTab(QWidget):
         )
         helper.setWordWrap(True)
         layout.addWidget(helper)
-
-        save_row = QHBoxLayout()
-        save_row.addStretch(1)
-        self.save_project_button = QPushButton("Save Project State")
-        self.save_project_button.clicked.connect(
-            self.save_project_requested.emit
-        )
-        save_row.addWidget(self.save_project_button)
-        layout.addLayout(save_row)
         return group
 
     def _build_inputs_group(self) -> QGroupBox:
         group = QGroupBox("Forward Model Inputs")
         layout = QFormLayout(group)
 
+        self.frames_dir_edit = QLineEdit()
+        self.frames_dir_edit.editingFinished.connect(
+            self._on_frames_dir_edited
+        )
+        self.pdb_frames_dir_edit = QLineEdit()
+        self.pdb_frames_dir_edit.editingFinished.connect(
+            self._on_pdb_frames_dir_edited
+        )
         self.clusters_dir_edit = QLineEdit()
         self.clusters_dir_edit.editingFinished.connect(
             self._on_clusters_dir_edited
         )
+        layout.addRow(self._cluster_preparation_actions_row())
+        layout.addRow("Frames folder", self._frames_row())
+        layout.addRow("PDB structure folder", self._pdb_frames_row())
         layout.addRow("Clusters folder", self._clusters_row())
 
         self.model_only_mode_checkbox = QCheckBox("Model Only Mode")
@@ -402,7 +423,17 @@ class ProjectSetupTab(QWidget):
         self.active_template_edit = QLineEdit()
         self.active_template_edit.setReadOnly(True)
         self.active_template_edit.setMinimumWidth(420)
-        header_layout.addRow("Active template", self.active_template_edit)
+        self.change_template_button = QPushButton("Change Template")
+        self.change_template_button.setEnabled(False)
+        self.change_template_button.clicked.connect(
+            self._emit_change_template_requested
+        )
+        active_row = QWidget()
+        active_layout = QHBoxLayout(active_row)
+        active_layout.setContentsMargins(0, 0, 0, 0)
+        active_layout.addWidget(self.active_template_edit, stretch=1)
+        active_layout.addWidget(self.change_template_button)
+        header_layout.addRow("Active template", active_row)
         layout.addWidget(header_widget)
 
         lower_layout = QHBoxLayout()
@@ -412,15 +443,41 @@ class ProjectSetupTab(QWidget):
         button_layout = QVBoxLayout(button_widget)
         button_layout.setContentsMargins(0, 0, 0, 0)
         button_layout.setSpacing(8)
-        self.build_components_button = QPushButton("Build SAXS Components")
-        self.build_components_button.clicked.connect(
-            self.build_components_requested.emit
-        )
         self.build_prior_weights_button = QPushButton("Generate Prior Weights")
         self.build_prior_weights_button.clicked.connect(
             self.build_prior_weights_requested.emit
         )
-        self.install_model_button = QPushButton("Install Model")
+        self.component_build_mode_label = QLabel("Component build mode")
+        self.component_build_mode_combo = QComboBox()
+        self.component_build_mode_combo.setMinimumWidth(220)
+        self.component_build_mode_combo.setToolTip(
+            "Choose whether Build SAXS Components uses the current "
+            "no-contrast Debye builder or launches the separate "
+            "contrast-mode workflow."
+        )
+        for mode, label in component_build_mode_choices():
+            self.component_build_mode_combo.addItem(label, userData=mode)
+        self.component_build_mode_hint_label = QLabel(
+            "No Contrast Mode keeps the existing builder. Contrast Mode "
+            "opens the separate contrast workflow scaffold."
+        )
+        self.component_build_mode_hint_label.setWordWrap(True)
+        self.build_components_button = QPushButton("Build SAXS Components")
+        self.build_components_button.clicked.connect(
+            self.build_components_requested.emit
+        )
+        self.view_contrast_distribution_button = QPushButton(
+            "View Representative Structures"
+        )
+        self.view_contrast_distribution_button.setEnabled(False)
+        self.view_contrast_distribution_button.setToolTip(
+            "Reopen the saved contrast-mode representative structures, meshes, "
+            "and electron-density outputs for the active computed distribution."
+        )
+        self.view_contrast_distribution_button.clicked.connect(
+            self.view_active_contrast_distribution_requested.emit
+        )
+        self.install_model_button = QPushButton("Install Custom Template")
         self.install_model_button.clicked.connect(
             self.install_model_requested.emit
         )
@@ -437,8 +494,11 @@ class ProjectSetupTab(QWidget):
             self._distribution_row(),
         )
         button_layout.addWidget(self.build_prior_weights_button)
+        button_layout.addWidget(self.component_build_mode_label)
+        button_layout.addWidget(self.component_build_mode_combo)
+        button_layout.addWidget(self.component_build_mode_hint_label)
         button_layout.addWidget(self.build_components_button)
-        button_layout.addWidget(self.install_model_button)
+        button_layout.addWidget(self.view_contrast_distribution_button)
         button_layout.addStretch(1)
         button_widget.setSizePolicy(
             QSizePolicy.Policy.Fixed,
@@ -514,10 +574,23 @@ class ProjectSetupTab(QWidget):
 
     def _distribution_row(self) -> QWidget:
         row = QWidget()
-        layout = QHBoxLayout(row)
+        layout = QVBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.computed_distribution_combo, stretch=1)
-        layout.addWidget(self.load_distribution_button)
+        layout.setSpacing(8)
+
+        top_row = QWidget()
+        top_layout = QHBoxLayout(top_row)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.addWidget(self.computed_distribution_combo, stretch=1)
+        top_layout.addWidget(self.load_distribution_button)
+        layout.addWidget(top_row)
+
+        install_row = QWidget()
+        install_layout = QHBoxLayout(install_row)
+        install_layout.setContentsMargins(0, 0, 0, 0)
+        install_layout.addWidget(self.install_model_button)
+        install_layout.addStretch(1)
+        layout.addWidget(install_row)
         return row
 
     def _build_activity_group(self) -> QGroupBox:
@@ -544,7 +617,7 @@ class ProjectSetupTab(QWidget):
         group = QGroupBox("Experimental Data and SAXS Components")
         group.setSizePolicy(
             QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Minimum,
+            QSizePolicy.Policy.Expanding,
         )
         layout = QVBoxLayout(group)
 
@@ -618,7 +691,7 @@ class ProjectSetupTab(QWidget):
         controls.addStretch(1)
         layout.addLayout(controls)
 
-        self.component_figure = Figure(figsize=(7.6, 5.8))
+        self.component_figure = Figure(figsize=(6.8, 5.2))
         self.component_canvas = FigureCanvasQTAgg(self.component_figure)
         self.component_canvas.mpl_connect(
             "pick_event",
@@ -628,16 +701,20 @@ class ProjectSetupTab(QWidget):
             self.component_canvas,
             self,
         )
+        self.component_canvas.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self.component_canvas.setMinimumHeight(COMPONENT_PLOT_MIN_HEIGHT)
         layout.addWidget(self.component_toolbar)
-        self.component_canvas.setMinimumHeight(420)
-        layout.addWidget(self.component_canvas)
+        layout.addWidget(self.component_canvas, stretch=1)
         return group
 
     def _build_prior_group(self) -> QGroupBox:
         group = QGroupBox("Prior Histograms")
         group.setSizePolicy(
             QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Minimum,
+            QSizePolicy.Policy.Expanding,
         )
         layout = QVBoxLayout(group)
 
@@ -703,10 +780,14 @@ class ProjectSetupTab(QWidget):
         controls.addStretch(1)
         layout.addLayout(controls)
 
-        self.prior_figure = Figure(figsize=(7.6, 3.8))
+        self.prior_figure = Figure(figsize=(6.8, 3.4))
         self.prior_canvas = FigureCanvasQTAgg(self.prior_figure)
-        self.prior_canvas.setMinimumHeight(300)
-        layout.addWidget(self.prior_canvas)
+        self.prior_canvas.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self.prior_canvas.setMinimumHeight(PRIOR_PLOT_MIN_HEIGHT)
+        layout.addWidget(self.prior_canvas, stretch=1)
         self._update_prior_control_state()
         return group
 
@@ -724,6 +805,80 @@ class ProjectSetupTab(QWidget):
         layout.addWidget(refresh_button)
         return row
 
+    def _frames_row(self) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.frames_dir_edit, stretch=1)
+
+        browse_button = QPushButton("Browse…")
+        browse_button.clicked.connect(self._choose_frames_directory)
+        layout.addWidget(browse_button)
+        return row
+
+    def _pdb_frames_row(self) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.pdb_frames_dir_edit, stretch=1)
+
+        browse_button = QPushButton("Browse…")
+        browse_button.clicked.connect(self._choose_pdb_frames_directory)
+        layout.addWidget(browse_button)
+        return row
+
+    @staticmethod
+    def _cluster_preparation_tooltip_text() -> str:
+        return (
+            "Prep steps: first extract frames from the MD trajectory in "
+            "mdtrajectory, optionally convert those XYZ frames to PDB with "
+            "xyz2pdb, then run cluster extraction, and finally choose the "
+            "resulting folders below."
+        )
+
+    def _prep_help_button(self, tooltip: str) -> QToolButton:
+        button = QToolButton()
+        button.setText("?")
+        button.setToolTip(tooltip)
+        button.setAutoRaise(True)
+        return button
+
+    def _cluster_preparation_actions_row(self) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        tooltip = self._cluster_preparation_tooltip_text()
+
+        self.open_mdtrajectory_button = QPushButton(
+            "Open MD Trajectory Extraction"
+        )
+        self.open_mdtrajectory_button.clicked.connect(
+            self.open_mdtrajectory_requested.emit
+        )
+        self.open_mdtrajectory_help_button = self._prep_help_button(tooltip)
+        self.open_xyz2pdb_button = QPushButton("Open XYZ -> PDB Conversion")
+        self.open_xyz2pdb_button.clicked.connect(
+            self.open_xyz2pdb_requested.emit
+        )
+        self.open_xyz2pdb_help_button = self._prep_help_button(tooltip)
+        self.open_cluster_button = QPushButton("Open Cluster Extraction")
+        self.open_cluster_button.clicked.connect(
+            self.open_cluster_requested.emit
+        )
+        self.open_cluster_help_button = self._prep_help_button(tooltip)
+
+        layout.addWidget(self.open_mdtrajectory_button)
+        layout.addWidget(self.open_mdtrajectory_help_button)
+        layout.addSpacing(8)
+        layout.addWidget(self.open_xyz2pdb_button)
+        layout.addWidget(self.open_xyz2pdb_help_button)
+        layout.addSpacing(8)
+        layout.addWidget(self.open_cluster_button)
+        layout.addWidget(self.open_cluster_help_button)
+        layout.addStretch(1)
+        return row
+
     def _elements_row(self) -> QWidget:
         row = QWidget()
         layout = QHBoxLayout(row)
@@ -731,14 +886,16 @@ class ProjectSetupTab(QWidget):
         layout.addWidget(self.available_elements_list, stretch=1)
 
         button_row = QVBoxLayout()
-        add_button = QPushButton("Add Selected")
-        add_button.clicked.connect(self._add_selected_elements_to_exclude)
-        remove_button = QPushButton("Remove Selected")
-        remove_button.clicked.connect(
+        self.exclude_selected_elements_button = QPushButton("Exclude Selected")
+        self.exclude_selected_elements_button.clicked.connect(
+            self._add_selected_elements_to_exclude
+        )
+        self.include_selected_elements_button = QPushButton("Include Selected")
+        self.include_selected_elements_button.clicked.connect(
             self._remove_selected_elements_from_exclude
         )
-        button_row.addWidget(add_button)
-        button_row.addWidget(remove_button)
+        button_row.addWidget(self.exclude_selected_elements_button)
+        button_row.addWidget(self.include_selected_elements_button)
         button_row.addStretch(1)
         layout.addLayout(button_row)
         return row
@@ -755,12 +912,15 @@ class ProjectSetupTab(QWidget):
             and self.computed_distribution_combo.count() > 0
             and self.selected_distribution_id() is not None
         )
+        self.view_contrast_distribution_button.setEnabled(
+            bool(selected and self._active_contrast_view_available)
+        )
         self.prior_mode_combo.setEnabled(selected)
         self.generate_prior_plot_button.setEnabled(selected)
         self.save_prior_png_button.setEnabled(selected)
         self.save_component_plot_data_button.setEnabled(selected)
         self.save_prior_plot_data_button.setEnabled(selected)
-        self.save_project_button.setEnabled(selected)
+        self._update_template_change_state()
         self._update_prior_control_state()
         if not selected:
             self._experimental_summary = None
@@ -768,160 +928,207 @@ class ProjectSetupTab(QWidget):
         self._refresh_data_status_labels()
         self._apply_model_only_mode_state()
 
+    @contextmanager
+    def batch_preview_updates(self):
+        self._preview_update_suspend_depth += 1
+        try:
+            yield
+        finally:
+            self._preview_update_suspend_depth = max(
+                self._preview_update_suspend_depth - 1,
+                0,
+            )
+            if self._preview_update_suspend_depth == 0:
+                self._flush_pending_preview_updates()
+
+    def _preview_updates_suspended(self) -> bool:
+        return self._preview_update_suspend_depth > 0
+
+    def _flush_pending_preview_updates(self) -> None:
+        if self._preview_updates_suspended():
+            return
+        redraw_saxs = self._pending_saxs_preview_redraw
+        redraw_prior = self._pending_prior_preview_redraw
+        self._pending_saxs_preview_redraw = False
+        self._pending_prior_preview_redraw = False
+        if redraw_saxs:
+            self._redraw_saxs_preview()
+        if redraw_prior:
+            self.draw_prior_plot(self._current_prior_json_path)
+
     def set_project_settings(
         self,
         settings: ProjectSettings,
         template_specs: list[TemplateSpec],
     ) -> None:
-        resolved_project_dir = Path(settings.project_dir).expanduser()
-        self.project_name_edit.setText(resolved_project_dir.name)
-        self.project_dir_edit.setText(str(resolved_project_dir.parent))
-        self.open_project_dir_edit.setText(settings.project_dir)
-        self.clusters_dir_edit.setText(settings.clusters_dir or "")
-        self.set_use_predicted_structure_weights(
-            settings.use_predicted_structure_weights
-        )
-        displayed_data_path = settings.experimental_data_path or (
-            settings.copied_experimental_data_file or ""
-        )
-        loadable_data_path = (
-            settings.copied_experimental_data_file
-            or settings.experimental_data_path
-            or ""
-        )
-        displayed_solvent_path = settings.solvent_data_path or (
-            settings.copied_solvent_data_file or ""
-        )
-        loadable_solvent_path = (
-            settings.copied_solvent_data_file
-            or settings.solvent_data_path
-            or ""
-        )
-        self.experimental_data_edit.setText(displayed_data_path)
-        self.solvent_data_edit.setText(displayed_solvent_path)
-        self._experimental_header_rows = int(
-            settings.experimental_header_rows or 0
-        )
-        self._experimental_q_column = settings.experimental_q_column
-        self._experimental_intensity_column = (
-            settings.experimental_intensity_column
-        )
-        self._experimental_error_column = settings.experimental_error_column
-        self._solvent_header_rows = int(settings.solvent_header_rows or 0)
-        self._solvent_q_column = settings.solvent_q_column
-        self._solvent_intensity_column = settings.solvent_intensity_column
-        self._solvent_error_column = settings.solvent_error_column
-        self.set_model_only_mode(settings.model_only_mode)
-        self.qmin_edit.setText(
-            "" if settings.q_min is None else f"{settings.q_min:g}"
-        )
-        self.qmax_edit.setText(
-            "" if settings.q_max is None else f"{settings.q_max:g}"
-        )
-        self.use_experimental_grid_checkbox.setChecked(
-            settings.use_experimental_grid
-        )
-        self.resample_points_spin.setValue(settings.q_points or 500)
-        self.exclude_elements_edit.setText(" ".join(settings.exclude_elements))
-        self._component_color_overrides = dict(settings.component_trace_colors)
-        self.set_component_trace_color_scheme(
-            settings.component_trace_color_scheme
-        )
-        self.set_experimental_trace_settings(
-            visible=settings.experimental_trace_visible,
-            color=settings.experimental_trace_color,
-        )
-        self.set_solvent_trace_settings(
-            visible=settings.solvent_trace_visible,
-            color=settings.solvent_trace_color,
-        )
-        self.set_available_elements(settings.available_elements)
-        self.set_available_templates(
-            template_specs,
-            settings.selected_model_template,
-        )
-
-        if settings.cluster_inventory_rows:
-            self._recognized_cluster_rows = list(
-                settings.cluster_inventory_rows
+        with self.batch_preview_updates():
+            resolved_project_dir = Path(settings.project_dir).expanduser()
+            self.project_name_edit.setText(resolved_project_dir.name)
+            self.project_dir_edit.setText(str(resolved_project_dir.parent))
+            self.open_project_dir_edit.setText(settings.project_dir)
+            self.frames_dir_edit.setText(settings.frames_dir or "")
+            self.pdb_frames_dir_edit.setText(settings.pdb_frames_dir or "")
+            self.clusters_dir_edit.setText(settings.clusters_dir or "")
+            self.set_use_predicted_structure_weights(
+                settings.use_predicted_structure_weights
             )
-            self._populate_recognized_clusters_table(
-                self._recognized_cluster_rows
+            displayed_data_path = settings.experimental_data_path or (
+                settings.copied_experimental_data_file or ""
             )
-        elif settings.clusters_dir:
-            self._recognized_cluster_rows = []
-            self._populate_recognized_clusters_table([])
-        else:
-            self._recognized_cluster_rows = []
-            self.set_available_elements([])
-            self._populate_recognized_clusters_table([])
-        self._update_secondary_filter_options(
-            settings.available_elements,
-            self._recognized_cluster_rows,
-        )
+            loadable_data_path = (
+                settings.copied_experimental_data_file
+                or settings.experimental_data_path
+                or ""
+            )
+            displayed_solvent_path = settings.solvent_data_path or (
+                settings.copied_solvent_data_file or ""
+            )
+            loadable_solvent_path = (
+                settings.copied_solvent_data_file
+                or settings.solvent_data_path
+                or ""
+            )
+            self.experimental_data_edit.setText(displayed_data_path)
+            self.solvent_data_edit.setText(displayed_solvent_path)
+            self._experimental_header_rows = int(
+                settings.experimental_header_rows or 0
+            )
+            self._experimental_q_column = settings.experimental_q_column
+            self._experimental_intensity_column = (
+                settings.experimental_intensity_column
+            )
+            self._experimental_error_column = (
+                settings.experimental_error_column
+            )
+            self._solvent_header_rows = int(settings.solvent_header_rows or 0)
+            self._solvent_q_column = settings.solvent_q_column
+            self._solvent_intensity_column = settings.solvent_intensity_column
+            self._solvent_error_column = settings.solvent_error_column
+            self.set_model_only_mode(settings.model_only_mode)
+            self.qmin_edit.setText(
+                "" if settings.q_min is None else f"{settings.q_min:g}"
+            )
+            self.qmax_edit.setText(
+                "" if settings.q_max is None else f"{settings.q_max:g}"
+            )
+            self.use_experimental_grid_checkbox.setChecked(
+                settings.use_experimental_grid
+            )
+            self.resample_points_spin.setValue(settings.q_points or 500)
+            self.exclude_elements_edit.setText(
+                " ".join(settings.exclude_elements)
+            )
+            self._component_color_overrides = dict(
+                settings.component_trace_colors
+            )
+            self.set_component_trace_color_scheme(
+                settings.component_trace_color_scheme
+            )
+            self.set_experimental_trace_settings(
+                visible=settings.experimental_trace_visible,
+                color=settings.experimental_trace_color,
+            )
+            self.set_solvent_trace_settings(
+                visible=settings.solvent_trace_visible,
+                color=settings.solvent_trace_color,
+            )
+            self.set_available_elements(settings.available_elements)
+            self.set_available_templates(
+                template_specs,
+                settings.selected_model_template,
+                active_name=settings.selected_model_template,
+            )
+            self.set_component_build_mode(settings.component_build_mode)
 
-        if loadable_data_path:
-            try:
-                summary = self._load_experimental_summary_from_path(
-                    Path(loadable_data_path),
-                    self._experimental_header_rows,
-                    q_column=self._experimental_q_column,
-                    intensity_column=self._experimental_intensity_column,
-                    error_column=self._experimental_error_column,
+            if settings.cluster_inventory_rows:
+                self._recognized_cluster_rows = list(
+                    settings.cluster_inventory_rows
                 )
-            except Exception:
+                self._populate_recognized_clusters_table(
+                    self._recognized_cluster_rows
+                )
+            elif settings.clusters_dir:
+                self._recognized_cluster_rows = []
+                self._populate_recognized_clusters_table([])
+            else:
+                self._recognized_cluster_rows = []
+                self.set_available_elements([])
+                self._populate_recognized_clusters_table([])
+            self._update_secondary_filter_options(
+                settings.available_elements,
+                self._recognized_cluster_rows,
+            )
+
+            if loadable_data_path:
+                try:
+                    summary = self._load_experimental_summary_from_path(
+                        Path(loadable_data_path),
+                        self._experimental_header_rows,
+                        q_column=self._experimental_q_column,
+                        intensity_column=self._experimental_intensity_column,
+                        error_column=self._experimental_error_column,
+                    )
+                except Exception:
+                    self._experimental_summary = None
+                    self.data_status_label.setText(
+                        "Experimental data selected.\n"
+                        "Parsing will be retried when you build the project."
+                    )
+                else:
+                    self._apply_experimental_file(
+                        Path(displayed_data_path),
+                        summary,
+                        force_recommended_q_range=(
+                            settings.q_min is None and settings.q_max is None
+                        ),
+                        log_to_activity=False,
+                        emit_project_change=False,
+                    )
+            else:
                 self._experimental_summary = None
-                self.data_status_label.setText(
-                    "Experimental data selected.\n"
-                    "Parsing will be retried when you build the project."
-                )
+            if loadable_solvent_path:
+                try:
+                    solvent_summary = self._load_solvent_summary_from_path(
+                        Path(loadable_solvent_path),
+                        self._solvent_header_rows,
+                        q_column=self._solvent_q_column,
+                        intensity_column=self._solvent_intensity_column,
+                        error_column=self._solvent_error_column,
+                    )
+                except Exception:
+                    self._solvent_summary = None
+                    self.solvent_status_label.setText(
+                        "Solvent data selected.\n"
+                        "Parsing will be retried when the project is built."
+                    )
+                else:
+                    self._apply_solvent_file(
+                        Path(displayed_solvent_path),
+                        solvent_summary,
+                        log_to_activity=False,
+                        emit_project_change=False,
+                    )
             else:
-                self._apply_experimental_file(
-                    Path(displayed_data_path),
-                    summary,
-                    force_recommended_q_range=(
-                        settings.q_min is None and settings.q_max is None
-                    ),
-                    log_to_activity=False,
-                    emit_project_change=False,
-                )
-        else:
-            self._experimental_summary = None
-        if loadable_solvent_path:
-            try:
-                solvent_summary = self._load_solvent_summary_from_path(
-                    Path(loadable_solvent_path),
-                    self._solvent_header_rows,
-                    q_column=self._solvent_q_column,
-                    intensity_column=self._solvent_intensity_column,
-                    error_column=self._solvent_error_column,
-                )
-            except Exception:
                 self._solvent_summary = None
-                self.solvent_status_label.setText(
-                    "Solvent data selected.\n"
-                    "Parsing will be retried when the project is built."
-                )
-            else:
-                self._apply_solvent_file(
-                    Path(displayed_solvent_path),
-                    solvent_summary,
-                    log_to_activity=False,
-                    emit_project_change=False,
-                )
-        else:
-            self._solvent_summary = None
-        self._refresh_data_status_labels()
-        self._apply_model_only_mode_state()
-        self._update_data_trace_control_state()
-        self._redraw_saxs_preview()
+            self._refresh_data_status_labels()
+            self._apply_model_only_mode_state()
+            self._update_data_trace_control_state()
+            self._redraw_saxs_preview()
 
     def set_available_templates(
         self,
         template_specs: list[TemplateSpec],
         selected_name: str | None,
+        *,
+        active_name: str | None = None,
     ) -> None:
         current_name = selected_name or self.selected_template_name()
+        resolved_active_name = (
+            active_name
+            or self._active_template_name
+            or (current_name if self.model_group.isEnabled() else None)
+        )
+        self._suspend_template_selection_signal = True
         self.template_combo.blockSignals(True)
         self.template_combo.clear()
         for spec in template_specs:
@@ -937,7 +1144,9 @@ class ProjectSetupTab(QWidget):
             if index >= 0:
                 self.template_combo.setCurrentIndex(index)
         self.template_combo.blockSignals(False)
+        self.set_active_template(resolved_active_name)
         self._on_template_combo_changed()
+        self._suspend_template_selection_signal = False
 
     def set_available_elements(self, elements: list[str]) -> None:
         current_exclude = set(self.exclude_elements())
@@ -953,13 +1162,73 @@ class ProjectSetupTab(QWidget):
         )
 
     def _update_active_template_field(self) -> None:
-        active_text = self.template_combo.currentText().strip()
+        active_text = self._template_display_text(self._active_template_name)
         self.active_template_edit.setText(active_text)
+        self.active_template_edit.setToolTip(active_text)
+
+    def _update_template_change_state(self) -> None:
+        selected_name = self.selected_template_name()
+        active_name = self.active_template_name()
+        has_project = self.model_group.isEnabled()
+        can_change = bool(
+            has_project and selected_name and selected_name != active_name
+        )
+        self.change_template_button.setEnabled(can_change)
+
+    def _emit_change_template_requested(self) -> None:
+        selected_name = self.selected_template_name()
+        if not selected_name:
+            return
+        self.change_template_requested.emit(selected_name)
+
+    def _template_display_text(self, template_name: str | None) -> str:
+        normalized_name = str(template_name or "").strip()
+        if not normalized_name:
+            return ""
+        index = self._find_template_index(normalized_name)
+        if index >= 0:
+            return self.template_combo.itemText(index).strip()
+        return normalized_name
+
+    def active_template_name(self) -> str | None:
+        return str(self._active_template_name or "").strip() or None
+
+    def set_active_template(
+        self,
+        template_name: str | None,
+        *,
+        sync_selected: bool = False,
+    ) -> None:
+        self._active_template_name = str(template_name or "").strip() or None
+        self._update_active_template_field()
+        if sync_selected and self._active_template_name:
+            self.set_selected_template(self._active_template_name)
+        self._update_template_change_state()
 
     def selected_template_name(self) -> str | None:
         if self.template_combo.count() == 0:
             return None
         return str(self.template_combo.currentData() or "").strip() or None
+
+    def set_selected_template(
+        self,
+        template_name: str | None,
+        *,
+        emit_signal: bool = False,
+    ) -> None:
+        selected = str(template_name or "").strip()
+        index = self._find_template_index(selected)
+        if index < 0:
+            return
+        if emit_signal:
+            self.template_combo.setCurrentIndex(index)
+            return
+        self._suspend_template_selection_signal = True
+        self.template_combo.blockSignals(True)
+        self.template_combo.setCurrentIndex(index)
+        self.template_combo.blockSignals(False)
+        self._suspend_template_selection_signal = False
+        self._on_template_combo_changed()
 
     def set_available_distributions(
         self,
@@ -993,6 +1262,20 @@ class ProjectSetupTab(QWidget):
             self.model_group.isEnabled()
             and self.selected_distribution_id() is not None
         )
+        self.view_contrast_distribution_button.setEnabled(
+            self.model_group.isEnabled()
+            and self._active_contrast_view_available
+        )
+
+    def set_active_contrast_distribution_view_available(
+        self,
+        available: bool,
+    ) -> None:
+        self._active_contrast_view_available = bool(available)
+        self.view_contrast_distribution_button.setEnabled(
+            self.model_group.isEnabled()
+            and self._active_contrast_view_available
+        )
 
     def selected_distribution_id(self) -> str | None:
         if self.computed_distribution_combo.count() <= 0:
@@ -1000,6 +1283,29 @@ class ProjectSetupTab(QWidget):
         return (
             str(self.computed_distribution_combo.currentData() or "").strip()
             or None
+        )
+
+    def component_build_mode(self) -> str:
+        return normalize_component_build_mode(
+            self.component_build_mode_combo.currentData()
+        )
+
+    def set_component_build_mode(self, mode: str | None) -> None:
+        normalized_mode = normalize_component_build_mode(mode)
+        target_index = self.component_build_mode_combo.findData(
+            normalized_mode
+        )
+        if target_index < 0:
+            target_index = self.component_build_mode_combo.findData(
+                COMPONENT_BUILD_MODE_NO_CONTRAST
+            )
+        if target_index < 0:
+            target_index = 0
+        self.component_build_mode_combo.blockSignals(True)
+        self.component_build_mode_combo.setCurrentIndex(target_index)
+        self.component_build_mode_combo.blockSignals(False)
+        self.component_build_mode_label.setText(
+            f"Component build mode ({component_build_mode_label(normalized_mode)})"
         )
 
     def show_deprecated_templates(self) -> bool:
@@ -1064,6 +1370,14 @@ class ProjectSetupTab(QWidget):
 
     def clusters_dir(self) -> Path | None:
         text = self.clusters_dir_edit.text().strip()
+        return Path(text).expanduser() if text else None
+
+    def frames_dir(self) -> Path | None:
+        text = self.frames_dir_edit.text().strip()
+        return Path(text).expanduser() if text else None
+
+    def pdb_frames_dir(self) -> Path | None:
+        text = self.pdb_frames_dir_edit.text().strip()
         return Path(text).expanduser() if text else None
 
     def experimental_data_path(self) -> Path | None:
@@ -1425,6 +1739,10 @@ class ProjectSetupTab(QWidget):
 
     def draw_component_plot(self, component_paths: list[Path] | None) -> None:
         self._component_paths = component_paths
+        if self._preview_updates_suspended():
+            self._pending_saxs_preview_redraw = True
+            self._pending_prior_preview_redraw = True
+            return
         self._redraw_saxs_preview()
         self._redraw_prior_preview_if_needed()
 
@@ -1496,6 +1814,9 @@ class ProjectSetupTab(QWidget):
         self.activity_progress_bar.setFormat("%v / %m items")
 
     def _redraw_saxs_preview(self) -> None:
+        if self._preview_updates_suspended():
+            self._pending_saxs_preview_redraw = True
+            return
         for axis in list(self.component_figure.axes):
             try:
                 axis.set_xscale("linear")
@@ -1623,6 +1944,9 @@ class ProjectSetupTab(QWidget):
             if json_path is not None
             else None
         )
+        if self._preview_updates_suspended():
+            self._pending_prior_preview_redraw = True
+            return
         self.prior_figure.clear()
         if json_path is None:
             axis = self.prior_figure.add_subplot(111)
@@ -1953,6 +2277,30 @@ class ProjectSetupTab(QWidget):
         self.clusters_dir_edit.setText(selected)
         self.request_cluster_scan()
         self.autosave_project_requested.emit("selected a new clusters folder")
+
+    def _choose_frames_directory(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Select extracted frames folder",
+            self.frames_dir_edit.text().strip() or str(Path.home()),
+        )
+        if not selected:
+            return
+        self.frames_dir_edit.setText(selected)
+        self.autosave_project_requested.emit("selected a new frames folder")
+
+    def _choose_pdb_frames_directory(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Select PDB structure folder",
+            self.pdb_frames_dir_edit.text().strip() or str(Path.home()),
+        )
+        if not selected:
+            return
+        self.pdb_frames_dir_edit.setText(selected)
+        self.autosave_project_requested.emit(
+            "selected a new PDB structure folder"
+        )
 
     def _choose_experimental_file(self) -> None:
         file_path, _selected_filter = QFileDialog.getOpenFileName(
@@ -2336,6 +2684,26 @@ class ProjectSetupTab(QWidget):
                 "cleared the clusters folder reference"
             )
 
+    def _on_frames_dir_edited(self) -> None:
+        if self.frames_dir() is not None:
+            self.autosave_project_requested.emit(
+                "updated the frames folder reference"
+            )
+        else:
+            self.autosave_project_requested.emit(
+                "cleared the frames folder reference"
+            )
+
+    def _on_pdb_frames_dir_edited(self) -> None:
+        if self.pdb_frames_dir() is not None:
+            self.autosave_project_requested.emit(
+                "updated the PDB structure folder reference"
+            )
+        else:
+            self.autosave_project_requested.emit(
+                "cleared the PDB structure folder reference"
+            )
+
     def _on_model_only_mode_toggled(self, enabled: bool) -> None:
         if enabled and self.use_experimental_grid_checkbox.isChecked():
             self.use_experimental_grid_checkbox.setChecked(False)
@@ -2443,6 +2811,9 @@ class ProjectSetupTab(QWidget):
 
     def _redraw_prior_preview_if_needed(self) -> None:
         if self._current_prior_json_path is None:
+            return
+        if self._preview_updates_suspended():
+            self._pending_prior_preview_redraw = True
             return
         self.draw_prior_plot(self._current_prior_json_path)
 
@@ -3286,11 +3657,14 @@ class ProjectSetupTab(QWidget):
         return f"{truncated:.{places}f}"
 
     def _on_template_combo_changed(self) -> None:
-        self._update_active_template_field()
         description = str(
             self.template_combo.currentData(Qt.ItemDataRole.ToolTipRole) or ""
         ).strip()
         self.template_combo.setToolTip(description)
+        self._update_template_change_state()
+        selected_name = self.selected_template_name()
+        if selected_name and not self._suspend_template_selection_signal:
+            self.template_selection_changed.emit(selected_name)
 
     def _find_template_index(self, template_name: str) -> int:
         for index in range(self.template_combo.count()):

@@ -612,6 +612,17 @@ def _structure_files_in_dir(directory: Path) -> list[Path]:
     )
 
 
+def _cluster_bin_progress_label(cluster_bin: ClusterBin) -> str:
+    if cluster_bin.motif == "no_motif":
+        return cluster_bin.structure
+    return f"{cluster_bin.structure}/{cluster_bin.motif}"
+
+
+def _estimated_pair_count(atom_count: float) -> float:
+    normalized = max(float(atom_count), 0.0)
+    return float(normalized * max(normalized - 1.0, 0.0) / 2.0)
+
+
 class DebyeProfileBuilder:
     """Average Debye scattering profiles using the legacy
     SAXSClusterAverager calculation."""
@@ -668,6 +679,7 @@ class DebyeProfileBuilder:
         processed_files = 0
         last_progress_report = -1
         for cluster_bin in active_cluster_bins:
+            cluster_label = _cluster_bin_progress_label(cluster_bin)
             single_atom_component = (
                 self._try_build_assumed_single_atom_component(cluster_bin)
             )
@@ -682,18 +694,18 @@ class DebyeProfileBuilder:
                     progress_callback(
                         progress_offset + processed_files,
                         max(progress_total or total_files or 1, 1),
-                        (
-                            "Building SAXS components: "
-                            f"{cluster_bin.structure}/{cluster_bin.motif}"
-                        ),
+                        ("Building SAXS components: " f"{cluster_label}"),
                     )
                 components.append(single_atom_component)
                 continue
 
             filtered_structures: list[tuple[np.ndarray, list[str]]] = []
             unique_elements: list[str] = []
+            loaded_atom_counts: list[int] = []
+            kept_atom_counts: list[int] = []
             for file_path in cluster_bin.files:
                 coords, elements = load_structure_file(file_path)
+                loaded_atom_counts.append(len(elements))
                 filtered = self._filter_atoms(coords, elements)
                 processed_files += 1
                 if progress_callback is not None and _should_emit_progress(
@@ -705,14 +717,13 @@ class DebyeProfileBuilder:
                     progress_callback(
                         progress_offset + processed_files,
                         max(progress_total or total_files or 1, 1),
-                        (
-                            "Building SAXS components: "
-                            f"{cluster_bin.structure}/{cluster_bin.motif}"
-                        ),
+                        ("Building SAXS components: " f"{cluster_label}"),
                     )
                 if filtered is None:
+                    kept_atom_counts.append(0)
                     continue
                 filtered_coords, filtered_elements = filtered
+                kept_atom_counts.append(len(filtered_elements))
                 filtered_structures.append(
                     (filtered_coords, filtered_elements)
                 )
@@ -729,6 +740,35 @@ class DebyeProfileBuilder:
             mean_trace = stacked.mean(axis=0)
             std_trace = stacked.std(axis=0)
             se_trace = std_trace / np.sqrt(stacked.shape[0])
+            if progress_callback is not None and kept_atom_counts:
+                average_loaded_atoms = float(
+                    np.mean(np.asarray(loaded_atom_counts, dtype=float))
+                )
+                average_kept_atoms = float(
+                    np.mean(np.asarray(kept_atom_counts, dtype=float))
+                )
+                excluded_fraction = (
+                    max(
+                        average_loaded_atoms - average_kept_atoms,
+                        0.0,
+                    )
+                    / average_loaded_atoms
+                    if average_loaded_atoms > 0.0
+                    else 0.0
+                )
+                average_pair_count = _estimated_pair_count(average_kept_atoms)
+                progress_callback(
+                    progress_offset + processed_files,
+                    max(progress_total or total_files or 1, 1),
+                    (
+                        "Building SAXS components: "
+                        f"{cluster_label} | avg kept N={average_kept_atoms:.1f} "
+                        "atoms/structure after exclusion "
+                        f"(loaded avg {average_loaded_atoms:.1f}, "
+                        f"{excluded_fraction * 100.0:.1f}% excluded) | "
+                        f"avg pairs ~{average_pair_count:,.1f}"
+                    ),
+                )
             components.append(
                 self._build_component(
                     cluster_bin,

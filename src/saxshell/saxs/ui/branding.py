@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
 import sys
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import unquote_to_bytes
+from xml.etree import ElementTree
 
-from PySide6.QtCore import QCoreApplication, QEvent, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -22,6 +25,16 @@ BRAND_SECONDARY_HEX = "#4f6074"
 BRAND_ICON_MIN_SIZE = 34
 BRAND_ICON_MAX_SIZE = 34
 BRAND_TITLE_MAX_POINT_SIZE = 13.5
+BRAND_ICON_MAX_ASPECT_RATIO = 3.0
+_SVG_NAMESPACE = "{http://www.w3.org/2000/svg}"
+_XLINK_HREF = "{http://www.w3.org/1999/xlink}href"
+_NON_DRAWING_SVG_TAGS = {
+    f"{_SVG_NAMESPACE}defs",
+    f"{_SVG_NAMESPACE}desc",
+    f"{_SVG_NAMESPACE}metadata",
+    f"{_SVG_NAMESPACE}style",
+    f"{_SVG_NAMESPACE}title",
+}
 
 
 def saxshell_icon_path() -> Path:
@@ -32,9 +45,117 @@ def saxshell_icon_path() -> Path:
     )
 
 
+def _decode_data_uri_image(data_uri: str) -> bytes | None:
+    metadata, separator, data = data_uri.partition(",")
+    if separator == "":
+        return None
+    if ";base64" in metadata:
+        try:
+            return base64.b64decode("".join(data.split()))
+        except ValueError:
+            return None
+    return unquote_to_bytes(data)
+
+
+def _trim_transparent_padding(pixmap: QPixmap) -> QPixmap:
+    image = pixmap.toImage()
+    min_x = image.width()
+    min_y = image.height()
+    max_x = -1
+    max_y = -1
+
+    for y in range(image.height()):
+        for x in range(image.width()):
+            if image.pixelColor(x, y).alpha() <= 0:
+                continue
+            min_x = min(min_x, x)
+            min_y = min(min_y, y)
+            max_x = max(max_x, x)
+            max_y = max(max_y, y)
+
+    if max_x < min_x or max_y < min_y:
+        return pixmap
+    if (
+        min_x == 0
+        and min_y == 0
+        and max_x == image.width() - 1
+        and max_y == image.height() - 1
+    ):
+        return pixmap
+
+    return pixmap.copy(min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
+
+
+def _load_embedded_svg_raster_pixmap(path: Path) -> QPixmap | None:
+    try:
+        root = ElementTree.fromstring(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ElementTree.ParseError):
+        return None
+
+    image_element: ElementTree.Element | None = None
+    for element in root.iter():
+        if element is root:
+            continue
+        if element.tag == f"{_SVG_NAMESPACE}image":
+            if image_element is not None:
+                return None
+            image_element = element
+            continue
+        if element.tag not in _NON_DRAWING_SVG_TAGS:
+            return None
+
+    if image_element is None:
+        return None
+
+    href = image_element.get("href") or image_element.get(_XLINK_HREF)
+    if not href or not href.startswith("data:image/"):
+        return None
+
+    image_bytes = _decode_data_uri_image(href)
+    if image_bytes is None:
+        return None
+
+    pixmap = QPixmap()
+    if not pixmap.loadFromData(image_bytes):
+        return None
+    return _trim_transparent_padding(pixmap)
+
+
+def _load_embedded_svg_raster_icon(path: Path) -> QIcon | None:
+    pixmap = _load_embedded_svg_raster_pixmap(path)
+    if pixmap is None:
+        return None
+    return QIcon(pixmap)
+
+
 @lru_cache(maxsize=1)
 def load_saxshell_icon() -> QIcon:
-    return QIcon(str(saxshell_icon_path()))
+    path = saxshell_icon_path()
+    if path.suffix.lower() == ".svg":
+        # Qt's SVG handler warns on embedded raster data URIs even though it
+        # still renders them, so decode that case ourselves first.
+        embedded_icon = _load_embedded_svg_raster_icon(path)
+        if embedded_icon is not None:
+            return embedded_icon
+    return QIcon(str(path))
+
+
+def load_saxshell_brand_pixmap(target_height: int) -> QPixmap:
+    target_height = max(1, int(target_height))
+    path = saxshell_icon_path()
+    if path.suffix.lower() == ".svg":
+        embedded_pixmap = _load_embedded_svg_raster_pixmap(path)
+        if embedded_pixmap is not None:
+            return embedded_pixmap.scaledToHeight(
+                target_height,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+
+    max_width = max(
+        target_height,
+        round(target_height * BRAND_ICON_MAX_ASPECT_RATIO),
+    )
+    return load_saxshell_icon().pixmap(QSize(max_width, target_height))
 
 
 class SAXShellBrandWidget(QWidget):
@@ -110,10 +231,15 @@ class SAXShellBrandWidget(QWidget):
         icon_size = max(
             BRAND_ICON_MIN_SIZE, min(BRAND_ICON_MAX_SIZE, icon_size)
         )
-        self._icon_label.setPixmap(
-            load_saxshell_icon().pixmap(icon_size, icon_size)
+        icon_pixmap = load_saxshell_brand_pixmap(icon_size)
+        icon_width = round(
+            icon_pixmap.width() / icon_pixmap.devicePixelRatio()
         )
-        self._icon_label.setFixedSize(icon_size, icon_size)
+        icon_height = round(
+            icon_pixmap.height() / icon_pixmap.devicePixelRatio()
+        )
+        self._icon_label.setPixmap(icon_pixmap)
+        self._icon_label.setFixedSize(icon_width, icon_height)
 
         layout_size = self._layout.sizeHint()
         self.setMinimumWidth(layout_size.width())

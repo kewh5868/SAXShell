@@ -130,6 +130,7 @@ class DreamTab(QWidget):
     preview_runtime_requested = Signal()
     run_dream_requested = Signal()
     load_results_requested = Signal()
+    preview_saved_run_requested = Signal()
     save_report_requested = Signal()
     recycle_output_requested = Signal()
     export_model_report_requested = Signal()
@@ -1169,6 +1170,16 @@ class DreamTab(QWidget):
             "results for inspection."
         )
         self.saved_runs_combo.setEnabled(False)
+        self.preview_saved_run_button = QPushButton("Preview Settings")
+        self.preview_saved_run_button.setToolTip(
+            "Open a preview window for the selected saved DREAM run so you "
+            "can inspect its saved settings and prior parameter map before "
+            "loading the run."
+        )
+        self.preview_saved_run_button.clicked.connect(
+            self.preview_saved_run_requested.emit
+        )
+        self.preview_saved_run_button.setEnabled(False)
         self.load_button = QPushButton("Load Selected Run")
         self.load_button.setToolTip(
             "Load the selected DREAM run from the active project runtime "
@@ -1202,8 +1213,11 @@ class DreamTab(QWidget):
         )
         self.analysis_actions_group = QGroupBox("DREAM Analysis")
         analysis_layout = QGridLayout(self.analysis_actions_group)
+        analysis_layout.setColumnStretch(1, 1)
+        analysis_layout.setColumnStretch(2, 1)
         analysis_layout.addWidget(QLabel("Saved run"), 0, 0)
         analysis_layout.addWidget(self.saved_runs_combo, 0, 1, 1, 2)
+        analysis_layout.addWidget(self.preview_saved_run_button, 0, 3)
         analysis_layout.addWidget(self.load_button, 1, 0)
         analysis_layout.addWidget(self.report_button, 1, 1)
         analysis_layout.addWidget(self.recycle_button, 1, 2)
@@ -1212,7 +1226,7 @@ class DreamTab(QWidget):
             2,
             0,
             1,
-            3,
+            4,
         )
         return self.analysis_actions_group
 
@@ -1436,6 +1450,7 @@ class DreamTab(QWidget):
             self.saved_runs_combo.addItem(self.NO_SAVED_RUNS_LABEL, None)
             self.saved_runs_combo.setCurrentIndex(0)
             self.saved_runs_combo.setEnabled(False)
+            self.preview_saved_run_button.setEnabled(False)
             self.load_button.setEnabled(False)
             self.saved_runs_combo.blockSignals(False)
             return
@@ -1450,6 +1465,7 @@ class DreamTab(QWidget):
         else:
             self.saved_runs_combo.setCurrentIndex(0)
         self.saved_runs_combo.setEnabled(True)
+        self.preview_saved_run_button.setEnabled(True)
         self.load_button.setEnabled(True)
         self.saved_runs_combo.blockSignals(False)
 
@@ -1458,6 +1474,12 @@ class DreamTab(QWidget):
         if value is None:
             return None
         text = str(value).strip()
+        return text or None
+
+    def selected_saved_run_label(self) -> str | None:
+        if self.selected_saved_run_dir() is None:
+            return None
+        text = self.saved_runs_combo.currentText().strip()
         return text or None
 
     def set_settings(
