@@ -19,11 +19,6 @@ from saxshell.toolbox.blender.common import (
     normalize_element_symbol,
     normalize_lighting_level,
 )
-from saxshell.toolbox.blender.workflow import (
-    BlenderXYZRenderSettings,
-    BlenderXYZRenderWorkflow,
-    build_render_output_paths,
-)
 from saxshell.toolbox.blender.ui.reference_atoms import (
     REFERENCE_ATOM_ELEMENTS,
     REFERENCE_ATOM_RENDER_QUALITY,
@@ -32,14 +27,17 @@ from saxshell.toolbox.blender.ui.reference_atoms import (
     reference_atom_key,
     reference_atom_path,
 )
+from saxshell.toolbox.blender.workflow import (
+    BlenderXYZRenderSettings,
+    BlenderXYZRenderWorkflow,
+    build_render_output_paths,
+)
 
 
 def _write_reference_xyz(path: Path, *, element: str) -> Path:
     symbol = normalize_element_symbol(element)
     path.write_text(
-        "1\n"
-        f"{symbol} Reference\n"
-        f"{symbol} 0.0 0.0 0.0\n",
+        "1\n" f"{symbol} Reference\n" f"{symbol} 0.0 0.0 0.0\n",
         encoding="utf-8",
     )
     return path
@@ -145,17 +143,12 @@ def main(argv: list[str] | None = None) -> int:
         else None
     )
     selected_lighting = (
-        tuple(
-            normalize_lighting_level(value)
-            for value in args.lighting_level
-        )
+        tuple(normalize_lighting_level(value) for value in args.lighting_level)
         if args.lighting_level
         else None
     )
     clean_all = (
-        not args.atom_style
-        and not args.lighting_level
-        and not args.element
+        not args.atom_style and not args.lighting_level and not args.element
     )
     if clean_all:
         for path in asset_dir.glob("*.png"):

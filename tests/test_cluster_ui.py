@@ -130,7 +130,9 @@ def test_definitions_panel_starts_blank_with_builtin_preset_available(qapp):
 
     assert panel.atom_type_definitions() == {}
     assert panel.pair_cutoff_definitions() == {}
-    assert f"{DEFAULT_CLUSTER_EXTRACTION_PRESET_NAME} (Built-in)" in preset_names
+    assert (
+        f"{DEFAULT_CLUSTER_EXTRACTION_PRESET_NAME} (Built-in)" in preset_names
+    )
 
     panel.load_preset(DEFAULT_CLUSTER_EXTRACTION_PRESET_NAME)
 

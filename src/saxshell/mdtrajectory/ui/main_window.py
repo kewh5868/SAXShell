@@ -264,8 +264,10 @@ class MDTrajectoryMainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if (
-            (self._inspect_thread is not None and self._inspect_thread.isRunning())
-            or (self._export_thread is not None and self._export_thread.isRunning())
+            self._inspect_thread is not None
+            and self._inspect_thread.isRunning()
+        ) or (
+            self._export_thread is not None and self._export_thread.isRunning()
         ):
             QMessageBox.warning(
                 self,
@@ -405,9 +407,7 @@ class MDTrajectoryMainWindow(QMainWindow):
             trajectory_file
             if trajectory_file is not None
             else (
-                None
-                if settings is None
-                else settings.resolved_trajectory_file
+                None if settings is None else settings.resolved_trajectory_file
             )
         )
         resolved_topology = (
@@ -723,9 +723,7 @@ class MDTrajectoryMainWindow(QMainWindow):
         reload_trajectory: bool = True,
     ) -> None:
         self._set_operation_busy(True, "Inspecting trajectory...")
-        self.export_panel.set_busy_progress(
-            "Inspection progress: starting..."
-        )
+        self.export_panel.set_busy_progress("Inspection progress: starting...")
         self._active_reload_trajectory = reload_trajectory
         self._inspect_thread = QThread(self)
         self._inspect_worker = InspectionWorker(
@@ -738,9 +736,7 @@ class MDTrajectoryMainWindow(QMainWindow):
         )
         self._inspect_worker.moveToThread(self._inspect_thread)
         self._inspect_thread.started.connect(self._inspect_worker.run)
-        self._inspect_worker.progress.connect(
-            self._handle_inspection_progress
-        )
+        self._inspect_worker.progress.connect(self._handle_inspection_progress)
         self._inspect_worker.metadata_ready.connect(
             self._handle_inspection_metadata
         )
@@ -761,9 +757,7 @@ class MDTrajectoryMainWindow(QMainWindow):
         post_cutoff_stride: int,
     ) -> None:
         self._set_operation_busy(True, "Exporting frames...")
-        self.export_panel.set_busy_progress(
-            "Export progress: starting..."
-        )
+        self.export_panel.set_busy_progress("Export progress: starting...")
         self._export_thread = QThread(self)
         self._export_worker = ExportWorker(
             manager=manager,
@@ -917,9 +911,7 @@ class MDTrajectoryMainWindow(QMainWindow):
             f"Stride: {self.state.stride}",
         ]
         if result.applied_cutoff_fs is not None:
-            lines.append(
-                f"Applied cutoff: {result.applied_cutoff_fs:.3f} fs"
-            )
+            lines.append(f"Applied cutoff: {result.applied_cutoff_fs:.3f} fs")
             lines.append(
                 "Post-cutoff frame interval: "
                 f"{self._resolved_post_cutoff_stride(min_time_fs=result.applied_cutoff_fs)}"

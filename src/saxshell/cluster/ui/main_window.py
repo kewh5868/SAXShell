@@ -410,8 +410,10 @@ class ClusterMainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if (
-            (self._inspect_thread is not None and self._inspect_thread.isRunning())
-            or (self._export_thread is not None and self._export_thread.isRunning())
+            self._inspect_thread is not None
+            and self._inspect_thread.isRunning()
+        ) or (
+            self._export_thread is not None and self._export_thread.isRunning()
         ):
             QMessageBox.warning(
                 self,
@@ -550,7 +552,10 @@ class ClusterMainWindow(QMainWindow):
         self._project_pdb_frames_dir = (
             None if settings is None else settings.resolved_pdb_frames_dir
         )
-        if self._project_xyz_frames_dir is None and self._project_pdb_frames_dir:
+        if (
+            self._project_xyz_frames_dir is None
+            and self._project_pdb_frames_dir
+        ):
             self._active_project_frames_kind = "pdb"
         elif (
             self._active_project_frames_kind == "pdb"
@@ -593,9 +598,7 @@ class ClusterMainWindow(QMainWindow):
                 Path(pdb_frames_dir).expanduser().resolve()
             )
         if clusters_dir is not None:
-            payload["clusters_dir"] = (
-                Path(clusters_dir).expanduser().resolve()
-            )
+            payload["clusters_dir"] = Path(clusters_dir).expanduser().resolve()
         self.project_paths_registered.emit(payload)
 
     def _register_project_paths(
@@ -639,8 +642,7 @@ class ClusterMainWindow(QMainWindow):
             updates.append(f"frames={Path(frames_dir).expanduser().resolve()}")
         if pdb_frames_dir is not None:
             updates.append(
-                "pdb_frames="
-                f"{Path(pdb_frames_dir).expanduser().resolve()}"
+                "pdb_frames=" f"{Path(pdb_frames_dir).expanduser().resolve()}"
             )
         if clusters_dir is not None:
             updates.append(

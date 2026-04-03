@@ -1,9 +1,9 @@
 import os
 from pathlib import Path
 
-from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 import numpy as np
 import pytest
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from PySide6.QtWidgets import QApplication
 
 from saxshell.mdtrajectory.frame.cp2k_ener import CP2KEnergyData
@@ -416,7 +416,9 @@ def test_mdtrajectory_export_registers_frames_dir_with_project(
             )
         )
 
-    monkeypatch.setattr(window, "_start_export_worker", fake_start_export_worker)
+    monkeypatch.setattr(
+        window, "_start_export_worker", fake_start_export_worker
+    )
 
     window.export_frames()
 

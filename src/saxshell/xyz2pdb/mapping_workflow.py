@@ -20,17 +20,17 @@ from .workflow import (
     XYZToPDBAssertionResult,
     XYZToPDBExportResult,
     XYZToPDBInspectionResult,
+    XYZToPDBOperationCancelled,
     XYZToPDBPreviewResult,
     XYZToPDBReferenceUpdateCandidate,
     XYZToPDBWorkflow,
-    XYZToPDBOperationCancelled,
-    _raise_if_cancelled,
-    _FrameSearchCache,
     _build_cryst1_line,
     _element_order_mismatch_message,
+    _FrameSearchCache,
     _normalized_atom_name,
     _normalized_element_symbol,
     _normalized_residue_name,
+    _raise_if_cancelled,
     _resolve_reference_backbone_pairs,
     default_reference_library_dir,
     list_reference_library,
@@ -187,7 +187,8 @@ class _ResolvedMoleculeVariant:
 
 @dataclass(slots=True)
 class ResolvedMoleculeMapping:
-    """Fully resolved mapping input built from one reference molecule."""
+    """Fully resolved mapping input built from one reference
+    molecule."""
 
     reference_name: str
     reference_path: Path
@@ -235,7 +236,8 @@ class XYZToPDBMappingPlan:
 
 @dataclass(slots=True)
 class XYZToPDBEstimateSolution:
-    """One integer solution for the estimated molecule/free-atom counts."""
+    """One integer solution for the estimated molecule/free-atom
+    counts."""
 
     molecule_counts: tuple[int, ...]
     free_atom_counts: dict[str, int]
@@ -284,7 +286,9 @@ class XYZToPDBEstimateResult:
     def to_dict(self) -> dict[str, object]:
         return {
             "analysis": self.analysis.to_dict(),
-            "solutions": [solution.to_dict(self.plan) for solution in self.solutions],
+            "solutions": [
+                solution.to_dict(self.plan) for solution in self.solutions
+            ],
             "warnings": list(self.warnings),
         }
 
@@ -351,7 +355,8 @@ class _MoleculeAssertionEntry:
 
 
 class XYZToPDBMappingWorkflow(XYZToPDBWorkflow):
-    """Native UI workflow that estimates and tests mappings without a JSON file."""
+    """Native UI workflow that estimates and tests mappings without a
+    JSON file."""
 
     def __init__(
         self,
@@ -630,6 +635,7 @@ class XYZToPDBMappingWorkflow(XYZToPDBWorkflow):
                         total_steps,
                         f"Mapping template from {xyz_file.name}...",
                     )
+
                 def on_template_status(
                     current_counts: dict[str, int],
                 ) -> None:
@@ -644,6 +650,7 @@ class XYZToPDBMappingWorkflow(XYZToPDBWorkflow):
                             current_counts,
                         ),
                     )
+
                 (
                     residues,
                     molecule_counts,
@@ -714,7 +721,9 @@ class XYZToPDBMappingWorkflow(XYZToPDBWorkflow):
                         f"Reused the first-frame atom-order mapping for {xyz_file.name}."
                     )
 
-            atoms = [atom.copy() for residue in residues for atom in residue.atoms]
+            atoms = [
+                atom.copy() for residue in residues for atom in residue.atoms
+            ]
             _raise_if_cancelled(cancel_callback)
             structure = PDBStructure(atoms=atoms, source_name=xyz_file.stem)
             written_path = structure.write_pdb_file(
@@ -874,9 +883,7 @@ class XYZToPDBMappingWorkflow(XYZToPDBWorkflow):
                     bonds=bonds,
                     preferred_backbone_pairs=preferred_backbone_pairs,
                     element_counts=dict(
-                        sorted(
-                            Counter(atom.element for atom in atoms).items()
-                        )
+                        sorted(Counter(atom.element for atom in atoms).items())
                     ),
                     tight_pass_scale=max(float(item.tight_pass_scale), 0.01),
                     relaxed_pass_scale=max(
@@ -908,7 +915,9 @@ class XYZToPDBMappingWorkflow(XYZToPDBWorkflow):
         frame,
         plan: XYZToPDBMappingPlan,
         solution: XYZToPDBEstimateSolution | None,
-        mapping_status_callback: Callable[[dict[str, int]], None] | None = None,
+        mapping_status_callback: (
+            Callable[[dict[str, int]], None] | None
+        ) = None,
         log_callback: Callable[[str], None] | None = None,
         cancel_callback: Callable[[], bool] | None = None,
     ) -> tuple[
@@ -956,9 +965,7 @@ class XYZToPDBMappingWorkflow(XYZToPDBWorkflow):
         for molecule_index, molecule in enumerate(plan.molecules):
             _raise_if_cancelled(cancel_callback)
             target_count = (
-                expected_counts[molecule_index]
-                if solution is not None
-                else 0
+                expected_counts[molecule_index] if solution is not None else 0
             )
             while molecule_counts[molecule.residue_name] < target_count:
                 _raise_if_cancelled(cancel_callback)
@@ -967,8 +974,7 @@ class XYZToPDBMappingWorkflow(XYZToPDBWorkflow):
                     used,
                     molecule,
                     frame_search_cache=frame_search_cache,
-                    log_callback=lambda message,
-                    residue_name=molecule.residue_name: append_console(
+                    log_callback=lambda message, residue_name=molecule.residue_name: append_console(
                         f"{residue_name}: {message}"
                     ),
                     cancel_callback=cancel_callback,
@@ -1030,9 +1036,7 @@ class XYZToPDBMappingWorkflow(XYZToPDBWorkflow):
 
         for molecule_index, molecule in enumerate(plan.molecules):
             expected = (
-                expected_counts[molecule_index]
-                if solution is not None
-                else 0
+                expected_counts[molecule_index] if solution is not None else 0
             )
             found = molecule_counts[molecule.residue_name]
             if (
@@ -1225,7 +1229,9 @@ class XYZToPDBMappingWorkflow(XYZToPDBWorkflow):
         )
         best_match: _VariantMatch | None = None
         best_score: tuple[float, float, int] | None = None
-        candidate_variants = molecule.variants if variants is None else variants
+        candidate_variants = (
+            molecule.variants if variants is None else variants
+        )
         for variant in candidate_variants:
             _raise_if_cancelled(cancel_callback)
             variant_definition = _scaled_variant_definition(variant, scale)
@@ -1241,8 +1247,7 @@ class XYZToPDBMappingWorkflow(XYZToPDBWorkflow):
                     used,
                     variant_definition,
                     frame_search_cache=frame_search_cache,
-                    search_status_callback=lambda message,
-                    reference_name=variant_definition.reference_name: (
+                    search_status_callback=lambda message, reference_name=variant_definition.reference_name: (
                         log_callback(
                             f"{pass_name} pass [{reference_name}]: {message}"
                         )
@@ -1361,7 +1366,9 @@ def _enumerate_estimate_solutions(
         ),
     )
     reordered_molecules = [plan.molecules[index] for index in order]
-    remaining = Counter({key: int(value) for key, value in total_counts.items()})
+    remaining = Counter(
+        {key: int(value) for key, value in total_counts.items()}
+    )
     solutions: list[XYZToPDBEstimateSolution] = []
     seen: set[tuple[int, ...]] = set()
     truncated = False
@@ -1530,7 +1537,9 @@ def _infer_direct_reference_bonds(
         for atom2_index in range(atom1_index + 1, len(atoms)):
             atom2 = atoms[atom2_index]
             distance = float(
-                np.linalg.norm(coordinates[atom2_index] - coordinates[atom1_index])
+                np.linalg.norm(
+                    coordinates[atom2_index] - coordinates[atom1_index]
+                )
             )
             if distance <= 0.0:
                 continue
@@ -1561,12 +1570,18 @@ def _infer_direct_reference_bonds(
     for bond in candidates:
         if atoms[bond.atom1_index].element == "H":
             current = hydrogen_best.get(bond.atom1_index)
-            if current is None or bond.reference_length < current.reference_length:
+            if (
+                current is None
+                or bond.reference_length < current.reference_length
+            ):
                 hydrogen_best[bond.atom1_index] = bond
             continue
         if atoms[bond.atom2_index].element == "H":
             current = hydrogen_best.get(bond.atom2_index)
-            if current is None or bond.reference_length < current.reference_length:
+            if (
+                current is None
+                or bond.reference_length < current.reference_length
+            ):
                 hydrogen_best[bond.atom2_index] = bond
             continue
         retained.append(bond)
@@ -1714,7 +1729,9 @@ def _build_variant(
         full_index: variant_index
         for variant_index, full_index in enumerate(kept_full_indices)
     }
-    variant_atoms = tuple(full_atoms[index].copy() for index in kept_full_indices)
+    variant_atoms = tuple(
+        full_atoms[index].copy() for index in kept_full_indices
+    )
     variant_bonds = tuple(
         ResolvedReferenceBond(
             atom1_index=full_to_variant[bond.atom1_index],
@@ -1725,7 +1742,8 @@ def _build_variant(
             tolerance=bond.tolerance,
         )
         for bond in full_bonds
-        if bond.atom1_index in full_to_variant and bond.atom2_index in full_to_variant
+        if bond.atom1_index in full_to_variant
+        and bond.atom2_index in full_to_variant
     )
     preferred_anchors = _resolve_variant_preferred_anchors(
         variant_atoms,
@@ -1734,7 +1752,13 @@ def _build_variant(
     )
     anchor_items: list[tuple[str, str, int, int, float]] = []
     seen_anchor_pairs: set[tuple[int, int]] = set()
-    for atom1_name, atom2_name, atom1_index, atom2_index, tolerance in preferred_anchors:
+    for (
+        atom1_name,
+        atom2_name,
+        atom1_index,
+        atom2_index,
+        tolerance,
+    ) in preferred_anchors:
         pair_key = tuple(sorted((atom1_index, atom2_index)))
         if pair_key in seen_anchor_pairs:
             continue
@@ -1867,7 +1891,9 @@ def _resolve_variant_preferred_anchors(
         if pair_key in seen_pairs:
             continue
         seen_pairs.add(pair_key)
-        bond = bond_lookup.get(tuple(sorted((normalized_atom1, normalized_atom2))))
+        bond = bond_lookup.get(
+            tuple(sorted((normalized_atom1, normalized_atom2)))
+        )
         if bond is not None:
             tolerance = float(bond.tolerance)
         else:
@@ -1938,19 +1964,24 @@ def _transform_full_reference(
         dtype=float,
     )
     if len(kept_full_indices) >= 3:
-        rotation, source_centroid, target_centroid = rigid_alignment_from_points(
-            kept_reference_coordinates,
-            target_coordinates,
+        rotation, source_centroid, target_centroid = (
+            rigid_alignment_from_points(
+                kept_reference_coordinates,
+                target_coordinates,
+            )
         )
         return (
             (full_reference_coordinates - source_centroid) @ rotation
         ) + target_centroid
     if len(kept_full_indices) == 2:
-        source_vector = kept_reference_coordinates[1] - kept_reference_coordinates[0]
+        source_vector = (
+            kept_reference_coordinates[1] - kept_reference_coordinates[0]
+        )
         target_vector = target_coordinates[1] - target_coordinates[0]
         rotation = rotation_matrix_from_to(source_vector, target_vector)
         return (
-            (full_reference_coordinates - kept_reference_coordinates[0]) @ rotation.T
+            (full_reference_coordinates - kept_reference_coordinates[0])
+            @ rotation.T
         ) + target_coordinates[0]
     if len(kept_full_indices) == 1:
         shift = target_coordinates[0] - kept_reference_coordinates[0]
@@ -1969,7 +2000,10 @@ def _fit_rmsd(
         return 0.0
     squared_distances = []
     for full_index, source_index in zip(kept_full_indices, assignment):
-        delta = transformed_full_coordinates[full_index] - frame.atoms[source_index].coordinates
+        delta = (
+            transformed_full_coordinates[full_index]
+            - frame.atoms[source_index].coordinates
+        )
         squared_distances.append(float(np.dot(delta, delta)))
     if not squared_distances:
         return 0.0
@@ -2013,7 +2047,9 @@ def _materialize_match(
     missing_full_indices = match.variant.missing_full_indices
     assignment_lookup = {
         full_index: source_index
-        for full_index, source_index in zip(kept_full_indices, match.assignment)
+        for full_index, source_index in zip(
+            kept_full_indices, match.assignment
+        )
     }
     used_indices = set(assignment_lookup.values())
     classification_note = ""
@@ -2038,7 +2074,9 @@ def _materialize_match(
     orphan_hydrogens = [
         index
         for index, atom in enumerate(frame.atoms)
-        if atom.element == "H" and not used[index] and index not in used_indices
+        if atom.element == "H"
+        and not used[index]
+        and index not in used_indices
     ]
     residue_atoms: list[PDBAtom] = []
     residue_source_indices: list[int] = []
@@ -2213,8 +2251,7 @@ def _write_assertion_molecules_for_frame(
     assertion_dir: Path,
 ) -> list[_MoleculeAssertionEntry]:
     reference_by_residue = {
-        molecule.residue_name: molecule
-        for molecule in plan.molecules
+        molecule.residue_name: molecule for molecule in plan.molecules
     }
     entries: list[_MoleculeAssertionEntry] = []
     for residue in residues:
@@ -2329,7 +2366,9 @@ def _build_assertion_report(
     assertion_dir: Path,
     entries: Sequence[_MoleculeAssertionEntry],
 ) -> XYZToPDBAssertionResult:
-    entries_by_residue: dict[str, list[_MoleculeAssertionEntry]] = defaultdict(list)
+    entries_by_residue: dict[str, list[_MoleculeAssertionEntry]] = defaultdict(
+        list
+    )
     for entry in entries:
         entries_by_residue[entry.residue_name].append(entry)
 
@@ -2455,11 +2494,7 @@ def _assertion_summary_for_residue(
             f"{residue_name}: {len(outlier_entries)} molecule(s) look skewed "
             "relative to the rest of the exported set."
         )
-    missing_entries = [
-        entry
-        for entry in entries
-        if entry.missing_atom_names
-    ]
+    missing_entries = [entry for entry in entries if entry.missing_atom_names]
     if missing_entries:
         warnings.append(
             f"{residue_name}: {len(missing_entries)} molecule(s) were missing "
@@ -2469,7 +2504,9 @@ def _assertion_summary_for_residue(
         residue_name=residue_name,
         molecule_count=len(entries),
         common_atom_count=max(entry.common_atom_count for entry in entries),
-        distance_pair_count=max(entry.distance_pair_count for entry in entries),
+        distance_pair_count=max(
+            entry.distance_pair_count for entry in entries
+        ),
         median_distribution_rmsd=median_rms,
         max_distribution_rmsd=max_rms,
         median_max_distance_delta=median_max,
@@ -2481,8 +2518,7 @@ def _assertion_summary_for_residue(
         warnings.append(
             f"{residue_name}: inspect files such as "
             + ", ".join(
-                str(entry.molecule_file.name)
-                for entry in outlier_entries[:3]
+                str(entry.molecule_file.name) for entry in outlier_entries[:3]
             )
             + "."
         )
@@ -2642,9 +2678,11 @@ def _align_coordinates_to_reference(
     target_points: np.ndarray,
 ) -> np.ndarray:
     if len(source_points) >= 3:
-        rotation, source_centroid, target_centroid = rigid_alignment_from_points(
-            source_points,
-            target_points,
+        rotation, source_centroid, target_centroid = (
+            rigid_alignment_from_points(
+                source_points,
+                target_points,
+            )
         )
         return ((coordinates - source_centroid) @ rotation) + target_centroid
     if len(source_points) == 2:
@@ -2652,7 +2690,9 @@ def _align_coordinates_to_reference(
             source_points[1] - source_points[0],
             target_points[1] - target_points[0],
         )
-        return ((coordinates - source_points[0]) @ rotation.T) + target_points[0]
+        return ((coordinates - source_points[0]) @ rotation.T) + target_points[
+            0
+        ]
     if len(source_points) == 1:
         return coordinates + (target_points[0] - source_points[0])
     return coordinates.copy()

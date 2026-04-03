@@ -1893,11 +1893,7 @@ def test_clusterdynamicsml_pdb_mode_injects_anchored_solvents_away_from_solute_a
     assert len(solvent_residues) == 2
     solute_centroid = np.mean(
         np.asarray(
-            [
-                atom.coordinates
-                for atom in atoms
-                if atom.residue_name != "DMF"
-            ],
+            [atom.coordinates for atom in atoms if atom.residue_name != "DMF"],
             dtype=float,
         ),
         axis=0,
@@ -1905,7 +1901,9 @@ def test_clusterdynamicsml_pdb_mode_injects_anchored_solvents_away_from_solute_a
     residue_atoms = list(solvent_residues.values())
     for residue_atoms_entry in residue_atoms:
         anchor = next(
-            atom for atom in residue_atoms_entry if atom.atom_name.strip() == "O1"
+            atom
+            for atom in residue_atoms_entry
+            if atom.atom_name.strip() == "O1"
         )
         non_anchor_coordinates = np.asarray(
             [
@@ -1916,7 +1914,9 @@ def test_clusterdynamicsml_pdb_mode_injects_anchored_solvents_away_from_solute_a
             dtype=float,
         )
         assert non_anchor_coordinates.size > 0
-        outward_vector = np.mean(non_anchor_coordinates, axis=0) - anchor.coordinates
+        outward_vector = (
+            np.mean(non_anchor_coordinates, axis=0) - anchor.coordinates
+        )
         anchor_outward = anchor.coordinates - solute_centroid
         assert float(np.dot(outward_vector, anchor_outward)) > 0.0
 
@@ -1929,7 +1929,8 @@ def test_clusterdynamicsml_pdb_mode_injects_anchored_solvents_away_from_solute_a
         dtype=float,
     )
     residue_distances = np.linalg.norm(
-        first_residue_atoms[:, np.newaxis, :] - second_residue_atoms[np.newaxis, :, :],
+        first_residue_atoms[:, np.newaxis, :]
+        - second_residue_atoms[np.newaxis, :, :],
         axis=2,
     )
     assert float(np.min(residue_distances)) >= 1.2

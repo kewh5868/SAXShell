@@ -12,8 +12,8 @@ from saxshell.structure import (
 
 from .clusternetwork import (
     DEFAULT_SAVE_STATE_FREQUENCY,
-    PairCutoffDefinitions,
     SEARCH_MODE_KDTREE,
+    PairCutoffDefinitions,
     normalize_pair_cutoffs,
     normalize_save_state_frequency,
     normalize_search_mode,
@@ -22,9 +22,7 @@ from .clusternetwork import (
 _PRESET_DIR_NAME = "_cluster_extraction_presets"
 _DEFAULT_PRESETS_FILENAME = "default_cluster_extraction_presets.json"
 _USER_PRESETS_FILENAME = "user_cluster_extraction_presets.json"
-DEFAULT_CLUSTER_EXTRACTION_PRESET_NAME = (
-    "Perovskite (DMF) - Partial Solvent"
-)
+DEFAULT_CLUSTER_EXTRACTION_PRESET_NAME = "Perovskite (DMF) - Partial Solvent"
 
 
 @dataclass(frozen=True, slots=True)

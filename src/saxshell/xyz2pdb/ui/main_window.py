@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
@@ -16,15 +16,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from saxshell.saxs.ui.branding import (
-    configure_saxshell_application,
-    load_saxshell_icon,
-    prepare_saxshell_application_identity,
-)
 from saxshell.saxs.project_manager import (
     ProjectSettings,
     SAXSProjectManager,
     build_project_paths,
+)
+from saxshell.saxs.ui.branding import (
+    configure_saxshell_application,
+    load_saxshell_icon,
+    prepare_saxshell_application_identity,
 )
 from saxshell.saxs.ui.project_status_label import CompactProjectStatusLabel
 from saxshell.xyz2pdb import (
@@ -88,7 +88,10 @@ class XYZToPDBExportWorker(QObject):
         self._cancel_requested = True
 
     def is_cancel_requested(self) -> bool:
-        return self._cancel_requested or QThread.currentThread().isInterruptionRequested()
+        return (
+            self._cancel_requested
+            or QThread.currentThread().isInterruptionRequested()
+        )
 
     @Slot()
     def run(self) -> None:
@@ -98,9 +101,8 @@ class XYZToPDBExportWorker(QObject):
                 reference_library_dir=self.config.library_dir,
                 output_dir=self.config.output_dir,
             )
-            self.progress.emit(
-                "Starting background xyz2pdb conversion."
-            )
+            self.progress.emit("Starting background xyz2pdb conversion.")
+
             def on_progress(processed: int, total: int, message: str) -> None:
                 self.progress_count.emit(processed, total, message)
 
@@ -357,7 +359,9 @@ class XYZToPDBMainWindow(QMainWindow):
             )
             log_lines = ["Test mapping complete."]
             log_lines.extend(test_result.console_messages)
-            log_lines.extend(f"Warning: {warning}" for warning in test_result.warnings)
+            log_lines.extend(
+                f"Warning: {warning}" for warning in test_result.warnings
+            )
             self.export_panel.set_log_text("\n".join(log_lines))
             self.statusBar().showMessage("Test mapping complete")
         except Exception as exc:
@@ -647,16 +651,26 @@ class XYZToPDBMainWindow(QMainWindow):
     ) -> list[str]:
         labels: list[str] = []
         for index, solution in enumerate(estimate.solutions, start=1):
-            molecule_text = ", ".join(
-                f"{residue} x{count}"
-                for residue, count in sorted(
-                    solution.molecule_count_by_residue(estimate.plan).items()
+            molecule_text = (
+                ", ".join(
+                    f"{residue} x{count}"
+                    for residue, count in sorted(
+                        solution.molecule_count_by_residue(
+                            estimate.plan
+                        ).items()
+                    )
                 )
-            ) or "no molecules"
-            unassigned_text = ", ".join(
-                f"{element} x{count}"
-                for element, count in sorted(solution.unassigned_counts.items())
-            ) or "none"
+                or "no molecules"
+            )
+            unassigned_text = (
+                ", ".join(
+                    f"{element} x{count}"
+                    for element, count in sorted(
+                        solution.unassigned_counts.items()
+                    )
+                )
+                or "none"
+            )
             labels.append(
                 f"Solution {index}: {molecule_text} | unassigned: {unassigned_text}"
             )
@@ -692,7 +706,9 @@ class XYZToPDBMainWindow(QMainWindow):
         assert isinstance(result, XYZToPDBExportResult)
         self._set_export_running(False)
         total_steps = max(
-            int(result.progress_total_steps or (len(result.written_files) + 1)),
+            int(
+                result.progress_total_steps or (len(result.written_files) + 1)
+            ),
             1,
         )
         self.export_panel.set_progress_complete(
@@ -728,7 +744,9 @@ class XYZToPDBMainWindow(QMainWindow):
         if registration_message is not None:
             self.export_panel.append_log(registration_message)
         if result.assertion_result is not None:
-            self._offer_assertion_reference_updates(result.assertion_result.reference_update_candidates)
+            self._offer_assertion_reference_updates(
+                result.assertion_result.reference_update_candidates
+            )
         self.statusBar().showMessage("XYZ to PDB conversion complete")
 
     @Slot(str)
@@ -880,7 +898,9 @@ class XYZToPDBMainWindow(QMainWindow):
         elif decision == "save_new_version":
             reference_name = versioned_reference_name
         else:
-            raise ValueError(f"Unsupported reference update action: {decision}")
+            raise ValueError(
+                f"Unsupported reference update action: {decision}"
+            )
         return create_reference_molecule(
             candidate.average_structure_file,
             reference_name=reference_name,
@@ -948,7 +968,9 @@ def launch_xyz2pdb_ui(
             else Path(project_dir).expanduser().resolve()
         ),
         input_path=(
-            None if input_path is None else Path(input_path).expanduser().resolve()
+            None
+            if input_path is None
+            else Path(input_path).expanduser().resolve()
         ),
         config_file=(
             None

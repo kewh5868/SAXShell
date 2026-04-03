@@ -42,8 +42,8 @@ from PySide6.QtWidgets import (
 )
 
 from saxshell.cluster import (
-    PDBShellReferenceDefinition,
     ExtractedFrameFolderClusterAnalyzer,
+    PDBShellReferenceDefinition,
     detect_frame_folder_mode,
     format_box_dimensions,
     format_search_mode_label,
@@ -675,9 +675,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self._active_job_preview: ClusterDynamicsMLPreview | None = None
         self._auto_detected_energy_file: Path | None = None
         self._history_panel_expanded = True
-        self._history_expanded_splitter_size = (
-            _HISTORY_EXPANDED_DEFAULT_HEIGHT
-        )
+        self._history_expanded_splitter_size = _HISTORY_EXPANDED_DEFAULT_HEIGHT
         self._suspend_preview_refresh = False
         self._initializing = True
         self._restoring_project_dataset = False
@@ -732,12 +730,9 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             self._refresh_selection_preview()
 
     def closeEvent(self, event) -> None:
-        if (
-            (self._run_thread is not None and self._run_thread.isRunning())
-            or (
-                self._dataset_load_thread is not None
-                and self._dataset_load_thread.isRunning()
-            )
+        if (self._run_thread is not None and self._run_thread.isRunning()) or (
+            self._dataset_load_thread is not None
+            and self._dataset_load_thread.isRunning()
         ):
             QMessageBox.warning(
                 self,
@@ -904,9 +899,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self.history_toggle_button.setToolTip(
             "Collapse or expand the saved prediction history panel."
         )
-        self.history_toggle_button.clicked.connect(
-            self._toggle_history_panel
-        )
+        self.history_toggle_button.clicked.connect(self._toggle_history_panel)
         history_header_row.addWidget(self.history_toggle_button)
         history_layout.addLayout(history_header_row)
         self.history_content = QWidget()
@@ -1914,7 +1907,9 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 f"clusters={Path(clusters_dir).expanduser().resolve()}"
             )
         if energy_file is not None:
-            updates.append(f"energy={Path(energy_file).expanduser().resolve()}")
+            updates.append(
+                f"energy={Path(energy_file).expanduser().resolve()}"
+            )
         if not updates:
             return None
         return "Updated project references: " + ", ".join(updates)

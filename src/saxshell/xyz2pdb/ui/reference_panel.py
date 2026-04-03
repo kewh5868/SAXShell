@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections import Counter
 import re
+from collections import Counter
 from pathlib import Path
 
 from PySide6.QtCore import QRegularExpression, Signal
@@ -346,9 +346,7 @@ class ReferenceLibraryPanel(QGroupBox):
                 "Choose both backbone atoms or leave both backbone selectors on Auto."
             )
         if atom1_name == atom2_name:
-            raise ValueError(
-                "Backbone atom 1 and atom 2 must be different."
-            )
+            raise ValueError("Backbone atom 1 and atom 2 must be different.")
         return ((str(atom1_name), str(atom2_name)),)
 
 

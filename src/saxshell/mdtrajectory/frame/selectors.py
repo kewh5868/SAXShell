@@ -10,6 +10,7 @@ FrameSelectionItem = TypeVar(
     FrameRecord,
 )
 
+
 def select_frames(
     frames: list[FrameSelectionItem],
     start: int | None = None,

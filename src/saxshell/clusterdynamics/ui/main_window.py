@@ -851,7 +851,9 @@ class ClusterDynamicsMainWindow(QMainWindow):
         self.dataset_panel.save_powerpoint_requested.connect(
             self.save_powerpoint_report
         )
-        self.dataset_panel.settings_changed.connect(self._on_project_dir_changed)
+        self.dataset_panel.settings_changed.connect(
+            self._on_project_dir_changed
+        )
 
         self.run_panel.set_selection_summary(
             "Select an extracted PDB or XYZ frames folder to preview the "
@@ -1889,9 +1891,7 @@ class ClusterDynamicsMainWindow(QMainWindow):
             )
         if not updates:
             return None
-        return (
-            "Updated project references: " + ", ".join(updates)
-        )
+        return "Updated project references: " + ", ".join(updates)
 
     def _handle_error(self, title: str, message: str) -> None:
         self.run_panel.append_log(f"{title}: {message}")

@@ -566,10 +566,9 @@ def create_material(
         principled.inputs["Coat Weight"].default_value = coat
     elif "Clearcoat" in principled.inputs:
         principled.inputs["Clearcoat"].default_value = coat
-    emission_input = (
-        principled.inputs.get("Emission Color")
-        or principled.inputs.get("Emission")
-    )
+    emission_input = principled.inputs.get(
+        "Emission Color"
+    ) or principled.inputs.get("Emission")
     if emission_input is not None:
         emission_input.default_value = base_color
     emission_strength_input = principled.inputs.get("Emission Strength")
@@ -1196,7 +1195,10 @@ def setup_render(
         if hasattr(scene.cycles, "caustics_refractive"):
             scene.cycles.caustics_refractive = False
         requested_device = (
-            str(cycles_device or os.environ.get("SAXSHELL_CYCLES_DEVICE", "auto"))
+            str(
+                cycles_device
+                or os.environ.get("SAXSHELL_CYCLES_DEVICE", "auto")
+            )
             .strip()
             .lower()
         )
@@ -1547,9 +1549,7 @@ def _effective_orientation_render_settings(
             else int(quality_defaults["samples"])
         ),
         "atom_scale": (
-            float(args.atom_scale)
-            if args.atom_scale is not None
-            else None
+            float(args.atom_scale) if args.atom_scale is not None else None
         ),
         "bond_radius": (
             float(args.bond_radius)
@@ -1584,8 +1584,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(_blend_args(argv))
     set_custom_aesthetics(
         tuple(
-            parse_custom_aesthetic_arg(text)
-            for text in args.custom_aesthetic
+            parse_custom_aesthetic_arg(text) for text in args.custom_aesthetic
         )
     )
     args.atom_style = normalize_atom_style(args.atom_style)

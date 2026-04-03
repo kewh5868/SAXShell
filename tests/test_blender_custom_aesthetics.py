@@ -251,7 +251,10 @@ def test_blender_window_loads_saved_custom_aesthetics_across_sessions(
     second = BlenderXYZRendererMainWindow()
     try:
         assert second.atom_style_combo.findData(spec.key) >= 0
-        assert second._custom_aesthetics_by_key[spec.key].name == "Session Palette"
+        assert (
+            second._custom_aesthetics_by_key[spec.key].name
+            == "Session Palette"
+        )
     finally:
         second.close()
 
@@ -266,7 +269,9 @@ def test_blender_window_persists_bond_thresholds_across_sessions(
     xyz_path = _write_xyz(tmp_path / "bond-thresholds.xyz", "Thresholds")
 
     first = BlenderXYZRendererMainWindow(initial_input_path=xyz_path)
-    defaults = build_bond_thresholds_for_structure(first._preview_structure.atoms)
+    defaults = build_bond_thresholds_for_structure(
+        first._preview_structure.atoms
+    )
     modified: list[BondThresholdSpec] = []
     target_key = defaults[0].pair_key
     for spec in defaults:
@@ -335,10 +340,16 @@ def test_render_script_preserves_none_atom_scale_for_custom_aesthetic(
     monkeypatch.setattr(render_module, "clear_scene", lambda: None)
     monkeypatch.setattr(render_module, "setup_render", lambda **kwargs: None)
     monkeypatch.setattr(render_module, "setup_world", lambda **kwargs: None)
-    monkeypatch.setattr(render_module, "setup_lighting", lambda *args, **kwargs: None)
-    monkeypatch.setattr(render_module, "create_camera_rig", lambda: (object(), object()))
+    monkeypatch.setattr(
+        render_module, "setup_lighting", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        render_module, "create_camera_rig", lambda: (object(), object())
+    )
     monkeypatch.setattr(render_module, "world_bounds", lambda objects: bounds)
-    monkeypatch.setattr(render_module, "_apply_orientation", lambda root, orientation: None)
+    monkeypatch.setattr(
+        render_module, "_apply_orientation", lambda root, orientation: None
+    )
     monkeypatch.setattr(
         render_module,
         "frame_camera",
@@ -357,12 +368,20 @@ def test_render_script_preserves_none_atom_scale_for_custom_aesthetic(
         pair_thresholds,
         bond_color_mode,
     ):
-        del atoms, bond_radius, bond_threshold, pair_thresholds, bond_color_mode
+        del (
+            atoms,
+            bond_radius,
+            bond_threshold,
+            pair_thresholds,
+            bond_color_mode,
+        )
         captured["atom_style"] = atom_style
         captured["atom_scale"] = atom_scale
         return object(), [object()]
 
-    monkeypatch.setattr(render_module, "build_structure", _fake_build_structure)
+    monkeypatch.setattr(
+        render_module, "build_structure", _fake_build_structure
+    )
 
     exit_code = render_module.main(
         [

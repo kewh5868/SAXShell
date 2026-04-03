@@ -188,7 +188,9 @@ class XYZToPDBExportPanel(QGroupBox):
         self.assertion_mode_checkbox.setEnabled(enabled)
         self.export_button.setEnabled(enabled)
         self.cancel_button.setEnabled(not enabled)
-        self.solution_combo.setEnabled(enabled and self.solution_combo.count() > 0)
+        self.solution_combo.setEnabled(
+            enabled and self.solution_combo.count() > 0
+        )
 
     def reset_progress(self) -> None:
         self.progress_bar.setRange(0, 1)

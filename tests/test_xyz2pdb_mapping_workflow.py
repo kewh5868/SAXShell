@@ -8,12 +8,12 @@ import numpy as np
 import pytest
 from scipy.optimize import linear_sum_assignment
 
+from saxshell.structure import PDBAtom, PDBStructure
 from saxshell.xyz2pdb import (
     create_reference_molecule,
     default_reference_library_dir,
     list_reference_library,
 )
-from saxshell.structure import PDBAtom, PDBStructure
 from saxshell.xyz2pdb import mapping_workflow as mapping_workflow_module
 from saxshell.xyz2pdb import workflow as workflow_module
 from saxshell.xyz2pdb.mapping_workflow import (
@@ -35,11 +35,12 @@ def _write_reference(path: Path, atoms: list[PDBAtom]) -> None:
     PDBStructure(atoms=atoms).write_pdb_file(path)
 
 
-def _write_xyz(path: Path, atoms: list[tuple[str, float, float, float]]) -> None:
+def _write_xyz(
+    path: Path, atoms: list[tuple[str, float, float, float]]
+) -> None:
     lines = [str(len(atoms)), path.stem]
     lines.extend(
-        f"{element} {x:.3f} {y:.3f} {z:.3f}"
-        for element, x, y, z in atoms
+        f"{element} {x:.3f} {y:.3f} {z:.3f}" for element, x, y, z in atoms
     )
     path.write_text("\n".join(lines) + "\n")
 
@@ -66,9 +67,21 @@ def _random_rotation_matrix(rng: np.random.Generator) -> np.ndarray:
     w, x, y, z = quaternion
     return np.array(
         [
-            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+            [
+                1.0 - 2.0 * (y * y + z * z),
+                2.0 * (x * y - z * w),
+                2.0 * (x * z + y * w),
+            ],
+            [
+                2.0 * (x * y + z * w),
+                1.0 - 2.0 * (x * x + z * z),
+                2.0 * (y * z - x * w),
+            ],
+            [
+                2.0 * (x * z - y * w),
+                2.0 * (y * z + x * w),
+                1.0 - 2.0 * (x * x + y * y),
+            ],
         ],
         dtype=float,
     )
@@ -154,7 +167,9 @@ def _build_dmso_box_xyz(
 
 
 def _residue_centroid(atoms: list[PDBAtom]) -> np.ndarray:
-    return np.mean(np.array([atom.coordinates for atom in atoms], dtype=float), axis=0)
+    return np.mean(
+        np.array([atom.coordinates for atom in atoms], dtype=float), axis=0
+    )
 
 
 def test_native_mapping_workflow_estimates_tests_and_exports_without_json(
@@ -199,7 +214,9 @@ def test_native_mapping_workflow_estimates_tests_and_exports_without_json(
         frames_dir,
         reference_library_dir=refs_dir,
     )
-    molecule_inputs = [MoleculeMappingInput(reference_name="pbi", residue_name="PBI")]
+    molecule_inputs = [
+        MoleculeMappingInput(reference_name="pbi", residue_name="PBI")
+    ]
     free_atom_inputs = [FreeAtomMappingInput(element="O", residue_name="SOL")]
 
     estimate = workflow.estimate_mapping(
@@ -286,7 +303,9 @@ def test_export_reuses_first_frame_mapping_template_for_later_frames(
         frames_dir,
         reference_library_dir=refs_dir,
     )
-    molecule_inputs = [MoleculeMappingInput(reference_name="pbi", residue_name="PBI")]
+    molecule_inputs = [
+        MoleculeMappingInput(reference_name="pbi", residue_name="PBI")
+    ]
     free_atom_inputs = [FreeAtomMappingInput(element="O", residue_name="SOL")]
     progress_events: list[tuple[int, int, str]] = []
     log_messages: list[str] = []
@@ -345,7 +364,11 @@ def test_export_reuses_first_frame_mapping_template_for_later_frames(
         7,
         "Validating XYZ atom order [3/3]: frame_0002.xyz",
     )
-    assert progress_events[4] == (4, 7, "Mapping template from frame_0000.xyz...")
+    assert progress_events[4] == (
+        4,
+        7,
+        "Mapping template from frame_0000.xyz...",
+    )
     assert any(
         message == "Template mapping progress in frame_0000.xyz: PBI 1/1"
         for _processed, _total, message in progress_events
@@ -353,8 +376,7 @@ def test_export_reuses_first_frame_mapping_template_for_later_frames(
     assert progress_events[-1] == (7, 7, "[3/3] Wrote frame_0002.xyz")
     assert any(
         "Validated XYZ atom order across 3 frame(s) against frame_0000.xyz "
-        "before template mapping."
-        == message
+        "before template mapping." == message
         for message in log_messages
     )
     assert any(
@@ -444,7 +466,9 @@ def test_export_uses_natural_frame_order_for_non_padded_indices(
         molecule_inputs=[
             MoleculeMappingInput(reference_name="pbi", residue_name="PBI")
         ],
-        free_atom_inputs=[FreeAtomMappingInput(element="O", residue_name="SOL")],
+        free_atom_inputs=[
+            FreeAtomMappingInput(element="O", residue_name="SOL")
+        ],
         progress_callback=lambda processed, total, message: progress_events.append(
             (processed, total, message)
         ),
@@ -688,7 +712,9 @@ def test_export_validates_folder_atom_order_before_template_mapping(
             molecule_inputs=[
                 MoleculeMappingInput(reference_name="pbi", residue_name="PBI")
             ],
-            free_atom_inputs=[FreeAtomMappingInput(element="H", residue_name="SOL")],
+            free_atom_inputs=[
+                FreeAtomMappingInput(element="H", residue_name="SOL")
+            ],
         )
 
     assert map_frame_calls == 0
@@ -736,8 +762,12 @@ def test_preferred_backbone_pairs_do_not_fall_back_to_other_bonds(tmp_path):
             ),
         ),
         anchors=(
-            AnchorPairDefinition(atom1_name="O1", atom2_name="N1", tolerance=0.2),
-            AnchorPairDefinition(atom1_name="N1", atom2_name="C1", tolerance=0.2),
+            AnchorPairDefinition(
+                atom1_name="O1", atom2_name="N1", tolerance=0.2
+            ),
+            AnchorPairDefinition(
+                atom1_name="N1", atom2_name="C1", tolerance=0.2
+            ),
         ),
         resolved_anchor_indices=((0, 1, 0.2), (1, 2, 0.2)),
         preferred_anchor_indices=((0, 1),),
@@ -796,7 +826,9 @@ def test_export_assertion_mode_writes_molecule_files_and_report(
         molecule_inputs=[
             MoleculeMappingInput(reference_name="pbi", residue_name="PBI")
         ],
-        free_atom_inputs=[FreeAtomMappingInput(element="O", residue_name="SOL")],
+        free_atom_inputs=[
+            FreeAtomMappingInput(element="O", residue_name="SOL")
+        ],
         output_dir=output_dir,
         assert_molecule_shapes=True,
         progress_callback=lambda processed, total, message: progress_events.append(
@@ -823,7 +855,9 @@ def test_export_assertion_mode_writes_molecule_files_and_report(
     assert candidate.reference_name == "pbi"
     assert candidate.reference_path == refs_dir / "pbi.pdb"
     assert candidate.average_structure_file.exists()
-    averaged_structure = PDBStructure.from_file(candidate.average_structure_file)
+    averaged_structure = PDBStructure.from_file(
+        candidate.average_structure_file
+    )
     averaged_distance = float(
         np.linalg.norm(
             averaged_structure.atoms[1].coordinates
@@ -838,7 +872,9 @@ def test_export_assertion_mode_writes_molecule_files_and_report(
         "frame_0000__PBI_0001.pdb",
         "frame_0001__PBI_0001.pdb",
     ]
-    report_text = export.assertion_result.report_file.read_text(encoding="utf-8")
+    report_text = export.assertion_result.report_file.read_text(
+        encoding="utf-8"
+    )
     assert "xyz2pdb assertion mode report" in report_text
     assert "PASS PBI" in report_text
     assert progress_events[-1] == (
@@ -852,8 +888,7 @@ def test_export_assertion_mode_writes_molecule_files_and_report(
         for message in log_messages
     )
     assert any(
-        "Assertion report written to" in message
-        for message in log_messages
+        "Assertion report written to" in message for message in log_messages
     )
 
 
@@ -904,7 +939,9 @@ def test_export_assertion_mode_warns_when_molecules_drift_from_reference(
         molecule_inputs=[
             MoleculeMappingInput(reference_name="pbi", residue_name="PBI")
         ],
-        free_atom_inputs=[FreeAtomMappingInput(element="O", residue_name="SOL")],
+        free_atom_inputs=[
+            FreeAtomMappingInput(element="O", residue_name="SOL")
+        ],
         output_dir=tmp_path / "mapped_pdb",
         assert_molecule_shapes=True,
     )
@@ -964,7 +1001,9 @@ def test_create_reference_molecule_writes_backbone_metadata(tmp_path):
     assert entry.backbone_pairs == (("PB1", "I1"),)
 
 
-def test_create_reference_molecule_uses_explicit_backbone_pair_metadata(tmp_path):
+def test_create_reference_molecule_uses_explicit_backbone_pair_metadata(
+    tmp_path,
+):
     refs_dir = tmp_path / "references"
     refs_dir.mkdir()
     source_path = tmp_path / "ocn_source.pdb"
@@ -1066,7 +1105,9 @@ def test_mapping_uses_preferred_backbone_pairs_from_reference_metadata(
         reference_library_dir=refs_dir,
     )
     test_result = workflow.test_mapping(
-        molecule_inputs=[MoleculeMappingInput(reference_name="ocn", residue_name="OCN")],
+        molecule_inputs=[
+            MoleculeMappingInput(reference_name="ocn", residue_name="OCN")
+        ],
         free_atom_inputs=[],
     )
 
@@ -1152,14 +1193,8 @@ def test_dmf_single_backbone_pair_scans_fewer_pairs_than_three_pair_setup(
     assert three_count == 3
     assert single_count < three_count
     assert "Backbone O1-N1: found 1 candidate pair(s)." in single_messages[0]
-    assert any(
-        "Backbone N1-C2:" in message
-        for message in three_messages
-    )
-    assert any(
-        "Backbone N1-C3:" in message
-        for message in three_messages
-    )
+    assert any("Backbone N1-C2:" in message for message in three_messages)
+    assert any("Backbone N1-C3:" in message for message in three_messages)
 
 
 def test_dmso_box_roundtrip_preserves_molecule_assignments_and_positions(
@@ -1234,7 +1269,9 @@ def test_dmso_box_roundtrip_preserves_molecule_assignments_and_positions(
 
     assert find_best_match_calls > 0
     assert test_result.molecule_counts == {"DMS": 4}
-    assert test_result.free_atom_counts == dict(sorted(expected_free_atom_counts.items()))
+    assert test_result.free_atom_counts == dict(
+        sorted(expected_free_atom_counts.items())
+    )
     assert test_result.unassigned_counts == {}
     assert any(
         "relaxed full-hydrogen pass" in warning
@@ -1460,7 +1497,9 @@ def test_find_best_match_cycles_backbone_candidates_and_reports_summary(
         (1,),
     )
 
-    def fake_candidate_backbone_pairs(*args, discovery_callback=None, **kwargs):
+    def fake_candidate_backbone_pairs(
+        *args, discovery_callback=None, **kwargs
+    ):
         if discovery_callback is not None:
             discovery_callback(2)
         return ((0, 1), (2, 3))
@@ -1543,8 +1582,7 @@ def test_find_best_match_cycles_backbone_candidates_and_reports_summary(
     assert assignment == (2, 3)
     assert assignment_order[:2] == [1, 2]
     assert any(
-        "Backbone O1-N1: found 2 candidate pair(s) so far."
-        == message
+        "Backbone O1-N1: found 2 candidate pair(s) so far." == message
         for message in search_messages
     )
     assert any(
@@ -2031,7 +2069,10 @@ def test_missing_hydrogen_modes_can_leave_assign_or_restore_hydrogen(
     )
     assert assign_result.unassigned_counts == {}
     assert len(assign_result.residues[0].atoms) == 2
-    assert round(float(assign_result.residues[0].atoms[1].coordinates[0]), 3) == 3.0
+    assert (
+        round(float(assign_result.residues[0].atoms[1].coordinates[0]), 3)
+        == 3.0
+    )
 
     restore_result = workflow.test_mapping(
         molecule_inputs=molecule_inputs,
@@ -2040,7 +2081,10 @@ def test_missing_hydrogen_modes_can_leave_assign_or_restore_hydrogen(
     )
     assert restore_result.unassigned_counts == {}
     assert len(restore_result.residues[0].atoms) == 2
-    assert round(float(restore_result.residues[0].atoms[1].coordinates[0]), 3) == 1.0
+    assert (
+        round(float(restore_result.residues[0].atoms[1].coordinates[0]), 3)
+        == 1.0
+    )
 
 
 def test_default_missing_hydrogen_limit_does_not_assume_deprotonation(
@@ -2084,7 +2128,9 @@ def test_default_missing_hydrogen_limit_does_not_assume_deprotonation(
     )
 
     result = workflow.test_mapping(
-        molecule_inputs=[MoleculeMappingInput(reference_name="oh", residue_name="HOH")],
+        molecule_inputs=[
+            MoleculeMappingInput(reference_name="oh", residue_name="HOH")
+        ],
         free_atom_inputs=[],
         hydrogen_mode="leave_unassigned",
     )

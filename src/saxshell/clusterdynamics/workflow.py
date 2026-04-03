@@ -1051,9 +1051,7 @@ def _parse_frame_filename_index(filename: str) -> int | None:
 def _parse_folder_start_time_from_name(folder_name: str) -> float | None:
     match = _FOLDER_START_TIME_PATTERN.search(folder_name.strip())
     if match is None:
-        match = _LEGACY_FOLDER_START_TIME_PATTERN.search(
-            folder_name.strip()
-        )
+        match = _LEGACY_FOLDER_START_TIME_PATTERN.search(folder_name.strip())
     if match is None:
         return None
     return float(match.group("value").replace("_", ".").replace("p", "."))

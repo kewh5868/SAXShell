@@ -77,7 +77,9 @@ class MoleculePreviewWidget(QWidget):
             point2 = projected_atoms[bond.atom2_index]
             average_depth = (point1[2] + point2[2]) / 2.0
             bond_items.append((average_depth, point1, point2))
-        for _depth, point1, point2 in sorted(bond_items, key=lambda item: item[0]):
+        for _depth, point1, point2 in sorted(
+            bond_items, key=lambda item: item[0]
+        ):
             painter.setPen(QPen(QColor("#9ea7b3"), 3.0, Qt.PenStyle.SolidLine))
             painter.drawLine(
                 int(round(point1[0])),
@@ -105,7 +107,9 @@ class MoleculePreviewWidget(QWidget):
                 int(round(radius * 2.0)),
             )
             if radius >= 10:
-                painter.setPen(QColor("#f7f7f7" if atom.element != "H" else "#3c3c3c"))
+                painter.setPen(
+                    QColor("#f7f7f7" if atom.element != "H" else "#3c3c3c")
+                )
                 painter.drawText(
                     int(round(x_coord - radius)),
                     int(round(y_coord - radius)),
@@ -117,7 +121,8 @@ class MoleculePreviewWidget(QWidget):
 
 
 class AssertionReferenceUpdateDialog(QDialog):
-    """Dialog that previews a passed assertion candidate before saving."""
+    """Dialog that previews a passed assertion candidate before
+    saving."""
 
     def __init__(
         self,
@@ -142,7 +147,9 @@ class AssertionReferenceUpdateDialog(QDialog):
         )
         self.resize(780, 560)
 
-        current_atoms = PDBStructure.from_file(self._candidate.reference_path).atoms
+        current_atoms = PDBStructure.from_file(
+            self._candidate.reference_path
+        ).atoms
         average_atoms = PDBStructure.from_file(
             self._candidate.average_structure_file
         ).atoms
@@ -174,7 +181,9 @@ class AssertionReferenceUpdateDialog(QDialog):
                 ]
             )
         )
-        summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        summary.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
         layout.addWidget(summary)
 
         preview_row = QHBoxLayout()

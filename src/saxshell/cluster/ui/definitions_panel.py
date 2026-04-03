@@ -22,14 +22,14 @@ from PySide6.QtWidgets import (
 )
 
 from saxshell.cluster import (
-    DEFAULT_SAVE_STATE_FREQUENCY,
     DEFAULT_CLUSTER_EXTRACTION_PRESET_NAME,
-    PDBShellReferenceDefinition,
+    DEFAULT_SAVE_STATE_FREQUENCY,
     SEARCH_MODE_BRUTEFORCE,
     SEARCH_MODE_KDTREE,
     SEARCH_MODE_VECTORIZED,
     ClusterExtractionPreset,
     PairCutoffDefinitions,
+    PDBShellReferenceDefinition,
     format_search_mode_label,
     load_cluster_extraction_presets,
     ordered_cluster_extraction_preset_names,
@@ -401,9 +401,7 @@ class ClusterDefinitionsPanel(QGroupBox):
         shell_header.setSectionResizeMode(
             1, QHeaderView.ResizeMode.ResizeToContents
         )
-        shell_header.setSectionResizeMode(
-            2, QHeaderView.ResizeMode.Stretch
-        )
+        shell_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.shell_reference_table)
         group.setVisible(False)
         return group
@@ -569,7 +567,9 @@ class ClusterDefinitionsPanel(QGroupBox):
         if element_item is None:
             return None
         element = element_item.text().strip().title()
-        residue_text = "" if residue_item is None else residue_item.text().strip()
+        residue_text = (
+            "" if residue_item is None else residue_item.text().strip()
+        )
         if not element:
             return None
         return element, (residue_text or None)
@@ -583,9 +583,13 @@ class ClusterDefinitionsPanel(QGroupBox):
         for row, (element, residue) in enumerate(rule_keys):
             table.insertRow(row)
             element_item = QTableWidgetItem(element)
-            element_item.setFlags(element_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            element_item.setFlags(
+                element_item.flags() & ~Qt.ItemFlag.ItemIsEditable
+            )
             residue_item = QTableWidgetItem("" if residue is None else residue)
-            residue_item.setFlags(residue_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            residue_item.setFlags(
+                residue_item.flags() & ~Qt.ItemFlag.ItemIsEditable
+            )
             table.setItem(row, 0, element_item)
             table.setItem(row, 1, residue_item)
             reference_combo = self._make_shell_reference_combo()
@@ -675,7 +679,10 @@ class ClusterDefinitionsPanel(QGroupBox):
     def shell_reference_definitions(
         self,
     ) -> tuple[PDBShellReferenceDefinition, ...]:
-        if not self._shell_reference_editing_enabled or self._frame_format != "pdb":
+        if (
+            not self._shell_reference_editing_enabled
+            or self._frame_format != "pdb"
+        ):
             return ()
 
         definitions: list[PDBShellReferenceDefinition] = []
@@ -707,8 +714,10 @@ class ClusterDefinitionsPanel(QGroupBox):
 
     def load_shell_reference_definitions(
         self,
-        definitions: tuple[PDBShellReferenceDefinition, ...]
-        | list[PDBShellReferenceDefinition],
+        definitions: (
+            tuple[PDBShellReferenceDefinition, ...]
+            | list[PDBShellReferenceDefinition]
+        ),
         *,
         emit_signal: bool = True,
     ) -> None:

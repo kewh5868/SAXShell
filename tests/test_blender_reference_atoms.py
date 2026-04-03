@@ -7,10 +7,10 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 from saxshell.toolbox.blender.common import (
-    ATOM_STYLE_LABELS,
     ATOM_STYLE_CHOICES,
-    LIGHTING_LEVEL_LABELS,
+    ATOM_STYLE_LABELS,
     LIGHTING_LEVEL_CHOICES,
+    LIGHTING_LEVEL_LABELS,
     OrientationSpec,
 )
 from saxshell.toolbox.blender.ui.main_window import OrientationPreviewWidget
@@ -110,8 +110,14 @@ def test_orientation_preview_widget_loads_reference_atom_swatch(qapp):
         assert widget.reference_lighting_label.text() == (
             f"Lighting: {LIGHTING_LEVEL_LABELS[3]}"
         )
-        assert widget.reference_dark_title_label.text() == REFERENCE_ATOM_LABELS["C"]
-        assert widget.reference_light_title_label.text() == REFERENCE_ATOM_LABELS["S"]
+        assert (
+            widget.reference_dark_title_label.text()
+            == REFERENCE_ATOM_LABELS["C"]
+        )
+        assert (
+            widget.reference_light_title_label.text()
+            == REFERENCE_ATOM_LABELS["S"]
+        )
         assert widget.reference_background_color() == "#fff4cf"
         assert "#fff4cf" in widget.reference_dark_image_label.styleSheet()
         assert "#fff4cf" in widget.reference_light_image_label.styleSheet()

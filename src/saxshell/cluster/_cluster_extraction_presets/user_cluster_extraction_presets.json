@@ -88,9 +88,7 @@
         "use_pbc": true,
         "search_mode": "kdtree",
         "save_state_frequency": 1000,
-        "shell_growth_levels": [
-          1
-        ],
+        "shell_growth_levels": [1],
         "shared_shells": true,
         "include_shell_atoms_in_stoichiometry": false
       }

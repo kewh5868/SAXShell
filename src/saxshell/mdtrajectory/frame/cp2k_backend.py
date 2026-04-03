@@ -102,8 +102,8 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
                     if not handle.readline():
                         break
                     for _ in range(atom_count):
-                            if not handle.readline():
-                                break
+                        if not handle.readline():
+                            break
         return count
 
     def _parse_xyz_frame_metadata(self) -> list[FrameMetadata]:

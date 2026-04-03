@@ -278,7 +278,9 @@ class AtomAppearanceOverride:
                 float(color[3]),
             ),
         )
-        object.__setattr__(self, "size_scale", max(float(self.size_scale), 0.05))
+        object.__setattr__(
+            self, "size_scale", max(float(self.size_scale), 0.05)
+        )
 
 
 @dataclass(slots=True, frozen=True)
@@ -835,7 +837,9 @@ def style_atom_size_scale(
     style = normalize_atom_style(atom_style)
     custom = _CUSTOM_AESTHETICS.get(style)
     if custom is not None:
-        override = custom.override_lookup().get(normalize_element_symbol(element))
+        override = custom.override_lookup().get(
+            normalize_element_symbol(element)
+        )
         if override is not None:
             return float(override.size_scale)
         return float(ATOM_STYLE_DEFAULTS[custom.base_style]["atom_scale"])

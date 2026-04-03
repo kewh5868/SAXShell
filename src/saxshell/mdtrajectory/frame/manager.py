@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from .base import FrameMetadata, FrameRecord
 from .cp2k_backend import CP2KTrajectoryBackend

@@ -1146,7 +1146,10 @@ def _write_prediction_structures(
             if entry.source != "predicted" or entry.structure_path is None:
                 continue
             resolved_source = entry.structure_path.expanduser().resolve()
-            if resolved_source in seen_sources or not resolved_source.is_file():
+            if (
+                resolved_source in seen_sources
+                or not resolved_source.is_file()
+            ):
                 continue
             seen_sources.add(resolved_source)
             target_path = _unique_child_path(output_dir, resolved_source.name)

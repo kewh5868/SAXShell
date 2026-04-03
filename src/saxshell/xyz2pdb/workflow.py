@@ -118,7 +118,8 @@ def rotation_matrix_about_axis(
     *,
     tolerance: float = 1.0e-8,
 ) -> np.ndarray:
-    """Return the rotation matrix for a right-handed rotation around one axis."""
+    """Return the rotation matrix for a right-handed rotation around one
+    axis."""
     normalized_axis = np.asarray(axis, dtype=float)
     axis_norm = float(np.linalg.norm(normalized_axis))
     if axis_norm < tolerance:
@@ -173,7 +174,10 @@ def _normalized_backbone_pairs(
         atom2_name = _normalized_atom_name(str(item[1]), fallback="A2")
         if atom1_name == atom2_name:
             continue
-        if atom1_name not in valid_atom_names or atom2_name not in valid_atom_names:
+        if (
+            atom1_name not in valid_atom_names
+            or atom2_name not in valid_atom_names
+        ):
             continue
         pair_key = tuple(sorted((atom1_name, atom2_name)))
         if pair_key in seen_pairs:
@@ -209,8 +213,7 @@ def _resolve_reference_backbone_pairs(
     atoms: Sequence[PDBAtom],
 ) -> tuple[tuple[str, str], ...]:
     atom_names = {
-        _reference_atom_name(atom, index)
-        for index, atom in enumerate(atoms)
+        _reference_atom_name(atom, index) for index, atom in enumerate(atoms)
     }
     metadata_path = _reference_metadata_path(reference_path)
     if metadata_path.is_file():
@@ -238,8 +241,7 @@ def _infer_preferred_reference_backbone_pairs(
 
     coordinates = np.array([atom.coordinates for atom in atoms], dtype=float)
     atom_names = [
-        _reference_atom_name(atom, index)
-        for index, atom in enumerate(atoms)
+        _reference_atom_name(atom, index) for index, atom in enumerate(atoms)
     ]
     heavy_element_counts = Counter(
         atom.element for atom in atoms if atom.element != "H"
@@ -247,7 +249,9 @@ def _infer_preferred_reference_backbone_pairs(
     if not heavy_element_counts:
         heavy_element_counts = Counter(atom.element for atom in atoms)
 
-    candidates: list[tuple[tuple[int, int, float, float, float], tuple[str, str]]] = []
+    candidates: list[
+        tuple[tuple[int, int, float, float, float], tuple[str, str]]
+    ] = []
     for atom1_index, atom1 in enumerate(atoms):
         for atom2_index in range(atom1_index + 1, len(atoms)):
             atom2 = atoms[atom2_index]
@@ -549,7 +553,8 @@ class MoleculeDefinition:
 
 @dataclass(slots=True)
 class _BackboneCandidateState:
-    """Incremental search state for one source backbone candidate pair."""
+    """Incremental search state for one source backbone candidate
+    pair."""
 
     candidate_index: int
     source_index1: int
@@ -680,7 +685,8 @@ class XYZToPDBPreviewResult:
 
 @dataclass(slots=True)
 class XYZToPDBAssertionResidueSummary:
-    """Assertion summary for one residue type across exported molecules."""
+    """Assertion summary for one residue type across exported
+    molecules."""
 
     residue_name: str
     molecule_count: int
@@ -701,9 +707,7 @@ class XYZToPDBAssertionResidueSummary:
             "distance_pair_count": int(self.distance_pair_count),
             "median_distribution_rmsd": float(self.median_distribution_rmsd),
             "max_distribution_rmsd": float(self.max_distribution_rmsd),
-            "median_max_distance_delta": float(
-                self.median_max_distance_delta
-            ),
+            "median_max_distance_delta": float(self.median_max_distance_delta),
             "max_max_distance_delta": float(self.max_max_distance_delta),
             "outlier_count": int(self.outlier_count),
             "passed": bool(self.passed),
@@ -743,7 +747,8 @@ class XYZToPDBReferenceUpdateCandidate:
 
 @dataclass(slots=True)
 class XYZToPDBAssertionResult:
-    """Optional molecule-shape assertion report produced during export."""
+    """Optional molecule-shape assertion report produced during
+    export."""
 
     molecule_dir: Path
     report_file: Path
@@ -970,8 +975,8 @@ def create_reference_molecule(
             },
         )
         if not resolved_backbone_pairs:
-            resolved_backbone_pairs = _infer_preferred_reference_backbone_pairs(
-                structure.atoms
+            resolved_backbone_pairs = (
+                _infer_preferred_reference_backbone_pairs(structure.atoms)
             )
     _write_reference_metadata(
         output_path,
@@ -1663,18 +1668,25 @@ class XYZToPDBWorkflow:
         best_assignment: tuple[int, ...] | None = None
         best_score: float | None = None
         constraint_index1 = np.array(
-            [index1 for index1, _index2, _tolerance in molecule.resolved_anchor_indices],
+            [
+                index1
+                for index1, _index2, _tolerance in molecule.resolved_anchor_indices
+            ],
             dtype=int,
         )
         constraint_index2 = np.array(
-            [index2 for _index1, index2, _tolerance in molecule.resolved_anchor_indices],
+            [
+                index2
+                for _index1, index2, _tolerance in molecule.resolved_anchor_indices
+            ],
             dtype=int,
         )
         constraint_reference_distances = np.array(
             [
                 float(
                     np.linalg.norm(
-                        reference_coordinates[index2] - reference_coordinates[index1]
+                        reference_coordinates[index2]
+                        - reference_coordinates[index1]
                     )
                 )
                 for index1, index2, _tolerance in molecule.resolved_anchor_indices
@@ -1690,12 +1702,16 @@ class XYZToPDBWorkflow:
         )
         if frame_search_cache is None:
             frame_search_cache = self._build_frame_search_cache(frame)
-        source_indices_by_element = frame_search_cache.source_indices_by_element
+        source_indices_by_element = (
+            frame_search_cache.source_indices_by_element
+        )
         source_coordinates_by_element = (
             frame_search_cache.source_coordinates_by_element
         )
         anchor_search_stages = self._anchor_search_stages(molecule)
-        for stage_index, search_anchor_pairs in enumerate(anchor_search_stages):
+        for stage_index, search_anchor_pairs in enumerate(
+            anchor_search_stages
+        ):
             _raise_if_cancelled(cancel_callback)
             stage_best_assignment: tuple[int, ...] | None = None
             stage_best_score: float | None = None
@@ -1726,11 +1742,13 @@ class XYZToPDBWorkflow:
                 if reference_length <= 0.0:
                     continue
 
-                candidate_pair_cache_key = self._candidate_backbone_pair_cache_key(
-                    anchor_atom1.element,
-                    anchor_atom2.element,
-                    reference_length,
-                    tolerance,
+                candidate_pair_cache_key = (
+                    self._candidate_backbone_pair_cache_key(
+                        anchor_atom1.element,
+                        anchor_atom2.element,
+                        reference_length,
+                        tolerance,
+                    )
                 )
                 cache_hit = (
                     candidate_pair_cache_key
@@ -1747,11 +1765,8 @@ class XYZToPDBWorkflow:
                     tolerance=tolerance,
                     discovery_callback=(
                         None
-                        if search_status_callback is None
-                        or cache_hit
-                        else lambda count,
-                        atom1_name=anchor_atom1.atom_name,
-                        atom2_name=anchor_atom2.atom_name: search_status_callback(
+                        if search_status_callback is None or cache_hit
+                        else lambda count, atom1_name=anchor_atom1.atom_name, atom2_name=anchor_atom2.atom_name: search_status_callback(
                             "Backbone "
                             f"{atom1_name}-{atom2_name}: "
                             f"found {count} candidate pair(s) so far."
@@ -1811,14 +1826,18 @@ class XYZToPDBWorkflow:
                     )
                     for _attempt_index in range(batch_attempts):
                         _raise_if_cancelled(cancel_callback)
-                        angle_radians = candidate_state.pending_angles.popleft()
+                        angle_radians = (
+                            candidate_state.pending_angles.popleft()
+                        )
                         fit_attempt_count += 1
                         candidate_state.total_attempts += 1
-                        target_coordinates = self._rotated_backbone_coordinates(
-                            candidate_state.base_transformed_coordinates,
-                            axis_origin=candidate_state.axis_origin,
-                            axis_direction=candidate_state.axis_direction,
-                            angle_radians=angle_radians,
+                        target_coordinates = (
+                            self._rotated_backbone_coordinates(
+                                candidate_state.base_transformed_coordinates,
+                                axis_origin=candidate_state.axis_origin,
+                                axis_direction=candidate_state.axis_direction,
+                                angle_radians=angle_radians,
+                            )
                         )
                         assignment, score = self._assign_reference_atoms(
                             frame,
@@ -1830,13 +1849,16 @@ class XYZToPDBWorkflow:
                             source_indices_by_element=source_indices_by_element,
                             source_coordinates_by_element=source_coordinates_by_element,
                         )
-                        if assignment is None or not self._assignment_satisfies_anchor_constraints(
-                            frame,
-                            assignment=assignment,
-                            constraint_index1=constraint_index1,
-                            constraint_index2=constraint_index2,
-                            constraint_reference_distances=constraint_reference_distances,
-                            constraint_tolerances=constraint_tolerances,
+                        if (
+                            assignment is None
+                            or not self._assignment_satisfies_anchor_constraints(
+                                frame,
+                                assignment=assignment,
+                                constraint_index1=constraint_index1,
+                                constraint_index2=constraint_index2,
+                                constraint_reference_distances=constraint_reference_distances,
+                                constraint_tolerances=constraint_tolerances,
+                            )
                         ):
                             candidate_state.failed_fit_count += 1
                             continue
@@ -1853,7 +1875,10 @@ class XYZToPDBWorkflow:
                                 candidate_state.candidate_index
                             )
 
-                    if candidate_state.total_attempts >= _BACKBONE_CANDIDATE_FIT_DEFER_ATTEMPTS:
+                    if (
+                        candidate_state.total_attempts
+                        >= _BACKBONE_CANDIDATE_FIT_DEFER_ATTEMPTS
+                    ):
                         if search_status_callback is not None:
                             search_status_callback(
                                 "Backbone "
@@ -1864,13 +1889,17 @@ class XYZToPDBWorkflow:
                                 "limit and was skipped."
                             )
                         continue
-                    if candidate_state.pending_angles or candidate_state.rotation_level < len(
-                        _BACKBONE_ROTATION_SAMPLE_COUNTS
+                    if (
+                        candidate_state.pending_angles
+                        or candidate_state.rotation_level
+                        < len(_BACKBONE_ROTATION_SAMPLE_COUNTS)
                     ):
                         pending_states.append(candidate_state)
 
                 if search_status_callback is not None:
-                    rejected_fit_count = fit_attempt_count - successful_fit_count
+                    rejected_fit_count = (
+                        fit_attempt_count - successful_fit_count
+                    )
                     search_status_callback(
                         "Backbone "
                         f"{anchor_atom1.atom_name}-{anchor_atom2.atom_name}: "
@@ -1949,9 +1978,11 @@ class XYZToPDBWorkflow:
         ordered_pairs = sorted(
             molecule.resolved_anchor_indices,
             key=lambda item: (
-                0
-                if tuple(sorted((item[0], item[1]))) in preferred_pairs
-                else 1,
+                (
+                    0
+                    if tuple(sorted((item[0], item[1]))) in preferred_pairs
+                    else 1
+                ),
                 preferred_pairs.get(
                     tuple(sorted((item[0], item[1]))),
                     len(preferred_pairs),
@@ -2023,8 +2054,12 @@ class XYZToPDBWorkflow:
                 cache_key
             )
 
-        candidate_indices1 = source_indices_by_element.get(anchor_atom1.element, [])
-        candidate_indices2 = source_indices_by_element.get(anchor_atom2.element, [])
+        candidate_indices1 = source_indices_by_element.get(
+            anchor_atom1.element, []
+        )
+        candidate_indices2 = source_indices_by_element.get(
+            anchor_atom2.element, []
+        )
         if not candidate_indices1 or not candidate_indices2:
             return ()
 
@@ -2035,7 +2070,9 @@ class XYZToPDBWorkflow:
             return ()
 
         if ranked_pairs is None:
-            ranked_pairs_with_distance: list[tuple[float, tuple[int, int]]] = []
+            ranked_pairs_with_distance: list[tuple[float, tuple[int, int]]] = (
+                []
+            )
             next_discovery_report = _BACKBONE_CANDIDATE_DISCOVERY_LOG_START
             for offset1, source_index1 in enumerate(candidate_indices1):
                 _raise_if_cancelled(cancel_callback)
@@ -2052,13 +2089,17 @@ class XYZToPDBWorkflow:
                         continue
                     ranked_pairs_with_distance.append(
                         (
-                            abs(float(distances[int(offset2)]) - reference_length),
+                            abs(
+                                float(distances[int(offset2)])
+                                - reference_length
+                            ),
                             (source_index1, source_index2),
                         )
                     )
                 if (
                     discovery_callback is not None
-                    and len(ranked_pairs_with_distance) >= next_discovery_report
+                    and len(ranked_pairs_with_distance)
+                    >= next_discovery_report
                 ):
                     discovery_callback(len(ranked_pairs_with_distance))
                     next_discovery_report *= 2
@@ -2106,9 +2147,7 @@ class XYZToPDBWorkflow:
                 continue
 
             transformed = (
-                (
-                    reference_coordinates - reference_coordinates[anchor_index1]
-                )
+                (reference_coordinates - reference_coordinates[anchor_index1])
                 @ rotation.T
             ) + position1
             axis_direction = position2 - position1
@@ -2201,7 +2240,10 @@ class XYZToPDBWorkflow:
         if not len(constraint_index1):
             return True
         assigned_coordinates = np.array(
-            [frame.atoms[source_index].coordinates for source_index in assignment],
+            [
+                frame.atoms[source_index].coordinates
+                for source_index in assignment
+            ],
             dtype=float,
         )
         candidate_distances = np.linalg.norm(
@@ -2223,9 +2265,7 @@ class XYZToPDBWorkflow:
     ) -> str:
         if fit_attempt_count <= 0:
             return "0.0%"
-        return (
-            f"{100.0 * float(successful_fit_count) / float(fit_attempt_count):.1f}%"
-        )
+        return f"{100.0 * float(successful_fit_count) / float(fit_attempt_count):.1f}%"
 
     def _anchor_constraints(
         self,

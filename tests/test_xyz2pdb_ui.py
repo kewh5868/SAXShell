@@ -122,7 +122,9 @@ def test_reference_library_dropdown_populates_from_selected_folder(
     assert window.mapping_panel.tight_scale_spin.suffix().strip() == "%"
     assert window.mapping_panel.relaxed_scale_spin.suffix().strip() == "%"
     assert window.mapping_panel.tight_scale_spin.value() == pytest.approx(85.0)
-    assert window.mapping_panel.relaxed_scale_spin.value() == pytest.approx(135.0)
+    assert window.mapping_panel.relaxed_scale_spin.value() == pytest.approx(
+        135.0
+    )
     assert "bond-table percent tolerances" in (
         window.mapping_panel.relaxed_scale_spin.toolTip()
     )
@@ -130,11 +132,19 @@ def test_reference_library_dropdown_populates_from_selected_folder(
         window.mapping_panel.max_missing_h_spin.toolTip()
     )
     header = window.mapping_panel.molecule_table.horizontalHeader()
-    assert header.sectionResizeMode(0) == QHeaderView.ResizeMode.ResizeToContents
+    assert (
+        header.sectionResizeMode(0) == QHeaderView.ResizeMode.ResizeToContents
+    )
     assert header.sectionResizeMode(1) == QHeaderView.ResizeMode.Stretch
     bond_header = window.mapping_panel.bond_table.horizontalHeader()
-    assert bond_header.sectionResizeMode(0) == QHeaderView.ResizeMode.ResizeToContents
-    assert bond_header.sectionResizeMode(1) == QHeaderView.ResizeMode.ResizeToContents
+    assert (
+        bond_header.sectionResizeMode(0)
+        == QHeaderView.ResizeMode.ResizeToContents
+    )
+    assert (
+        bond_header.sectionResizeMode(1)
+        == QHeaderView.ResizeMode.ResizeToContents
+    )
     assert window.mapping_panel.bond_table.horizontalHeaderItem(2).text() == (
         "Ref (A)"
     )
@@ -188,7 +198,10 @@ def test_main_window_creates_reference_and_suggests_output_dir(
     window.reference_panel.residue_edit.setText("PBI")
     assert not window.reference_panel.backbone_atom1_combo.isEnabled()
     assert not window.reference_panel.backbone_atom2_combo.isEnabled()
-    assert "XYZ source detected" in window.reference_panel.backbone_help_label.text()
+    assert (
+        "XYZ source detected"
+        in window.reference_panel.backbone_help_label.text()
+    )
 
     window.create_reference_molecule()
 
@@ -229,7 +242,10 @@ def test_main_window_creates_reference_with_selected_pdb_backbone_pair(
     assert atom_names == ["Auto", "O1", "C1", "N1"]
     assert window.reference_panel.backbone_atom1_combo.isEnabled()
     assert window.reference_panel.backbone_atom2_combo.isEnabled()
-    assert "PDB source detected" in window.reference_panel.backbone_help_label.text()
+    assert (
+        "PDB source detected"
+        in window.reference_panel.backbone_help_label.text()
+    )
 
     window.reference_panel.backbone_atom1_combo.setCurrentText("O1")
     window.reference_panel.backbone_atom2_combo.setCurrentText("N1")
@@ -307,11 +323,16 @@ def test_main_window_native_mapping_flow_estimates_and_reports_export_progress_w
     window.mapping_panel._add_molecule()
 
     window.estimate_mapping()
-    assert "Estimated molecules: PBI x1" in window.export_panel.preview_box.toPlainText()
+    assert (
+        "Estimated molecules: PBI x1"
+        in window.export_panel.preview_box.toPlainText()
+    )
     assert window.export_panel.solution_combo.count() == 1
 
     assert not hasattr(window.export_panel, "test_button")
-    assert window.export_panel.export_button.text() == "Convert XYZ Frames to PDB"
+    assert (
+        window.export_panel.export_button.text() == "Convert XYZ Frames to PDB"
+    )
     assert window.export_panel.cancel_button.text() == "Cancel Mapping"
     assert window.export_panel.cancel_button.isEnabled() is False
     assert window.export_panel.assertion_mode_enabled() is False
@@ -337,7 +358,10 @@ def test_main_window_native_mapping_flow_estimates_and_reports_export_progress_w
     assert "Mapping template from input.xyz..." in (
         window.export_panel.log_box.toPlainText()
     )
-    assert window.statusBar().currentMessage() == "Mapping template from input.xyz..."
+    assert (
+        window.statusBar().currentMessage()
+        == "Mapping template from input.xyz..."
+    )
     window._set_export_running(True)
     assert window.export_panel.export_button.isEnabled() is False
     assert window.export_panel.cancel_button.isEnabled() is True
@@ -383,7 +407,9 @@ def test_main_window_cancel_export_requests_stop_without_closing(
     assert window.export_panel.progress_label.text() == (
         "Canceling current conversion..."
     )
-    assert "Cancellation requested." in window.export_panel.log_box.toPlainText()
+    assert (
+        "Cancellation requested." in window.export_panel.log_box.toPlainText()
+    )
     assert window.isVisible() is False
 
 
@@ -591,8 +617,9 @@ def test_main_window_assertion_candidates_can_save_new_version_one_at_a_time(
     assert (refs_dir / "pbi_20260401_120000.pdb").exists()
     assert (refs_dir / "pbi_20260401_120000.json").exists()
     assert not (refs_dir / "dmf_20260401_120000.pdb").exists()
-    assert "Saved assertion-derived reference version pbi_20260401_120000." in (
-        window.export_panel.log_box.toPlainText()
+    assert (
+        "Saved assertion-derived reference version pbi_20260401_120000."
+        in (window.export_panel.log_box.toPlainText())
     )
     assert "Skipped assertion-derived reference update for dmf." in (
         window.export_panel.log_box.toPlainText()

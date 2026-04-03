@@ -12,7 +12,7 @@ from typing import Callable, Sequence
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from saxshell.cluster import PDBShellReferenceDefinition, PairCutoffDefinitions
+from saxshell.cluster import PairCutoffDefinitions, PDBShellReferenceDefinition
 from saxshell.cluster.clusternetwork import (
     detect_frame_folder_mode,
     stoichiometry_label,
@@ -418,9 +418,9 @@ class ClusterDynamicsMLWorkflow:
         self.q_points = max(int(q_points), 2)
         self._project_manager = SAXSProjectManager()
         self._cached_frames_input_format: str | None = None
-        self._cached_resolved_pdb_shell_references: tuple[
-            _ResolvedPDBShellReference, ...
-        ] | None = None
+        self._cached_resolved_pdb_shell_references: (
+            tuple[_ResolvedPDBShellReference, ...] | None
+        ) = None
 
     def preview_selection(self) -> ClusterDynamicsMLPreview:
         dynamics_preview = (
@@ -2225,18 +2225,15 @@ class ClusterDynamicsMLWorkflow:
         source_anchor = reference_coordinates[reference.anchor_atom_index]
         target_anchor = np.asarray(anchor_coordinate, dtype=float)
         if solute_coordinates.size == 0:
-            solute_centroid = (
-                target_anchor
-                - _safe_unit_vector(reference.reference_outward_vector)
+            solute_centroid = target_anchor - _safe_unit_vector(
+                reference.reference_outward_vector
             )
         else:
             solute_centroid = np.mean(
                 np.asarray(solute_coordinates, dtype=float),
                 axis=0,
             )
-        source_outward = _safe_unit_vector(
-            reference.reference_outward_vector
-        )
+        source_outward = _safe_unit_vector(reference.reference_outward_vector)
         target_outward = _safe_unit_vector(
             target_anchor - solute_centroid,
             fallback=source_outward,
@@ -2274,7 +2271,8 @@ class ClusterDynamicsMLWorkflow:
                 if obstacle_set.size == 0 or candidate_non_anchor.size == 0:
                     continue
                 distances = np.linalg.norm(
-                    candidate_non_anchor[:, np.newaxis, :] - obstacle_set[np.newaxis, :, :],
+                    candidate_non_anchor[:, np.newaxis, :]
+                    - obstacle_set[np.newaxis, :, :],
                     axis=2,
                 )
                 min_clearance = min(
@@ -2838,11 +2836,7 @@ class ClusterDynamicsMLWorkflow:
                 raise ValueError(
                     "PDB shell references must be unique per shell "
                     f"element/residue pair. Duplicate rule: {shell_element}"
-                    + (
-                        ""
-                        if shell_residue is None
-                        else f" ({shell_residue})"
-                    )
+                    + ("" if shell_residue is None else f" ({shell_residue})")
                     + "."
                 )
             seen_shell_keys.add(shell_key)
@@ -2967,14 +2961,12 @@ class ClusterDynamicsMLWorkflow:
                 None,
             )
             partner_data = preferred_partner
-            if (
-                partner_data is None
-                or int(partner_data[0]) == int(anchor_index)
+            if partner_data is None or int(partner_data[0]) == int(
+                anchor_index
             ):
                 partner_data = deprecated_partner
-            if (
-                partner_data is None
-                or int(partner_data[0]) == int(anchor_index)
+            if partner_data is None or int(partner_data[0]) == int(
+                anchor_index
             ):
                 partner_data = fallback_partner
             if partner_data is None:
@@ -3007,7 +2999,9 @@ class ClusterDynamicsMLWorkflow:
                     - reference_coordinates[anchor_index]
                 )
             backbone_distance = float(
-                np.linalg.norm(partner_atom.coordinates - anchor_atom.coordinates)
+                np.linalg.norm(
+                    partner_atom.coordinates - anchor_atom.coordinates
+                )
             )
             resolved.append(
                 _ResolvedPDBShellReference(
@@ -3079,7 +3073,10 @@ class ClusterDynamicsMLWorkflow:
             if atom.atom_type in {"node", "linker", "shell"}
         }
         ordered_atoms = tuple(
-            atom.copy() for atom in sorted(selected_atoms.values(), key=lambda atom: atom.atom_id)
+            atom.copy()
+            for atom in sorted(
+                selected_atoms.values(), key=lambda atom: atom.atom_id
+            )
         )
         if not ordered_atoms:
             return None

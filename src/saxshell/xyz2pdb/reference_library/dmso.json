@@ -1,9 +1,4 @@
 {
-  "backbone_pairs": [
-    [
-      "O1",
-      "S1"
-    ]
-  ],
+  "backbone_pairs": [["O1", "S1"]],
   "residue_name": "DMS"
 }

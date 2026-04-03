@@ -10,8 +10,8 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
-    QGroupBox,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -25,8 +25,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from saxshell.xyz2pdb import ReferenceLibraryEntry
 from saxshell.structure import PDBStructure
+from saxshell.xyz2pdb import ReferenceLibraryEntry
 from saxshell.xyz2pdb.mapping_workflow import (
     FreeAtomMappingInput,
     MoleculeMappingInput,
@@ -79,7 +79,9 @@ class XYZToPDBMappingPanel(QGroupBox):
         self.hydrogen_mode_combo.currentIndexChanged.connect(
             lambda _index: self.settings_changed.emit()
         )
-        hydrogen_layout.addRow("Missing hydrogen mode", self.hydrogen_mode_combo)
+        hydrogen_layout.addRow(
+            "Missing hydrogen mode", self.hydrogen_mode_combo
+        )
         layout.addWidget(hydrogen_group)
         self.setLayout(layout)
 
@@ -102,7 +104,9 @@ class XYZToPDBMappingPanel(QGroupBox):
         )
         _configure_residue_line_edit(self.free_residue_edit)
         add_button = QPushButton("Add Free Atom")
-        add_button.clicked.connect(lambda _checked=False: self._add_free_atom())
+        add_button.clicked.connect(
+            lambda _checked=False: self._add_free_atom()
+        )
         remove_button = QPushButton("Remove Selected")
         remove_button.clicked.connect(
             lambda _checked=False: self._remove_selected_free_atom()
@@ -327,7 +331,9 @@ class XYZToPDBMappingPanel(QGroupBox):
         self,
         entries: Sequence[ReferenceLibraryEntry],
         *,
-        bond_defaults_by_name: dict[str, tuple[ReferenceBondToleranceInput, ...]] | None = None,
+        bond_defaults_by_name: (
+            dict[str, tuple[ReferenceBondToleranceInput, ...]] | None
+        ) = None,
     ) -> None:
         if bond_defaults_by_name is not None:
             self._reference_bond_defaults = dict(bond_defaults_by_name)
@@ -370,7 +376,9 @@ class XYZToPDBMappingPanel(QGroupBox):
         return list(self._molecule_inputs)
 
     def hydrogen_mode(self) -> str:
-        return str(self.hydrogen_mode_combo.currentData() or "leave_unassigned")
+        return str(
+            self.hydrogen_mode_combo.currentData() or "leave_unassigned"
+        )
 
     def _add_free_atom(self) -> None:
         element = str(self.free_element_combo.currentData() or "").strip()
@@ -410,7 +418,9 @@ class XYZToPDBMappingPanel(QGroupBox):
             return
         self._molecule_inputs.append(molecule)
         self._refresh_molecule_table()
-        self.molecule_table.selectRow(max(self.molecule_table.rowCount() - 1, 0))
+        self.molecule_table.selectRow(
+            max(self.molecule_table.rowCount() - 1, 0)
+        )
         self.settings_changed.emit()
 
     def _update_selected_molecule(self) -> None:
@@ -433,7 +443,9 @@ class XYZToPDBMappingPanel(QGroupBox):
         del self._molecule_inputs[row]
         self._refresh_molecule_table()
         if self.molecule_table.rowCount():
-            self.molecule_table.selectRow(min(row, self.molecule_table.rowCount() - 1))
+            self.molecule_table.selectRow(
+                min(row, self.molecule_table.rowCount() - 1)
+            )
         else:
             self._populate_bond_table(())
         self.settings_changed.emit()
@@ -496,7 +508,9 @@ class XYZToPDBMappingPanel(QGroupBox):
         molecule = self._molecule_inputs[row]
         self._set_combo_value(self.reference_combo, molecule.reference_name)
         self.molecule_residue_edit.setText(molecule.residue_name)
-        self.tight_scale_spin.setValue(float(molecule.tight_pass_scale) * 100.0)
+        self.tight_scale_spin.setValue(
+            float(molecule.tight_pass_scale) * 100.0
+        )
         self.relaxed_scale_spin.setValue(
             float(molecule.relaxed_pass_scale) * 100.0
         )
@@ -509,7 +523,9 @@ class XYZToPDBMappingPanel(QGroupBox):
 
     def _apply_selected_reference_defaults(self, *, force: bool) -> None:
         reference_name = str(self.reference_combo.currentData() or "").strip()
-        default_residue_name = self._reference_residue_defaults.get(reference_name)
+        default_residue_name = self._reference_residue_defaults.get(
+            reference_name
+        )
         if not default_residue_name:
             return
         current_residue_name = self.molecule_residue_edit.text().strip()
@@ -571,17 +587,25 @@ class XYZToPDBMappingPanel(QGroupBox):
             tolerance_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.bond_table.setItem(row, 3, tolerance_item)
             for column in range(4, self.bond_table.columnCount()):
-                self.bond_table.setItem(row, column, self._readonly_table_item(""))
+                self.bond_table.setItem(
+                    row, column, self._readonly_table_item("")
+                )
         self._populating_bond_table = False
         self._refresh_bond_table_range_columns()
 
-    def _bond_inputs_from_table(self) -> tuple[ReferenceBondToleranceInput, ...]:
+    def _bond_inputs_from_table(
+        self,
+    ) -> tuple[ReferenceBondToleranceInput, ...]:
         result: list[ReferenceBondToleranceInput] = []
         for row in range(self.bond_table.rowCount()):
             atom1_item = self.bond_table.item(row, 0)
             atom2_item = self.bond_table.item(row, 1)
             tolerance_item = self.bond_table.item(row, 3)
-            if atom1_item is None or atom2_item is None or tolerance_item is None:
+            if (
+                atom1_item is None
+                or atom2_item is None
+                or tolerance_item is None
+            ):
                 continue
             try:
                 tolerance = float(tolerance_item.text().strip())
@@ -718,9 +742,7 @@ class XYZToPDBMappingPanel(QGroupBox):
 
     def _readonly_table_item(self, text: str) -> QTableWidgetItem:
         item = QTableWidgetItem(text)
-        item.setFlags(
-            Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
-        )
+        item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
         item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         return item
 
