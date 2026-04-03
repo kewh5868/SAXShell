@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+from typing import Callable
 
-from .base import FrameRecord
+from .base import FrameMetadata, FrameRecord
 from .cp2k_backend import CP2KTrajectoryBackend
 from .exporters import export_pdb_frames, export_xyz_frames
 from .selectors import select_frames
@@ -12,6 +13,8 @@ from .selectors import select_frames
 if TYPE_CHECKING:
     from .cp2k_ener import CP2KEnergyData
     from .cutoff_analysis import SteadyStateResult
+
+ExportProgressCallback = Callable[[int, int, str], None]
 
 
 @dataclass(slots=True)
@@ -76,6 +79,9 @@ class TrajectoryManager:
         self.frames = self.backend.iter_frames()
         return self.frames
 
+    def load_frame_metadata(self) -> list[FrameMetadata]:
+        return self.backend.load_frame_metadata()
+
     def get_selected_frames(
         self,
         start: int | None = None,
@@ -109,11 +115,13 @@ class TrajectoryManager:
         min_time_fs: float | None = None,
         post_cutoff_stride: int = 1,
     ) -> FrameSelectionPreview:
-        if self.frames is None:
-            self.load_frames()
-
-        assert self.frames is not None
-        selected_frames = self.get_selected_frames(
+        frame_metadata = self.load_frame_metadata()
+        self._validate_time_cutoff_support(
+            frames=frame_metadata,
+            min_time_fs=min_time_fs,
+        )
+        selected_frames = select_frames(
+            frame_metadata,
             start=start,
             stop=stop,
             stride=stride,
@@ -127,7 +135,7 @@ class TrajectoryManager:
         ]
 
         return FrameSelectionPreview(
-            total_frames=len(self.frames),
+            total_frames=len(frame_metadata),
             selected_frames=len(selected_frames),
             start=start,
             stop=stop,
@@ -145,7 +153,7 @@ class TrajectoryManager:
             first_time_fs=selected_times[0] if selected_times else None,
             last_time_fs=selected_times[-1] if selected_times else None,
             time_metadata_frames=sum(
-                frame.time_fs is not None for frame in self.frames
+                frame.time_fs is not None for frame in frame_metadata
             ),
         )
 
@@ -157,6 +165,7 @@ class TrajectoryManager:
         stride: int = 1,
         min_time_fs: float | None = None,
         post_cutoff_stride: int = 1,
+        progress_callback: ExportProgressCallback | None = None,
     ) -> list[Path]:
         frames = self.get_selected_frames(
             start=start,
@@ -169,17 +178,33 @@ class TrajectoryManager:
         if not frames:
             return []
 
+        total_frames = len(frames)
+        if progress_callback is not None:
+            progress_callback(
+                0,
+                total_frames,
+                f"Preparing to export {total_frames} frame(s)...",
+            )
+
         if frames[0].file_type == "xyz":
-            return export_xyz_frames(frames, output_dir=output_dir)
+            return export_xyz_frames(
+                frames,
+                output_dir=output_dir,
+                progress_callback=progress_callback,
+            )
 
         if frames[0].file_type == "pdb":
-            return export_pdb_frames(frames, output_dir=output_dir)
+            return export_pdb_frames(
+                frames,
+                output_dir=output_dir,
+                progress_callback=progress_callback,
+            )
 
         raise ValueError("Unsupported frame type for export.")
 
     def _validate_time_cutoff_support(
         self,
-        frames: list[FrameRecord],
+        frames: list[FrameMetadata] | list[FrameRecord],
         min_time_fs: float | None,
     ) -> None:
         if min_time_fs is None:

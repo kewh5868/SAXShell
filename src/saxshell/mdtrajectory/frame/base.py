@@ -6,6 +6,14 @@ from pathlib import Path
 
 
 @dataclass(slots=True)
+class FrameMetadata:
+    """Lightweight frame metadata used for selection previews."""
+
+    frame_index: int
+    time_fs: float | None = None
+
+
+@dataclass(slots=True)
 class FrameRecord:
     """In-memory representation of one trajectory frame."""
 
@@ -28,10 +36,21 @@ class TrajectoryBackend(ABC):
         self.topology_file = (
             Path(topology_file) if topology_file is not None else None
         )
+        self._frame_metadata: list[FrameMetadata] | None = None
+
+    def load_frame_metadata(self) -> list[FrameMetadata]:
+        """Return cached frame metadata for lightweight inspection."""
+        if self._frame_metadata is None:
+            self._frame_metadata = self.iter_frame_metadata()
+        return self._frame_metadata
 
     @abstractmethod
     def inspect(self) -> dict[str, object]:
         """Return basic metadata about the trajectory."""
+
+    @abstractmethod
+    def iter_frame_metadata(self) -> list[FrameMetadata]:
+        """Return lightweight frame metadata for previews."""
 
     @abstractmethod
     def iter_frames(self) -> list[FrameRecord]:

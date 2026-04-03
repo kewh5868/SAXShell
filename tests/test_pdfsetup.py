@@ -98,7 +98,7 @@ if __name__ == "__main__":
 
 
 def _build_frames_dir(tmp_path: Path) -> Path:
-    frames_dir = tmp_path / "splitxyz_f0fs"
+    frames_dir = tmp_path / "splitxyz_f0_t0fs"
     frames_dir.mkdir()
     xyz = (
         "3\n" "frame\n" "Pb 0.0 0.0 0.0\n" "I 2.0 0.0 0.0\n" "I 0.0 2.0 0.0\n"

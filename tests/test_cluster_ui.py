@@ -1,3 +1,4 @@
+import json
 import os
 
 import pytest
@@ -7,6 +8,7 @@ import saxshell.cluster.cli as cluster_cli_module
 import saxshell.clusters as clusters_launcher
 from saxshell import saxshell as saxshell_module
 from saxshell.cluster import (
+    DEFAULT_CLUSTER_EXTRACTION_PRESET_NAME,
     DEFAULT_SAVE_STATE_FREQUENCY,
     example_atom_type_definitions,
     example_pair_cutoff_definitions,
@@ -22,6 +24,7 @@ from saxshell.cluster.ui.main_window import (
     estimate_selection,
     suggest_cluster_output_dir,
 )
+from saxshell.saxs.project_manager import SAXSProjectManager
 
 
 @pytest.fixture(scope="module")
@@ -31,6 +34,14 @@ def qapp():
     if app is None:
         app = QApplication([])
     yield app
+
+
+@pytest.fixture(autouse=True)
+def cluster_preset_path(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "SAXSHELL_CLUSTER_EXTRACTION_PRESETS_PATH",
+        str(tmp_path / "cluster_extraction_presets.json"),
+    )
 
 
 def test_cluster_output_dir_suggestion_uses_source_directory(tmp_path):
@@ -109,8 +120,19 @@ def test_definitions_panel_switches_to_xyz_mode(qapp):
     assert not panel.include_shell_atoms_in_stoichiometry()
 
 
-def test_definitions_panel_starts_with_example_values(qapp):
+def test_definitions_panel_starts_blank_with_builtin_preset_available(qapp):
     panel = ClusterDefinitionsPanel()
+
+    preset_names = [
+        panel.preset_combo.itemText(index)
+        for index in range(panel.preset_combo.count())
+    ]
+
+    assert panel.atom_type_definitions() == {}
+    assert panel.pair_cutoff_definitions() == {}
+    assert f"{DEFAULT_CLUSTER_EXTRACTION_PRESET_NAME} (Built-in)" in preset_names
+
+    panel.load_preset(DEFAULT_CLUSTER_EXTRACTION_PRESET_NAME)
 
     assert panel.atom_type_definitions() == {
         "node": [("Pb", None)],
@@ -125,6 +147,58 @@ def test_definitions_panel_starts_with_example_values(qapp):
     assert panel.search_mode() == "kdtree"
     assert panel.save_state_frequency() == DEFAULT_SAVE_STATE_FREQUENCY
     assert not panel.include_shell_atoms_in_stoichiometry()
+
+
+def test_definitions_panel_saves_and_recalls_custom_presets_without_box(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    preset_file = tmp_path / "cluster_extraction_presets.json"
+    panel = ClusterDefinitionsPanel()
+    panel.load_preset(DEFAULT_CLUSTER_EXTRACTION_PRESET_NAME)
+    panel.set_use_pbc(True)
+    panel.set_search_mode("vectorized")
+    panel.set_save_state_frequency(250)
+    panel.set_default_cutoff(4.25)
+    panel.set_shell_growth_levels((1, 2))
+    panel.set_shared_shells(True)
+    panel.set_include_shell_atoms_in_stoichiometry(True)
+    panel.set_box_dimensions((10.0, 11.0, 12.0))
+
+    panel.save_current_preset("Custom solvent shell")
+
+    assert preset_file.exists()
+    payload = json.loads(preset_file.read_text())
+    preset_payload = payload["presets"]["Custom solvent shell"]
+    assert "box_dimensions" not in json.dumps(preset_payload)
+
+    panel.set_box_dimensions((21.0, 22.0, 23.0), emit_signal=False)
+    panel.load_atom_type_definitions({}, emit_signal=False)
+    panel.load_pair_cutoff_definitions({}, emit_signal=False)
+    panel.set_use_pbc(False, emit_signal=False)
+    panel.set_search_mode("kdtree", emit_signal=False)
+    panel.set_save_state_frequency(
+        DEFAULT_SAVE_STATE_FREQUENCY,
+        emit_signal=False,
+    )
+    panel.set_default_cutoff(None, emit_signal=False)
+    panel.set_shell_growth_levels((), emit_signal=False)
+    panel.set_shared_shells(False, emit_signal=False)
+    panel.set_include_shell_atoms_in_stoichiometry(False, emit_signal=False)
+
+    panel.load_preset("Custom solvent shell")
+
+    assert panel.atom_type_definitions() == example_atom_type_definitions()
+    assert panel.pair_cutoff_definitions() == example_pair_cutoff_definitions()
+    assert panel.use_pbc()
+    assert panel.search_mode() == "vectorized"
+    assert panel.save_state_frequency() == 250
+    assert panel.default_cutoff() == 4.25
+    assert panel.shell_growth_levels() == (1, 2)
+    assert panel.shared_shells()
+    assert panel.include_shell_atoms_in_stoichiometry()
+    assert panel.box_dimensions() == (21.0, 22.0, 23.0)
 
 
 def test_cluster_main_window_preview_includes_output_details(
@@ -173,6 +247,90 @@ def test_cluster_main_window_preview_includes_output_details(
     assert "Output format: .pdb" in text
     assert "Frame file range: frame_0000.pdb to frame_0009.pdb" in text
     assert "Output folder: clusters_splitpdb0001" in text
+
+
+def test_cluster_main_window_shows_compact_project_status_and_registers_paths(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "saxs_project"
+    manager.create_project(project_dir)
+    frames_dir = tmp_path / "splitxyz0001"
+    frames_dir.mkdir()
+    (frames_dir / "frame_0000.xyz").write_text(
+        "1\nframe\nPb 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    clusters_dir = tmp_path / "clusters_splitxyz0001"
+    clusters_dir.mkdir()
+
+    window = ClusterMainWindow(
+        initial_frames_dir=frames_dir,
+        initial_project_dir=project_dir,
+    )
+    updates = []
+    window.project_paths_registered.connect(updates.append)
+    message = window._register_project_paths(
+        frames_dir=frames_dir,
+        clusters_dir=clusters_dir,
+    )
+    saved_settings = manager.load_project(project_dir)
+
+    assert window.project_banner is None
+    assert window.project_status_label is not None
+    assert project_dir.name in window.project_status_label.toolTip()
+    assert str(project_dir) in window.project_status_label.full_text()
+    assert window.project_status_label.parent() is window.statusBar()
+    assert saved_settings.resolved_frames_dir == frames_dir.resolve()
+    assert saved_settings.resolved_clusters_dir == clusters_dir.resolve()
+    assert updates == [
+        {
+            "project_dir": project_dir.resolve(),
+            "frames_dir": frames_dir.resolve(),
+            "clusters_dir": clusters_dir.resolve(),
+        }
+    ]
+    assert "Updated project folder references:" in (message or "")
+    window.close()
+
+
+def test_cluster_main_window_can_toggle_between_project_xyz_and_pdb_folders(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "saxs_project"
+    settings = manager.create_project(project_dir)
+    xyz_frames_dir = tmp_path / "splitxyz0001"
+    xyz_frames_dir.mkdir()
+    (xyz_frames_dir / "frame_0000.xyz").write_text(
+        "1\nframe\nPb 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    pdb_frames_dir = tmp_path / "xyz2pdb_splitxyz0001"
+    pdb_frames_dir.mkdir()
+    (pdb_frames_dir / "frame_0000.pdb").write_text(
+        "MODEL        1\nENDMDL\n",
+        encoding="utf-8",
+    )
+    settings.frames_dir = str(xyz_frames_dir)
+    settings.pdb_frames_dir = str(pdb_frames_dir)
+    manager.save_project(settings)
+
+    window = ClusterMainWindow(initial_project_dir=project_dir)
+
+    assert not window.trajectory_panel.project_source_widget.isHidden()
+    assert window.trajectory_panel.project_source_combo.count() == 2
+    assert window.trajectory_panel.get_frames_dir() == xyz_frames_dir
+
+    window.trajectory_panel.project_source_combo.setCurrentIndex(1)
+
+    assert window.trajectory_panel.selected_project_source_kind() == "pdb"
+    assert window.trajectory_panel.get_frames_dir() == pdb_frames_dir
+    window.close()
 
 
 def test_cluster_main_window_switches_to_xyz_mode(qapp, tmp_path):

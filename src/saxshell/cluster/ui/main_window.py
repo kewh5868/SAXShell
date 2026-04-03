@@ -34,11 +34,17 @@ from saxshell.cluster import (
 from saxshell.cluster.ui.definitions_panel import ClusterDefinitionsPanel
 from saxshell.cluster.ui.export_panel import ClusterExportPanel
 from saxshell.cluster.ui.trajectory_panel import ClusterTrajectoryPanel
+from saxshell.saxs.project_manager import (
+    ProjectSettings,
+    SAXSProjectManager,
+    build_project_paths,
+)
 from saxshell.saxs.ui.branding import (
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.saxs.ui.project_status_label import CompactProjectStatusLabel
 from saxshell.structure import AtomTypeDefinitions
 
 
@@ -363,8 +369,20 @@ _OPEN_WINDOWS: list["ClusterMainWindow"] = []
 class ClusterMainWindow(QMainWindow):
     """Main Qt6 window for the cluster extraction application."""
 
-    def __init__(self, initial_frames_dir: Path | None = None) -> None:
+    project_paths_registered = Signal(object)
+
+    def __init__(
+        self,
+        initial_frames_dir: Path | None = None,
+        initial_project_dir: Path | None = None,
+    ) -> None:
         super().__init__()
+        self._project_manager = SAXSProjectManager()
+        self._project_dir = (
+            None
+            if initial_project_dir is None
+            else Path(initial_project_dir).expanduser().resolve()
+        )
         self._last_summary: dict[str, object] | None = None
         self._frame_format: str | None = None
         self._inspect_thread: QThread | None = None
@@ -373,13 +391,37 @@ class ClusterMainWindow(QMainWindow):
         self._export_worker: ClusterExportWorker | None = None
         self._progress_dialog: ClusterProgressDialog | None = None
         self._export_phase = "idle"
+        self._project_xyz_frames_dir: Path | None = None
+        self._project_pdb_frames_dir: Path | None = None
+        self._active_project_frames_kind = "xyz"
         self._build_ui()
+        self._refresh_project_frame_sources()
 
-        if initial_frames_dir is not None:
+        default_frames_dir = (
+            self._project_xyz_frames_dir
+            or initial_frames_dir
+            or self._project_pdb_frames_dir
+        )
+        if default_frames_dir is not None:
             self.trajectory_panel.frames_dir_edit.setText(
-                str(initial_frames_dir)
+                str(default_frames_dir)
             )
-            self._update_suggested_output_dir(initial_frames_dir)
+            self._update_suggested_output_dir(default_frames_dir)
+
+    def closeEvent(self, event) -> None:
+        if (
+            (self._inspect_thread is not None and self._inspect_thread.isRunning())
+            or (self._export_thread is not None and self._export_thread.isRunning())
+        ):
+            QMessageBox.warning(
+                self,
+                "Cluster Extraction",
+                "Please wait for the current frames inspection or cluster "
+                "export to finish before closing this window.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell (cluster)")
@@ -387,8 +429,11 @@ class ClusterMainWindow(QMainWindow):
         self.resize(1360, 860)
 
         central = QWidget()
-        root = QHBoxLayout(central)
+        root = QVBoxLayout(central)
         root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+
+        self.project_banner = None
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -411,6 +456,9 @@ class ClusterMainWindow(QMainWindow):
 
         root.addWidget(splitter)
         self.setCentralWidget(central)
+        self.project_status_label = self._build_project_status_label()
+        if self.project_status_label is not None:
+            self.statusBar().addPermanentWidget(self.project_status_label)
         self.statusBar().showMessage("Ready")
 
         self.trajectory_panel.inspect_requested.connect(
@@ -421,6 +469,14 @@ class ClusterMainWindow(QMainWindow):
         )
         self.trajectory_panel.frames_dir_changed.connect(
             self._on_frames_dir_changed
+        )
+        self.trajectory_panel.project_source_changed.connect(
+            self._on_project_source_changed
+        )
+        self.trajectory_panel.frames_dir_edit.editingFinished.connect(
+            lambda: self._register_project_paths(
+                **self._current_project_input_registration()
+            )
         )
         self.export_panel.settings_changed.connect(
             self._refresh_selection_preview
@@ -441,6 +497,159 @@ class ClusterMainWindow(QMainWindow):
         )
         self._set_frame_format(None)
 
+    def _load_project_settings(self) -> ProjectSettings | None:
+        if self._project_dir is None:
+            return None
+        project_file = build_project_paths(self._project_dir).project_file
+        if not project_file.is_file():
+            return None
+        try:
+            return self._project_manager.load_project(self._project_dir)
+        except Exception:
+            return None
+
+    def _project_status_text(self) -> str | None:
+        if self._project_dir is None:
+            return None
+        return f"Active project: {self._project_dir}"
+
+    def _project_status_tooltip(self) -> str | None:
+        if self._project_dir is None:
+            return None
+        settings = self._load_project_settings()
+        project_name = (
+            self._project_dir.name
+            if settings is None
+            else settings.project_name.strip() or self._project_dir.name
+        )
+        return (
+            f"Active project: {project_name}\n"
+            f"{self._project_dir}\n\n"
+            "This window is linked to the active SAXS project, so saved "
+            "XYZ frames, optional PDB structure, and clusters folders are "
+            "written back to that project when you inspect or export data "
+            "here."
+        )
+
+    def _build_project_status_label(
+        self,
+    ) -> CompactProjectStatusLabel | None:
+        status_text = self._project_status_text()
+        if status_text is None:
+            return None
+        label = CompactProjectStatusLabel(self.statusBar())
+        label.setToolTip(self._project_status_tooltip() or "")
+        label.set_full_text(status_text)
+        return label
+
+    def _refresh_project_frame_sources(self) -> None:
+        settings = self._load_project_settings()
+        self._project_xyz_frames_dir = (
+            None if settings is None else settings.resolved_frames_dir
+        )
+        self._project_pdb_frames_dir = (
+            None if settings is None else settings.resolved_pdb_frames_dir
+        )
+        if self._project_xyz_frames_dir is None and self._project_pdb_frames_dir:
+            self._active_project_frames_kind = "pdb"
+        elif (
+            self._active_project_frames_kind == "pdb"
+            and self._project_pdb_frames_dir is None
+        ):
+            self._active_project_frames_kind = "xyz"
+        self.trajectory_panel.set_project_frame_sources(
+            self._project_xyz_frames_dir,
+            self._project_pdb_frames_dir,
+            active_kind=self._active_project_frames_kind,
+        )
+
+    def _on_project_source_changed(self, kind: object) -> None:
+        if kind is None:
+            return
+        self._active_project_frames_kind = str(kind)
+
+    def _current_project_input_registration(self) -> dict[str, Path | None]:
+        frames_dir = self.trajectory_panel.get_frames_dir()
+        if self._active_project_frames_kind == "pdb":
+            return {"pdb_frames_dir": frames_dir}
+        return {"frames_dir": frames_dir}
+
+    def _emit_project_paths_registered(
+        self,
+        *,
+        frames_dir: Path | None = None,
+        pdb_frames_dir: Path | None = None,
+        clusters_dir: Path | None = None,
+    ) -> None:
+        if self._project_dir is None:
+            return
+        payload: dict[str, object] = {
+            "project_dir": Path(self._project_dir).expanduser().resolve(),
+        }
+        if frames_dir is not None:
+            payload["frames_dir"] = Path(frames_dir).expanduser().resolve()
+        if pdb_frames_dir is not None:
+            payload["pdb_frames_dir"] = (
+                Path(pdb_frames_dir).expanduser().resolve()
+            )
+        if clusters_dir is not None:
+            payload["clusters_dir"] = (
+                Path(clusters_dir).expanduser().resolve()
+            )
+        self.project_paths_registered.emit(payload)
+
+    def _register_project_paths(
+        self,
+        *,
+        frames_dir: Path | None = None,
+        pdb_frames_dir: Path | None = None,
+        clusters_dir: Path | None = None,
+    ) -> str | None:
+        settings = self._load_project_settings()
+        if settings is None:
+            return None
+        try:
+            settings.frames_dir = (
+                None
+                if frames_dir is None
+                else str(Path(frames_dir).expanduser().resolve())
+            )
+            if pdb_frames_dir is not None:
+                settings.pdb_frames_dir = str(
+                    Path(pdb_frames_dir).expanduser().resolve()
+                )
+            if clusters_dir is not None:
+                settings.clusters_dir = str(
+                    Path(clusters_dir).expanduser().resolve()
+                )
+            self._project_manager.save_project(settings)
+            self._emit_project_paths_registered(
+                frames_dir=frames_dir,
+                pdb_frames_dir=pdb_frames_dir,
+                clusters_dir=clusters_dir,
+            )
+            self._refresh_project_frame_sources()
+        except Exception as exc:
+            return (
+                "The project frames/PDB/clusters references could not be "
+                f"updated: {exc}"
+            )
+        updates: list[str] = []
+        if frames_dir is not None:
+            updates.append(f"frames={Path(frames_dir).expanduser().resolve()}")
+        if pdb_frames_dir is not None:
+            updates.append(
+                "pdb_frames="
+                f"{Path(pdb_frames_dir).expanduser().resolve()}"
+            )
+        if clusters_dir is not None:
+            updates.append(
+                f"clusters={Path(clusters_dir).expanduser().resolve()}"
+            )
+        if not updates:
+            return None
+        return "Updated project folder references: " + ", ".join(updates)
+
     def inspect_frames_folder(self) -> None:
         try:
             if self._inspect_thread is not None:
@@ -449,11 +658,16 @@ class ClusterMainWindow(QMainWindow):
             frames_dir = self.trajectory_panel.get_frames_dir()
             if frames_dir is None:
                 raise ValueError("No extracted frames folder selected.")
+            registration_message = self._register_project_paths(
+                **self._current_project_input_registration()
+            )
 
             self.export_panel.set_log(
                 "Inspection request received.\n"
                 f"Loading extracted frames from: {frames_dir}"
             )
+            if registration_message is not None:
+                self.export_panel.append_log(registration_message)
             self.trajectory_panel.set_summary_text(
                 "Inspecting extracted frames folder..."
             )
@@ -676,6 +890,12 @@ class ClusterMainWindow(QMainWindow):
         self._close_progress_dialog()
         self.statusBar().showMessage("Extraction Complete!")
         self._refresh_selection_preview()
+        registration_message = self._register_project_paths(
+            **self._current_project_input_registration(),
+            clusters_dir=result.output_dir,
+        )
+        if registration_message is not None:
+            self.export_panel.append_log(registration_message)
         next_dir = next_available_output_dir(
             result.output_dir.parent,
             result.output_dir.name,
@@ -990,6 +1210,11 @@ class ClusterMainWindow(QMainWindow):
             self.definitions_panel.search_mode()
         )
         lines = [
+            (
+                "Project source: PDB structure folder"
+                if self._active_project_frames_kind == "pdb"
+                else "Project source: XYZ frames folder"
+            ),
             f"Mode: {mode_text}",
             f"PBC: {'on' if self.definitions_panel.use_pbc() else 'off'}",
             f"Search mode: {search_mode_label}",
@@ -1154,6 +1379,8 @@ def _base_output_dir_name(frames_dir: Path) -> str:
 
 def launch_cluster_ui(
     frames_dir: str | Path | None = None,
+    *,
+    project_dir: str | Path | None = None,
 ) -> int:
     """Launch the Qt6 cluster extraction UI."""
     app = QApplication.instance()
@@ -1164,7 +1391,16 @@ def launch_cluster_ui(
     configure_saxshell_application(app)
 
     window = ClusterMainWindow(
-        initial_frames_dir=Path(frames_dir) if frames_dir is not None else None
+        initial_frames_dir=(
+            Path(frames_dir).expanduser().resolve()
+            if frames_dir is not None
+            else None
+        ),
+        initial_project_dir=(
+            Path(project_dir).expanduser().resolve()
+            if project_dir is not None
+            else None
+        ),
     )
     _OPEN_WINDOWS.append(window)
     window.show()

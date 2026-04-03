@@ -55,11 +55,17 @@ from saxshell.bondanalysis.results import (
     load_result_index,
 )
 from saxshell.bondanalysis.ui.plot_window import BondAnalysisPlotWindow
+from saxshell.saxs.project_manager import (
+    ProjectSettings,
+    SAXSProjectManager,
+    build_project_paths,
+)
 from saxshell.saxs.ui.branding import (
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.saxs.ui.project_status_label import CompactProjectStatusLabel
 
 _OPEN_WINDOWS: list["BondAnalysisMainWindow"] = []
 
@@ -104,9 +110,16 @@ class BondAnalysisMainWindow(QMainWindow):
     def __init__(
         self,
         initial_clusters_dir: str | Path | None = None,
+        initial_project_dir: str | Path | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self._project_manager = SAXSProjectManager()
+        self._project_dir = (
+            None
+            if initial_project_dir is None
+            else Path(initial_project_dir).expanduser().resolve()
+        )
         self._run_thread: QThread | None = None
         self._run_worker: BondAnalysisWorker | None = None
         self._presets: dict[str, BondAnalysisPreset] = {}
@@ -118,14 +131,29 @@ class BondAnalysisMainWindow(QMainWindow):
         else:
             self._update_selection_summary()
 
+    def closeEvent(self, event) -> None:
+        if self._run_thread is not None and self._run_thread.isRunning():
+            QMessageBox.warning(
+                self,
+                "Bond Analysis",
+                "Please wait for the current bond-analysis run to finish "
+                "before closing this window.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
+
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell (bondanalysis)")
         self.setWindowIcon(load_saxshell_icon())
         self.resize(1320, 840)
 
         central = QWidget()
-        root = QHBoxLayout(central)
+        root = QVBoxLayout(central)
         root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+
+        self.project_banner = None
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_left_panel())
@@ -134,8 +162,69 @@ class BondAnalysisMainWindow(QMainWindow):
 
         root.addWidget(splitter)
         self.setCentralWidget(central)
+        self.project_status_label = self._build_project_status_label()
+        if self.project_status_label is not None:
+            self.statusBar().addPermanentWidget(self.project_status_label)
         self.statusBar().showMessage("Ready")
         self._reload_presets()
+
+    def _load_project_settings(self) -> ProjectSettings | None:
+        if self._project_dir is None:
+            return None
+        project_file = build_project_paths(self._project_dir).project_file
+        if not project_file.is_file():
+            return None
+        try:
+            return self._project_manager.load_project(self._project_dir)
+        except Exception:
+            return None
+
+    def _project_status_text(self) -> str | None:
+        if self._project_dir is None:
+            return None
+        return f"Active project: {self._project_dir}"
+
+    def _project_status_tooltip(self) -> str | None:
+        if self._project_dir is None:
+            return None
+        settings = self._load_project_settings()
+        project_name = (
+            self._project_dir.name
+            if settings is None
+            else settings.project_name.strip() or self._project_dir.name
+        )
+        return (
+            f"Active project: {project_name}\n"
+            f"{self._project_dir}\n\n"
+            "This window is linked to the active SAXS project, so a "
+            "selected clusters folder is saved back to that project."
+        )
+
+    def _build_project_status_label(
+        self,
+    ) -> CompactProjectStatusLabel | None:
+        status_text = self._project_status_text()
+        if status_text is None:
+            return None
+        label = CompactProjectStatusLabel(self.statusBar())
+        label.setToolTip(self._project_status_tooltip() or "")
+        label.set_full_text(status_text)
+        return label
+
+    def _register_project_clusters_dir(self) -> None:
+        settings = self._load_project_settings()
+        if settings is None:
+            return
+        try:
+            clusters_dir = self._clusters_dir_path()
+            settings.clusters_dir = (
+                None
+                if clusters_dir is None
+                else str(clusters_dir.expanduser().resolve())
+            )
+            self._project_manager.save_project(settings)
+        except Exception:
+            return
 
     def _build_left_panel(self) -> QWidget:
         left = QWidget()
@@ -279,6 +368,9 @@ class BondAnalysisMainWindow(QMainWindow):
         self.clusters_dir_edit = QLineEdit()
         self.clusters_dir_edit.textChanged.connect(
             self._on_clusters_dir_changed
+        )
+        self.clusters_dir_edit.editingFinished.connect(
+            self._register_project_clusters_dir
         )
         layout.addRow(
             "Clusters directory",
@@ -457,6 +549,8 @@ class BondAnalysisMainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, title)
         if path:
             line_edit.setText(path)
+            if line_edit is self.clusters_dir_edit:
+                self._register_project_clusters_dir()
 
     def _choose_existing_results_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(
@@ -472,6 +566,7 @@ class BondAnalysisMainWindow(QMainWindow):
 
     def set_clusters_dir(self, clusters_dir: str | Path) -> None:
         self.clusters_dir_edit.setText(str(clusters_dir))
+        self._register_project_clusters_dir()
 
     def load_existing_results_dir(self, output_dir: str | Path) -> None:
         result_index = load_result_index(output_dir)
@@ -482,6 +577,7 @@ class BondAnalysisMainWindow(QMainWindow):
         self.clusters_dir_edit.blockSignals(True)
         self.clusters_dir_edit.setText(str(result_index.clusters_dir))
         self.clusters_dir_edit.blockSignals(False)
+        self._register_project_clusters_dir()
         self._set_bond_pair_rows(result_index.bond_pairs)
         self._set_angle_triplet_rows(result_index.angle_triplets)
         self._restore_cluster_type_list(result_index)

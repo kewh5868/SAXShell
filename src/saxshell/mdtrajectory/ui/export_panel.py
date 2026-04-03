@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QTextEdit,
@@ -28,6 +29,7 @@ class ExportPanel(QGroupBox):
     def __init__(self) -> None:
         super().__init__("Export")
         self._suggested_output_dir: Path | None = None
+        self.output_dir_button: QPushButton | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -54,6 +56,7 @@ class ExportPanel(QGroupBox):
             "Only export frames at or after the currently selected cutoff "
             "time."
         )
+        self.use_cutoff_box.setChecked(True)
         self.use_cutoff_box.toggled.connect(self._handle_use_cutoff_toggled)
         form.addRow("", self.use_cutoff_box)
 
@@ -101,6 +104,15 @@ class ExportPanel(QGroupBox):
         )
         layout.addWidget(self.export_button)
 
+        self.progress_label = QLabel("Progress: idle")
+        layout.addWidget(self.progress_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%v / %m")
+        layout.addWidget(self.progress_bar)
+
         layout.addWidget(QLabel("Export Log"))
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
@@ -115,14 +127,14 @@ class ExportPanel(QGroupBox):
         row = QHBoxLayout(widget)
         row.setContentsMargins(0, 0, 0, 0)
 
-        button = QPushButton("Browse")
-        button.setToolTip("Browse for the output directory.")
-        button.clicked.connect(
+        self.output_dir_button = QPushButton("Browse")
+        self.output_dir_button.setToolTip("Browse for the output directory.")
+        self.output_dir_button.clicked.connect(
             lambda _checked=False: self._choose_dir(line_edit)
         )
 
         row.addWidget(line_edit)
-        row.addWidget(button)
+        row.addWidget(self.output_dir_button)
         return widget
 
     def _choose_dir(self, line_edit: QLineEdit) -> None:
@@ -170,6 +182,66 @@ class ExportPanel(QGroupBox):
             self.log_box.setPlainText(text)
             return
         self.log_box.setPlainText(f"{current}\n{text}")
+
+    def set_controls_enabled(self, enabled: bool) -> None:
+        self.output_dir_edit.setEnabled(enabled)
+        if self.output_dir_button is not None:
+            self.output_dir_button.setEnabled(enabled)
+        self.use_cutoff_box.setEnabled(enabled)
+        self.post_cutoff_stride_box.setEnabled(
+            enabled and self.use_cutoff_box.isChecked()
+        )
+        self.post_cutoff_stride_spin.setEnabled(
+            enabled
+            and self.use_cutoff_box.isChecked()
+            and self.post_cutoff_stride_box.isChecked()
+        )
+        self.export_button.setEnabled(enabled)
+
+    def reset_progress(self) -> None:
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%v / %m")
+        self.progress_label.setText("Progress: idle")
+
+    def set_busy_progress(self, text: str) -> None:
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setFormat("Working...")
+        self.progress_label.setText(text)
+
+    def update_progress(
+        self,
+        processed: int,
+        total: int,
+        text: str,
+    ) -> None:
+        if total <= 0:
+            self.set_busy_progress(text)
+            return
+        total = max(int(total), 1)
+        processed = max(0, min(int(processed), total))
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(processed)
+        self.progress_bar.setFormat("%v / %m")
+        self.progress_label.setText(text)
+
+    def set_progress_complete(
+        self,
+        text: str,
+        *,
+        total: int | None = None,
+    ) -> None:
+        maximum = max(1, int(total) if total is not None else 1)
+        self.progress_bar.setRange(0, maximum)
+        self.progress_bar.setValue(maximum)
+        self.progress_bar.setFormat("%v / %m")
+        self.progress_label.setText(text)
+
+    def set_progress_failed(self, text: str) -> None:
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%v / %m")
+        self.progress_label.setText(text)
 
     def _handle_use_cutoff_toggled(self, _checked: bool) -> None:
         self._update_post_cutoff_stride_controls()

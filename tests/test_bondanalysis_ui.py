@@ -21,6 +21,7 @@ from saxshell.bondanalysis import (
 from saxshell.bondanalysis.results import build_plot_request, load_result_index
 from saxshell.bondanalysis.ui.main_window import BondAnalysisMainWindow
 from saxshell.bondanalysis.ui.plot_window import BondAnalysisPlotWindow
+from saxshell.saxs.project_manager import SAXSProjectManager
 
 
 def _write_xyz_cluster(path, atoms):
@@ -161,6 +162,47 @@ def test_bondanalysis_main_window_prefills_cluster_types_and_output_dir(
     assert window.angle_triplet_table.item(2, 0).text() == "O"
     assert window.angle_triplet_table.item(2, 1).text() == "Pb"
     assert window.angle_triplet_table.item(2, 2).text() == "S"
+    window.close()
+
+
+def test_bondanalysis_main_window_shows_compact_project_status_and_registers_clusters_dir(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    monkeypatch.setenv(
+        "SAXSHELL_BONDANALYSIS_PRESETS_PATH",
+        str(tmp_path / "bondanalysis_presets.json"),
+    )
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "saxs_project"
+    manager.create_project(project_dir)
+    clusters_dir = tmp_path / "clusters_splitxyz0001"
+    pbi2_dir = clusters_dir / "PbI2"
+    pbi2_dir.mkdir(parents=True)
+    _write_xyz_cluster(
+        pbi2_dir / "frame_0000_AAA.xyz",
+        [
+            ("Pb", 0.0, 0.0, 0.0),
+            ("I", 2.0, 0.0, 0.0),
+            ("I", 0.0, 2.0, 0.0),
+        ],
+    )
+
+    window = BondAnalysisMainWindow(
+        initial_clusters_dir=clusters_dir,
+        initial_project_dir=project_dir,
+    )
+    saved_settings = manager.load_project(project_dir)
+
+    assert window.project_banner is None
+    assert window.project_status_label is not None
+    assert project_dir.name in window.project_status_label.toolTip()
+    assert str(project_dir) in window.project_status_label.full_text()
+    assert window.project_status_label.parent() is window.statusBar()
+    assert saved_settings.resolved_clusters_dir == clusters_dir.resolve()
+    window.close()
 
 
 def test_bondanalysis_main_window_saves_custom_presets_across_sessions(

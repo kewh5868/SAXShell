@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.backends.backend_qtagg import (
+    NavigationToolbar2QT as NavigationToolbar,
+)
 from matplotlib.figure import Figure
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
@@ -270,6 +273,11 @@ class CutoffPanel(QGroupBox):
             "Drag the magenta vertical line to choose a manual cutoff time."
         )
         self.canvas.cutoff_changed.connect(self._sync_cutoff_from_plot)
+        self.plot_toolbar = NavigationToolbar(self.canvas, self)
+        self.plot_toolbar.setToolTip(
+            "Matplotlib navigation toolbar for zoom, pan, and saving the plot."
+        )
+        layout.addWidget(self.plot_toolbar)
         layout.addWidget(self.canvas)
 
         self.cutoff_label = QLabel("Selected cutoff: None")

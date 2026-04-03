@@ -33,6 +33,10 @@ _FRAME_FILENAME_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _FOLDER_START_TIME_PATTERN = re.compile(
+    r"(?:^|_)t(?P<value>\d+(?:[p_]\d+)?)fs(?:\d{4})?$",
+    re.IGNORECASE,
+)
+_LEGACY_FOLDER_START_TIME_PATTERN = re.compile(
     r"(?:^|_)f(?P<value>\d+(?:_\d+)?)fs(?:\d{4})?$",
     re.IGNORECASE,
 )
@@ -970,6 +974,9 @@ def _resolve_folder_start_time(
     if metadata_payload is not None:
         selection_payload = metadata_payload.get("selection")
         if isinstance(selection_payload, dict):
+            first_time_fs = selection_payload.get("first_time_fs")
+            if first_time_fs is not None:
+                return float(first_time_fs), "mdtrajectory export metadata"
             applied_cutoff_fs = selection_payload.get("applied_cutoff_fs")
             if applied_cutoff_fs is not None:
                 return float(applied_cutoff_fs), "mdtrajectory export metadata"
@@ -1044,8 +1051,12 @@ def _parse_frame_filename_index(filename: str) -> int | None:
 def _parse_folder_start_time_from_name(folder_name: str) -> float | None:
     match = _FOLDER_START_TIME_PATTERN.search(folder_name.strip())
     if match is None:
+        match = _LEGACY_FOLDER_START_TIME_PATTERN.search(
+            folder_name.strip()
+        )
+    if match is None:
         return None
-    return float(match.group("value").replace("_", "."))
+    return float(match.group("value").replace("_", ".").replace("p", "."))
 
 
 def _resolve_time_window(

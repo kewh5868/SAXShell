@@ -7,12 +7,16 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
-from saxshell.cluster import PairCutoffDefinitions
-from saxshell.cluster.clusternetwork import stoichiometry_label
+from saxshell.cluster import PDBShellReferenceDefinition, PairCutoffDefinitions
+from saxshell.cluster.clusternetwork import (
+    detect_frame_folder_mode,
+    stoichiometry_label,
+)
 from saxshell.clusterdynamics import (
     ClusterDynamicsResult,
     ClusterDynamicsSelectionPreview,
@@ -32,7 +36,12 @@ from saxshell.saxs.project_manager import (
     load_built_component_q_range,
     load_experimental_data_file,
 )
-from saxshell.structure import AtomTypeDefinitions
+from saxshell.structure import AtomTypeDefinitions, PDBAtom, PDBStructure
+from saxshell.xyz2pdb import list_reference_library, resolve_reference_path
+from saxshell.xyz2pdb.workflow import (
+    rotation_matrix_about_axis,
+    rotation_matrix_from_to,
+)
 
 PredictionProgressCallback = Callable[[str], None]
 _STOICHIOMETRY_TOKEN_PATTERN = re.compile(r"([A-Z][a-z]*)(\d*)")
@@ -272,6 +281,34 @@ class _DebyeWallerPairModel:
     support_count: int
 
 
+@dataclass(slots=True)
+class _LoadedMLStructure:
+    coordinates: np.ndarray
+    elements: list[str]
+    pdb_atoms: tuple[PDBAtom, ...] = ()
+
+
+@dataclass(slots=True)
+class _ResolvedPDBShellReference:
+    shell_element: str
+    shell_residue: str | None
+    reference_name: str
+    reference_path: Path
+    reference_residue_name: str
+    reference_atoms: tuple[PDBAtom, ...]
+    anchor_atom_name: str
+    anchor_atom_element: str
+    anchor_atom_index: int
+    reference_outward_vector: np.ndarray
+    backbone_atom1_name: str
+    backbone_atom2_name: str
+    backbone_atom1_element: str
+    backbone_atom2_element: str
+    backbone_atom1_index: int
+    backbone_atom2_index: int
+    backbone_distance: float
+
+
 class ClusterDynamicsMLWorkflow:
     """Predict larger-cluster states from smaller-cluster data."""
 
@@ -291,6 +328,9 @@ class ClusterDynamicsMLWorkflow:
         shared_shells: bool = False,
         include_shell_atoms_in_stoichiometry: bool = False,
         search_mode: str = "kdtree",
+        pdb_shell_reference_definitions: Sequence[
+            PDBShellReferenceDefinition
+        ] = (),
         folder_start_time_fs: float | None = None,
         first_frame_time_fs: float = 0.0,
         frame_timestep_fs: float = 0.5,
@@ -333,6 +373,9 @@ class ClusterDynamicsMLWorkflow:
             include_shell_atoms_in_stoichiometry
         )
         self.search_mode = str(search_mode)
+        self.pdb_shell_reference_definitions = tuple(
+            pdb_shell_reference_definitions
+        )
         self.folder_start_time_fs = folder_start_time_fs
         self.first_frame_time_fs = float(first_frame_time_fs)
         self.frame_timestep_fs = float(frame_timestep_fs)
@@ -374,6 +417,10 @@ class ClusterDynamicsMLWorkflow:
         self.q_max = None if q_max is None else float(q_max)
         self.q_points = max(int(q_points), 2)
         self._project_manager = SAXSProjectManager()
+        self._cached_frames_input_format: str | None = None
+        self._cached_resolved_pdb_shell_references: tuple[
+            _ResolvedPDBShellReference, ...
+        ] | None = None
 
     def preview_selection(self) -> ClusterDynamicsMLPreview:
         dynamics_preview = (
@@ -719,13 +766,14 @@ class ClusterDynamicsMLWorkflow:
                 }
             )
             for path in paths:
-                try:
-                    coords, elements = load_structure_file(path)
-                except Exception:
+                loaded = self._load_structure_for_analysis(path)
+                if loaded is None:
                     continue
-                descriptor_rows.append(_structure_descriptor_row(coords))
+                descriptor_rows.append(
+                    _structure_descriptor_row(loaded.coordinates)
+                )
                 filtered_counts = _filtered_structure_counts(
-                    elements,
+                    loaded.elements,
                     tracked_elements=tracked_elements,
                 )
                 if filtered_counts:
@@ -1332,7 +1380,9 @@ class ClusterDynamicsMLWorkflow:
         deduplicated: list[tuple[dict[str, int], str | None, str]] = []
         seen_labels: set[str] = set()
         for counts, source_label, notes in candidates:
-            normalized = _normalized_counts(counts)
+            normalized = self._apply_pdb_shell_backbone_count_constraints(
+                counts
+            )
             if any(
                 normalized.get(element, 0) < minimum_count
                 for element, minimum_count in required_non_node_counts.items()
@@ -1382,6 +1432,14 @@ class ClusterDynamicsMLWorkflow:
                 best_row = row
         return best_row
 
+    def _apply_pdb_shell_backbone_count_constraints(
+        self,
+        counts: dict[str, int],
+    ) -> dict[str, int]:
+        # Deprecated backbone-pair count coupling is intentionally disabled.
+        # PDB solvent injection now uses only the predicted shell-anchor atom.
+        return _normalized_counts(counts)
+
     def _generate_predicted_structure(
         self,
         source_observation: ClusterDynamicsMLTrainingObservation | None,
@@ -1397,18 +1455,17 @@ class ClusterDynamicsMLWorkflow:
             source_observation is not None
             and source_observation.representative_path is not None
         ):
-            try:
-                source_coords, source_elements = load_structure_file(
-                    source_observation.representative_path
+            loaded = self._load_structure_for_analysis(
+                source_observation.representative_path
+            )
+            if loaded is not None:
+                source_coords_array = np.asarray(
+                    loaded.coordinates,
+                    dtype=float,
                 )
-            except Exception:
-                source_coords = None
-                source_elements = None
-            if source_coords is not None and source_elements is not None:
-                source_coords_array = np.asarray(source_coords, dtype=float)
                 normalized_elements = [
                     _normalized_element_symbol(element)
-                    for element in source_elements
+                    for element in loaded.elements
                 ]
                 node_indices = [
                     index
@@ -1459,10 +1516,20 @@ class ClusterDynamicsMLWorkflow:
             predictions,
             frame_timestep_fs=self.frame_timestep_fs,
         )
+        source_observation_by_label = {
+            row.label: row for row in training_observations
+        }
         predicted_structure_paths = [
-            _write_predicted_structure_file(
+            self._write_predicted_structure_file(
                 prediction,
                 predicted_structure_dir=predicted_structure_dir,
+                source_observation=(
+                    None
+                    if prediction.source_label is None
+                    else source_observation_by_label.get(
+                        prediction.source_label
+                    )
+                ),
             )
             for prediction in predictions
         ]
@@ -1653,13 +1720,12 @@ class ClusterDynamicsMLWorkflow:
             for structure_path in _structure_files_for_cluster_dir(
                 observation.structure_dir
             ):
-                try:
-                    coords, elements = load_structure_file(structure_path)
-                except Exception:
+                loaded = self._load_structure_for_analysis(structure_path)
+                if loaded is None:
                     continue
                 filtered = _filtered_coordinates_and_elements(
-                    coords,
-                    elements,
+                    loaded.coordinates,
+                    loaded.elements,
                     tracked_elements=tracked_elements,
                 )
                 if filtered is None:
@@ -1902,6 +1968,450 @@ class ClusterDynamicsMLWorkflow:
         predicted_structure_dir.mkdir(parents=True, exist_ok=True)
         return component_dir, predicted_structure_dir
 
+    def _write_predicted_structure_file(
+        self,
+        prediction: PredictedClusterCandidate,
+        *,
+        predicted_structure_dir: Path,
+        source_observation: ClusterDynamicsMLTrainingObservation | None,
+    ) -> Path:
+        if self._frames_input_format() != "pdb":
+            return _write_predicted_structure_file(
+                prediction,
+                predicted_structure_dir=predicted_structure_dir,
+            )
+
+        structure_path = (
+            predicted_structure_dir
+            / f"{_predicted_structure_file_stem(prediction)}.pdb"
+        )
+        atoms = self._build_predicted_pdb_atoms(
+            prediction,
+            source_observation=source_observation,
+        )
+        structure = PDBStructure(
+            atoms=list(atoms),
+            source_name=_predicted_structure_file_stem(prediction),
+        )
+        structure.write_pdb_file(structure_path, list(atoms))
+        return structure_path
+
+    def _build_predicted_pdb_atoms(
+        self,
+        prediction: PredictedClusterCandidate,
+        *,
+        source_observation: ClusterDynamicsMLTrainingObservation | None,
+    ) -> list[PDBAtom]:
+        predicted_coordinates = np.asarray(
+            prediction.generated_coordinates,
+            dtype=float,
+        )
+        predicted_elements = [
+            _normalized_element_symbol(element)
+            for element in prediction.generated_elements
+        ]
+        atoms: list[PDBAtom] = []
+        consumed_indices: set[int] = set()
+        next_atom_id = 1
+        next_residue_number = 1
+
+        atom_type_by_element = self._atom_type_by_element()
+        solute_coordinates = np.asarray(
+            [
+                coordinate
+                for element, coordinate in zip(
+                    predicted_elements,
+                    predicted_coordinates,
+                    strict=False,
+                )
+                if atom_type_by_element.get(element) in {"node", "linker"}
+            ],
+            dtype=float,
+        )
+        if solute_coordinates.size == 0:
+            solute_coordinates = np.asarray(predicted_coordinates, dtype=float)
+        placed_solvent_coordinates = np.zeros((0, 3), dtype=float)
+
+        for reference in self._active_pdb_shell_references():
+            for anchor_index in self._shell_anchor_indices(
+                predicted_coordinates,
+                predicted_elements,
+                reference=reference,
+                consumed_indices=consumed_indices,
+            ):
+                reserved_anchor_coordinates = np.asarray(
+                    [
+                        predicted_coordinates[index]
+                        for index, element in enumerate(predicted_elements)
+                        if index not in consumed_indices
+                        and index != anchor_index
+                        and element == reference.shell_element
+                    ],
+                    dtype=float,
+                )
+                aligned_atoms = self._anchored_reference_atoms_to_prediction(
+                    reference,
+                    anchor_coordinate=predicted_coordinates[anchor_index],
+                    solute_coordinates=solute_coordinates,
+                    placed_solvent_coordinates=placed_solvent_coordinates,
+                    reserved_anchor_coordinates=reserved_anchor_coordinates,
+                    residue_number=next_residue_number,
+                    starting_atom_id=next_atom_id,
+                )
+                atoms.extend(aligned_atoms)
+                next_atom_id += len(aligned_atoms)
+                next_residue_number += 1
+                consumed_indices.add(anchor_index)
+                new_solvent_coordinates = np.asarray(
+                    [atom.coordinates for atom in aligned_atoms],
+                    dtype=float,
+                )
+                if placed_solvent_coordinates.size == 0:
+                    placed_solvent_coordinates = new_solvent_coordinates
+                else:
+                    placed_solvent_coordinates = np.vstack(
+                        (
+                            placed_solvent_coordinates,
+                            new_solvent_coordinates,
+                        )
+                    )
+
+        source_templates_by_element = self._source_pdb_atom_templates(
+            source_observation
+        )
+        used_template_counts: defaultdict[str, int] = defaultdict(int)
+
+        for atom_index, (element, coordinate) in enumerate(
+            zip(predicted_elements, predicted_coordinates, strict=False)
+        ):
+            if atom_index in consumed_indices:
+                continue
+            template_list = source_templates_by_element.get(element, [])
+            template_index = used_template_counts[element]
+            template_atom = (
+                None
+                if template_index >= len(template_list)
+                else template_list[template_index]
+            )
+            used_template_counts[element] += 1
+            atom_type = atom_type_by_element.get(element, "shell")
+            residue_name, atom_name = self._predicted_free_atom_identity(
+                element,
+                atom_type=atom_type,
+                template_atom=template_atom,
+                occurrence_index=used_template_counts[element],
+            )
+            atoms.append(
+                PDBAtom(
+                    atom_id=next_atom_id,
+                    atom_name=atom_name,
+                    residue_name=residue_name,
+                    residue_number=next_residue_number,
+                    coordinates=np.asarray(coordinate, dtype=float).copy(),
+                    element=element,
+                    atom_type=atom_type,
+                )
+            )
+            next_atom_id += 1
+            next_residue_number += 1
+
+        return atoms
+
+    def _source_pdb_atom_templates(
+        self,
+        source_observation: ClusterDynamicsMLTrainingObservation | None,
+    ) -> dict[str, list[PDBAtom]]:
+        if (
+            source_observation is None
+            or source_observation.representative_path is None
+            or source_observation.representative_path.suffix.lower() != ".pdb"
+        ):
+            return {}
+        loaded = self._load_filtered_pdb_structure(
+            source_observation.representative_path
+        )
+        if loaded is None or not loaded.pdb_atoms:
+            return {}
+        grouped: dict[str, list[PDBAtom]] = defaultdict(list)
+        for atom in loaded.pdb_atoms:
+            if atom.atom_type not in {"node", "linker"}:
+                continue
+            grouped[_normalized_element_symbol(atom.element)].append(
+                atom.copy()
+            )
+        return dict(grouped)
+
+    def _predicted_free_atom_identity(
+        self,
+        element: str,
+        *,
+        atom_type: str,
+        template_atom: PDBAtom | None,
+        occurrence_index: int,
+    ) -> tuple[str, str]:
+        if template_atom is not None:
+            return template_atom.residue_name, template_atom.atom_name
+        for reference in self._active_pdb_shell_references():
+            if element == reference.shell_element:
+                return (
+                    reference.reference_residue_name,
+                    reference.anchor_atom_name,
+                )
+        residue_name = {
+            "node": "NOD",
+            "linker": "LNK",
+            "shell": "SOL",
+        }.get(atom_type, "UNK")
+        atom_name = f"{element.upper()}{int(max(occurrence_index, 1))}"
+        return residue_name, atom_name
+
+    def _shell_anchor_indices(
+        self,
+        coordinates: np.ndarray,
+        elements: list[str],
+        *,
+        reference: _ResolvedPDBShellReference,
+        consumed_indices: set[int],
+    ) -> list[int]:
+        del coordinates
+        return [
+            index
+            for index, element in enumerate(elements)
+            if index not in consumed_indices
+            and element == reference.shell_element
+        ]
+
+    def _anchored_reference_atoms_to_prediction(
+        self,
+        reference: _ResolvedPDBShellReference,
+        *,
+        anchor_coordinate: np.ndarray,
+        solute_coordinates: np.ndarray,
+        placed_solvent_coordinates: np.ndarray,
+        reserved_anchor_coordinates: np.ndarray,
+        residue_number: int,
+        starting_atom_id: int,
+    ) -> list[PDBAtom]:
+        transformed_coordinates = self._anchored_reference_coordinates(
+            reference,
+            anchor_coordinate=anchor_coordinate,
+            solute_coordinates=solute_coordinates,
+            placed_solvent_coordinates=placed_solvent_coordinates,
+            reserved_anchor_coordinates=reserved_anchor_coordinates,
+        )
+        transformed_atoms: list[PDBAtom] = []
+        for offset, template_atom in enumerate(reference.reference_atoms):
+            copied = template_atom.copy()
+            copied.atom_id = starting_atom_id + offset
+            copied.residue_number = residue_number
+            copied.residue_name = reference.reference_residue_name
+            copied.coordinates = transformed_coordinates[offset].copy()
+            transformed_atoms.append(copied)
+        return transformed_atoms
+
+    def _anchored_reference_coordinates(
+        self,
+        reference: _ResolvedPDBShellReference,
+        *,
+        anchor_coordinate: np.ndarray,
+        solute_coordinates: np.ndarray,
+        placed_solvent_coordinates: np.ndarray,
+        reserved_anchor_coordinates: np.ndarray,
+    ) -> np.ndarray:
+        reference_coordinates = np.asarray(
+            [atom.coordinates for atom in reference.reference_atoms],
+            dtype=float,
+        )
+        source_anchor = reference_coordinates[reference.anchor_atom_index]
+        target_anchor = np.asarray(anchor_coordinate, dtype=float)
+        if solute_coordinates.size == 0:
+            solute_centroid = (
+                target_anchor
+                - _safe_unit_vector(reference.reference_outward_vector)
+            )
+        else:
+            solute_centroid = np.mean(
+                np.asarray(solute_coordinates, dtype=float),
+                axis=0,
+            )
+        source_outward = _safe_unit_vector(
+            reference.reference_outward_vector
+        )
+        target_outward = _safe_unit_vector(
+            target_anchor - solute_centroid,
+            fallback=source_outward,
+        )
+        base_rotation = rotation_matrix_from_to(
+            source_outward,
+            target_outward,
+        )
+        base_coordinates = (
+            (reference_coordinates - source_anchor) @ base_rotation.T
+        ) + target_anchor
+        base_relative = base_coordinates - target_anchor
+        non_anchor_mask = np.ones(len(reference.reference_atoms), dtype=bool)
+        non_anchor_mask[reference.anchor_atom_index] = False
+        rotation_axis = _safe_unit_vector(
+            target_outward,
+            fallback=source_outward,
+        )
+        best_coordinates = np.asarray(base_coordinates, dtype=float)
+        best_score: float | None = None
+        for sample_index in range(24):
+            angle = (2.0 * math.pi * float(sample_index)) / 24.0
+            axis_rotation = rotation_matrix_about_axis(rotation_axis, angle)
+            candidate_coordinates = (
+                base_relative @ axis_rotation.T
+            ) + target_anchor
+            candidate_non_anchor = candidate_coordinates[non_anchor_mask]
+            overlap_penalty = 0.0
+            min_clearance = 8.0
+            for obstacle_set in (
+                np.asarray(solute_coordinates, dtype=float),
+                np.asarray(placed_solvent_coordinates, dtype=float),
+                np.asarray(reserved_anchor_coordinates, dtype=float),
+            ):
+                if obstacle_set.size == 0 or candidate_non_anchor.size == 0:
+                    continue
+                distances = np.linalg.norm(
+                    candidate_non_anchor[:, np.newaxis, :] - obstacle_set[np.newaxis, :, :],
+                    axis=2,
+                )
+                min_clearance = min(
+                    min_clearance,
+                    float(np.min(distances)),
+                )
+                overlap_penalty += float(
+                    np.sum(
+                        np.square(np.clip(1.2 - distances, 0.0, None)),
+                        dtype=float,
+                    )
+                    * 800.0
+                )
+                overlap_penalty += float(
+                    np.sum(
+                        np.square(np.clip(1.5 - distances, 0.0, None)),
+                        dtype=float,
+                    )
+                    * 15.0
+                )
+            centroid_vector = (
+                np.mean(candidate_non_anchor, axis=0) - target_anchor
+                if candidate_non_anchor.size > 0
+                else target_outward
+            )
+            outward_alignment = float(
+                np.dot(
+                    _safe_unit_vector(
+                        centroid_vector,
+                        fallback=target_outward,
+                    ),
+                    target_outward,
+                )
+            )
+            score = (
+                overlap_penalty
+                - (min_clearance * 0.5)
+                - (outward_alignment * 10.0)
+            )
+            if best_score is None or score < best_score:
+                best_score = float(score)
+                best_coordinates = np.asarray(
+                    candidate_coordinates,
+                    dtype=float,
+                )
+        return best_coordinates
+
+    # Deprecated backbone-pair helpers are kept below for future reference.
+
+    def _pair_shell_backbone_indices(
+        self,
+        coordinates: np.ndarray,
+        elements: list[str],
+        *,
+        reference: _ResolvedPDBShellReference,
+        consumed_indices: set[int],
+    ) -> list[tuple[int, int]]:
+        anchor_indices = [
+            index
+            for index, element in enumerate(elements)
+            if index not in consumed_indices
+            and element == reference.backbone_atom1_element
+        ]
+        axis_indices = [
+            index
+            for index, element in enumerate(elements)
+            if index not in consumed_indices
+            and element == reference.backbone_atom2_element
+        ]
+        if not anchor_indices or not axis_indices:
+            return []
+
+        cost_matrix = np.zeros(
+            (len(anchor_indices), len(axis_indices)),
+            dtype=float,
+        )
+        for row_index, anchor_index in enumerate(anchor_indices):
+            for column_index, axis_index in enumerate(axis_indices):
+                distance = float(
+                    np.linalg.norm(
+                        coordinates[anchor_index] - coordinates[axis_index]
+                    )
+                )
+                cost_matrix[row_index, column_index] = abs(
+                    distance - reference.backbone_distance
+                )
+        row_indices, column_indices = linear_sum_assignment(cost_matrix)
+        return [
+            (anchor_indices[int(row_index)], axis_indices[int(column_index)])
+            for row_index, column_index in zip(
+                row_indices,
+                column_indices,
+                strict=False,
+            )
+        ]
+
+    def _aligned_reference_atoms_to_prediction(
+        self,
+        reference: _ResolvedPDBShellReference,
+        *,
+        anchor_coordinate: np.ndarray,
+        axis_coordinate: np.ndarray,
+        residue_number: int,
+        starting_atom_id: int,
+    ) -> list[PDBAtom]:
+        reference_coordinates = np.asarray(
+            [atom.coordinates for atom in reference.reference_atoms],
+            dtype=float,
+        )
+        source_anchor = reference_coordinates[reference.backbone_atom1_index]
+        source_axis = reference_coordinates[reference.backbone_atom2_index]
+        source_vector = source_axis - source_anchor
+        target_vector = np.asarray(axis_coordinate, dtype=float) - np.asarray(
+            anchor_coordinate,
+            dtype=float,
+        )
+        source_length = float(np.linalg.norm(source_vector))
+        target_length = float(np.linalg.norm(target_vector))
+        if source_length <= 1.0e-12 or target_length <= 1.0e-12:
+            scale = 1.0
+            rotation = np.eye(3, dtype=float)
+        else:
+            scale = target_length / source_length
+            rotation = rotation_matrix_from_to(source_vector, target_vector)
+        transformed_coordinates = (
+            ((reference_coordinates - source_anchor) * scale) @ rotation.T
+        ) + np.asarray(anchor_coordinate, dtype=float)
+        transformed_atoms: list[PDBAtom] = []
+        for offset, template_atom in enumerate(reference.reference_atoms):
+            copied = template_atom.copy()
+            copied.atom_id = starting_atom_id + offset
+            copied.residue_number = residue_number
+            copied.residue_name = reference.reference_residue_name
+            copied.coordinates = transformed_coordinates[offset].copy()
+            transformed_atoms.append(copied)
+        return transformed_atoms
+
     def _build_observed_saxs_component(
         self,
         observation: ClusterDynamicsMLTrainingObservation,
@@ -1998,10 +2508,13 @@ class ClusterDynamicsMLWorkflow:
         if weight <= 0.0:
             return None
         try:
+            structure_coordinates, structure_elements = load_structure_file(
+                structure_path
+            )
             included_pair_indices = (
                 _first_shell_pair_indices(
-                    prediction.generated_coordinates,
-                    list(prediction.generated_elements),
+                    structure_coordinates,
+                    list(structure_elements),
                     node_elements=set(self._atom_type_elements("node")),
                     pair_cutoff_definitions=self.pair_cutoff_definitions,
                 )
@@ -2011,16 +2524,16 @@ class ClusterDynamicsMLWorkflow:
             trace = np.asarray(
                 (
                     compute_debye_intensity_with_debye_waller(
-                        prediction.generated_coordinates,
-                        list(prediction.generated_elements),
+                        structure_coordinates,
+                        list(structure_elements),
                         q_values,
                         pair_sigma_by_element=pair_sigma_by_element,
                         included_pair_indices=included_pair_indices,
                     )
                     if pair_sigma_by_element
                     else compute_debye_intensity(
-                        prediction.generated_coordinates,
-                        list(prediction.generated_elements),
+                        structure_coordinates,
+                        list(structure_elements),
                         q_values,
                     )
                 ),
@@ -2284,6 +2797,304 @@ class ClusterDynamicsMLWorkflow:
                     mapping[normalized] = geometry_type
         return mapping
 
+    def _frames_input_format(self) -> str:
+        if self._cached_frames_input_format is None:
+            frame_format, _frame_paths = detect_frame_folder_mode(
+                self.frames_dir
+            )
+            self._cached_frames_input_format = str(frame_format)
+        return self._cached_frames_input_format
+
+    def _active_pdb_shell_references(
+        self,
+    ) -> tuple[_ResolvedPDBShellReference, ...]:
+        if self._frames_input_format() != "pdb":
+            return ()
+        if self._cached_resolved_pdb_shell_references is None:
+            self._cached_resolved_pdb_shell_references = (
+                self._resolve_pdb_shell_references()
+            )
+        return self._cached_resolved_pdb_shell_references
+
+    def _resolve_pdb_shell_references(
+        self,
+    ) -> tuple[_ResolvedPDBShellReference, ...]:
+        resolved: list[_ResolvedPDBShellReference] = []
+        seen_shell_keys: set[tuple[str, str | None]] = set()
+        seen_shell_elements: set[str] = set()
+        for definition in self.pdb_shell_reference_definitions:
+            shell_element = _normalized_element_symbol(
+                definition.shell_element
+            )
+            if not shell_element:
+                continue
+            shell_residue = (
+                None
+                if definition.shell_residue is None
+                else (str(definition.shell_residue).strip().upper() or None)
+            )
+            shell_key = (shell_element, shell_residue)
+            if shell_key in seen_shell_keys:
+                raise ValueError(
+                    "PDB shell references must be unique per shell "
+                    f"element/residue pair. Duplicate rule: {shell_element}"
+                    + (
+                        ""
+                        if shell_residue is None
+                        else f" ({shell_residue})"
+                    )
+                    + "."
+                )
+            seen_shell_keys.add(shell_key)
+            if shell_element in seen_shell_elements:
+                raise ValueError(
+                    "PDB shell references currently need unique shell "
+                    "elements so predicted shell anchors can be matched "
+                    f"unambiguously. Duplicate shell element: {shell_element}."
+                )
+            seen_shell_elements.add(shell_element)
+            reference_path = resolve_reference_path(definition.reference_name)
+            reference_structure = PDBStructure.from_file(reference_path)
+            reference_entry = next(
+                (
+                    entry
+                    for entry in list_reference_library(reference_path.parent)
+                    if entry.path.resolve() == reference_path.resolve()
+                ),
+                None,
+            )
+            preferred_pairs = (
+                ()
+                if reference_entry is None
+                else tuple(reference_entry.backbone_pairs)
+            )
+            atom_lookup = {
+                atom.atom_name.strip(): (index, atom)
+                for index, atom in enumerate(reference_structure.atoms)
+            }
+            matching_shell_atoms = [
+                (index, atom)
+                for index, atom in enumerate(reference_structure.atoms)
+                if _normalized_element_symbol(atom.element) == shell_element
+            ]
+            if not matching_shell_atoms:
+                raise ValueError(
+                    "Reference molecule "
+                    f"{definition.reference_name!r} does not contain any "
+                    f"{shell_element} atom for the shell anchor."
+                )
+
+            deprecated_atom1_name = (
+                ""
+                if definition.backbone_atom1_name in {None, ""}
+                else str(definition.backbone_atom1_name).strip()
+            )
+            deprecated_atom2_name = (
+                ""
+                if definition.backbone_atom2_name in {None, ""}
+                else str(definition.backbone_atom2_name).strip()
+            )
+
+            def _matching_shell_atom(
+                atom_name: str,
+            ) -> tuple[int, PDBAtom] | None:
+                if not atom_name:
+                    return None
+                atom_data = atom_lookup.get(atom_name)
+                if atom_data is None:
+                    return None
+                if (
+                    _normalized_element_symbol(atom_data[1].element)
+                    != shell_element
+                ):
+                    return None
+                return atom_data
+
+            preferred_anchor_name = ""
+            preferred_partner_name = ""
+            for atom1_name, atom2_name in preferred_pairs:
+                atom1_data = atom_lookup.get(str(atom1_name).strip())
+                atom2_data = atom_lookup.get(str(atom2_name).strip())
+                if (
+                    atom1_data is not None
+                    and _normalized_element_symbol(atom1_data[1].element)
+                    == shell_element
+                ):
+                    preferred_anchor_name = str(atom1_name).strip()
+                    preferred_partner_name = str(atom2_name).strip()
+                    break
+                if (
+                    atom2_data is not None
+                    and _normalized_element_symbol(atom2_data[1].element)
+                    == shell_element
+                ):
+                    preferred_anchor_name = str(atom2_name).strip()
+                    preferred_partner_name = str(atom1_name).strip()
+                    break
+
+            anchor_data = (
+                _matching_shell_atom(deprecated_atom1_name)
+                or _matching_shell_atom(deprecated_atom2_name)
+                or _matching_shell_atom(preferred_anchor_name)
+            )
+            if anchor_data is None and len(matching_shell_atoms) == 1:
+                anchor_data = matching_shell_atoms[0]
+            if anchor_data is None:
+                raise ValueError(
+                    "Reference molecule "
+                    f"{definition.reference_name!r} contains multiple "
+                    f"{shell_element} atoms. Add preferred backbone metadata "
+                    "in the reference library so one shell anchor can be "
+                    "chosen automatically."
+                )
+
+            anchor_index, anchor_atom = anchor_data
+            anchor_name = anchor_atom.atom_name.strip()
+            anchor_element = _normalized_element_symbol(anchor_atom.element)
+
+            preferred_partner = atom_lookup.get(preferred_partner_name)
+            deprecated_partner = (
+                atom_lookup.get(deprecated_atom2_name)
+                if deprecated_atom2_name != anchor_name
+                else None
+            )
+            fallback_partner = next(
+                (
+                    (index, atom)
+                    for index, atom in enumerate(reference_structure.atoms)
+                    if index != anchor_index
+                ),
+                None,
+            )
+            partner_data = preferred_partner
+            if (
+                partner_data is None
+                or int(partner_data[0]) == int(anchor_index)
+            ):
+                partner_data = deprecated_partner
+            if (
+                partner_data is None
+                or int(partner_data[0]) == int(anchor_index)
+            ):
+                partner_data = fallback_partner
+            if partner_data is None:
+                raise ValueError(
+                    "Reference molecule "
+                    f"{definition.reference_name!r} must contain at least two "
+                    "atoms so the deprecated backbone placement can be kept "
+                    "for future reference."
+                )
+
+            partner_index, partner_atom = partner_data
+            partner_name = partner_atom.atom_name.strip()
+            partner_element = _normalized_element_symbol(partner_atom.element)
+            reference_coordinates = np.asarray(
+                [atom.coordinates for atom in reference_structure.atoms],
+                dtype=float,
+            )
+            non_anchor_indices = [
+                index
+                for index in range(len(reference_structure.atoms))
+                if index != anchor_index
+            ]
+            reference_outward_vector = (
+                np.mean(reference_coordinates[non_anchor_indices], axis=0)
+                - reference_coordinates[anchor_index]
+            )
+            if float(np.linalg.norm(reference_outward_vector)) <= 1.0e-12:
+                reference_outward_vector = (
+                    reference_coordinates[partner_index]
+                    - reference_coordinates[anchor_index]
+                )
+            backbone_distance = float(
+                np.linalg.norm(partner_atom.coordinates - anchor_atom.coordinates)
+            )
+            resolved.append(
+                _ResolvedPDBShellReference(
+                    shell_element=shell_element,
+                    shell_residue=shell_residue,
+                    reference_name=str(definition.reference_name).strip(),
+                    reference_path=reference_path,
+                    reference_residue_name=(
+                        reference_structure.atoms[0].residue_name
+                        if reference_structure.atoms
+                        else "UNK"
+                    ),
+                    reference_atoms=tuple(
+                        atom.copy() for atom in reference_structure.atoms
+                    ),
+                    anchor_atom_name=anchor_name,
+                    anchor_atom_element=anchor_element,
+                    anchor_atom_index=int(anchor_index),
+                    reference_outward_vector=np.asarray(
+                        reference_outward_vector,
+                        dtype=float,
+                    ),
+                    backbone_atom1_name=anchor_name,
+                    backbone_atom2_name=partner_name,
+                    backbone_atom1_element=anchor_element,
+                    backbone_atom2_element=partner_element,
+                    backbone_atom1_index=int(anchor_index),
+                    backbone_atom2_index=int(partner_index),
+                    backbone_distance=backbone_distance,
+                )
+            )
+        return tuple(resolved)
+
+    def _load_structure_for_analysis(
+        self,
+        file_path: Path,
+    ) -> _LoadedMLStructure | None:
+        if (
+            self._frames_input_format() == "pdb"
+            and file_path.suffix.lower() == ".pdb"
+        ):
+            return self._load_filtered_pdb_structure(file_path)
+        try:
+            coordinates, elements = load_structure_file(file_path)
+        except Exception:
+            return None
+        return _LoadedMLStructure(
+            coordinates=np.asarray(coordinates, dtype=float),
+            elements=[
+                _normalized_element_symbol(element) for element in elements
+            ],
+        )
+
+    def _load_filtered_pdb_structure(
+        self,
+        file_path: Path,
+    ) -> _LoadedMLStructure | None:
+        try:
+            structure = PDBStructure.from_file(
+                file_path,
+                atom_type_definitions=self.atom_type_definitions,
+            )
+        except Exception:
+            return None
+
+        selected_atoms: dict[int, PDBAtom] = {
+            atom.atom_id: atom
+            for atom in structure.atoms
+            if atom.atom_type in {"node", "linker", "shell"}
+        }
+        ordered_atoms = tuple(
+            atom.copy() for atom in sorted(selected_atoms.values(), key=lambda atom: atom.atom_id)
+        )
+        if not ordered_atoms:
+            return None
+        return _LoadedMLStructure(
+            coordinates=np.asarray(
+                [atom.coordinates for atom in ordered_atoms],
+                dtype=float,
+            ),
+            elements=[
+                _normalized_element_symbol(atom.element)
+                for atom in ordered_atoms
+            ],
+            pdb_atoms=ordered_atoms,
+        )
+
     def _structure_files_for_observation(
         self,
         observation: ClusterDynamicsMLTrainingObservation,
@@ -2349,14 +3160,13 @@ class ClusterDynamicsMLWorkflow:
             for file_path in self._structure_files_for_observation(
                 observation
             ):
-                try:
-                    coords, raw_elements = load_structure_file(file_path)
-                except Exception:
+                loaded = self._load_structure_for_analysis(file_path)
+                if loaded is None:
                     continue
-                coordinates = np.asarray(coords, dtype=float)
+                coordinates = np.asarray(loaded.coordinates, dtype=float)
                 elements = [
                     _normalized_element_symbol(element)
-                    for element in raw_elements
+                    for element in loaded.elements
                 ]
                 geometry_types = [
                     atom_type_by_element.get(element, "shell")

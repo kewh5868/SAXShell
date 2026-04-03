@@ -1,16 +1,23 @@
 from __future__ import annotations
 
-from .base import FrameRecord
+from typing import TypeVar
 
+from .base import FrameMetadata, FrameRecord
+
+FrameSelectionItem = TypeVar(
+    "FrameSelectionItem",
+    FrameMetadata,
+    FrameRecord,
+)
 
 def select_frames(
-    frames: list[FrameRecord],
+    frames: list[FrameSelectionItem],
     start: int | None = None,
     stop: int | None = None,
     stride: int = 1,
     min_time_fs: float | None = None,
     post_cutoff_stride: int = 1,
-) -> list[FrameRecord]:
+) -> list[FrameSelectionItem]:
     """Apply index-based and optional time-based filtering to frame
     records.
 

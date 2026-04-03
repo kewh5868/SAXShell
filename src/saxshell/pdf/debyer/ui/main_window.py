@@ -329,6 +329,18 @@ class DebyerPDFMainWindow(QMainWindow):
             self._refresh_saved_calculations()
         self._refresh_plot()
 
+    def closeEvent(self, event) -> None:
+        if self._run_thread is not None and self._run_thread.isRunning():
+            QMessageBox.warning(
+                self,
+                "Debyer PDF",
+                "Please wait for the current Debyer PDF calculation to "
+                "finish before closing this window.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
+
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell (pdfsetup)")
         self.setWindowIcon(load_saxshell_icon())
@@ -1641,6 +1653,7 @@ class DebyerPDFMainWindow(QMainWindow):
         self._run_worker.failed.connect(self._on_failed)
         self._run_worker.finished.connect(self._run_thread.quit)
         self._run_worker.failed.connect(self._run_thread.quit)
+        self._run_thread.finished.connect(self._cleanup_run_thread)
         self._run_thread.finished.connect(self._run_thread.deleteLater)
         self._run_thread.start()
 
@@ -1691,6 +1704,12 @@ class DebyerPDFMainWindow(QMainWindow):
             "Estimated time remaining: unavailable"
         )
         QMessageBox.warning(self, "Debyer calculation failed", message)
+
+    def _cleanup_run_thread(self) -> None:
+        if self._run_worker is not None:
+            self._run_worker.deleteLater()
+            self._run_worker = None
+        self._run_thread = None
 
     def _rebuild_traces_and_plot(self) -> None:
         if self._current_calculation is None:

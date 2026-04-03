@@ -4,6 +4,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -23,14 +24,33 @@ class ClusterTrajectoryPanel(QGroupBox):
     inspect_requested = Signal()
     settings_changed = Signal()
     frames_dir_changed = Signal(object)
+    project_source_changed = Signal(object)
 
     def __init__(self) -> None:
         super().__init__("Extracted Frames")
+        self._project_xyz_frames_dir: Path | None = None
+        self._project_pdb_frames_dir: Path | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout()
         form = QFormLayout()
+
+        self.project_source_widget = QWidget()
+        source_row = QHBoxLayout(self.project_source_widget)
+        source_row.setContentsMargins(0, 0, 0, 0)
+        self.project_source_combo = QComboBox()
+        self.project_source_combo.currentIndexChanged.connect(
+            self._on_project_source_changed
+        )
+        source_row.addWidget(self.project_source_combo)
+        self.project_source_hint = QLabel(
+            "Switch between the project XYZ folder and optional PDB folder."
+        )
+        self.project_source_hint.setWordWrap(True)
+        source_row.addWidget(self.project_source_hint, stretch=1)
+        form.addRow("Project source", self.project_source_widget)
+        self.project_source_widget.setVisible(False)
 
         self.mode_label = QLabel("Mode: Auto-detect")
         self.mode_label.setToolTip(
@@ -81,6 +101,20 @@ class ClusterTrajectoryPanel(QGroupBox):
 
         self.setLayout(layout)
 
+    def _on_project_source_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        kind = self.project_source_combo.currentData()
+        if kind == "xyz":
+            path = self._project_xyz_frames_dir
+        elif kind == "pdb":
+            path = self._project_pdb_frames_dir
+        else:
+            path = None
+        if path is not None and self.frames_dir_edit.text() != str(path):
+            self.frames_dir_edit.setText(str(path))
+        self.project_source_changed.emit(kind)
+
     def _make_path_row(self, line_edit: QLineEdit) -> QWidget:
         widget = QWidget()
         row = QHBoxLayout(widget)
@@ -119,6 +153,40 @@ class ClusterTrajectoryPanel(QGroupBox):
         if detail:
             text = f"{text} ({detail})"
         self.mode_label.setText(text)
+
+    def set_project_frame_sources(
+        self,
+        xyz_frames_dir: Path | None,
+        pdb_frames_dir: Path | None,
+        *,
+        active_kind: str | None = None,
+    ) -> None:
+        self._project_xyz_frames_dir = xyz_frames_dir
+        self._project_pdb_frames_dir = pdb_frames_dir
+        self.project_source_combo.blockSignals(True)
+        self.project_source_combo.clear()
+        if xyz_frames_dir is not None:
+            self.project_source_combo.addItem("XYZ frames folder", "xyz")
+        if pdb_frames_dir is not None:
+            self.project_source_combo.addItem("PDB structure folder", "pdb")
+        if self.project_source_combo.count() == 0:
+            self.project_source_widget.setVisible(False)
+            self.project_source_combo.blockSignals(False)
+            return
+        self.project_source_widget.setVisible(
+            xyz_frames_dir is not None and pdb_frames_dir is not None
+        )
+        if active_kind is not None:
+            index = self.project_source_combo.findData(active_kind)
+            if index >= 0:
+                self.project_source_combo.setCurrentIndex(index)
+        self.project_source_combo.blockSignals(False)
+
+    def selected_project_source_kind(self) -> str | None:
+        if self.project_source_combo.count() == 0:
+            return None
+        current = self.project_source_combo.currentData()
+        return None if current is None else str(current)
 
     def get_frames_dir(self) -> Path | None:
         text = self.frames_dir_edit.text().strip()

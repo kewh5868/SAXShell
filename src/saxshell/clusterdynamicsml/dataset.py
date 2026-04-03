@@ -125,9 +125,7 @@ def save_cluster_dynamicsai_dataset(
                 result.saxs_comparison, dataset_file
             )
         )
-    written_files.extend(
-        _write_prediction_structures(result.predictions, dataset_file)
-    )
+    written_files.extend(_write_prediction_structures(result, dataset_file))
     return SavedClusterDynamicsMLDataset(
         dataset_file=dataset_file,
         written_files=tuple(written_files),
@@ -1134,15 +1132,31 @@ def _write_saxs_component_profiles(
 
 
 def _write_prediction_structures(
-    predictions: tuple[PredictedClusterCandidate, ...],
+    result: ClusterDynamicsMLResult,
     dataset_file: Path,
 ) -> list[Path]:
     output_dir = dataset_file.with_name(
         f"{dataset_file.stem}_predicted_structures"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
+    if result.saxs_comparison is not None:
+        copied_files: list[Path] = []
+        seen_sources: set[Path] = set()
+        for entry in result.saxs_comparison.component_weights:
+            if entry.source != "predicted" or entry.structure_path is None:
+                continue
+            resolved_source = entry.structure_path.expanduser().resolve()
+            if resolved_source in seen_sources or not resolved_source.is_file():
+                continue
+            seen_sources.add(resolved_source)
+            target_path = _unique_child_path(output_dir, resolved_source.name)
+            shutil.copy2(resolved_source, target_path)
+            copied_files.append(target_path)
+        if copied_files:
+            return copied_files
+
     written_files: list[Path] = []
-    for entry in predictions:
+    for entry in result.predictions:
         output_path = output_dir / (
             f"{entry.target_node_count:02d}_rank{entry.rank:02d}_{entry.label}.xyz"
         )
