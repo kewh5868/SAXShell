@@ -3,6 +3,10 @@
 In this repository, **Prefit** is the lmfit-facing side of the SAXS workflow.
 It gives you a fast, editable model preview before you commit to a pyDREAM run.
 
+That preview only becomes meaningful after the project has a template,
+experimental data, and a cluster-derived component set from the supporting
+applications.
+
 ## Role of lmfit in SAXSShell
 
 The template system defines an lmfit-compatible profile function. Prefit then
@@ -45,3 +49,12 @@ Prefit is often enough when you want:
 
 If you need posterior uncertainty, parameter correlations, or a more formal
 sampling workflow, move to the pyDREAM tab.
+
+## Related pages
+
+- [Project Configuration](project-configuration.md)
+- [Cluster Extraction](cluster-extraction.md)
+- [Template System](template-system.md)
+- [Pre-loaded SAXS Models](preloaded-saxs-models.md)
+- [SAXS Prefit](saxs-prefit.md)
+- [pyDREAM Workflow](pydream-workflow.md)

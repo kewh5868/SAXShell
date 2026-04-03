@@ -45,7 +45,8 @@ Bond-pair and angle-analysis workflows and UI.
 ### `src/saxshell/saxs`
 
 SAXS-specific project management, templates, Debye profile generation, Prefit,
-DREAM runtime support, and the main SAXS UI.
+DREAM runtime support, the contrast-mode supporting workflow, and the main SAXS
+UI.
 
 ### `src/saxshell/fullrmc`
 

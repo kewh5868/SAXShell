@@ -246,3 +246,11 @@ the current model families as follows:
   normalized likelihood, explicit `model_monosq(...)` helper.
 - `template_pydream_poly_lma_hs_legacy.py`: compatibility wrapper around the
   current mixed-shape approximate Poly LMA model.
+
+## Related pages
+
+- [Template System](template-system.md)
+- [Project Configuration](project-configuration.md)
+- [SAXS Prefit](saxs-prefit.md)
+- [LMFit Workflow](lmfit-workflow.md)
+- [pyDREAM Workflow](pydream-workflow.md)

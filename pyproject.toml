@@ -64,9 +64,11 @@ namespaces = false
 dependencies = { file = ["requirements/pip.txt"] }
 
 [tool.setuptools.package-data]
-"saxshell.xyz2pdb" = ["reference_library/*.pdb", "reference_library/*.txt"]
+"saxshell.cluster" = ["_cluster_extraction_presets/*.json"]
+"saxshell.xyz2pdb" = ["reference_library/*.json", "reference_library/*.pdb", "reference_library/*.txt"]
 "saxshell.fullrmc" = ["_solution_property_presets/*.json"]
 "saxshell.saxs" = ["_beam_geometry_presets/*.json", "_ui_assets/*.svg"]
+"saxshell.toolbox.blender.ui" = ["reference_atoms/*.png"]
 
 [tool.codespell]
 exclude-file = ".codespell/ignore_lines.txt"

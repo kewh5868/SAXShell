@@ -609,6 +609,14 @@ coefficients to the main SAXS prefit and DREAM refinement templates as optional
 refinable parameters, but that is not yet part of the default SAXSShell model
 workflow.
 
+## Related pages
+
+- [Cluster Extraction](cluster-extraction.md)
+- [Cluster Dynamics](cluster-dynamics.md)
+- [Project Configuration](project-configuration.md)
+- [SAXS Prefit](saxs-prefit.md)
+- [Results and Export](results-and-export.md)
+
 ## References
 
 [^hoerl1970]: Hoerl, A. E., and Kennard, R. W. "Ridge Regression: Biased Estimation for Nonorthogonal Problems." _Technometrics_ 12, no. 1 (1970): 55-67. <https://doi.org/10.1080/00401706.1970.10488634>

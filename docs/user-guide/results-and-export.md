@@ -3,6 +3,9 @@
 SAXSShell stores more than one kind of output. Some files are meant for people,
 and some are meant for the workflow itself.
 
+That output footprint spans both the main SAXS UI and the supporting
+applications when they are launched against the same active project.
+
 ## Prefit outputs
 
 Prefit can currently save or export:
@@ -40,3 +43,12 @@ worthwhile, especially when a project will be reopened later.
 
 TODO: document the exact condensed-export file set and naming conventions once
 the current export schema is declared stable.
+
+## Related pages
+
+- [Project Configuration](project-configuration.md)
+- [SAXS Prefit](saxs-prefit.md)
+- [pyDREAM Workflow](pydream-workflow.md)
+- [Cluster Dynamics](cluster-dynamics.md)
+- [Cluster Dynamics ML](cluster-dynamics-ml.md)
+- [PDF Calculation](pdf-calculation.md)

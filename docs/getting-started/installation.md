@@ -62,6 +62,7 @@ Common translations from installed CLI form to source-checkout form are:
 
 - `mdtrajectory ...` -> `PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory ...`
 - `clusters ...` -> `PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.cluster ...`
+- `blenderxyz ...` -> `PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.toolbox.blender.cli ...`
 - `saxshell saxs ...` -> `PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs ...`
 - `saxshell fullrmc ...` -> `PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.fullrmc ...`
 
@@ -102,6 +103,10 @@ saxshell fullrmc --help
 - The SAXS workflow also depends on scientific Python packages such as NumPy,
   SciPy, and lmfit.
 - The SAXS Debye component builder uses `xraydb`.
+- The `blenderxyz` application also requires a separate Blender installation:
+  <https://www.blender.org/download/>
+- The Blender renderer works best when `blender` is on `PATH`, but you can also
+  browse to the Blender executable or `.app` bundle from inside the UI.
 
 ## Debyer installation for PDF calculations
 

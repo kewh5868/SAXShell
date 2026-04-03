@@ -32,10 +32,13 @@ errors.err
 src/saxshell/_deprecated/
 src/saxshell/saxs/_deprecated/
 examples/
+src/saxshell.txt
 src/saxsshell_updates_planned.txt
+src/saxsshell_updates_planned_02.txt
 src/saxshell/fullrmc/_deprecated/
 src/saxshell/debyer/_deprecated/
 src/saxshell/toolbox/_deprecated/
+src/saxshell/xyz2pdb/_deprecated/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
