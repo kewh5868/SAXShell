@@ -11,7 +11,6 @@ from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
-    QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,

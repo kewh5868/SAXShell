@@ -348,7 +348,7 @@ def _covalent_radius(element: str) -> float:
         "Si": 1.11,
         "Sn": 1.39,
         "Sr": 1.95,
-        "Te": 1.38,
+        "Te": 1.38,  # codespell:ignore Te
         "Ti": 1.60,
         "Tl": 1.45,
         "V": 1.53,
@@ -1666,7 +1666,6 @@ class XYZToPDBWorkflow:
             dtype=float,
         )
         best_assignment: tuple[int, ...] | None = None
-        best_score: float | None = None
         constraint_index1 = np.array(
             [
                 index1
@@ -1920,7 +1919,6 @@ class XYZToPDBWorkflow:
 
             if stage_best_assignment is not None:
                 best_assignment = stage_best_assignment
-                best_score = stage_best_score
                 break
         return best_assignment
 

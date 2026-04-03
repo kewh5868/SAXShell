@@ -11,7 +11,7 @@ os.environ.setdefault(
     str(Path(tempfile.gettempdir()) / "saxshell_mplconfig"),
 )
 
-from saxshell.toolbox.blender.common import (
+from saxshell.toolbox.blender.common import (  # noqa: E402
     ATOM_STYLE_CHOICES,
     LIGHTING_LEVEL_CHOICES,
     OrientationSpec,
@@ -19,7 +19,7 @@ from saxshell.toolbox.blender.common import (
     normalize_element_symbol,
     normalize_lighting_level,
 )
-from saxshell.toolbox.blender.ui.reference_atoms import (
+from saxshell.toolbox.blender.ui.reference_atoms import (  # noqa: E402
     REFERENCE_ATOM_ELEMENTS,
     REFERENCE_ATOM_RENDER_QUALITY,
     iter_reference_atom_matrix,
@@ -27,7 +27,7 @@ from saxshell.toolbox.blender.ui.reference_atoms import (
     reference_atom_key,
     reference_atom_path,
 )
-from saxshell.toolbox.blender.workflow import (
+from saxshell.toolbox.blender.workflow import (  # noqa: E402
     BlenderXYZRenderSettings,
     BlenderXYZRenderWorkflow,
     build_render_output_paths,

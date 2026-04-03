@@ -20,8 +20,6 @@ from .workflow import (
     XYZToPDBAssertionResult,
     XYZToPDBExportResult,
     XYZToPDBInspectionResult,
-    XYZToPDBOperationCancelled,
-    XYZToPDBPreviewResult,
     XYZToPDBReferenceUpdateCandidate,
     XYZToPDBWorkflow,
     _build_cryst1_line,
@@ -97,7 +95,7 @@ _COVALENT_RADII = {
     "Si": 1.11,
     "Sn": 1.39,
     "Sr": 1.95,
-    "Te": 1.38,
+    "Te": 1.38,  # codespell:ignore Te
     "Ti": 1.60,
     "Tl": 1.45,
     "V": 1.53,

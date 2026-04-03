@@ -7,8 +7,6 @@ from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
-    QHBoxLayout,
-    QLabel,
     QMainWindow,
     QMessageBox,
     QScrollArea,

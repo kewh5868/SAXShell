@@ -38,7 +38,6 @@ from .common import (
     sanitize_orientation_key,
     set_custom_aesthetics,
     style_atom_color,
-    style_display_radius,
 )
 
 _PROGRESS_START_PREFIX = "BLENDERXYZ_PROGRESS_START "

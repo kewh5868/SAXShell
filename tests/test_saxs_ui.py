@@ -13837,8 +13837,6 @@ def test_project_setup_loads_saved_distribution_with_cropped_q_range(
     manager.save_project(original_settings)
     manager.build_scattering_components(original_settings)
     manager.generate_prior_weights(original_settings)
-    original_artifacts = project_artifact_paths(original_settings)
-
     reduced_settings = manager.load_project(project_dir)
     reduced_settings.clusters_dir = str(clusters_dir)
     reduced_settings.q_min = 0.12

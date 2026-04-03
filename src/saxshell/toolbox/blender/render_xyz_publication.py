@@ -23,7 +23,6 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 from saxshell.toolbox.blender.common import (  # noqa: E402
-    ATOM_STYLE_CHOICES,
     COVALENT_RADII,
     DEFAULT_ATOM_STYLE,
     DEFAULT_BOND_THRESHOLD_SCALE,

@@ -9,12 +9,12 @@ import pytest
 
 pytest.importorskip("xraydb")
 
-import saxshell.saxs.contrast.representatives as contrast_representatives_module
-from saxshell.saxs.contrast.debye import (
+import saxshell.saxs.contrast.representatives as contrast_representatives_module  # noqa: E402
+from saxshell.saxs.contrast.debye import (  # noqa: E402
     build_contrast_component_profiles,
     compute_contrast_debye_intensity,
 )
-from saxshell.saxs.contrast.electron_density import (
+from saxshell.saxs.contrast.electron_density import (  # noqa: E402
     CONTRAST_SOLVENT_METHOD_DIRECT,
     CONTRAST_SOLVENT_METHOD_NEAT,
     CONTRAST_SOLVENT_METHOD_REFERENCE,
@@ -22,17 +22,17 @@ from saxshell.saxs.contrast.electron_density import (
     ContrastSolventDensitySettings,
     compute_contrast_geometry_and_electron_density,
 )
-from saxshell.saxs.contrast.representatives import (
+from saxshell.saxs.contrast.representatives import (  # noqa: E402
     analyze_contrast_representatives,
 )
-from saxshell.saxs.contrast.settings import (
+from saxshell.saxs.contrast.settings import (  # noqa: E402
     COMPONENT_BUILD_MODE_CONTRAST,
     COMPONENT_BUILD_MODE_NO_CONTRAST,
     ContrastRepresentativeSamplerSettings,
 )
-from saxshell.saxs.debye import ClusterBin
-from saxshell.saxs.debye.profiles import compute_debye_intensity
-from saxshell.saxs.project_manager import (
+from saxshell.saxs.debye import ClusterBin  # noqa: E402
+from saxshell.saxs.debye.profiles import compute_debye_intensity  # noqa: E402
+from saxshell.saxs.project_manager import (  # noqa: E402
     SAXSProjectManager,
     project_artifact_paths,
 )
