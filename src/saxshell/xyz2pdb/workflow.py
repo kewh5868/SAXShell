@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 import re
-from collections import Counter, defaultdict
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections import Counter, defaultdict, deque
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from string import ascii_letters, digits
 
@@ -14,6 +14,23 @@ from scipy.optimize import linear_sum_assignment
 from saxshell.structure import PDBAtom, PDBStructure
 
 _SAFE_FILENAME_CHARS = frozenset(ascii_letters + digits + "-_")
+_REFERENCE_BACKBONE_PAIR_LIMIT = 3
+_BACKBONE_CANDIDATE_DISCOVERY_LOG_START = 10
+_BACKBONE_CANDIDATE_FIT_DEFER_ATTEMPTS = 5000
+_BACKBONE_ROTATION_SAMPLE_COUNTS = (12, 24, 48, 96, 192)
+_BACKBONE_ROTATION_BATCH_SIZE = 24
+_BACKBONE_ROTATION_KEY_SCALE = 1_000_000
+
+
+class XYZToPDBOperationCancelled(RuntimeError):
+    """Raised when a long-running xyz2pdb task is canceled."""
+
+
+def _raise_if_cancelled(
+    cancel_callback: Callable[[], bool] | None,
+) -> None:
+    if cancel_callback is not None and cancel_callback():
+        raise XYZToPDBOperationCancelled("XYZ-to-PDB conversion canceled.")
 
 
 def rotation_matrix_from_to(
@@ -95,9 +112,246 @@ def rigid_alignment_from_points(
     return rotation, source_centroid, target_centroid
 
 
+def rotation_matrix_about_axis(
+    axis: Sequence[float],
+    angle_radians: float,
+    *,
+    tolerance: float = 1.0e-8,
+) -> np.ndarray:
+    """Return the rotation matrix for a right-handed rotation around one axis."""
+    normalized_axis = np.asarray(axis, dtype=float)
+    axis_norm = float(np.linalg.norm(normalized_axis))
+    if axis_norm < tolerance:
+        raise ValueError("Rotation axis must have non-zero length.")
+    normalized_axis = normalized_axis / axis_norm
+    x_value, y_value, z_value = normalized_axis
+    skew = np.array(
+        [
+            [0.0, -z_value, y_value],
+            [z_value, 0.0, -x_value],
+            [-y_value, x_value, 0.0],
+        ],
+        dtype=float,
+    )
+    return (
+        np.eye(3)
+        + np.sin(angle_radians) * skew
+        + (1.0 - np.cos(angle_radians)) * (skew @ skew)
+    )
+
+
 def default_reference_library_dir() -> Path:
     """Return the bundled reference-library folder."""
     return Path(__file__).resolve().parent / "reference_library"
+
+
+def _reference_metadata_path(reference_path: Path) -> Path:
+    return reference_path.with_suffix(".json")
+
+
+def _reference_atom_name(atom: PDBAtom, index: int) -> str:
+    return _normalized_atom_name(
+        atom.atom_name,
+        fallback=f"{atom.element}{index + 1}",
+    )
+
+
+def _normalized_backbone_pairs(
+    value: object,
+    *,
+    valid_atom_names: set[str],
+) -> tuple[tuple[str, str], ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+
+    normalized_pairs: list[tuple[str, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for item in value:
+        if not isinstance(item, list | tuple) or len(item) != 2:
+            continue
+        atom1_name = _normalized_atom_name(str(item[0]), fallback="A1")
+        atom2_name = _normalized_atom_name(str(item[1]), fallback="A2")
+        if atom1_name == atom2_name:
+            continue
+        if atom1_name not in valid_atom_names or atom2_name not in valid_atom_names:
+            continue
+        pair_key = tuple(sorted((atom1_name, atom2_name)))
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+        normalized_pairs.append((atom1_name, atom2_name))
+    return tuple(normalized_pairs)
+
+
+def _write_reference_metadata(
+    reference_path: Path,
+    *,
+    residue_name: str,
+    backbone_pairs: Sequence[tuple[str, str]],
+) -> None:
+    metadata_path = _reference_metadata_path(reference_path)
+    payload = {
+        "residue_name": str(residue_name),
+        "backbone_pairs": [
+            [str(atom1_name), str(atom2_name)]
+            for atom1_name, atom2_name in backbone_pairs
+        ],
+    }
+    metadata_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _resolve_reference_backbone_pairs(
+    reference_path: Path,
+    *,
+    atoms: Sequence[PDBAtom],
+) -> tuple[tuple[str, str], ...]:
+    atom_names = {
+        _reference_atom_name(atom, index)
+        for index, atom in enumerate(atoms)
+    }
+    metadata_path = _reference_metadata_path(reference_path)
+    if metadata_path.is_file():
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            normalized_pairs = _normalized_backbone_pairs(
+                payload.get("backbone_pairs"),
+                valid_atom_names=atom_names,
+            )
+            if normalized_pairs:
+                return normalized_pairs
+    return _infer_preferred_reference_backbone_pairs(atoms)
+
+
+def _infer_preferred_reference_backbone_pairs(
+    atoms: Sequence[PDBAtom],
+    *,
+    max_pairs: int = _REFERENCE_BACKBONE_PAIR_LIMIT,
+) -> tuple[tuple[str, str], ...]:
+    if not atoms:
+        return ()
+
+    coordinates = np.array([atom.coordinates for atom in atoms], dtype=float)
+    atom_names = [
+        _reference_atom_name(atom, index)
+        for index, atom in enumerate(atoms)
+    ]
+    heavy_element_counts = Counter(
+        atom.element for atom in atoms if atom.element != "H"
+    )
+    if not heavy_element_counts:
+        heavy_element_counts = Counter(atom.element for atom in atoms)
+
+    candidates: list[tuple[tuple[int, int, float, float, float], tuple[str, str]]] = []
+    for atom1_index, atom1 in enumerate(atoms):
+        for atom2_index in range(atom1_index + 1, len(atoms)):
+            atom2 = atoms[atom2_index]
+            distance = float(
+                np.linalg.norm(
+                    coordinates[atom2_index] - coordinates[atom1_index]
+                )
+            )
+            if distance <= 0.0:
+                continue
+            radius1 = _covalent_radius(atom1.element)
+            radius2 = _covalent_radius(atom2.element)
+            threshold = 1.18 * (radius1 + radius2)
+            if distance > threshold:
+                continue
+
+            heavy_pair = atom1.element != "H" and atom2.element != "H"
+            hetero_pair = atom1.element != atom2.element
+            rarity = 1.0 / (
+                heavy_element_counts.get(atom1.element, 1)
+                * heavy_element_counts.get(atom2.element, 1)
+            )
+            score = (
+                1 if heavy_pair else 0,
+                1 if hetero_pair else 0,
+                float(rarity),
+                float(distance),
+                -float(atom1_index + atom2_index),
+            )
+            candidates.append(
+                (
+                    score,
+                    (atom_names[atom1_index], atom_names[atom2_index]),
+                )
+            )
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    preferred_pairs: list[tuple[str, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for _score, pair in candidates:
+        pair_key = tuple(sorted(pair))
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+        preferred_pairs.append(pair)
+        if len(preferred_pairs) >= max(max_pairs, 1):
+            break
+    return tuple(preferred_pairs)
+
+
+def _covalent_radius(element: str) -> float:
+    radii = {
+        "Ag": 1.45,
+        "Al": 1.21,
+        "As": 1.19,
+        "Au": 1.36,
+        "B": 0.84,
+        "Ba": 2.15,
+        "Be": 0.96,
+        "Bi": 1.48,
+        "Br": 1.20,
+        "C": 0.76,
+        "Ca": 1.76,
+        "Cd": 1.44,
+        "Cl": 1.02,
+        "Co": 1.26,
+        "Cr": 1.39,
+        "Cs": 2.44,
+        "Cu": 1.32,
+        "F": 0.57,
+        "Fe": 1.32,
+        "Ga": 1.22,
+        "Ge": 1.20,
+        "H": 0.31,
+        "Hg": 1.32,
+        "I": 1.39,
+        "In": 1.42,
+        "K": 2.03,
+        "Li": 1.28,
+        "Mg": 1.41,
+        "Mn": 1.39,
+        "Mo": 1.54,
+        "N": 0.71,
+        "Na": 1.66,
+        "Ni": 1.24,
+        "O": 0.66,
+        "P": 1.07,
+        "Pb": 1.46,
+        "Pd": 1.39,
+        "Pt": 1.36,
+        "S": 1.05,
+        "Sb": 1.39,
+        "Se": 1.20,
+        "Si": 1.11,
+        "Sn": 1.39,
+        "Sr": 1.95,
+        "Te": 1.38,
+        "Ti": 1.60,
+        "Tl": 1.45,
+        "V": 1.53,
+        "Zn": 1.22,
+        "Zr": 1.75,
+    }
+    return float(radii.get(element, 0.85))
 
 
 def next_available_output_dir(parent_dir: Path, folder_name: str) -> Path:
@@ -127,6 +381,40 @@ def suggest_output_dir(input_path: str | Path) -> Path:
     if not folder_label:
         folder_label = "xyz"
     return next_available_output_dir(parent_dir, f"xyz2pdb_{folder_label}")
+
+
+def _natural_sort_key(value: str) -> tuple[tuple[int, int | str], ...]:
+    parts = re.findall(r"\d+|\D+", str(value or "").casefold())
+    key_parts: list[tuple[int, int | str]] = []
+    for part in parts:
+        if part.isdigit():
+            key_parts.append((0, int(part)))
+        else:
+            key_parts.append((1, part))
+    key_parts.append((2, str(value or "").casefold()))
+    return tuple(key_parts)
+
+
+def _element_order_mismatch_message(
+    *,
+    frame_name: str,
+    atom_index: int,
+    expected_element: str,
+    found_element: str,
+    reference_frame_name: str | None = None,
+) -> str:
+    if reference_frame_name:
+        prefix = (
+            f"Frame {frame_name} changed element order compared with "
+            f"{reference_frame_name}"
+        )
+    else:
+        prefix = f"Frame {frame_name} changed element order"
+    return (
+        f"{prefix} at atom index {atom_index}: expected {expected_element}, "
+        f"found {found_element}. This usually means the XYZ files do not "
+        "share one atom order or were loaded in the wrong frame order."
+    )
 
 
 def _normalized_element_symbol(value: str) -> str:
@@ -230,6 +518,7 @@ class ReferenceLibraryEntry:
     residue_name: str
     atom_count: int
     atom_names: tuple[str, ...]
+    backbone_pairs: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(slots=True)
@@ -240,6 +529,7 @@ class ReferenceCreationResult:
     path: Path
     residue_name: str
     atom_count: int
+    backbone_pairs: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(slots=True)
@@ -253,7 +543,39 @@ class MoleculeDefinition:
     reference_atoms: tuple[PDBAtom, ...]
     anchors: tuple[AnchorPairDefinition, ...]
     resolved_anchor_indices: tuple[tuple[int, int, float], ...]
+    preferred_anchor_indices: tuple[tuple[int, int], ...] = ()
     max_assignment_distance: float | None = None
+
+
+@dataclass(slots=True)
+class _BackboneCandidateState:
+    """Incremental search state for one source backbone candidate pair."""
+
+    candidate_index: int
+    source_index1: int
+    source_index2: int
+    base_transformed_coordinates: np.ndarray
+    fixed_assignment: dict[int, int]
+    axis_origin: np.ndarray
+    axis_direction: np.ndarray
+    pending_angles: deque[float] = field(default_factory=deque)
+    attempted_angle_keys: set[int] = field(default_factory=set)
+    rotation_level: int = 0
+    total_attempts: int = 0
+    successful_fit_count: int = 0
+    failed_fit_count: int = 0
+
+
+@dataclass(slots=True)
+class _FrameSearchCache:
+    """Per-frame search data reused across repeated molecule matches."""
+
+    source_indices_by_element: dict[str, list[int]]
+    source_coordinates_by_element: dict[str, np.ndarray]
+    candidate_pairs_by_key: dict[
+        tuple[str, str, float, float],
+        tuple[tuple[int, int], ...],
+    ] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -357,12 +679,108 @@ class XYZToPDBPreviewResult:
 
 
 @dataclass(slots=True)
+class XYZToPDBAssertionResidueSummary:
+    """Assertion summary for one residue type across exported molecules."""
+
+    residue_name: str
+    molecule_count: int
+    common_atom_count: int
+    distance_pair_count: int
+    median_distribution_rmsd: float
+    max_distribution_rmsd: float
+    median_max_distance_delta: float
+    max_max_distance_delta: float
+    outlier_count: int
+    passed: bool
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "residue_name": self.residue_name,
+            "molecule_count": int(self.molecule_count),
+            "common_atom_count": int(self.common_atom_count),
+            "distance_pair_count": int(self.distance_pair_count),
+            "median_distribution_rmsd": float(self.median_distribution_rmsd),
+            "max_distribution_rmsd": float(self.max_distribution_rmsd),
+            "median_max_distance_delta": float(
+                self.median_max_distance_delta
+            ),
+            "max_max_distance_delta": float(self.max_max_distance_delta),
+            "outlier_count": int(self.outlier_count),
+            "passed": bool(self.passed),
+        }
+
+
+@dataclass(slots=True)
+class XYZToPDBReferenceUpdateCandidate:
+    """One assertion-derived reference update candidate."""
+
+    residue_name: str
+    reference_name: str
+    reference_path: Path
+    reference_residue_name: str
+    average_structure_file: Path
+    molecule_count: int
+    median_distribution_rmsd: float
+    max_distribution_rmsd: float
+    backbone_pairs: tuple[tuple[str, str], ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "residue_name": self.residue_name,
+            "reference_name": self.reference_name,
+            "reference_path": str(self.reference_path),
+            "reference_residue_name": self.reference_residue_name,
+            "average_structure_file": str(self.average_structure_file),
+            "molecule_count": int(self.molecule_count),
+            "median_distribution_rmsd": float(self.median_distribution_rmsd),
+            "max_distribution_rmsd": float(self.max_distribution_rmsd),
+            "backbone_pairs": [
+                [str(atom1_name), str(atom2_name)]
+                for atom1_name, atom2_name in self.backbone_pairs
+            ],
+        }
+
+
+@dataclass(slots=True)
+class XYZToPDBAssertionResult:
+    """Optional molecule-shape assertion report produced during export."""
+
+    molecule_dir: Path
+    report_file: Path
+    total_molecules: int
+    passed: bool
+    residue_summaries: tuple[XYZToPDBAssertionResidueSummary, ...]
+    reference_update_candidates: tuple[
+        XYZToPDBReferenceUpdateCandidate, ...
+    ] = ()
+    warnings: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "molecule_dir": str(self.molecule_dir),
+            "report_file": str(self.report_file),
+            "total_molecules": int(self.total_molecules),
+            "passed": bool(self.passed),
+            "residue_summaries": [
+                summary.to_dict() for summary in self.residue_summaries
+            ],
+            "reference_update_candidates": [
+                candidate.to_dict()
+                for candidate in self.reference_update_candidates
+            ],
+            "warnings": list(self.warnings),
+        }
+
+
+@dataclass(slots=True)
 class XYZToPDBExportResult:
     """Result of writing converted PDB files to disk."""
 
     output_dir: Path
     written_files: tuple[Path, ...]
     preview: XYZToPDBPreviewResult
+    progress_total_steps: int | None = None
+    assertion_result: XYZToPDBAssertionResult | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -370,6 +788,16 @@ class XYZToPDBExportResult:
             "written_files": [str(path) for path in self.written_files],
             "written_count": len(self.written_files),
             "preview": self.preview.to_dict(),
+            "progress_total_steps": (
+                None
+                if self.progress_total_steps is None
+                else int(self.progress_total_steps)
+            ),
+            "assertion_result": (
+                None
+                if self.assertion_result is None
+                else self.assertion_result.to_dict()
+            ),
         }
 
 
@@ -394,6 +822,10 @@ def list_reference_library(
             structure.atoms[0].residue_name if structure.atoms else "UNK"
         )
         atom_names = tuple(atom.atom_name for atom in structure.atoms)
+        backbone_pairs = _resolve_reference_backbone_pairs(
+            path,
+            atoms=structure.atoms,
+        )
         entries.append(
             ReferenceLibraryEntry(
                 name=path.stem,
@@ -401,6 +833,7 @@ def list_reference_library(
                 residue_name=residue_name,
                 atom_count=len(structure.atoms),
                 atom_names=atom_names,
+                backbone_pairs=backbone_pairs,
             )
         )
     return entries
@@ -441,6 +874,7 @@ def create_reference_molecule(
     reference_name: str,
     residue_name: str | None = None,
     library_dir: str | Path | None = None,
+    backbone_pairs: Sequence[tuple[str, str]] | None = None,
 ) -> ReferenceCreationResult:
     """Convert one source structure into a stored reference PDB."""
     source_path = Path(source_file)
@@ -517,12 +951,39 @@ def create_reference_molecule(
             "Reference creation supports only .pdb and .xyz source files."
         )
 
+    if not re.fullmatch(r"[A-Z]{3}", resolved_residue_name):
+        raise ValueError(
+            "Reference residues must be exactly three capital letters."
+        )
+
     structure.write_pdb_file(output_path)
+    if backbone_pairs is None:
+        resolved_backbone_pairs = _infer_preferred_reference_backbone_pairs(
+            structure.atoms
+        )
+    else:
+        resolved_backbone_pairs = _normalized_backbone_pairs(
+            list(backbone_pairs),
+            valid_atom_names={
+                _reference_atom_name(atom, index)
+                for index, atom in enumerate(structure.atoms)
+            },
+        )
+        if not resolved_backbone_pairs:
+            resolved_backbone_pairs = _infer_preferred_reference_backbone_pairs(
+                structure.atoms
+            )
+    _write_reference_metadata(
+        output_path,
+        residue_name=resolved_residue_name,
+        backbone_pairs=resolved_backbone_pairs,
+    )
     return ReferenceCreationResult(
         name=safe_name,
         path=output_path,
         residue_name=resolved_residue_name,
         atom_count=len(structure.atoms),
+        backbone_pairs=resolved_backbone_pairs,
     )
 
 
@@ -584,6 +1045,34 @@ class XYZToPDBWorkflow:
                 )
             )
         return XYZFrame(filepath=path, comment=lines[1], atoms=atoms)
+
+    @staticmethod
+    def read_xyz_element_sequence(filepath: str | Path) -> tuple[str, ...]:
+        """Read only the ordered element list from one XYZ frame."""
+        path = Path(filepath)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if len(lines) < 2:
+            raise ValueError(f"The XYZ file is incomplete: {path}")
+        try:
+            atom_count = int(lines[0].strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"The XYZ file does not start with an atom count: {path}"
+            ) from exc
+
+        atom_lines = [line for line in lines[2:] if line.strip()]
+        if len(atom_lines) < atom_count:
+            raise ValueError(
+                f"The XYZ file does not contain {atom_count} atom lines: {path}"
+            )
+
+        elements: list[str] = []
+        for line in atom_lines[:atom_count]:
+            parts = line.split()
+            if len(parts) < 4:
+                raise ValueError(f"Malformed XYZ atom line: {line!r}")
+            elements.append(_normalized_element_symbol(parts[0]))
+        return tuple(elements)
 
     def inspect(self) -> XYZToPDBInspectionResult:
         """Inspect the selected input path and optional
@@ -690,6 +1179,8 @@ class XYZToPDBWorkflow:
         progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> XYZToPDBExportResult:
         """Convert the selected XYZ input into PDB files on disk."""
+        inspection = self.inspect()
+        self._validate_xyz_element_order(inspection.xyz_files)
         preview = self.preview_conversion(output_dir=output_dir)
         configuration = self.load_configuration()
         output_path = preview.output_dir
@@ -746,11 +1237,105 @@ class XYZToPDBWorkflow:
                 for path in self.input_path.iterdir()
                 if path.is_file() and path.suffix.lower() == ".xyz"
             ),
-            key=lambda path: path.name.lower(),
+            key=lambda path: _natural_sort_key(path.name),
         )
         if not xyz_files:
             raise ValueError(f"No .xyz files were found in {self.input_path}")
         return "xyz_folder", xyz_files
+
+    def _validate_xyz_element_order(
+        self,
+        xyz_files: Sequence[Path],
+        *,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+        progress_step: int | None = None,
+        total_steps: int | None = None,
+        log_callback: Callable[[str], None] | None = None,
+        cancel_callback: Callable[[], bool] | None = None,
+    ) -> None:
+        if len(xyz_files) <= 1:
+            return
+
+        reference_file = xyz_files[0]
+        frame_count = len(xyz_files)
+        expected_elements = self.read_xyz_element_sequence(reference_file)
+        if (
+            progress_callback is not None
+            and progress_step is not None
+            and total_steps is not None
+        ):
+            progress_callback(
+                progress_step,
+                total_steps,
+                "Validating XYZ atom order "
+                f"[1/{frame_count}]: {reference_file.name} (reference)",
+            )
+
+        for frame_index, xyz_file in enumerate(xyz_files[1:], start=2):
+            _raise_if_cancelled(cancel_callback)
+            if (
+                progress_callback is not None
+                and progress_step is not None
+                and total_steps is not None
+            ):
+                progress_callback(
+                    progress_step + frame_index - 1,
+                    total_steps,
+                    "Validating XYZ atom order "
+                    f"[{frame_index}/{frame_count}]: {xyz_file.name}",
+                )
+            candidate_elements = self.read_xyz_element_sequence(xyz_file)
+            self._validate_element_sequence_against_reference(
+                expected_elements,
+                candidate_elements,
+                frame_name=xyz_file.name,
+                reference_frame_name=reference_file.name,
+            )
+
+        if log_callback is not None:
+            log_callback(
+                "Validated XYZ atom order across "
+                f"{len(xyz_files)} frame(s) against {reference_file.name} "
+                "before template mapping."
+            )
+
+    def _validate_element_sequence_against_reference(
+        self,
+        expected_elements: Sequence[str],
+        candidate_elements: Sequence[str],
+        *,
+        frame_name: str,
+        reference_frame_name: str | None = None,
+    ) -> None:
+        if len(candidate_elements) != len(expected_elements):
+            if reference_frame_name is None:
+                raise ValueError(
+                    f"Frame {frame_name} contains {len(candidate_elements)} atoms, "
+                    f"but the template expects {len(expected_elements)}. XYZ "
+                    "frames must share the same atom count and element order "
+                    "to reuse one mapping template."
+                )
+            raise ValueError(
+                f"Frame {frame_name} contains {len(candidate_elements)} atoms, "
+                f"but {reference_frame_name} contains {len(expected_elements)}. "
+                "XYZ frames must share the same atom count and element order "
+                "to reuse one mapping template."
+            )
+
+        for atom_index, (expected_element, found_element) in enumerate(
+            zip(expected_elements, candidate_elements),
+            start=1,
+        ):
+            if expected_element != found_element:
+                raise ValueError(
+                    _element_order_mismatch_message(
+                        frame_name=frame_name,
+                        atom_index=atom_index,
+                        expected_element=expected_element,
+                        found_element=found_element,
+                        reference_frame_name=reference_frame_name,
+                    )
+                )
 
     def _parse_pbc_params(
         self,
@@ -870,6 +1455,10 @@ class XYZToPDBWorkflow:
                     reference_atoms=reference_atoms,
                     anchors=tuple(anchors),
                     resolved_anchor_indices=tuple(resolved_anchor_indices),
+                    preferred_anchor_indices=tuple(
+                        (index1, index2)
+                        for index1, index2, _tolerance in resolved_anchor_indices
+                    ),
                     max_assignment_distance=(
                         None
                         if max_assignment_distance is None
@@ -1060,7 +1649,12 @@ class XYZToPDBWorkflow:
         frame: XYZFrame,
         used: Sequence[bool],
         molecule: MoleculeDefinition,
+        *,
+        search_status_callback: Callable[[str], None] | None = None,
+        cancel_callback: Callable[[], bool] | None = None,
+        frame_search_cache: _FrameSearchCache | None = None,
     ) -> tuple[int, ...] | None:
+        _raise_if_cancelled(cancel_callback)
         reference_atoms = molecule.reference_atoms
         reference_coordinates = np.array(
             [atom.coordinates for atom in reference_atoms],
@@ -1068,101 +1662,570 @@ class XYZToPDBWorkflow:
         )
         best_assignment: tuple[int, ...] | None = None
         best_score: float | None = None
-        anchor_constraints = self._anchor_constraints(
-            reference_coordinates,
-            molecule.resolved_anchor_indices,
+        constraint_index1 = np.array(
+            [index1 for index1, _index2, _tolerance in molecule.resolved_anchor_indices],
+            dtype=int,
         )
-        anchor_reference_indices = tuple(sorted(anchor_constraints))
-
-        for (
-            anchor_index1,
-            anchor_index2,
-            tolerance,
-        ) in molecule.resolved_anchor_indices:
-            anchor_atom1 = reference_atoms[anchor_index1]
-            anchor_atom2 = reference_atoms[anchor_index2]
-            reference_vector = (
-                reference_coordinates[anchor_index2]
-                - reference_coordinates[anchor_index1]
-            )
-            reference_length = float(np.linalg.norm(reference_vector))
-            if reference_length <= 0.0:
-                continue
-
-            candidate_indices1 = [
-                index
-                for index, atom in enumerate(frame.atoms)
-                if not used[index] and atom.element == anchor_atom1.element
-            ]
-            candidate_indices2 = [
-                index
-                for index, atom in enumerate(frame.atoms)
-                if not used[index] and atom.element == anchor_atom2.element
-            ]
-            for source_index1 in candidate_indices1:
-                position1 = frame.atoms[source_index1].coordinates
-                for source_index2 in candidate_indices2:
-                    if source_index1 == source_index2:
-                        continue
-                    position2 = frame.atoms[source_index2].coordinates
-                    candidate_distance = float(
-                        np.linalg.norm(position2 - position1)
+        constraint_index2 = np.array(
+            [index2 for _index1, index2, _tolerance in molecule.resolved_anchor_indices],
+            dtype=int,
+        )
+        constraint_reference_distances = np.array(
+            [
+                float(
+                    np.linalg.norm(
+                        reference_coordinates[index2] - reference_coordinates[index1]
                     )
-                    if abs(candidate_distance - reference_length) > tolerance:
-                        continue
-                    try:
-                        rotation = rotation_matrix_from_to(
-                            reference_vector,
-                            position2 - position1,
+                )
+                for index1, index2, _tolerance in molecule.resolved_anchor_indices
+            ],
+            dtype=float,
+        )
+        constraint_tolerances = np.array(
+            [
+                float(tolerance)
+                for _index1, _index2, tolerance in molecule.resolved_anchor_indices
+            ],
+            dtype=float,
+        )
+        if frame_search_cache is None:
+            frame_search_cache = self._build_frame_search_cache(frame)
+        source_indices_by_element = frame_search_cache.source_indices_by_element
+        source_coordinates_by_element = (
+            frame_search_cache.source_coordinates_by_element
+        )
+        anchor_search_stages = self._anchor_search_stages(molecule)
+        for stage_index, search_anchor_pairs in enumerate(anchor_search_stages):
+            _raise_if_cancelled(cancel_callback)
+            stage_best_assignment: tuple[int, ...] | None = None
+            stage_best_score: float | None = None
+            if (
+                stage_index > 0
+                and search_status_callback is not None
+                and search_anchor_pairs
+            ):
+                search_status_callback(
+                    "Preferred backbone pairs did not yield a match; "
+                    f"falling back to {len(search_anchor_pairs)} additional "
+                    "bond pair(s)."
+                )
+
+            for (
+                anchor_index1,
+                anchor_index2,
+                tolerance,
+            ) in search_anchor_pairs:
+                _raise_if_cancelled(cancel_callback)
+                anchor_atom1 = reference_atoms[anchor_index1]
+                anchor_atom2 = reference_atoms[anchor_index2]
+                reference_vector = (
+                    reference_coordinates[anchor_index2]
+                    - reference_coordinates[anchor_index1]
+                )
+                reference_length = float(np.linalg.norm(reference_vector))
+                if reference_length <= 0.0:
+                    continue
+
+                candidate_pair_cache_key = self._candidate_backbone_pair_cache_key(
+                    anchor_atom1.element,
+                    anchor_atom2.element,
+                    reference_length,
+                    tolerance,
+                )
+                cache_hit = (
+                    candidate_pair_cache_key
+                    in frame_search_cache.candidate_pairs_by_key
+                )
+                candidate_pairs = self._candidate_backbone_pairs(
+                    frame,
+                    used,
+                    source_indices_by_element=source_indices_by_element,
+                    source_coordinates_by_element=source_coordinates_by_element,
+                    anchor_atom1=anchor_atom1,
+                    anchor_atom2=anchor_atom2,
+                    reference_length=reference_length,
+                    tolerance=tolerance,
+                    discovery_callback=(
+                        None
+                        if search_status_callback is None
+                        or cache_hit
+                        else lambda count,
+                        atom1_name=anchor_atom1.atom_name,
+                        atom2_name=anchor_atom2.atom_name: search_status_callback(
+                            "Backbone "
+                            f"{atom1_name}-{atom2_name}: "
+                            f"found {count} candidate pair(s) so far."
                         )
-                    except ValueError:
+                    ),
+                    cancel_callback=cancel_callback,
+                    frame_search_cache=frame_search_cache,
+                )
+                if search_status_callback is not None:
+                    if cache_hit:
+                        cached_pair_count = len(
+                            frame_search_cache.candidate_pairs_by_key[
+                                candidate_pair_cache_key
+                            ]
+                        )
+                        search_status_callback(
+                            "Backbone "
+                            f"{anchor_atom1.atom_name}-{anchor_atom2.atom_name}: "
+                            f"reusing {cached_pair_count} cached candidate "
+                            f"pair(s); {len(candidate_pairs)} remain after "
+                            "filtering matched atoms."
+                        )
+                    else:
+                        search_status_callback(
+                            "Backbone "
+                            f"{anchor_atom1.atom_name}-{anchor_atom2.atom_name}: "
+                            f"found {len(candidate_pairs)} candidate pair(s)."
+                        )
+                candidate_states = self._backbone_candidate_states(
+                    frame,
+                    reference_atoms=reference_atoms,
+                    reference_coordinates=reference_coordinates,
+                    reference_vector=reference_vector,
+                    anchor_index1=anchor_index1,
+                    anchor_index2=anchor_index2,
+                    candidate_pairs=candidate_pairs,
+                )
+                searchable_candidate_count = len(candidate_states)
+                fit_attempt_count = 0
+                successful_fit_count = 0
+                selected_candidate_index: int | None = None
+                pending_states = deque(candidate_states)
+
+                while pending_states:
+                    _raise_if_cancelled(cancel_callback)
+                    candidate_state = pending_states.popleft()
+                    if not candidate_state.pending_angles:
+                        self._extend_candidate_rotation_schedule(
+                            candidate_state
+                        )
+                    if not candidate_state.pending_angles:
                         continue
 
-                    transformed = (
-                        (
-                            reference_coordinates
-                            - reference_coordinates[anchor_index1]
-                        )
-                        @ rotation.T
-                    ) + position1
-                    initial_anchor_assignment = {
-                        anchor_index1: source_index1,
-                        anchor_index2: source_index2,
-                    }
-                    expanded_anchor_assignments = (
-                        self._expand_anchor_assignments(
-                            frame,
-                            used,
-                            reference_atoms=reference_atoms,
-                            anchor_reference_indices=anchor_reference_indices,
-                            anchor_constraints=anchor_constraints,
-                            initial_assignment=initial_anchor_assignment,
-                        )
+                    batch_attempts = min(
+                        len(candidate_state.pending_angles),
+                        _BACKBONE_ROTATION_BATCH_SIZE,
                     )
-                    for anchor_assignment in expanded_anchor_assignments:
-                        target_coordinates = transformed
-                        if len(anchor_assignment) >= 3:
-                            target_coordinates = (
-                                self._transform_reference_with_anchors(
-                                    reference_coordinates,
-                                    frame,
-                                    anchor_assignment,
-                                )
-                            )
+                    for _attempt_index in range(batch_attempts):
+                        _raise_if_cancelled(cancel_callback)
+                        angle_radians = candidate_state.pending_angles.popleft()
+                        fit_attempt_count += 1
+                        candidate_state.total_attempts += 1
+                        target_coordinates = self._rotated_backbone_coordinates(
+                            candidate_state.base_transformed_coordinates,
+                            axis_origin=candidate_state.axis_origin,
+                            axis_direction=candidate_state.axis_direction,
+                            angle_radians=angle_radians,
+                        )
                         assignment, score = self._assign_reference_atoms(
                             frame,
                             used,
                             reference_atoms=reference_atoms,
                             target_coordinates=target_coordinates,
-                            fixed_assignment=anchor_assignment,
+                            fixed_assignment=candidate_state.fixed_assignment,
                             max_assignment_distance=molecule.max_assignment_distance,
+                            source_indices_by_element=source_indices_by_element,
+                            source_coordinates_by_element=source_coordinates_by_element,
                         )
-                        if assignment is None:
+                        if assignment is None or not self._assignment_satisfies_anchor_constraints(
+                            frame,
+                            assignment=assignment,
+                            constraint_index1=constraint_index1,
+                            constraint_index2=constraint_index2,
+                            constraint_reference_distances=constraint_reference_distances,
+                            constraint_tolerances=constraint_tolerances,
+                        ):
+                            candidate_state.failed_fit_count += 1
                             continue
-                        if best_score is None or score < best_score:
-                            best_assignment = assignment
-                            best_score = score
+
+                        candidate_state.successful_fit_count += 1
+                        successful_fit_count += 1
+                        if (
+                            stage_best_score is None
+                            or score < stage_best_score
+                        ):
+                            stage_best_assignment = assignment
+                            stage_best_score = score
+                            selected_candidate_index = (
+                                candidate_state.candidate_index
+                            )
+
+                    if candidate_state.total_attempts >= _BACKBONE_CANDIDATE_FIT_DEFER_ATTEMPTS:
+                        if search_status_callback is not None:
+                            search_status_callback(
+                                "Backbone "
+                                f"{anchor_atom1.atom_name}-{anchor_atom2.atom_name}: "
+                                f"candidate {candidate_state.candidate_index}/"
+                                f"{searchable_candidate_count} reached the "
+                                f"{_BACKBONE_CANDIDATE_FIT_DEFER_ATTEMPTS} unique-fit "
+                                "limit and was skipped."
+                            )
+                        continue
+                    if candidate_state.pending_angles or candidate_state.rotation_level < len(
+                        _BACKBONE_ROTATION_SAMPLE_COUNTS
+                    ):
+                        pending_states.append(candidate_state)
+
+                if search_status_callback is not None:
+                    rejected_fit_count = fit_attempt_count - successful_fit_count
+                    search_status_callback(
+                        "Backbone "
+                        f"{anchor_atom1.atom_name}-{anchor_atom2.atom_name}: "
+                        f"{len(candidate_pairs)} candidate pair(s), "
+                        f"{fit_attempt_count} unique fit(s), "
+                        f"{successful_fit_count} successful fit(s), "
+                        f"{rejected_fit_count} rejected fit(s), success rate "
+                        f"{self._format_fit_success_rate(successful_fit_count, fit_attempt_count)}, "
+                        + (
+                            "selected 0 molecule(s)."
+                            if selected_candidate_index is None
+                            else (
+                                "selected candidate "
+                                f"{selected_candidate_index}/{searchable_candidate_count}."
+                            )
+                        )
+                    )
+
+            if stage_best_assignment is not None:
+                best_assignment = stage_best_assignment
+                best_score = stage_best_score
+                break
         return best_assignment
+
+    def _build_frame_search_cache(
+        self,
+        frame: XYZFrame,
+    ) -> _FrameSearchCache:
+        source_indices_by_element = self._source_indices_by_element(frame)
+        source_coordinates_by_element = {
+            element: np.array(
+                [
+                    frame.atoms[source_index].coordinates
+                    for source_index in source_indices
+                ],
+                dtype=float,
+            )
+            for element, source_indices in source_indices_by_element.items()
+        }
+        return _FrameSearchCache(
+            source_indices_by_element=source_indices_by_element,
+            source_coordinates_by_element=source_coordinates_by_element,
+        )
+
+    def _anchor_search_stages(
+        self,
+        molecule: MoleculeDefinition,
+    ) -> tuple[tuple[tuple[int, int, float], ...], ...]:
+        ordered_pairs = self._ordered_anchor_search_pairs(molecule)
+        preferred_pair_keys = {
+            tuple(sorted((index1, index2)))
+            for index1, index2 in molecule.preferred_anchor_indices
+        }
+        if not preferred_pair_keys:
+            return (ordered_pairs,)
+
+        preferred_pairs = tuple(
+            pair
+            for pair in ordered_pairs
+            if tuple(sorted((pair[0], pair[1]))) in preferred_pair_keys
+        )
+        if not preferred_pairs:
+            return (ordered_pairs,)
+        return (preferred_pairs,)
+
+    def _ordered_anchor_search_pairs(
+        self,
+        molecule: MoleculeDefinition,
+    ) -> tuple[tuple[int, int, float], ...]:
+        preferred_pairs = {
+            tuple(sorted((index1, index2))): order
+            for order, (index1, index2) in enumerate(
+                molecule.preferred_anchor_indices
+            )
+        }
+        ordered_pairs = sorted(
+            molecule.resolved_anchor_indices,
+            key=lambda item: (
+                0
+                if tuple(sorted((item[0], item[1]))) in preferred_pairs
+                else 1,
+                preferred_pairs.get(
+                    tuple(sorted((item[0], item[1]))),
+                    len(preferred_pairs),
+                ),
+                abs(item[2]),
+            ),
+        )
+        return tuple(ordered_pairs)
+
+    def _unused_source_indices_by_element(
+        self,
+        frame: XYZFrame,
+        used: Sequence[bool],
+    ) -> dict[str, list[int]]:
+        source_indices_by_element: dict[str, list[int]] = defaultdict(list)
+        for source_index, atom in enumerate(frame.atoms):
+            if used[source_index]:
+                continue
+            source_indices_by_element[atom.element].append(source_index)
+        return source_indices_by_element
+
+    def _source_indices_by_element(
+        self,
+        frame: XYZFrame,
+    ) -> dict[str, list[int]]:
+        source_indices_by_element: dict[str, list[int]] = defaultdict(list)
+        for source_index, atom in enumerate(frame.atoms):
+            source_indices_by_element[atom.element].append(source_index)
+        return source_indices_by_element
+
+    def _candidate_backbone_pair_cache_key(
+        self,
+        element1: str,
+        element2: str,
+        reference_length: float,
+        tolerance: float,
+    ) -> tuple[str, str, float, float]:
+        return (
+            str(element1),
+            str(element2),
+            float(reference_length),
+            float(tolerance),
+        )
+
+    def _candidate_backbone_pairs(
+        self,
+        frame: XYZFrame,
+        used: Sequence[bool],
+        *,
+        source_indices_by_element: dict[str, list[int]],
+        source_coordinates_by_element: dict[str, np.ndarray],
+        anchor_atom1: PDBAtom,
+        anchor_atom2: PDBAtom,
+        reference_length: float,
+        tolerance: float,
+        discovery_callback: Callable[[int], None] | None = None,
+        cancel_callback: Callable[[], bool] | None = None,
+        frame_search_cache: _FrameSearchCache | None = None,
+    ) -> tuple[tuple[int, int], ...]:
+        cache_key = self._candidate_backbone_pair_cache_key(
+            anchor_atom1.element,
+            anchor_atom2.element,
+            reference_length,
+            tolerance,
+        )
+        ranked_pairs: tuple[tuple[int, int], ...] | None = None
+        if frame_search_cache is not None:
+            ranked_pairs = frame_search_cache.candidate_pairs_by_key.get(
+                cache_key
+            )
+
+        candidate_indices1 = source_indices_by_element.get(anchor_atom1.element, [])
+        candidate_indices2 = source_indices_by_element.get(anchor_atom2.element, [])
+        if not candidate_indices1 or not candidate_indices2:
+            return ()
+
+        candidate_coordinates2 = source_coordinates_by_element.get(
+            anchor_atom2.element
+        )
+        if candidate_coordinates2 is None or not len(candidate_coordinates2):
+            return ()
+
+        if ranked_pairs is None:
+            ranked_pairs_with_distance: list[tuple[float, tuple[int, int]]] = []
+            next_discovery_report = _BACKBONE_CANDIDATE_DISCOVERY_LOG_START
+            for offset1, source_index1 in enumerate(candidate_indices1):
+                _raise_if_cancelled(cancel_callback)
+                position1 = frame.atoms[source_index1].coordinates
+                distances = np.linalg.norm(
+                    candidate_coordinates2 - position1,
+                    axis=1,
+                )
+                for offset2 in np.flatnonzero(
+                    np.abs(distances - reference_length) <= tolerance
+                ):
+                    source_index2 = candidate_indices2[int(offset2)]
+                    if source_index1 == source_index2:
+                        continue
+                    ranked_pairs_with_distance.append(
+                        (
+                            abs(float(distances[int(offset2)]) - reference_length),
+                            (source_index1, source_index2),
+                        )
+                    )
+                if (
+                    discovery_callback is not None
+                    and len(ranked_pairs_with_distance) >= next_discovery_report
+                ):
+                    discovery_callback(len(ranked_pairs_with_distance))
+                    next_discovery_report *= 2
+            ranked_pairs_with_distance.sort(key=lambda item: item[0])
+            ranked_pairs = tuple(
+                pair for _distance, pair in ranked_pairs_with_distance
+            )
+            if frame_search_cache is not None:
+                frame_search_cache.candidate_pairs_by_key[cache_key] = (
+                    ranked_pairs
+                )
+
+        if not any(used):
+            return ranked_pairs
+        return tuple(
+            pair
+            for pair in ranked_pairs
+            if not used[pair[0]] and not used[pair[1]]
+        )
+
+    def _backbone_candidate_states(
+        self,
+        frame: XYZFrame,
+        *,
+        reference_atoms: Sequence[PDBAtom],
+        reference_coordinates: np.ndarray,
+        reference_vector: np.ndarray,
+        anchor_index1: int,
+        anchor_index2: int,
+        candidate_pairs: Sequence[tuple[int, int]],
+    ) -> tuple[_BackboneCandidateState, ...]:
+        states: list[_BackboneCandidateState] = []
+        for candidate_index, (source_index1, source_index2) in enumerate(
+            candidate_pairs,
+            start=1,
+        ):
+            position1 = frame.atoms[source_index1].coordinates
+            position2 = frame.atoms[source_index2].coordinates
+            try:
+                rotation = rotation_matrix_from_to(
+                    reference_vector,
+                    position2 - position1,
+                )
+            except ValueError:
+                continue
+
+            transformed = (
+                (
+                    reference_coordinates - reference_coordinates[anchor_index1]
+                )
+                @ rotation.T
+            ) + position1
+            axis_direction = position2 - position1
+            axis_norm = float(np.linalg.norm(axis_direction))
+            if axis_norm <= 0.0:
+                continue
+            states.append(
+                _BackboneCandidateState(
+                    candidate_index=candidate_index,
+                    source_index1=source_index1,
+                    source_index2=source_index2,
+                    base_transformed_coordinates=transformed,
+                    fixed_assignment={
+                        anchor_index1: source_index1,
+                        anchor_index2: source_index2,
+                    },
+                    axis_origin=position1.copy(),
+                    axis_direction=axis_direction / axis_norm,
+                )
+            )
+        return tuple(states)
+
+    def _extend_candidate_rotation_schedule(
+        self,
+        candidate_state: _BackboneCandidateState,
+    ) -> bool:
+        while candidate_state.rotation_level < len(
+            _BACKBONE_ROTATION_SAMPLE_COUNTS
+        ):
+            angles = self._rotation_angles_for_level(
+                candidate_state.rotation_level
+            )
+            candidate_state.rotation_level += 1
+            added_count = 0
+            for angle_radians in angles:
+                angle_key = int(
+                    round(float(angle_radians) * _BACKBONE_ROTATION_KEY_SCALE)
+                )
+                if angle_key in candidate_state.attempted_angle_keys:
+                    continue
+                candidate_state.attempted_angle_keys.add(angle_key)
+                candidate_state.pending_angles.append(float(angle_radians))
+                added_count += 1
+            if added_count > 0:
+                return True
+        return False
+
+    def _rotation_angles_for_level(
+        self,
+        level: int,
+    ) -> tuple[float, ...]:
+        sample_count = _BACKBONE_ROTATION_SAMPLE_COUNTS[level]
+        return tuple(
+            float(value)
+            for value in np.linspace(
+                0.0,
+                2.0 * np.pi,
+                int(sample_count),
+                endpoint=False,
+                dtype=float,
+            )
+        )
+
+    def _rotated_backbone_coordinates(
+        self,
+        base_coordinates: np.ndarray,
+        *,
+        axis_origin: np.ndarray,
+        axis_direction: np.ndarray,
+        angle_radians: float,
+    ) -> np.ndarray:
+        if abs(float(angle_radians)) <= 1.0e-12:
+            return base_coordinates
+        rotation = rotation_matrix_about_axis(
+            axis_direction,
+            float(angle_radians),
+        )
+        return ((base_coordinates - axis_origin) @ rotation.T) + axis_origin
+
+    def _assignment_satisfies_anchor_constraints(
+        self,
+        frame: XYZFrame,
+        *,
+        assignment: Sequence[int],
+        constraint_index1: np.ndarray,
+        constraint_index2: np.ndarray,
+        constraint_reference_distances: np.ndarray,
+        constraint_tolerances: np.ndarray,
+    ) -> bool:
+        if not len(constraint_index1):
+            return True
+        assigned_coordinates = np.array(
+            [frame.atoms[source_index].coordinates for source_index in assignment],
+            dtype=float,
+        )
+        candidate_distances = np.linalg.norm(
+            assigned_coordinates[constraint_index2]
+            - assigned_coordinates[constraint_index1],
+            axis=1,
+        )
+        return bool(
+            np.all(
+                np.abs(candidate_distances - constraint_reference_distances)
+                <= constraint_tolerances
+            )
+        )
+
+    def _format_fit_success_rate(
+        self,
+        successful_fit_count: int,
+        fit_attempt_count: int,
+    ) -> str:
+        if fit_attempt_count <= 0:
+            return "0.0%"
+        return (
+            f"{100.0 * float(successful_fit_count) / float(fit_attempt_count):.1f}%"
+        )
 
     def _anchor_constraints(
         self,
@@ -1197,14 +2260,38 @@ class XYZToPDBWorkflow:
         anchor_constraints: dict[int, list[tuple[int, float, float]]],
         initial_assignment: dict[int, int],
     ) -> list[dict[int, int]]:
-        if not anchor_reference_indices:
-            return [dict(initial_assignment)]
+        return list(
+            self._iter_expanded_anchor_assignments(
+                frame,
+                used,
+                reference_atoms=reference_atoms,
+                anchor_reference_indices=anchor_reference_indices,
+                anchor_constraints=anchor_constraints,
+                initial_assignment=initial_assignment,
+            )
+        )
 
-        assignments: list[dict[int, int]] = []
+    def _iter_expanded_anchor_assignments(
+        self,
+        frame: XYZFrame,
+        used: Sequence[bool],
+        *,
+        reference_atoms: Sequence[PDBAtom],
+        anchor_reference_indices: Sequence[int],
+        anchor_constraints: dict[int, list[tuple[int, float, float]]],
+        initial_assignment: dict[int, int],
+    ) -> Iterator[dict[int, int]]:
+        if not anchor_reference_indices:
+            yield dict(initial_assignment)
+            return
+
+        yielded_assignment = False
 
         def recurse(current_assignment: dict[int, int]) -> None:
+            nonlocal yielded_assignment
             if len(current_assignment) == len(anchor_reference_indices):
-                assignments.append(dict(current_assignment))
+                yielded_assignment = True
+                yield dict(current_assignment)
                 return
 
             remaining_indices = [
@@ -1232,13 +2319,12 @@ class XYZToPDBWorkflow:
             )
             for source_index in next_candidates:
                 current_assignment[next_reference_index] = source_index
-                recurse(current_assignment)
+                yield from recurse(current_assignment)
                 del current_assignment[next_reference_index]
 
-        recurse(dict(initial_assignment))
-        if assignments:
-            return assignments
-        return [dict(initial_assignment)]
+        yield from recurse(dict(initial_assignment))
+        if not yielded_assignment:
+            yield dict(initial_assignment)
 
     def _candidate_anchor_source_indices(
         self,
@@ -1328,6 +2414,8 @@ class XYZToPDBWorkflow:
         target_coordinates: np.ndarray,
         fixed_assignment: dict[int, int],
         max_assignment_distance: float | None,
+        source_indices_by_element: dict[str, list[int]] | None = None,
+        source_coordinates_by_element: dict[str, np.ndarray] | None = None,
     ) -> tuple[tuple[int, ...] | None, float]:
         assignment_by_reference_index = dict(fixed_assignment)
         distances: list[float] = []
@@ -1356,13 +2444,17 @@ class XYZToPDBWorkflow:
 
         claimed_source_indices = set(fixed_assignment.values())
         for element, reference_indices in reference_indices_by_element.items():
-            source_indices = [
-                index
-                for index, atom in enumerate(frame.atoms)
-                if not used[index]
-                and index not in claimed_source_indices
-                and atom.element == element
-            ]
+            source_indices = self._candidate_assignment_source_indices(
+                frame,
+                used,
+                claimed_source_indices=claimed_source_indices,
+                element=element,
+                reference_indices=reference_indices,
+                target_coordinates=target_coordinates,
+                max_assignment_distance=max_assignment_distance,
+                source_indices_by_element=source_indices_by_element,
+                source_coordinates_by_element=source_coordinates_by_element,
+            )
             if len(source_indices) < len(reference_indices):
                 return None, 0.0
 
@@ -1402,6 +2494,92 @@ class XYZToPDBWorkflow:
         score = float(np.mean(distances)) if distances else 0.0
         return ordered_assignment, score
 
+    def _candidate_assignment_source_indices(
+        self,
+        frame: XYZFrame,
+        used: Sequence[bool],
+        *,
+        claimed_source_indices: set[int],
+        element: str,
+        reference_indices: Sequence[int],
+        target_coordinates: np.ndarray,
+        max_assignment_distance: float | None,
+        source_indices_by_element: dict[str, list[int]] | None = None,
+        source_coordinates_by_element: dict[str, np.ndarray] | None = None,
+    ) -> list[int]:
+        cached_indices = (
+            None
+            if source_indices_by_element is None
+            else source_indices_by_element.get(element)
+        )
+        cached_coordinates = (
+            None
+            if source_coordinates_by_element is None
+            else source_coordinates_by_element.get(element)
+        )
+        if cached_indices is None:
+            source_indices = [
+                index
+                for index, atom in enumerate(frame.atoms)
+                if not used[index]
+                and index not in claimed_source_indices
+                and atom.element == element
+            ]
+            source_coordinates = None
+        else:
+            keep_mask = np.array(
+                [
+                    not used[index] and index not in claimed_source_indices
+                    for index in cached_indices
+                ],
+                dtype=bool,
+            )
+            source_indices = [
+                index
+                for index, keep in zip(cached_indices, keep_mask)
+                if bool(keep)
+            ]
+            if cached_coordinates is None:
+                source_coordinates = None
+            else:
+                source_coordinates = cached_coordinates[keep_mask]
+        if len(source_indices) <= len(reference_indices):
+            return source_indices
+
+        radius = self._local_assignment_radius(max_assignment_distance)
+        if radius is None:
+            return source_indices
+
+        if source_coordinates is None:
+            source_coordinates = np.array(
+                [frame.atoms[index].coordinates for index in source_indices],
+                dtype=float,
+            )
+        reference_targets = np.array(
+            [target_coordinates[index] for index in reference_indices],
+            dtype=float,
+        )
+        deltas = (
+            source_coordinates[:, np.newaxis, :]
+            - reference_targets[np.newaxis, :, :]
+        )
+        minimum_distances = np.min(np.linalg.norm(deltas, axis=2), axis=1)
+        local_indices = [
+            source_indices[offset]
+            for offset in np.flatnonzero(minimum_distances <= radius)
+        ]
+        if len(local_indices) >= len(reference_indices):
+            return local_indices
+        return source_indices
+
+    def _local_assignment_radius(
+        self,
+        max_assignment_distance: float | None,
+    ) -> float | None:
+        if max_assignment_distance is not None:
+            return max(float(max_assignment_distance) * 1.5, 0.75)
+        return 2.5
+
     def _apply_template(
         self,
         frame: XYZFrame,
@@ -1421,9 +2599,12 @@ class XYZToPDBWorkflow:
                 xyz_atom = frame.atoms[source_index]
                 if xyz_atom.element != template_atom.element:
                     raise ValueError(
-                        f"Frame {frame.filepath.name} changed element order at atom "
-                        f"index {source_index + 1}: expected {template_atom.element}, "
-                        f"found {xyz_atom.element}."
+                        _element_order_mismatch_message(
+                            frame_name=frame.filepath.name,
+                            atom_index=source_index + 1,
+                            expected_element=template_atom.element,
+                            found_element=xyz_atom.element,
+                        )
                     )
                 copied_atom = template_atom.copy()
                 copied_atom.coordinates = xyz_atom.coordinates.copy()
@@ -1456,7 +2637,10 @@ __all__ = [
     "MoleculeDefinition",
     "ReferenceCreationResult",
     "ReferenceLibraryEntry",
+    "XYZToPDBReferenceUpdateCandidate",
     "XYZAtomRecord",
+    "XYZToPDBAssertionResidueSummary",
+    "XYZToPDBAssertionResult",
     "XYZFrame",
     "XYZToPDBConfiguration",
     "XYZToPDBExportResult",
