@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shlex
 import sys
 from pathlib import Path
@@ -11,7 +12,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from PySide6.QtCore import QObject, QSettings, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -49,13 +50,11 @@ from saxshell.saxs.ui.branding import (
     prepare_saxshell_application_identity,
 )
 from saxshell.toolbox.blender.common import (
-    ATOM_STYLE_DEFAULTS,
-    ATOM_STYLE_DESCRIPTIONS,
     ATOM_STYLE_LABELS,
-    CPK_COLORS,
-    DEFAULT_ATOM_COLOR,
+    COVALENT_RADII,
+    AtomAppearanceOverride,
+    CustomAestheticSpec,
     DEFAULT_ATOM_STYLE,
-    DEFAULT_BOND_COLOR,
     DEFAULT_LEGEND_FONT,
     DEFAULT_LIGHTING_LEVEL,
     DEFAULT_RENDER_QUALITY,
@@ -63,10 +62,29 @@ from saxshell.toolbox.blender.common import (
     RENDER_QUALITY_LABELS,
     BondThresholdSpec,
     OrientationSpec,
+    atom_style_base,
+    atom_style_defaults,
+    atom_style_description,
+    atom_style_is_custom,
+    atom_style_label,
+    available_atom_style_labels,
+    deserialize_custom_aesthetic,
+    encode_bond_threshold_arg,
+    get_custom_aesthetic,
     normalize_atom_style,
+    normalize_builtin_atom_style,
     normalize_lighting_level,
     normalize_render_quality,
+    parse_bond_threshold_arg,
     sanitize_orientation_key,
+    sanitize_custom_aesthetic_key,
+    serialize_custom_aesthetic,
+    set_custom_aesthetics,
+    style_atom_color,
+    style_atom_size_scale,
+    style_display_radius,
+    style_neutral_bond_color,
+    style_split_bond_color,
 )
 from saxshell.toolbox.blender.workflow import (
     BlenderPreviewStructure,
@@ -77,13 +95,17 @@ from saxshell.toolbox.blender.workflow import (
     build_bond_thresholds_for_structure,
     build_default_orientation_catalog,
     compose_euler_degrees,
-    display_radius,
     infer_title,
     load_preview_structure,
     read_structure_comment,
     resolve_blender_executable,
     resolve_desktop_dir,
     suggest_output_dir,
+)
+from saxshell.toolbox.blender.ui.reference_atoms import (
+    REFERENCE_ATOM_BACKGROUND,
+    REFERENCE_ATOM_LABELS,
+    reference_atom_path,
 )
 
 _OPEN_WINDOWS: list["BlenderXYZRendererMainWindow"] = []
@@ -95,8 +117,11 @@ _INCLUDE_PHOTOSHOOT_KEY = "toolbox/blender/include_photoshoot"
 _RENDER_TITLE_KEY = "toolbox/blender/render_title"
 _RECENT_INPUT_FILES_KEY = "toolbox/blender/recent_input_files"
 _ATOM_STYLE_KEY = "toolbox/blender/atom_style"
+_CUSTOM_AESTHETICS_KEY = "toolbox/blender/custom_aesthetics"
+_BOND_THRESHOLD_OVERRIDES_KEY = "toolbox/blender/bond_threshold_overrides"
 _RENDER_QUALITY_KEY = "toolbox/blender/render_quality"
 _PREVIEW_BACKGROUND_KEY = "toolbox/blender/preview_background"
+_REFERENCE_BACKGROUND_KEY = "toolbox/blender/reference_background"
 _NUDGE_INCREMENT_KEY = "toolbox/blender/nudge_increment"
 _SAVE_BLEND_FILES_KEY = "toolbox/blender/save_blend_files"
 _LEGEND_FONT_KEY = "toolbox/blender/legend_font"
@@ -119,7 +144,7 @@ _RENDER_MATCHED_VIEW_ELEV = 0.0
 
 
 def _preview_palette(atom_style: str) -> dict[str, object]:
-    style = normalize_atom_style(atom_style)
+    style = atom_style_base(atom_style)
     if style == "paper_gloss":
         return {
             "background": "#fdfbf8",
@@ -217,68 +242,43 @@ def _preview_palette(atom_style: str) -> dict[str, object]:
     }
 
 
+def _color_to_hex(
+    color: tuple[float, float, float, float] | tuple[float, float, float],
+) -> str:
+    channels = tuple(float(channel) for channel in tuple(color)[:3])
+    return "#{:02x}{:02x}{:02x}".format(
+        int(max(0.0, min(1.0, channels[0])) * 255.0),
+        int(max(0.0, min(1.0, channels[1])) * 255.0),
+        int(max(0.0, min(1.0, channels[2])) * 255.0),
+    )
+
+
+def _qcolor_to_rgba(color: QColor) -> tuple[float, float, float, float]:
+    return (
+        float(color.redF()),
+        float(color.greenF()),
+        float(color.blueF()),
+        float(color.alphaF()),
+    )
+
+
+def _rgba_to_qcolor(
+    color: tuple[float, float, float, float],
+) -> QColor:
+    return QColor.fromRgbF(
+        float(color[0]),
+        float(color[1]),
+        float(color[2]),
+        float(color[3]),
+    )
+
+
 def _preview_atom_color(
     element: str,
     *,
     atom_style: str,
 ) -> tuple[float, float, float]:
-    style = normalize_atom_style(atom_style)
-    if style == "monochrome":
-        if element == "H":
-            return (0.94, 0.94, 0.95)
-        return (0.73, 0.75, 0.79)
-
-    color = CPK_COLORS.get(element, DEFAULT_ATOM_COLOR)
-    if style == "paper_gloss":
-        if element == "C":
-            return (0.28, 0.34, 0.62)
-        return tuple(
-            min(1.0, float(component) * 0.88 + 0.09) for component in color[:3]
-        )
-    if style == "soft_studio":
-        return tuple(
-            min(1.0, float(component) * 0.76 + 0.18) for component in color[:3]
-        )
-    if style == "flat_diagram":
-        return tuple(
-            min(1.0, float(component) * 0.82 + 0.08) for component in color[:3]
-        )
-    if style == "toon_matte":
-        return tuple(
-            max(0.0, min(1.0, float(component) * 0.96 + 0.05))
-            for component in color[:3]
-        )
-    if style == "poster_pop":
-        if element == "C":
-            return (0.18, 0.23, 0.45)
-        return tuple(
-            max(0.0, min(1.0, float(component) * 1.02 + 0.02))
-            for component in color[:3]
-        )
-    if style == "pastel_cartoon":
-        return tuple(
-            min(1.0, float(component) * 0.68 + 0.24) for component in color[:3]
-        )
-    if style == "crystal_flat":
-        return tuple(
-            min(1.0, float(component) * 0.90 + 0.10) for component in color[:3]
-        )
-    if style == "crystal_cartoon":
-        return tuple(
-            max(0.0, min(1.0, float(component) * 1.06 + 0.02))
-            for component in color[:3]
-        )
-    if style == "crystal_shadow_gloss":
-        return tuple(
-            min(1.0, float(component) * 0.92 + 0.08) for component in color[:3]
-        )
-    if style == "vesta" and element == "C":
-        return (0.42, 0.44, 0.48)
-    if style == "vesta":
-        return tuple(
-            min(1.0, float(component) * 0.92 + 0.05) for component in color[:3]
-        )
-    return color[:3]
+    return style_atom_color(element, atom_style=atom_style)[:3]
 
 
 def _preview_bond_color(
@@ -286,39 +286,11 @@ def _preview_bond_color(
     *,
     atom_style: str,
 ) -> tuple[float, float, float]:
-    atom_color = _preview_atom_color(element, atom_style=atom_style)
-    return tuple(
-        max(0.0, min(1.0, float(component) * 0.72 + 0.06))
-        for component in atom_color
-    )
+    return style_split_bond_color(element, atom_style=atom_style)[:3]
 
 
 def _preview_neutral_bond_color(atom_style: str) -> tuple[float, float, float]:
-    style = normalize_atom_style(atom_style)
-    base = DEFAULT_BOND_COLOR[:3]
-    if style == "paper_gloss":
-        return (0.44, 0.42, 0.47)
-    if style == "soft_studio":
-        return (0.48, 0.45, 0.42)
-    if style == "flat_diagram":
-        return (0.42, 0.45, 0.49)
-    if style == "toon_matte":
-        return (0.44, 0.46, 0.49)
-    if style == "poster_pop":
-        return (0.40, 0.43, 0.47)
-    if style == "pastel_cartoon":
-        return (0.50, 0.47, 0.45)
-    if style == "crystal_flat":
-        return (0.41, 0.44, 0.48)
-    if style == "crystal_cartoon":
-        return (0.39, 0.43, 0.49)
-    if style == "crystal_shadow_gloss":
-        return (0.46, 0.42, 0.46)
-    if style == "monochrome":
-        return (0.46, 0.47, 0.50)
-    if style == "cpk":
-        return (0.40, 0.46, 0.55)
-    return tuple(float(component) for component in base)
+    return style_neutral_bond_color(atom_style)[:3]
 
 
 def _preview_structure_elements(
@@ -345,6 +317,8 @@ class OrientationPreviewWidget(QWidget):
         self._orientation: OrientationSpec | None = None
         self._positions = np.zeros((0, 3), dtype=float)
         self._atom_style = DEFAULT_ATOM_STYLE
+        self._reference_background_color = REFERENCE_ATOM_BACKGROUND
+        self._reference_pixmap_cache: dict[tuple[str, int, str], QPixmap] = {}
         self._updating_controls = False
         self._axis = None
         self._axis_reference = None
@@ -482,7 +456,17 @@ class OrientationPreviewWidget(QWidget):
             "motion_notify_event", self._handle_canvas_motion
         )
         self.canvas.mpl_connect("scroll_event", self._handle_canvas_scroll)
-        layout.addWidget(self.canvas, stretch=1)
+
+        preview_row = QHBoxLayout()
+        preview_row.setContentsMargins(0, 0, 0, 0)
+        preview_row.setSpacing(10)
+        preview_row.addWidget(self.canvas, stretch=1)
+        preview_row.addWidget(
+            self._build_reference_panel(),
+            stretch=0,
+            alignment=Qt.AlignmentFlag.AlignTop,
+        )
+        layout.addLayout(preview_row, stretch=1)
 
         self.controls_group = QGroupBox("Selected Orientation")
         controls_layout = QFormLayout(self.controls_group)
@@ -517,6 +501,82 @@ class OrientationPreviewWidget(QWidget):
         self._set_interaction_mode("rotate")
         self._set_nudge_buttons_enabled(False)
         self._set_toolbar_angle_spins_enabled(False)
+
+    def _build_reference_panel(self) -> QWidget:
+        panel = QGroupBox("Render Reference")
+        panel.setMinimumWidth(250)
+        panel.setMaximumWidth(300)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        self.reference_style_label = QLabel("Aesthetic: None")
+        self.reference_style_label.setWordWrap(True)
+        layout.addWidget(self.reference_style_label)
+
+        self.reference_lighting_label = QLabel("Lighting: None")
+        self.reference_lighting_label.setWordWrap(True)
+        layout.addWidget(self.reference_lighting_label)
+
+        images_row = QHBoxLayout()
+        images_row.setContentsMargins(0, 0, 0, 0)
+        images_row.setSpacing(8)
+
+        dark_card = QVBoxLayout()
+        dark_card.setContentsMargins(0, 0, 0, 0)
+        dark_card.setSpacing(4)
+        self.reference_dark_title_label = QLabel(REFERENCE_ATOM_LABELS["C"])
+        self.reference_dark_title_label.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+        self.reference_dark_title_label.setWordWrap(True)
+        dark_card.addWidget(self.reference_dark_title_label)
+        self.reference_dark_image_label = QLabel("Select an orientation row")
+        self.reference_dark_image_label.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+        self.reference_dark_image_label.setMinimumSize(114, 114)
+        self.reference_dark_image_label.setFrameShape(QFrame.Shape.StyledPanel)
+        self.reference_dark_image_label.setWordWrap(True)
+        dark_card.addWidget(self.reference_dark_image_label, stretch=1)
+        images_row.addLayout(dark_card, stretch=1)
+
+        light_card = QVBoxLayout()
+        light_card.setContentsMargins(0, 0, 0, 0)
+        light_card.setSpacing(4)
+        self.reference_light_title_label = QLabel(REFERENCE_ATOM_LABELS["S"])
+        self.reference_light_title_label.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+        self.reference_light_title_label.setWordWrap(True)
+        light_card.addWidget(self.reference_light_title_label)
+        self.reference_light_image_label = QLabel("Select an orientation row")
+        self.reference_light_image_label.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+        self.reference_light_image_label.setMinimumSize(114, 114)
+        self.reference_light_image_label.setFrameShape(QFrame.Shape.StyledPanel)
+        self.reference_light_image_label.setWordWrap(True)
+        light_card.addWidget(self.reference_light_image_label, stretch=1)
+        images_row.addLayout(light_card, stretch=1)
+
+        layout.addLayout(images_row)
+
+        self.reference_status_label = QLabel("")
+        self.reference_status_label.setWordWrap(True)
+        self.reference_status_label.setStyleSheet("color: #4b5563;")
+        layout.addWidget(self.reference_status_label)
+
+        self.reference_hint_label = QLabel(
+            "Transparent Blender carbon and sulfur renders composited on "
+            "the selected reference background."
+        )
+        self.reference_hint_label.setWordWrap(True)
+        self.reference_hint_label.setStyleSheet("color: #4b5563;")
+        layout.addWidget(self.reference_hint_label)
+        layout.addStretch(1)
+        self._apply_reference_background()
+        return panel
 
     def detach_controls_group(self) -> QGroupBox:
         layout = self.layout()
@@ -699,6 +759,135 @@ class OrientationPreviewWidget(QWidget):
         palette = _preview_palette(self._atom_style)
         return str(palette["background"])
 
+    def set_reference_background_color(self, color_value: str | None) -> None:
+        color_text = str(color_value).strip() if color_value else ""
+        self._reference_background_color = (
+            color_text or REFERENCE_ATOM_BACKGROUND
+        )
+        self._apply_reference_background()
+
+    def reference_background_color(self) -> str:
+        return self._reference_background_color
+
+    def _reference_image_labels(self) -> tuple[QLabel, ...]:
+        labels: list[QLabel] = []
+        for name in (
+            "reference_dark_image_label",
+            "reference_light_image_label",
+        ):
+            label = getattr(self, name, None)
+            if isinstance(label, QLabel):
+                labels.append(label)
+        return tuple(labels)
+
+    def _apply_reference_background(self) -> None:
+        labels = self._reference_image_labels()
+        if not labels:
+            return
+        for label in labels:
+            label.setStyleSheet(
+                "background-color: "
+                f"{self._reference_background_color}; "
+                "border: 1px solid #c8d0da;"
+            )
+        if any(label.pixmap() is not None for label in labels):
+            self._refresh_reference_preview()
+
+    def _reference_pixmap(
+        self,
+        atom_style: str,
+        lighting_level: int,
+        element: str,
+    ) -> QPixmap | None:
+        cache_key = (
+            normalize_atom_style(atom_style),
+            normalize_lighting_level(lighting_level),
+            str(element).strip().upper(),
+        )
+        cached = self._reference_pixmap_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        path = reference_atom_path(*cache_key)
+        if not path.is_file():
+            return None
+        pixmap = QPixmap(str(path))
+        if pixmap.isNull():
+            return None
+        self._reference_pixmap_cache[cache_key] = pixmap
+        return pixmap
+
+    def _refresh_reference_preview(self) -> None:
+        labels = self._reference_image_labels()
+        if not labels:
+            return
+        if self._orientation is None:
+            self.reference_style_label.setText("Aesthetic: None")
+            self.reference_lighting_label.setText("Lighting: None")
+            self.reference_status_label.setText("")
+            for label in labels:
+                label.clear()
+                label.setText("Select an orientation row")
+            return
+
+        lighting_level = self._orientation.effective_lighting_level(
+            DEFAULT_LIGHTING_LEVEL
+        )
+        self.reference_style_label.setText(
+            "Aesthetic: "
+            f"{atom_style_label(self._atom_style)}"
+        )
+        self.reference_lighting_label.setText(
+            "Lighting: "
+            f"{LIGHTING_LEVEL_LABELS[lighting_level]}"
+        )
+        if atom_style_is_custom(self._atom_style):
+            self.reference_status_label.setText(
+                "Reference swatches are only generated for built-in "
+                "aesthetics. Use the live preview to inspect custom atom "
+                "colors and sizes."
+            )
+            for label in labels:
+                label.clear()
+                label.setText("Unavailable")
+            return
+        self.reference_status_label.setText("")
+        missing_elements: list[str] = []
+        for element, label in (
+            ("C", self.reference_dark_image_label),
+            ("S", self.reference_light_image_label),
+        ):
+            pixmap = self._reference_pixmap(
+                self._atom_style,
+                lighting_level,
+                element,
+            )
+            if pixmap is None:
+                label.clear()
+                label.setText("Missing swatch")
+                missing_elements.append(element)
+                continue
+            scaled = pixmap.scaled(
+                label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            label.setText("")
+            label.setPixmap(scaled)
+        if missing_elements:
+            names = ", ".join(
+                REFERENCE_ATOM_LABELS[element]
+                for element in missing_elements
+            )
+            self.reference_status_label.setText(
+                f"Reference render not found for {names}. "
+                "Run generate_reference_atoms.py to rebuild the swatches."
+            )
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        if self._orientation is not None:
+            self._refresh_reference_preview()
+
     def _update_canvas_cursor(self, *, dragging: bool = False) -> None:
         if dragging:
             if self._drag_mode in {"rotate", "pan"}:
@@ -717,9 +906,7 @@ class OrientationPreviewWidget(QWidget):
         self._positions = np.zeros((0, 3), dtype=float)
         self._updating_controls = True
         self.source_label.setText("None")
-        self.preview_style_label.setText(
-            ATOM_STYLE_LABELS[normalize_atom_style(self._atom_style)]
-        )
+        self.preview_style_label.setText(atom_style_label(self._atom_style))
         self.name_edit.clear()
         self.name_edit.setReadOnly(True)
         self.enabled_box.setChecked(False)
@@ -734,6 +921,7 @@ class OrientationPreviewWidget(QWidget):
         self.reset_view_button.setEnabled(False)
         self._updating_controls = False
         self._update_rotation_readout()
+        self._refresh_reference_preview()
 
         self.figure.clear()
         axis = self.figure.add_subplot(111, projection="3d")
@@ -782,7 +970,7 @@ class OrientationPreviewWidget(QWidget):
         self._atom_style = normalize_atom_style(atom_style)
         self._updating_controls = True
         self.source_label.setText(orientation.source.title())
-        self.preview_style_label.setText(ATOM_STYLE_LABELS[self._atom_style])
+        self.preview_style_label.setText(atom_style_label(self._atom_style))
         self.name_edit.setEnabled(True)
         self.enabled_box.setEnabled(True)
         self.name_edit.setReadOnly(orientation.source != "custom")
@@ -800,11 +988,13 @@ class OrientationPreviewWidget(QWidget):
         self.reset_view_button.setEnabled(True)
         self._updating_controls = False
         self._update_rotation_readout()
+        self._refresh_reference_preview()
         self._draw_preview(reset_view=reset_view)
 
     def refresh_style(self, atom_style: str) -> None:
         self._atom_style = normalize_atom_style(atom_style)
-        self.preview_style_label.setText(ATOM_STYLE_LABELS[self._atom_style])
+        self.preview_style_label.setText(atom_style_label(self._atom_style))
+        self._refresh_reference_preview()
         if self._structure is not None and self._orientation is not None:
             self._draw_preview()
 
@@ -851,7 +1041,7 @@ class OrientationPreviewWidget(QWidget):
         z_values = rotated[:, 2]
         palette = _preview_palette(self._atom_style)
         background_color = self.effective_background_color()
-        atom_scale = float(ATOM_STYLE_DEFAULTS[self._atom_style]["atom_scale"])
+        style_defaults = atom_style_defaults(self._atom_style)
 
         self.figure.clear()
         axis = self.figure.add_subplot(111, projection="3d")
@@ -887,13 +1077,11 @@ class OrientationPreviewWidget(QWidget):
 
         depth_min = float(y_values.min())
         depth_span = max(float(y_values.max()) - depth_min, 1.0e-6)
-        bond_color_mode = str(
-            ATOM_STYLE_DEFAULTS[self._atom_style]["bond_color_mode"]
-        )
+        bond_color_mode = str(style_defaults["bond_color_mode"])
         neutral_bond_color = _preview_neutral_bond_color(self._atom_style)
         bond_width = max(
             2.4,
-            10.0 * float(ATOM_STYLE_DEFAULTS[self._atom_style]["bond_radius"]),
+            10.0 * float(style_defaults["bond_radius"]),
         )
 
         for left_index, right_index in sorted(
@@ -952,7 +1140,7 @@ class OrientationPreviewWidget(QWidget):
                     (start[0], end[0]),
                     (start[1], end[1]),
                     (start[2], end[2]),
-                    color=str(palette["bond"]),
+                    color=neutral_bond_color,
                     linewidth=bond_width,
                     alpha=0.68 + depth_factor * 0.14,
                     solid_capstyle="round",
@@ -968,7 +1156,11 @@ class OrientationPreviewWidget(QWidget):
                 atom_style=self._atom_style,
             )
             size = (
-                display_radius(atom.element, atom_scale=atom_scale) * 30.0
+                style_display_radius(
+                    atom.element,
+                    atom_style=self._atom_style,
+                )
+                * 30.0
             ) ** 2
             axis.scatter(
                 [x_values[atom_index]],
@@ -1501,6 +1693,284 @@ class BondThresholdEditorDialog(QDialog):
         return tuple(thresholds)
 
 
+class AtomAestheticEditorDialog(QDialog):
+    """Edit per-element atom colors and size scales for a custom aesthetic."""
+
+    def __init__(
+        self,
+        *,
+        active_style: str,
+        elements: tuple[str, ...] | list[str],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._elements = tuple(elements)
+        self._active_style = normalize_atom_style(active_style)
+        self._active_custom = get_custom_aesthetic(self._active_style)
+        self._active_base_style = atom_style_base(self._active_style)
+        self.setWindowTitle("Atom Colors and Sizes")
+        self.resize(760, 520)
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Adjust per-element atom colors and sizes for the elements present "
+            "in the active structure. Built-in aesthetics stay read-only; "
+            "saving here creates or updates a named custom aesthetic that can "
+            "be recalled across sessions. Elements not listed in this table fall "
+            "back to the chosen preset when reused on another structure."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        self.name_edit = QLineEdit()
+        default_name = (
+            self._active_custom.name
+            if self._active_custom is not None
+            else f"{atom_style_label(self._active_style)} Custom"
+        )
+        self.name_edit.setText(default_name)
+        form.addRow("Custom Name", self.name_edit)
+
+        self.seed_preset_combo = QComboBox()
+        for key, label in ATOM_STYLE_LABELS.items():
+            self.seed_preset_combo.addItem(label, key)
+        self.seed_preset_combo.setCurrentIndex(
+            max(
+                self.seed_preset_combo.findData(self._active_base_style),
+                0,
+            )
+        )
+        form.addRow("Preset Seed", self.seed_preset_combo)
+        layout.addLayout(form)
+
+        controls_row = QHBoxLayout()
+        self.apply_preset_button = QPushButton("Load Preset Values")
+        self.apply_preset_button.clicked.connect(self._apply_selected_preset)
+        controls_row.addWidget(self.apply_preset_button)
+        self.reset_active_button = QPushButton("Reset To Active Aesthetic")
+        self.reset_active_button.clicked.connect(self._reset_to_active_style)
+        controls_row.addWidget(self.reset_active_button)
+        controls_row.addStretch(1)
+        layout.addLayout(controls_row)
+
+        self.table = QTableWidget(len(self._elements), 4, self)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Element",
+                "Color",
+                "Size Scale",
+                "Radius (\u00c5)",
+            ]
+        )
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(
+            0,
+            QHeaderView.ResizeMode.ResizeToContents,
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            1,
+            QHeaderView.ResizeMode.Stretch,
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            2,
+            QHeaderView.ResizeMode.ResizeToContents,
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            3,
+            QHeaderView.ResizeMode.ResizeToContents,
+        )
+        layout.addWidget(self.table, stretch=1)
+
+        for row_index, element in enumerate(self._elements):
+            element_item = QTableWidgetItem(element)
+            element_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            )
+            self.table.setItem(row_index, 0, element_item)
+
+            color_button = QPushButton()
+            color_button.clicked.connect(
+                lambda _checked=False, row=row_index: self._choose_row_color(row)
+            )
+            self.table.setCellWidget(row_index, 1, color_button)
+
+            scale_spin = QDoubleSpinBox(self.table)
+            scale_spin.setDecimals(3)
+            scale_spin.setRange(0.05, 4.0)
+            scale_spin.setSingleStep(0.02)
+            scale_spin.setAlignment(Qt.AlignmentFlag.AlignRight)
+            scale_spin.valueChanged.connect(
+                lambda _value, row=row_index: self._update_radius_cell(row)
+            )
+            self.table.setCellWidget(row_index, 2, scale_spin)
+
+            radius_item = QTableWidgetItem()
+            radius_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            )
+            radius_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            self.table.setItem(row_index, 3, radius_item)
+
+        self._apply_style_values(self._active_style)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        save_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if save_button is not None:
+            save_button.setText("Save Custom Aesthetic")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _row_element(self, row_index: int) -> str:
+        item = self.table.item(row_index, 0)
+        return item.text().strip() if item is not None else "X"
+
+    def _row_color_button(self, row_index: int) -> QPushButton | None:
+        widget = self.table.cellWidget(row_index, 1)
+        return widget if isinstance(widget, QPushButton) else None
+
+    def _row_scale_spin(self, row_index: int) -> QDoubleSpinBox | None:
+        widget = self.table.cellWidget(row_index, 2)
+        return widget if isinstance(widget, QDoubleSpinBox) else None
+
+    def _row_rgba(
+        self,
+        row_index: int,
+    ) -> tuple[float, float, float, float]:
+        button = self._row_color_button(row_index)
+        data = button.property("rgba") if button is not None else None
+        if isinstance(data, tuple) and len(data) == 4:
+            return tuple(float(channel) for channel in data)
+        element = self._row_element(row_index)
+        return style_atom_color(element, atom_style=self._active_style)
+
+    def _set_row_color(
+        self,
+        row_index: int,
+        rgba: tuple[float, float, float, float],
+    ) -> None:
+        button = self._row_color_button(row_index)
+        if button is None:
+            return
+        hex_value = _color_to_hex(rgba)
+        text_color = "#111827"
+        if (
+            (rgba[0] * 0.299 + rgba[1] * 0.587 + rgba[2] * 0.114)
+            < 0.52
+        ):
+            text_color = "#f9fafb"
+        button.setProperty("rgba", rgba)
+        button.setText(hex_value)
+        button.setStyleSheet(
+            "background-color: "
+            f"{hex_value}; "
+            f"color: {text_color}; "
+            "border: 1px solid #aeb7c2; padding: 4px 8px;"
+        )
+
+    def _update_radius_cell(self, row_index: int) -> None:
+        scale_spin = self._row_scale_spin(row_index)
+        radius_item = self.table.item(row_index, 3)
+        if scale_spin is None or radius_item is None:
+            return
+        element = self._row_element(row_index)
+        radius = max(
+            COVALENT_RADII.get(element, 0.85) * float(scale_spin.value()),
+            0.18,
+        )
+        radius_item.setText(f"{radius:.3f}")
+
+    def _apply_style_values(self, atom_style: str) -> None:
+        style = normalize_atom_style(atom_style)
+        for row_index, element in enumerate(self._elements):
+            self._set_row_color(
+                row_index,
+                style_atom_color(element, atom_style=style),
+            )
+            scale_spin = self._row_scale_spin(row_index)
+            if scale_spin is not None:
+                scale_spin.setValue(
+                    style_atom_size_scale(element, atom_style=style)
+                )
+            self._update_radius_cell(row_index)
+
+    @Slot()
+    def _apply_selected_preset(self) -> None:
+        preset = normalize_builtin_atom_style(
+            str(self.seed_preset_combo.currentData())
+        )
+        self._apply_style_values(preset)
+
+    @Slot()
+    def _reset_to_active_style(self) -> None:
+        self._apply_style_values(self._active_style)
+        self.seed_preset_combo.setCurrentIndex(
+            max(
+                self.seed_preset_combo.findData(self._active_base_style),
+                0,
+            )
+        )
+
+    def _choose_row_color(self, row_index: int) -> None:
+        current = _rgba_to_qcolor(self._row_rgba(row_index))
+        color = QColorDialog.getColor(
+            current,
+            self,
+            f"Select {self._row_element(row_index)} Color",
+        )
+        if not color.isValid():
+            return
+        self._set_row_color(row_index, _qcolor_to_rgba(color))
+
+    def custom_aesthetic(
+        self,
+        *,
+        existing_specs: tuple[CustomAestheticSpec, ...] | list[CustomAestheticSpec],
+    ) -> CustomAestheticSpec:
+        name = self.name_edit.text().strip()
+        if not name:
+            raise ValueError("Enter a name for the custom aesthetic.")
+        key = (
+            self._active_custom.key
+            if self._active_custom is not None
+            else sanitize_custom_aesthetic_key(name)
+        )
+        existing_by_name = {
+            spec.name.strip().lower(): spec.key
+            for spec in existing_specs
+        }
+        existing_key = existing_by_name.get(name.lower())
+        if existing_key is not None and existing_key != key:
+            raise ValueError(
+                "Choose a different custom aesthetic name. That name is already in use."
+            )
+        base_style = normalize_builtin_atom_style(
+            str(self.seed_preset_combo.currentData())
+        )
+        overrides = tuple(
+            AtomAppearanceOverride(
+                element=self._row_element(row_index),
+                color=self._row_rgba(row_index),
+                size_scale=float(self._row_scale_spin(row_index).value()),
+            )
+            for row_index in range(self.table.rowCount())
+            if self._row_scale_spin(row_index) is not None
+        )
+        return CustomAestheticSpec(
+            key=key,
+            name=name,
+            base_style=base_style,
+            overrides=overrides,
+        )
+
+
 class BlenderXYZRendererMainWindow(QMainWindow):
     """Launcher window for batch Blender XYZ rendering."""
 
@@ -1513,6 +1983,7 @@ class BlenderXYZRendererMainWindow(QMainWindow):
     ) -> None:
         super().__init__(parent)
         self._settings_store = QSettings()
+        self._custom_aesthetics_by_key = self._load_custom_aesthetics_from_settings()
         self._run_thread: QThread | None = None
         self._run_worker: BlenderXYZRenderWorker | None = None
         self._preview_structure: BlenderPreviewStructure | None = None
@@ -1527,6 +1998,129 @@ class BlenderXYZRendererMainWindow(QMainWindow):
         if initial_input_path is not None:
             self.set_input_path(initial_input_path)
         self._refresh_blender_hint()
+
+    def closeEvent(self, event) -> None:
+        if self._run_thread is not None and self._run_thread.isRunning():
+            QMessageBox.warning(
+                self,
+                "Blender Structure Renderer",
+                "Please wait for the current Blender render job to finish "
+                "before closing this window.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def _load_custom_aesthetics_from_settings(
+        self,
+    ) -> dict[str, CustomAestheticSpec]:
+        raw_value = self._settings_store.value(_CUSTOM_AESTHETICS_KEY, "[]")
+        if isinstance(raw_value, (list, tuple)):
+            payload_text = json.dumps(list(raw_value))
+        else:
+            payload_text = str(raw_value or "[]")
+        try:
+            payload = json.loads(payload_text)
+        except Exception:
+            payload = []
+        specs: list[CustomAestheticSpec] = []
+        if isinstance(payload, list):
+            for item in payload:
+                try:
+                    specs.append(deserialize_custom_aesthetic(item))
+                except Exception:
+                    continue
+        set_custom_aesthetics(tuple(specs))
+        return {spec.key: spec for spec in specs}
+
+    def _persist_custom_aesthetics(self) -> None:
+        specs = tuple(
+            self._custom_aesthetics_by_key[key]
+            for key in sorted(
+                self._custom_aesthetics_by_key,
+                key=lambda item: (
+                    self._custom_aesthetics_by_key[item].name.lower(),
+                    item,
+                ),
+            )
+        )
+        set_custom_aesthetics(specs)
+        self._settings_store.setValue(
+            _CUSTOM_AESTHETICS_KEY,
+            json.dumps(
+                [serialize_custom_aesthetic(spec) for spec in specs],
+                sort_keys=True,
+            ),
+        )
+
+    def _saved_bond_threshold_map(self) -> dict[str, list[str]]:
+        raw_value = self._settings_store.value(
+            _BOND_THRESHOLD_OVERRIDES_KEY,
+            "{}",
+        )
+        payload_text = (
+            json.dumps(list(raw_value))
+            if isinstance(raw_value, (list, tuple))
+            else str(raw_value or "{}")
+        )
+        try:
+            payload = json.loads(payload_text)
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            return {}
+        normalized: dict[str, list[str]] = {}
+        for path_text, encoded in payload.items():
+            if not isinstance(path_text, str):
+                continue
+            if isinstance(encoded, str):
+                values = [encoded] if encoded.strip() else []
+            elif isinstance(encoded, list):
+                values = [str(item) for item in encoded if str(item).strip()]
+            else:
+                values = []
+            normalized[path_text] = values
+        return normalized
+
+    def _persist_bond_threshold_map(
+        self,
+        data: dict[str, list[str]],
+    ) -> None:
+        self._settings_store.setValue(
+            _BOND_THRESHOLD_OVERRIDES_KEY,
+            json.dumps(data, sort_keys=True),
+        )
+
+    def _saved_bond_thresholds_for_path(
+        self,
+        input_path: str | Path,
+    ) -> tuple[BondThresholdSpec, ...]:
+        resolved = str(Path(input_path).expanduser().resolve())
+        encoded = self._saved_bond_threshold_map().get(resolved, [])
+        specs: list[BondThresholdSpec] = []
+        for item in encoded:
+            try:
+                specs.append(parse_bond_threshold_arg(item))
+            except Exception:
+                continue
+        return tuple(specs)
+
+    def _persist_bond_thresholds_for_path(
+        self,
+        input_path: str | Path,
+        thresholds: tuple[BondThresholdSpec, ...],
+        *,
+        default_thresholds: tuple[BondThresholdSpec, ...],
+    ) -> None:
+        resolved = str(Path(input_path).expanduser().resolve())
+        mapping = self._saved_bond_threshold_map()
+        if tuple(thresholds) == tuple(default_thresholds):
+            mapping.pop(resolved, None)
+        else:
+            mapping[resolved] = [
+                encode_bond_threshold_arg(spec) for spec in thresholds
+            ]
+        self._persist_bond_threshold_map(mapping)
 
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell (Blender Structure Renderer)")
@@ -1694,12 +2288,24 @@ class BlenderXYZRendererMainWindow(QMainWindow):
         layout = QFormLayout(group)
 
         self.atom_style_combo = QComboBox()
-        for key, label in ATOM_STYLE_LABELS.items():
-            self.atom_style_combo.addItem(label, key)
+        self._refresh_atom_style_combo_options()
         self.atom_style_combo.currentIndexChanged.connect(
             self._handle_atom_style_changed
         )
         layout.addRow("Default Aesthetic", self.atom_style_combo)
+
+        aesthetic_editor_row = QHBoxLayout()
+        aesthetic_editor_row.setContentsMargins(0, 0, 0, 0)
+        aesthetic_editor_row.setSpacing(6)
+        self.edit_aesthetic_button = QPushButton(
+            "Edit Atom Colors and Sizes..."
+        )
+        self.edit_aesthetic_button.clicked.connect(
+            self._edit_selected_aesthetic
+        )
+        aesthetic_editor_row.addWidget(self.edit_aesthetic_button)
+        aesthetic_editor_row.addStretch(1)
+        layout.addRow("Custom Aesthetic", self._wrap_layout(aesthetic_editor_row))
 
         self.render_quality_combo = QComboBox()
         for key, label in RENDER_QUALITY_LABELS.items():
@@ -1739,6 +2345,38 @@ class BlenderXYZRendererMainWindow(QMainWindow):
         layout.addRow(
             "Preview Background",
             self._wrap_layout(preview_background_row),
+        )
+
+        reference_background_row = QHBoxLayout()
+        reference_background_row.setContentsMargins(0, 0, 0, 0)
+        reference_background_row.setSpacing(6)
+        self.reference_background_chip = QFrame()
+        self.reference_background_chip.setFrameShape(
+            QFrame.Shape.StyledPanel
+        )
+        self.reference_background_chip.setFixedSize(24, 24)
+        reference_background_row.addWidget(self.reference_background_chip)
+        self.reference_background_value_label = QLabel()
+        reference_background_row.addWidget(
+            self.reference_background_value_label, stretch=1
+        )
+        self.reference_background_button = QPushButton("Choose...")
+        self.reference_background_button.clicked.connect(
+            self._choose_reference_background
+        )
+        reference_background_row.addWidget(self.reference_background_button)
+        self.reference_background_reset_button = QPushButton(
+            "Use White Default"
+        )
+        self.reference_background_reset_button.clicked.connect(
+            self._reset_reference_background
+        )
+        reference_background_row.addWidget(
+            self.reference_background_reset_button
+        )
+        layout.addRow(
+            "Reference Background",
+            self._wrap_layout(reference_background_row),
         )
 
         self.style_hint_label = QLabel()
@@ -1916,6 +2554,69 @@ class BlenderXYZRendererMainWindow(QMainWindow):
         widget.setLayout(layout)
         return widget
 
+    def _populate_combo_options(
+        self,
+        combo: QComboBox,
+        options: dict[object, str],
+        *,
+        current_data: object | None = None,
+    ) -> None:
+        previous = combo.currentData() if current_data is None else current_data
+        combo.blockSignals(True)
+        combo.clear()
+        for key, label in options.items():
+            combo.addItem(label, key)
+        target_index = combo.findData(previous)
+        if target_index < 0:
+            target_index = 0 if combo.count() > 0 else -1
+        if target_index >= 0:
+            combo.setCurrentIndex(target_index)
+        combo.blockSignals(False)
+
+    def _atom_style_options(self) -> dict[str, str]:
+        return available_atom_style_labels()
+
+    def _refresh_atom_style_combo_options(self) -> None:
+        if not hasattr(self, "atom_style_combo"):
+            return
+        self._populate_combo_options(
+            self.atom_style_combo,
+            self._atom_style_options(),
+        )
+
+    def _refresh_orientation_style_combo_options(self) -> None:
+        if not hasattr(self, "orientation_table"):
+            return
+        options = self._atom_style_options()
+        for row_index in range(self.orientation_table.rowCount()):
+            combo = self.orientation_table.cellWidget(
+                row_index,
+                _ORIENTATION_STYLE_COLUMN,
+            )
+            if isinstance(combo, QComboBox):
+                current_data = combo.currentData()
+                self._populate_combo_options(
+                    combo,
+                    options,
+                    current_data=current_data,
+                )
+
+    def _refresh_all_atom_style_controls(
+        self,
+        *,
+        selected_style: str | None = None,
+    ) -> None:
+        selected = normalize_atom_style(
+            selected_style or str(self.atom_style_combo.currentData())
+        )
+        self._refresh_atom_style_combo_options()
+        index = self.atom_style_combo.findData(selected)
+        if index >= 0:
+            self.atom_style_combo.blockSignals(True)
+            self.atom_style_combo.setCurrentIndex(index)
+            self.atom_style_combo.blockSignals(False)
+        self._refresh_orientation_style_combo_options()
+
     def _set_render_progress(
         self,
         value: int,
@@ -1992,6 +2693,15 @@ class BlenderXYZRendererMainWindow(QMainWindow):
         self.orientation_preview.set_background_override(
             saved_preview_background or None
         )
+        saved_reference_background = str(
+            self._settings_store.value(
+                _REFERENCE_BACKGROUND_KEY,
+                REFERENCE_ATOM_BACKGROUND,
+            )
+        ).strip()
+        self.orientation_preview.set_reference_background_color(
+            saved_reference_background or REFERENCE_ATOM_BACKGROUND
+        )
         saved_nudge_increment = self._settings_store.value(
             _NUDGE_INCREMENT_KEY,
             5.0,
@@ -1999,6 +2709,7 @@ class BlenderXYZRendererMainWindow(QMainWindow):
         )
         self.orientation_preview.set_nudge_increment(saved_nudge_increment)
         self._refresh_preview_background_controls()
+        self._refresh_reference_background_controls()
         self.include_presets_box.setChecked(
             self._settings_store.value(
                 _INCLUDE_PRESETS_KEY,
@@ -2065,12 +2776,15 @@ class BlenderXYZRendererMainWindow(QMainWindow):
         self._refresh_style_hint()
         if self.orientation_table.rowCount() == 0:
             self.orientation_preview.refresh_style(atom_style)
+        else:
+            self._sync_preview_from_selection()
         self._refresh_preview_background_controls()
+        self._refresh_reference_background_controls()
 
     def _refresh_style_hint(self) -> None:
         atom_style = self._selected_atom_style()
         render_quality = self._selected_render_quality()
-        description = ATOM_STYLE_DESCRIPTIONS[atom_style]
+        description = atom_style_description(atom_style)
         quality_label = RENDER_QUALITY_LABELS[render_quality]
         self.style_hint_label.setText(
             f"{description} {quality_label} render quality tunes sampling, "
@@ -2127,11 +2841,62 @@ class BlenderXYZRendererMainWindow(QMainWindow):
             self._preview_structure.input_path,
             pair_thresholds=self._bond_thresholds,
         )
+        self._persist_bond_thresholds_for_path(
+            self._preview_structure.input_path,
+            self._bond_thresholds,
+            default_thresholds=default_thresholds,
+        )
         self._refresh_bond_threshold_summary()
         self._custom_orientations = self._extract_custom_orientations()
         self._sync_preview_from_selection()
         self.statusBar().showMessage(
             "Updated bond thresholds for the active structure."
+        )
+
+    @Slot()
+    def _edit_selected_aesthetic(self) -> None:
+        if self._preview_structure is None:
+            self._show_error(
+                "Load a structure file before editing atom colors and sizes."
+            )
+            return
+        active_style = self._selected_atom_style()
+        dialog = AtomAestheticEditorDialog(
+            active_style=active_style,
+            elements=tuple(_preview_structure_elements(self._preview_structure)),
+            parent=self,
+        )
+        if dialog.exec() != int(QDialog.DialogCode.Accepted):
+            return
+        try:
+            spec = dialog.custom_aesthetic(
+                existing_specs=tuple(self._custom_aesthetics_by_key.values())
+            )
+        except Exception as exc:
+            self._show_error(str(exc))
+            return
+
+        self._custom_aesthetics_by_key[spec.key] = spec
+        self._persist_custom_aesthetics()
+        self._refresh_all_atom_style_controls(selected_style=spec.key)
+        self._settings_store.setValue(_ATOM_STYLE_KEY, spec.key)
+        selected_index = self.atom_style_combo.findData(spec.key)
+        if selected_index >= 0:
+            self.atom_style_combo.setCurrentIndex(selected_index)
+
+        row_index = self._selected_row()
+        if row_index >= 0:
+            row_style_combo = self.orientation_table.cellWidget(
+                row_index,
+                _ORIENTATION_STYLE_COLUMN,
+            )
+            if isinstance(row_style_combo, QComboBox):
+                style_index = row_style_combo.findData(spec.key)
+                if style_index >= 0:
+                    row_style_combo.setCurrentIndex(style_index)
+        self._refresh_style_hint()
+        self.statusBar().showMessage(
+            f"Saved custom aesthetic '{spec.name}'."
         )
 
     def _refresh_preview_background_controls(self) -> None:
@@ -2146,6 +2911,22 @@ class BlenderXYZRendererMainWindow(QMainWindow):
             "background-color: " f"{effective}; " "border: 1px solid #aeb7c2;"
         )
         self.preview_background_reset_button.setEnabled(bool(override))
+
+    def _refresh_reference_background_controls(self) -> None:
+        color_value = self.orientation_preview.reference_background_color()
+        is_default = color_value == REFERENCE_ATOM_BACKGROUND
+        label = (
+            f"{color_value} (white default)"
+            if is_default
+            else f"{color_value} (custom)"
+        )
+        self.reference_background_value_label.setText(label)
+        self.reference_background_chip.setStyleSheet(
+            "background-color: "
+            f"{color_value}; "
+            "border: 1px solid #aeb7c2;"
+        )
+        self.reference_background_reset_button.setEnabled(not is_default)
 
     @Slot()
     def _choose_preview_background(self) -> None:
@@ -2166,6 +2947,28 @@ class BlenderXYZRendererMainWindow(QMainWindow):
         self.orientation_preview.set_background_override(None)
         self._settings_store.remove(_PREVIEW_BACKGROUND_KEY)
         self._refresh_preview_background_controls()
+
+    @Slot()
+    def _choose_reference_background(self) -> None:
+        color = QColorDialog.getColor(
+            QColor(self.orientation_preview.reference_background_color()),
+            self,
+            "Select Reference Background",
+        )
+        if not color.isValid():
+            return
+        color_name = str(color.name())
+        self.orientation_preview.set_reference_background_color(color_name)
+        self._settings_store.setValue(_REFERENCE_BACKGROUND_KEY, color_name)
+        self._refresh_reference_background_controls()
+
+    @Slot()
+    def _reset_reference_background(self) -> None:
+        self.orientation_preview.set_reference_background_color(
+            REFERENCE_ATOM_BACKGROUND
+        )
+        self._settings_store.remove(_REFERENCE_BACKGROUND_KEY)
+        self._refresh_reference_background_controls()
 
     def _refresh_blender_hint(self) -> None:
         blender_text = self.blender_edit.text().strip()
@@ -2523,7 +3326,7 @@ class BlenderXYZRendererMainWindow(QMainWindow):
             style_combo = self._create_orientation_table_combo(
                 row_index=row_index,
                 column=_ORIENTATION_STYLE_COLUMN,
-                options=ATOM_STYLE_LABELS,
+                options=self._atom_style_options(),
             )
         style_index = max(
             style_combo.findData(orientation.effective_atom_style()),
@@ -2759,7 +3562,11 @@ class BlenderXYZRendererMainWindow(QMainWindow):
         self.input_edit.setText(str(input_path))
 
         try:
-            self._preview_structure = load_preview_structure(input_path)
+            saved_thresholds = self._saved_bond_thresholds_for_path(input_path)
+            self._preview_structure = load_preview_structure(
+                input_path,
+                pair_thresholds=saved_thresholds or None,
+            )
         except Exception as exc:
             self._preview_structure = None
             self._bond_thresholds = ()
@@ -3035,6 +3842,7 @@ class BlenderXYZRendererMainWindow(QMainWindow):
             transparent=True,
             save_blend_file=self.save_blend_files_box.isChecked(),
             legend_font_family=legend_font_family,
+            custom_aesthetics=tuple(self._custom_aesthetics_by_key.values()),
         )
 
     @Slot()
@@ -3129,11 +3937,14 @@ class BlenderXYZRendererMainWindow(QMainWindow):
             self.title_edit,
             self.output_dir_edit,
             self.atom_style_combo,
+            self.edit_aesthetic_button,
             self.render_quality_combo,
             self.legend_font_combo,
             self.edit_bond_thresholds_button,
             self.preview_background_button,
             self.preview_background_reset_button,
+            self.reference_background_button,
+            self.reference_background_reset_button,
             self.blender_browse_button,
             self.input_browse_button,
             self.output_dir_browse_button,

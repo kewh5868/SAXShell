@@ -80,6 +80,19 @@ CLI, including:
 - `crystal_cartoon`
 - `crystal_shadow_gloss`
 
+For brighter publication-friendly results, start with `toon_matte`,
+`poster_pop`, `soft_studio`, or `crystal_flat`. The cartoon presets are tuned
+to track the flatter visualizer look more closely, and lighting levels `3` to
+`4` are a good starting point when you want a high-key figure instead of a
+low-light studio render.
+
+Reference carbon-and-sulfur swatches for the UI can be regenerated with:
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 \
+  python src/saxshell/toolbox/blender/ui/generate_reference_atoms.py
+```
+
 ## Notes
 
 - Run this script from Blender, not from plain Python.

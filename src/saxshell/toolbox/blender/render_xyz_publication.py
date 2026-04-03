@@ -13,6 +13,7 @@ Run with:
 
 import argparse
 import math
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,12 +24,8 @@ if str(_SRC_ROOT) not in sys.path:
 
 from saxshell.toolbox.blender.common import (  # noqa: E402
     ATOM_STYLE_CHOICES,
-    ATOM_STYLE_DEFAULTS,
     COVALENT_RADII,
-    CPK_COLORS,
-    DEFAULT_ATOM_COLOR,
     DEFAULT_ATOM_STYLE,
-    DEFAULT_BOND_COLOR,
     DEFAULT_BOND_THRESHOLD_SCALE,
     DEFAULT_LIGHTING_LEVEL,
     DEFAULT_RENDER_HEIGHT,
@@ -40,6 +37,8 @@ from saxshell.toolbox.blender.common import (  # noqa: E402
     RENDER_QUALITY_DEFAULTS,
     BondThresholdSpec,
     OrientationSpec,
+    atom_style_base,
+    atom_style_defaults,
     bond_threshold_lookup,
     build_blend_output_path,
     build_render_output_path,
@@ -50,7 +49,13 @@ from saxshell.toolbox.blender.common import (  # noqa: E402
     normalize_lighting_level,
     normalize_render_quality,
     parse_bond_threshold_arg,
+    parse_custom_aesthetic_arg,
     parse_orientation_arg,
+    set_custom_aesthetics,
+    style_atom_color,
+    style_display_radius,
+    style_neutral_bond_color,
+    style_split_bond_color,
 )
 
 try:
@@ -207,10 +212,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Cycles sample count. Defaults to the selected render-quality preset.",
     )
     parser.add_argument(
+        "--sample-floor",
+        type=int,
+        default=None,
+        help=(
+            "Optional minimum sample floor override. When omitted, the "
+            "selected render-quality preset decides the floor."
+        ),
+    )
+    parser.add_argument(
         "--atom-style",
-        choices=ATOM_STYLE_CHOICES,
         default=DEFAULT_ATOM_STYLE,
-        help="Atom and bond styling preset.",
+        help="Atom and bond styling preset or saved custom aesthetic key.",
     )
     parser.add_argument(
         "--atom-scale",
@@ -240,6 +253,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--custom-aesthetic",
+        action="append",
+        default=[],
+        help=(
+            "JSON-encoded saved custom aesthetic definition. May be provided "
+            "multiple times."
+        ),
+    )
+    parser.add_argument(
         "--render-quality",
         choices=RENDER_QUALITY_CHOICES,
         default=DEFAULT_RENDER_QUALITY,
@@ -251,6 +273,15 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=LIGHTING_LEVEL_CHOICES,
         default=DEFAULT_LIGHTING_LEVEL,
         help="Overall lighting brightness preset from 1 (lowest) to 5 (brightest).",
+    )
+    parser.add_argument(
+        "--execution-device",
+        choices=("auto", "cpu", "gpu"),
+        default="auto",
+        help=(
+            "Cycles execution device. 'auto' prefers GPU when available, "
+            "'cpu' skips GPU kernel startup for lightweight reference renders."
+        ),
     )
     parser.add_argument(
         "--bond-color-mode",
@@ -520,6 +551,7 @@ def create_material(
     roughness: float,
     specular: float = 0.5,
     coat: float = 0.0,
+    emission_strength: float = 0.0,
 ) -> bpy.types.Material:
     material = bpy.data.materials.new(name=name)
     material.use_nodes = True
@@ -534,6 +566,17 @@ def create_material(
         principled.inputs["Coat Weight"].default_value = coat
     elif "Clearcoat" in principled.inputs:
         principled.inputs["Clearcoat"].default_value = coat
+    emission_input = (
+        principled.inputs.get("Emission Color")
+        or principled.inputs.get("Emission")
+    )
+    if emission_input is not None:
+        emission_input.default_value = base_color
+    emission_strength_input = principled.inputs.get("Emission Strength")
+    if emission_strength_input is not None:
+        emission_strength_input.default_value = max(
+            float(emission_strength), 0.0
+        )
     return material
 
 
@@ -611,101 +654,25 @@ def create_bond_segment(
     return obj
 
 
-def darken_color(
-    color: tuple[float, float, float, float],
-    factor: float = 0.80,
-) -> tuple[float, float, float, float]:
-    return (
-        color[0] * factor,
-        color[1] * factor,
-        color[2] * factor,
-        color[3],
-    )
-
-
-def soften_color(
-    color: tuple[float, float, float, float],
-    *,
-    mix: float,
-    target: tuple[float, float, float] = (1.0, 1.0, 1.0),
-) -> tuple[float, float, float, float]:
-    return (
-        color[0] * (1.0 - mix) + target[0] * mix,
-        color[1] * (1.0 - mix) + target[1] * mix,
-        color[2] * (1.0 - mix) + target[2] * mix,
-        color[3],
-    )
-
-
 def atom_surface_color(
     element: str,
     *,
     atom_style: str,
 ) -> tuple[float, float, float, float]:
-    style = normalize_atom_style(atom_style)
-    if style == "paper_gloss":
-        color = CPK_COLORS.get(element, DEFAULT_ATOM_COLOR)
-        if element == "C":
-            return (0.28, 0.34, 0.62, 1.0)
-        return soften_color(color, mix=0.10)
-    if style == "soft_studio":
-        color = CPK_COLORS.get(element, DEFAULT_ATOM_COLOR)
-        return soften_color(color, mix=0.22)
-    if style == "flat_diagram":
-        color = CPK_COLORS.get(element, DEFAULT_ATOM_COLOR)
-        return soften_color(color, mix=0.08)
-    if style == "toon_matte":
-        color = CPK_COLORS.get(element, DEFAULT_ATOM_COLOR)
-        return tuple(
-            max(0.0, min(1.0, float(component) * 0.98 + 0.04))
-            for component in color[:3]
-        ) + (1.0,)
-    if style == "poster_pop":
-        color = CPK_COLORS.get(element, DEFAULT_ATOM_COLOR)
-        if element == "C":
-            return (0.18, 0.23, 0.45, 1.0)
-        return tuple(
-            max(0.0, min(1.0, float(component) * 1.04 + 0.02))
-            for component in color[:3]
-        ) + (1.0,)
-    if style == "pastel_cartoon":
-        color = CPK_COLORS.get(element, DEFAULT_ATOM_COLOR)
-        return soften_color(color, mix=0.28, target=(1.0, 0.97, 0.95))
-    if style == "crystal_flat":
-        color = CPK_COLORS.get(element, DEFAULT_ATOM_COLOR)
-        return soften_color(color, mix=0.10)
-    if style == "crystal_cartoon":
-        color = CPK_COLORS.get(element, DEFAULT_ATOM_COLOR)
-        return tuple(
-            max(0.0, min(1.0, float(component) * 1.06 + 0.02))
-            for component in color[:3]
-        ) + (1.0,)
-    if style == "crystal_shadow_gloss":
-        color = CPK_COLORS.get(element, DEFAULT_ATOM_COLOR)
-        return soften_color(color, mix=0.12, target=(1.0, 0.99, 0.98))
-    if style == "monochrome":
-        if element == "H":
-            return (0.96, 0.96, 0.97, 1.0)
-        return (0.74, 0.76, 0.79, 1.0)
-
-    color = CPK_COLORS.get(element, DEFAULT_ATOM_COLOR)
-    if style == "vesta":
-        if element == "C":
-            return (0.42, 0.44, 0.47, 1.0)
-        return soften_color(color, mix=0.06)
-    return color
+    return style_atom_color(element, atom_style=atom_style)
 
 
 def atom_material_profile(
     atom_style: str,
 ) -> dict[str, float]:
-    style = normalize_atom_style(atom_style)
+    style = atom_style_base(atom_style)
     if style == "paper_gloss":
         return {
             "metallic": 0.0,
             "roughness": 0.10,
             "specular": 0.70,
             "coat": 0.34,
+            "emission": 0.02,
         }
     if style == "soft_studio":
         return {
@@ -713,48 +680,55 @@ def atom_material_profile(
             "roughness": 0.16,
             "specular": 0.60,
             "coat": 0.22,
+            "emission": 0.03,
         }
     if style == "flat_diagram":
         return {
             "metallic": 0.0,
-            "roughness": 0.34,
-            "specular": 0.20,
+            "roughness": 0.46,
+            "specular": 0.14,
             "coat": 0.0,
+            "emission": 0.04,
         }
     if style == "toon_matte":
         return {
             "metallic": 0.0,
-            "roughness": 0.58,
-            "specular": 0.10,
+            "roughness": 0.70,
+            "specular": 0.05,
             "coat": 0.0,
+            "emission": 0.06,
         }
     if style == "poster_pop":
         return {
             "metallic": 0.0,
-            "roughness": 0.40,
-            "specular": 0.14,
+            "roughness": 0.48,
+            "specular": 0.10,
             "coat": 0.0,
+            "emission": 0.06,
         }
     if style == "pastel_cartoon":
         return {
             "metallic": 0.0,
-            "roughness": 0.50,
-            "specular": 0.16,
+            "roughness": 0.62,
+            "specular": 0.08,
             "coat": 0.0,
+            "emission": 0.06,
         }
     if style == "crystal_flat":
         return {
             "metallic": 0.0,
-            "roughness": 0.42,
-            "specular": 0.14,
+            "roughness": 0.50,
+            "specular": 0.12,
             "coat": 0.0,
+            "emission": 0.04,
         }
     if style == "crystal_cartoon":
         return {
             "metallic": 0.0,
-            "roughness": 0.30,
-            "specular": 0.26,
+            "roughness": 0.38,
+            "specular": 0.18,
             "coat": 0.02,
+            "emission": 0.05,
         }
     if style == "crystal_shadow_gloss":
         return {
@@ -762,6 +736,7 @@ def atom_material_profile(
             "roughness": 0.18,
             "specular": 0.60,
             "coat": 0.10,
+            "emission": 0.03,
         }
     if style == "monochrome":
         return {
@@ -769,6 +744,7 @@ def atom_material_profile(
             "roughness": 0.22,
             "specular": 0.48,
             "coat": 0.08,
+            "emission": 0.02,
         }
     if style == "cpk":
         return {
@@ -776,25 +752,28 @@ def atom_material_profile(
             "roughness": 0.16,
             "specular": 0.56,
             "coat": 0.16,
+            "emission": 0.03,
         }
     return {
         "metallic": 0.0,
         "roughness": 0.20,
         "specular": 0.52,
         "coat": 0.18,
+        "emission": 0.02,
     }
 
 
 def bond_material_profile(
     atom_style: str,
 ) -> dict[str, float]:
-    style = normalize_atom_style(atom_style)
+    style = atom_style_base(atom_style)
     if style == "paper_gloss":
         return {
             "metallic": 0.0,
             "roughness": 0.18,
             "specular": 0.48,
             "coat": 0.06,
+            "emission": 0.01,
         }
     if style == "soft_studio":
         return {
@@ -802,48 +781,55 @@ def bond_material_profile(
             "roughness": 0.28,
             "specular": 0.30,
             "coat": 0.01,
+            "emission": 0.02,
         }
     if style == "flat_diagram":
         return {
             "metallic": 0.0,
-            "roughness": 0.44,
-            "specular": 0.16,
+            "roughness": 0.48,
+            "specular": 0.12,
             "coat": 0.0,
+            "emission": 0.03,
         }
     if style == "toon_matte":
         return {
             "metallic": 0.0,
-            "roughness": 0.50,
-            "specular": 0.08,
+            "roughness": 0.58,
+            "specular": 0.05,
             "coat": 0.0,
+            "emission": 0.03,
         }
     if style == "poster_pop":
         return {
             "metallic": 0.0,
-            "roughness": 0.38,
-            "specular": 0.12,
+            "roughness": 0.42,
+            "specular": 0.10,
             "coat": 0.0,
+            "emission": 0.03,
         }
     if style == "pastel_cartoon":
         return {
             "metallic": 0.0,
-            "roughness": 0.46,
-            "specular": 0.12,
+            "roughness": 0.52,
+            "specular": 0.08,
             "coat": 0.0,
+            "emission": 0.03,
         }
     if style == "crystal_flat":
+        return {
+            "metallic": 0.0,
+            "roughness": 0.44,
+            "specular": 0.10,
+            "coat": 0.0,
+            "emission": 0.03,
+        }
+    if style == "crystal_cartoon":
         return {
             "metallic": 0.0,
             "roughness": 0.38,
             "specular": 0.12,
             "coat": 0.0,
-        }
-    if style == "crystal_cartoon":
-        return {
-            "metallic": 0.0,
-            "roughness": 0.32,
-            "specular": 0.16,
-            "coat": 0.0,
+            "emission": 0.03,
         }
     if style == "crystal_shadow_gloss":
         return {
@@ -851,6 +837,7 @@ def bond_material_profile(
             "roughness": 0.24,
             "specular": 0.26,
             "coat": 0.02,
+            "emission": 0.01,
         }
     if style == "monochrome":
         return {
@@ -858,6 +845,7 @@ def bond_material_profile(
             "roughness": 0.24,
             "specular": 0.34,
             "coat": 0.02,
+            "emission": 0.01,
         }
     if style == "cpk":
         return {
@@ -865,12 +853,14 @@ def bond_material_profile(
             "roughness": 0.22,
             "specular": 0.42,
             "coat": 0.03,
+            "emission": 0.02,
         }
     return {
         "metallic": 0.0,
         "roughness": 0.23,
         "specular": 0.38,
         "coat": 0.03,
+        "emission": 0.01,
     }
 
 
@@ -895,19 +885,19 @@ def render_quality_filter_size(render_quality: str) -> float:
 def render_quality_exposure(render_quality: str) -> float:
     quality = normalize_render_quality(render_quality)
     if quality == "draft":
-        return 0.05
+        return 0.0
     if quality == "balanced":
-        return 0.14
-    return 0.22
+        return 0.06
+    return 0.12
 
 
 def render_quality_light_scale(render_quality: str) -> float:
     quality = normalize_render_quality(render_quality)
     if quality == "draft":
-        return 0.94
+        return 0.86
     if quality == "balanced":
-        return 1.08
-    return 1.26
+        return 0.96
+    return 1.06
 
 
 def lighting_level_exposure_offset(lighting_level: int) -> float:
@@ -936,7 +926,7 @@ def build_structure(
     atoms: list[AtomRecord],
     *,
     atom_style: str,
-    atom_scale: float,
+    atom_scale: float | None,
     bond_radius: float,
     bond_threshold: float,
     pair_thresholds: (
@@ -961,11 +951,16 @@ def build_structure(
                 roughness=atom_profile["roughness"],
                 specular=atom_profile["specular"],
                 coat=atom_profile["coat"],
+                emission_strength=atom_profile["emission"],
             )
         atom_objects.append(
             create_atom_object(
                 atom,
-                radius=display_radius(atom.element, atom_scale),
+                radius=style_display_radius(
+                    atom.element,
+                    atom_style=atom_style,
+                    atom_scale_override=atom_scale,
+                ),
                 material=atom_materials[atom.element],
                 parent=root,
                 index=index,
@@ -975,11 +970,12 @@ def build_structure(
     bond_profile = bond_material_profile(atom_style)
     neutral_bond_material = create_material(
         "Bond_Neutral",
-        base_color=DEFAULT_BOND_COLOR,
+        base_color=style_neutral_bond_color(atom_style),
         metallic=bond_profile["metallic"],
         roughness=bond_profile["roughness"],
         specular=bond_profile["specular"],
         coat=bond_profile["coat"],
+        emission_strength=bond_profile["emission"],
     )
     split_bond_materials: dict[str, bpy.types.Material] = {}
     created_bonds: list[bpy.types.Object] = []
@@ -1001,16 +997,15 @@ def build_structure(
                 if element not in split_bond_materials:
                     split_bond_materials[element] = create_material(
                         f"Bond_{element}",
-                        base_color=darken_color(
-                            atom_surface_color(
-                                element,
-                                atom_style=atom_style,
-                            )
+                        base_color=style_split_bond_color(
+                            element,
+                            atom_style=atom_style,
                         ),
                         metallic=bond_profile["metallic"],
                         roughness=bond_profile["roughness"] + 0.02,
                         specular=bond_profile["specular"],
                         coat=bond_profile["coat"],
+                        emission_strength=bond_profile["emission"],
                     )
                 segment = create_bond_segment(
                     bond_start,
@@ -1105,33 +1100,44 @@ def setup_world(*, transparent: bool, atom_style: str) -> None:
     scene.world = world
     world.use_nodes = True
     background = world.node_tree.nodes.get("Background")
-    style = normalize_atom_style(atom_style)
+    style = atom_style_base(atom_style)
     if background is not None:
         if style == "paper_gloss":
-            background.inputs[0].default_value = (0.996, 0.992, 0.986, 1.0)
+            background.inputs[0].default_value = (0.997, 0.994, 0.989, 1.0)
+            background.inputs[1].default_value = 0.08
         elif style == "soft_studio":
-            background.inputs[0].default_value = (0.985, 0.977, 0.968, 1.0)
+            background.inputs[0].default_value = (0.990, 0.984, 0.976, 1.0)
+            background.inputs[1].default_value = 0.09
         elif style == "flat_diagram":
             background.inputs[0].default_value = (1.0, 1.0, 1.0, 1.0)
+            background.inputs[1].default_value = 0.08
         elif style == "toon_matte":
-            background.inputs[0].default_value = (0.998, 0.971, 0.925, 1.0)
+            background.inputs[0].default_value = (0.999, 0.978, 0.944, 1.0)
+            background.inputs[1].default_value = 0.08
         elif style == "poster_pop":
-            background.inputs[0].default_value = (0.998, 0.965, 0.915, 1.0)
+            background.inputs[0].default_value = (0.999, 0.973, 0.937, 1.0)
+            background.inputs[1].default_value = 0.08
         elif style == "pastel_cartoon":
-            background.inputs[0].default_value = (0.998, 0.978, 0.964, 1.0)
+            background.inputs[0].default_value = (0.999, 0.985, 0.975, 1.0)
+            background.inputs[1].default_value = 0.09
         elif style == "crystal_flat":
             background.inputs[0].default_value = (1.0, 1.0, 1.0, 1.0)
+            background.inputs[1].default_value = 0.08
         elif style == "crystal_cartoon":
-            background.inputs[0].default_value = (0.999, 0.994, 0.978, 1.0)
+            background.inputs[0].default_value = (0.999, 0.996, 0.985, 1.0)
+            background.inputs[1].default_value = 0.08
         elif style == "crystal_shadow_gloss":
-            background.inputs[0].default_value = (0.998, 0.987, 0.968, 1.0)
+            background.inputs[0].default_value = (0.999, 0.990, 0.975, 1.0)
+            background.inputs[1].default_value = 0.08
         elif style == "monochrome":
-            background.inputs[0].default_value = (0.98, 0.98, 0.985, 1.0)
+            background.inputs[0].default_value = (0.986, 0.986, 0.989, 1.0)
+            background.inputs[1].default_value = 0.08
         elif style == "cpk":
-            background.inputs[0].default_value = (0.962, 0.970, 0.986, 1.0)
+            background.inputs[0].default_value = (0.972, 0.978, 0.990, 1.0)
+            background.inputs[1].default_value = 0.08
         else:
-            background.inputs[0].default_value = (0.992, 0.994, 0.998, 1.0)
-        background.inputs[1].default_value = 0.16
+            background.inputs[0].default_value = (0.994, 0.996, 0.999, 1.0)
+            background.inputs[1].default_value = 0.08
     scene.render.film_transparent = True
 
 
@@ -1140,13 +1146,20 @@ def setup_render(
     width: int,
     height: int,
     samples: int,
+    sample_floor_override: int | None,
     transparent: bool,
     render_quality: str,
     lighting_level: int,
+    cycles_device: str = "auto",
 ) -> None:
     scene = bpy.context.scene
     quality = normalize_render_quality(render_quality)
-    tuned_samples = max(int(samples), render_quality_sample_floor(quality))
+    sample_floor = (
+        max(int(sample_floor_override), 1)
+        if sample_floor_override is not None
+        else render_quality_sample_floor(quality)
+    )
+    tuned_samples = max(int(samples), sample_floor)
     scene.render.engine = (
         "CYCLES"
         if getattr(bpy.app.build_options, "cycles", False)
@@ -1182,10 +1195,18 @@ def setup_render(
             scene.cycles.caustics_reflective = False
         if hasattr(scene.cycles, "caustics_refractive"):
             scene.cycles.caustics_refractive = False
-        try:
-            scene.cycles.device = "GPU"
-        except Exception:
+        requested_device = (
+            str(cycles_device or os.environ.get("SAXSHELL_CYCLES_DEVICE", "auto"))
+            .strip()
+            .lower()
+        )
+        if requested_device == "cpu":
             scene.cycles.device = "CPU"
+        else:
+            try:
+                scene.cycles.device = "GPU"
+            except Exception:
+                scene.cycles.device = "CPU"
     elif hasattr(scene, "eevee"):
         scene.eevee.taa_render_samples = max(tuned_samples, 64)
         scene.eevee.use_gtao = True
@@ -1244,70 +1265,75 @@ def setup_lighting(
     light_scale = render_quality_light_scale(
         render_quality
     ) * lighting_level_scale(lighting_level)
-    style = normalize_atom_style(atom_style)
-    key_energy = 5200.0 * light_scale
-    fill_energy = 2600.0 * light_scale
-    rim_energy = 3200.0 * light_scale
-    top_energy = 1800.0 * light_scale
-    sun_energy = 0.6 * light_scale
+    style = atom_style_base(atom_style)
+    key_energy = 3600.0 * light_scale
+    fill_energy = 2100.0 * light_scale
+    rim_energy = 1700.0 * light_scale
+    top_energy = 1450.0 * light_scale
+    sun_energy = 0.48 * light_scale
     if style == "monochrome":
-        fill_energy *= 0.84
-        rim_energy *= 1.12
+        fill_energy *= 0.92
+        rim_energy *= 1.06
         sun_energy *= 1.08
     elif style == "paper_gloss":
-        key_energy *= 1.18
-        rim_energy *= 1.26
-        top_energy *= 0.86
-        sun_energy *= 0.92
-    elif style == "soft_studio":
-        key_energy *= 0.98
-        fill_energy *= 1.14
-        rim_energy *= 0.84
-        top_energy *= 1.10
-    elif style == "flat_diagram":
-        key_energy *= 0.82
-        fill_energy *= 1.24
-        rim_energy *= 0.58
-        top_energy *= 0.92
-    elif style == "toon_matte":
-        key_energy *= 0.92
-        fill_energy *= 1.28
-        rim_energy *= 0.50
-        top_energy *= 1.08
-        sun_energy *= 1.12
-    elif style == "poster_pop":
-        key_energy *= 1.04
-        fill_energy *= 1.22
-        rim_energy *= 0.62
-        top_energy *= 1.04
-        sun_energy *= 1.10
-    elif style == "pastel_cartoon":
-        key_energy *= 0.94
-        fill_energy *= 1.30
-        rim_energy *= 0.56
-        top_energy *= 1.12
-        sun_energy *= 1.08
-    elif style == "crystal_flat":
-        key_energy *= 0.86
-        fill_energy *= 1.24
-        rim_energy *= 0.52
-        top_energy *= 0.98
-        sun_energy *= 1.08
-    elif style == "crystal_cartoon":
-        key_energy *= 0.98
-        fill_energy *= 1.20
-        rim_energy *= 0.68
-        top_energy *= 1.04
-        sun_energy *= 1.10
-    elif style == "crystal_shadow_gloss":
-        key_energy *= 1.10
-        fill_energy *= 1.08
+        key_energy *= 0.96
+        fill_energy *= 0.96
         rim_energy *= 0.92
-        top_energy *= 0.96
-        sun_energy *= 1.02
+        top_energy *= 0.82
+        sun_energy *= 0.88
+    elif style == "soft_studio":
+        key_energy *= 0.84
+        fill_energy *= 1.00
+        rim_energy *= 0.58
+        top_energy *= 0.88
+        sun_energy *= 0.84
+    elif style == "flat_diagram":
+        key_energy *= 0.70
+        fill_energy *= 1.08
+        rim_energy *= 0.22
+        top_energy *= 0.84
+        sun_energy *= 0.86
+    elif style == "toon_matte":
+        key_energy *= 0.68
+        fill_energy *= 1.10
+        rim_energy *= 0.18
+        top_energy *= 0.82
+        sun_energy *= 0.84
+    elif style == "poster_pop":
+        key_energy *= 0.72
+        fill_energy *= 1.08
+        rim_energy *= 0.22
+        top_energy *= 0.86
+        sun_energy *= 0.86
+    elif style == "pastel_cartoon":
+        key_energy *= 0.68
+        fill_energy *= 1.08
+        rim_energy *= 0.18
+        top_energy *= 0.86
+        sun_energy *= 0.84
+    elif style == "crystal_flat":
+        key_energy *= 0.72
+        fill_energy *= 1.08
+        rim_energy *= 0.20
+        top_energy *= 0.84
+        sun_energy *= 0.86
+    elif style == "crystal_cartoon":
+        key_energy *= 0.74
+        fill_energy *= 1.10
+        rim_energy *= 0.24
+        top_energy *= 0.88
+        sun_energy *= 0.88
+    elif style == "crystal_shadow_gloss":
+        key_energy *= 0.90
+        fill_energy *= 0.98
+        rim_energy *= 0.64
+        top_energy *= 0.88
+        sun_energy *= 0.88
     elif style == "vesta":
-        key_energy *= 1.08
-        top_energy *= 0.94
+        key_energy *= 0.86
+        fill_energy *= 0.98
+        top_energy *= 0.88
+        sun_energy *= 0.88
     add_area_light(
         "KeyLight",
         location=(-2.2 * extent, -1.9 * extent, 2.1 * extent),
@@ -1506,11 +1532,11 @@ def _resolve_output_targets(
 def _effective_orientation_render_settings(
     args: argparse.Namespace,
     orientation: OrientationSpec,
-) -> dict[str, str | float | int]:
+) -> dict[str, str | float | int | None]:
     atom_style = orientation.effective_atom_style(args.atom_style)
     render_quality = orientation.effective_render_quality(args.render_quality)
     lighting_level = orientation.effective_lighting_level(args.lighting_level)
-    atom_defaults = ATOM_STYLE_DEFAULTS[atom_style]
+    atom_defaults = atom_style_defaults(atom_style)
     quality_defaults = RENDER_QUALITY_DEFAULTS[render_quality]
     return {
         "atom_style": atom_style,
@@ -1523,7 +1549,7 @@ def _effective_orientation_render_settings(
         "atom_scale": (
             float(args.atom_scale)
             if args.atom_scale is not None
-            else float(atom_defaults["atom_scale"])
+            else None
         ),
         "bond_radius": (
             float(args.bond_radius)
@@ -1556,6 +1582,12 @@ def _apply_orientation(
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(_blend_args(argv))
+    set_custom_aesthetics(
+        tuple(
+            parse_custom_aesthetic_arg(text)
+            for text in args.custom_aesthetic
+        )
+    )
     args.atom_style = normalize_atom_style(args.atom_style)
     args.render_quality = normalize_render_quality(args.render_quality)
     args.lighting_level = normalize_lighting_level(args.lighting_level)
@@ -1594,9 +1626,11 @@ def main(argv: list[str] | None = None) -> int:
             width=args.width,
             height=args.height,
             samples=int(effective_settings["samples"]),
+            sample_floor_override=args.sample_floor,
             transparent=args.transparent,
             render_quality=str(effective_settings["render_quality"]),
             lighting_level=int(effective_settings["lighting_level"]),
+            cycles_device=str(args.execution_device),
         )
         setup_world(
             transparent=args.transparent,
@@ -1606,7 +1640,11 @@ def main(argv: list[str] | None = None) -> int:
         root, structure_objects = build_structure(
             atoms,
             atom_style=str(effective_settings["atom_style"]),
-            atom_scale=float(effective_settings["atom_scale"]),
+            atom_scale=(
+                float(effective_settings["atom_scale"])
+                if effective_settings["atom_scale"] is not None
+                else None
+            ),
             bond_radius=float(effective_settings["bond_radius"]),
             bond_threshold=args.bond_threshold,
             pair_thresholds=args.bond_pair_threshold,

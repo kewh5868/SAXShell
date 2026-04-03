@@ -10,8 +10,6 @@ import numpy as np
 
 from .common import (
     COVALENT_RADII,
-    CPK_COLORS,
-    DEFAULT_ATOM_COLOR,
     DEFAULT_ATOM_STYLE,
     DEFAULT_BOND_THRESHOLD_SCALE,
     DEFAULT_LEGEND_FONT,
@@ -19,13 +17,17 @@ from .common import (
     DEFAULT_RENDER_HEIGHT,
     DEFAULT_RENDER_QUALITY,
     DEFAULT_RENDER_WIDTH,
+    CustomAestheticSpec,
     BondThresholdSpec,
     OrientationSpec,
+    atom_style_base,
     bond_threshold_lookup,
     build_blend_output_path,
     build_legend_output_path,
     build_render_output_path,
+    custom_aesthetics,
     complete_bond_threshold_specs,
+    encode_custom_aesthetic_arg,
     encode_bond_threshold_arg,
     encode_orientation_arg,
     infer_title,
@@ -34,6 +36,9 @@ from .common import (
     normalize_lighting_level,
     normalize_render_quality,
     sanitize_orientation_key,
+    set_custom_aesthetics,
+    style_atom_color,
+    style_display_radius,
 )
 
 _PROGRESS_START_PREFIX = "BLENDERXYZ_PROGRESS_START "
@@ -84,6 +89,9 @@ class BlenderXYZRenderSettings:
     save_blend_file: bool = False
     legend_font_family: str = DEFAULT_LEGEND_FONT
     lighting_level: int = DEFAULT_LIGHTING_LEVEL
+    custom_aesthetics: tuple[CustomAestheticSpec, ...] | None = None
+    execution_device: str = "auto"
+    sample_floor_override: int | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -451,71 +459,16 @@ def display_radius(element: str, atom_scale: float = 0.62) -> float:
     return max(base * atom_scale, 0.18)
 
 
-def _soften_color(
-    color: tuple[float, float, float, float],
-    *,
-    mix: float,
-    target: tuple[float, float, float] = (1.0, 1.0, 1.0),
-) -> tuple[float, float, float, float]:
-    return (
-        color[0] * (1.0 - mix) + target[0] * mix,
-        color[1] * (1.0 - mix) + target[1] * mix,
-        color[2] * (1.0 - mix) + target[2] * mix,
-        color[3],
-    )
-
-
 def _legend_atom_color(
     element: str,
     *,
     atom_style: str,
 ) -> tuple[float, float, float, float]:
-    style = normalize_atom_style(atom_style)
-    color = CPK_COLORS.get(element, DEFAULT_ATOM_COLOR)
-    if style == "paper_gloss":
-        if element == "C":
-            return (0.28, 0.34, 0.62, 1.0)
-        return _soften_color(color, mix=0.10)
-    if style == "soft_studio":
-        return _soften_color(color, mix=0.22)
-    if style == "flat_diagram":
-        return _soften_color(color, mix=0.08)
-    if style == "toon_matte":
-        return tuple(
-            max(0.0, min(1.0, float(component) * 0.98 + 0.04))
-            for component in color[:3]
-        ) + (1.0,)
-    if style == "poster_pop":
-        if element == "C":
-            return (0.18, 0.23, 0.45, 1.0)
-        return tuple(
-            max(0.0, min(1.0, float(component) * 1.04 + 0.02))
-            for component in color[:3]
-        ) + (1.0,)
-    if style == "pastel_cartoon":
-        return _soften_color(color, mix=0.28, target=(1.0, 0.97, 0.95))
-    if style == "crystal_flat":
-        return _soften_color(color, mix=0.10)
-    if style == "crystal_cartoon":
-        return tuple(
-            max(0.0, min(1.0, float(component) * 1.06 + 0.02))
-            for component in color[:3]
-        ) + (1.0,)
-    if style == "crystal_shadow_gloss":
-        return _soften_color(color, mix=0.12, target=(1.0, 0.99, 0.98))
-    if style == "monochrome":
-        if element == "H":
-            return (0.96, 0.96, 0.97, 1.0)
-        return (0.74, 0.76, 0.79, 1.0)
-    if style == "vesta":
-        if element == "C":
-            return (0.42, 0.44, 0.47, 1.0)
-        return _soften_color(color, mix=0.06)
-    return color
+    return style_atom_color(element, atom_style=atom_style)
 
 
 def _legend_text_color(atom_style: str) -> tuple[float, float, float, float]:
-    style = normalize_atom_style(atom_style)
+    style = atom_style_base(atom_style)
     if style in {"flat_diagram", "toon_matte", "crystal_flat"}:
         return (0.16, 0.17, 0.19, 1.0)
     if style in {"poster_pop", "crystal_cartoon"}:
@@ -526,7 +479,7 @@ def _legend_text_color(atom_style: str) -> tuple[float, float, float, float]:
 
 
 def _legend_shadow_color(atom_style: str) -> tuple[float, float, float, float]:
-    style = normalize_atom_style(atom_style)
+    style = atom_style_base(atom_style)
     if style in {"paper_gloss", "soft_studio", "crystal_shadow_gloss"}:
         return (0.12, 0.10, 0.14, 0.24)
     if style in {"poster_pop", "crystal_cartoon"}:
@@ -564,7 +517,7 @@ def render_atom_legend_image(
     if not elements:
         raise ValueError("No atom types are available for legend rendering.")
 
-    style = normalize_atom_style(atom_style)
+    style = atom_style_base(atom_style)
     text_color = _legend_text_color(style)
     shadow_color = _legend_shadow_color(style)
     font_name = (
@@ -954,6 +907,8 @@ class BlenderXYZRenderWorkflow:
         self.settings = settings
 
     def prepare_settings(self) -> BlenderXYZRenderSettings:
+        if self.settings.custom_aesthetics is not None:
+            set_custom_aesthetics(self.settings.custom_aesthetics)
         input_path = Path(self.settings.input_path).expanduser().resolve()
         output_dir = Path(self.settings.output_dir).expanduser().resolve()
         atom_style = normalize_atom_style(self.settings.atom_style)
@@ -993,6 +948,11 @@ class BlenderXYZRenderWorkflow:
             if requested_samples is not None
             else None
         )
+        sample_floor_override = (
+            max(int(self.settings.sample_floor_override), 1)
+            if self.settings.sample_floor_override is not None
+            else None
+        )
 
         atom_scale = (
             float(self.settings.atom_scale)
@@ -1018,6 +978,24 @@ class BlenderXYZRenderWorkflow:
         bond_thresholds = build_bond_thresholds_for_structure(
             structure.atoms,
             overrides=self.settings.bond_thresholds,
+        )
+        available_custom_aesthetics = (
+            tuple(self.settings.custom_aesthetics)
+            if self.settings.custom_aesthetics is not None
+            else custom_aesthetics()
+        )
+        referenced_custom_keys = {
+            atom_style,
+            *(
+                orientation.atom_style
+                for orientation in orientations
+                if orientation.atom_style
+            ),
+        }
+        referenced_custom_aesthetics = tuple(
+            spec
+            for spec in available_custom_aesthetics
+            if spec.key in referenced_custom_keys
         )
 
         return BlenderXYZRenderSettings(
@@ -1047,6 +1025,14 @@ class BlenderXYZRenderWorkflow:
                 or DEFAULT_LEGEND_FONT
             ),
             lighting_level=lighting_level,
+            custom_aesthetics=referenced_custom_aesthetics,
+            execution_device=(
+                str(self.settings.execution_device).strip().lower()
+                if str(self.settings.execution_device).strip().lower()
+                in {"auto", "cpu", "gpu"}
+                else "auto"
+            ),
+            sample_floor_override=sample_floor_override,
         )
 
     def build_command(
@@ -1057,6 +1043,7 @@ class BlenderXYZRenderWorkflow:
         command = [
             str(prepared.blender_executable),
             "--background",
+            "--factory-startup",
             "--python",
             str(render_script_path()),
             "--",
@@ -1074,9 +1061,18 @@ class BlenderXYZRenderWorkflow:
             prepared.render_quality,
             "--lighting-level",
             str(prepared.lighting_level),
+            "--execution-device",
+            str(prepared.execution_device),
         ]
         if prepared.samples is not None:
             command.extend(["--samples", str(prepared.samples)])
+        if prepared.sample_floor_override is not None:
+            command.extend(
+                [
+                    "--sample-floor",
+                    str(int(prepared.sample_floor_override)),
+                ]
+            )
         if prepared.atom_scale is not None:
             command.extend(
                 ["--atom-scale", f"{float(prepared.atom_scale):.3f}"]
@@ -1103,6 +1099,10 @@ class BlenderXYZRenderWorkflow:
         command.append("--transparent")
         if prepared.save_blend_file:
             command.append("--save-blend-files")
+        for spec in prepared.custom_aesthetics or ():
+            command.extend(
+                ["--custom-aesthetic", encode_custom_aesthetic_arg(spec)]
+            )
         for bond_threshold in prepared.bond_thresholds:
             command.extend(
                 [
