@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 from pathlib import Path
 
@@ -90,6 +91,25 @@ def _build_offset_frames_dir(tmp_path: Path) -> Path:
     )
     for index, content in enumerate(sequence, start=1866):
         (frames_dir / f"frame_{index:04d}.xyz").write_text(content)
+    return frames_dir
+
+
+def _build_named_offset_frames_dir(
+    tmp_path: Path,
+    *,
+    folder_name: str,
+    start_index: int,
+) -> Path:
+    frames_dir = tmp_path / folder_name
+    frames_dir.mkdir()
+    sequence = (
+        _connected_xyz_lines(),
+        _disconnected_xyz_lines(),
+    )
+    for offset, content in enumerate(sequence):
+        (frames_dir / f"frame_{start_index + offset:04d}.xyz").write_text(
+            content
+        )
     return frames_dir
 
 
@@ -222,6 +242,77 @@ def test_cluster_dynamics_uses_frame_filename_indices_for_time_axis(tmp_path):
     )
 
 
+def test_cluster_dynamics_parses_new_mdtrajectory_folder_name(tmp_path):
+    frames_dir = _build_named_offset_frames_dir(
+        tmp_path,
+        folder_name="splitxyz_f995_t497p5fs",
+        start_index=995,
+    )
+    workflow = ClusterDynamicsWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        frame_timestep_fs=0.5,
+        frames_per_colormap_timestep=1,
+    )
+
+    preview = workflow.preview_selection()
+
+    assert preview.folder_start_time_fs == pytest.approx(497.5)
+    assert preview.first_frame_time_fs == pytest.approx(497.5)
+    assert preview.first_selected_source_frame_index == 995
+    assert preview.last_selected_source_frame_index == 996
+    assert preview.time_source_label == "Frame filenames x timestep"
+    assert preview.time_warnings == ()
+
+
+def test_cluster_dynamics_prefers_export_first_time_from_metadata(tmp_path):
+    frames_dir = _build_named_offset_frames_dir(
+        tmp_path,
+        folder_name="splitxyz_f995_t497p5fs",
+        start_index=995,
+    )
+    metadata_path = frames_dir / "mdtrajectory_export.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "selection": {
+                    "applied_cutoff_fs": 497.5,
+                    "first_time_fs": 501.0,
+                },
+                "written_frames": [
+                    {
+                        "filename": "frame_0995.xyz",
+                        "frame_index": 995,
+                        "time_fs": 501.0,
+                    },
+                    {
+                        "filename": "frame_0996.xyz",
+                        "frame_index": 996,
+                        "time_fs": 501.5,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    workflow = ClusterDynamicsWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        frame_timestep_fs=0.5,
+        frames_per_colormap_timestep=1,
+    )
+
+    preview = workflow.preview_selection()
+
+    assert preview.folder_start_time_fs == pytest.approx(501.0)
+    assert preview.folder_start_time_source == "mdtrajectory export metadata"
+    assert preview.first_frame_time_fs == pytest.approx(501.0)
+    assert preview.time_source_label == "mdtrajectory export metadata"
+    assert preview.time_warnings == ()
+
+
 def test_cluster_dynamics_dataset_round_trip(tmp_path):
     frames_dir = _build_frames_dir(tmp_path)
     energy_path = _write_energy_file(tmp_path)
@@ -322,6 +413,31 @@ def test_cluster_dynamics_main_window_inherits_project_dir_and_start_time(
     window.close()
 
 
+def test_cluster_dynamics_main_window_inherits_registered_frames_dir_from_project(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    frames_dir = _build_offset_frames_dir(tmp_path)
+    energy_path = _write_energy_file(tmp_path)
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "saxs_project"
+    settings = manager.create_project(project_dir)
+    settings.frames_dir = str(frames_dir)
+    settings.energy_file = str(energy_path)
+    manager.save_project(settings)
+
+    window = ClusterDynamicsMainWindow(initial_project_dir=project_dir)
+    preview_text = window.run_panel.selection_box.toPlainText()
+
+    assert window.dataset_panel.project_dir() == project_dir
+    assert window.trajectory_panel.get_frames_dir() == frames_dir
+    assert window.run_panel.energy_file() == energy_path
+    assert window.time_panel.folder_start_time_fs() == pytest.approx(847.0)
+    assert "Source frame index range: 1866 to 1867" in preview_text
+    window.close()
+
+
 def test_cluster_dynamics_main_window_exports_colormap_and_lifetime_csv(
     qapp,
     tmp_path,
@@ -382,6 +498,42 @@ def test_cluster_dynamics_main_window_exports_colormap_and_lifetime_csv(
     assert "colormap_value" in colormap_rows[0]
     assert pb2i_lifetime["mean_lifetime_fs"] == "15"
     assert pb2i_lifetime["std_lifetime_fs"] == "5"
+    window.close()
+
+
+def test_cluster_dynamics_main_window_registers_frames_dir_with_project(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    frames_dir = _build_frames_dir(tmp_path)
+    energy_path = _write_energy_file(tmp_path)
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "saxs_project"
+    manager.create_project(project_dir)
+    result = ClusterDynamicsWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=1,
+    ).analyze()
+
+    window = ClusterDynamicsMainWindow(
+        initial_frames_dir=frames_dir,
+        initial_energy_file=energy_path,
+        initial_project_dir=project_dir,
+    )
+    window._on_run_finished(result)
+
+    saved_settings = manager.load_project(project_dir)
+    assert saved_settings.resolved_frames_dir == frames_dir.resolve()
+    assert saved_settings.resolved_energy_file == energy_path.resolve()
+    assert saved_settings.frames_dir_snapshot is not None
+    assert saved_settings.energy_file_snapshot is not None
+    assert "Updated project references:" in (
+        window.run_panel.log_box.toPlainText()
+    )
     window.close()
 
 

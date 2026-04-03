@@ -4,6 +4,10 @@ SAXS projects are file-backed. The application stores enough metadata in the
 project directory to let you reopen a project and continue without rebuilding
 everything from scratch each time.
 
+The project directory is also where the main SAXS UI meets the supporting
+applications: cluster folders, component metadata, saved PDF calculations, and
+fit artifacts all end up tied back to the same project state.
+
 ## What a project captures
 
 From the current project-manager and Prefit workflow code, a SAXS project can
@@ -49,5 +53,8 @@ That means the active template can affect:
 ## Related pages
 
 - [Project Setup](../getting-started/project-setup.md)
+- [Cluster Extraction](cluster-extraction.md)
 - [SAXS Prefit](saxs-prefit.md)
+- [pyDREAM Workflow](pydream-workflow.md)
+- [PDF Calculation](pdf-calculation.md)
 - [Template System](template-system.md)

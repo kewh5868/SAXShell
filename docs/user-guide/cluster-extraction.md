@@ -33,19 +33,27 @@ mdtrajectory export traj.xyz --energy-file traj.ener --use-suggested-cutoff --te
 ```
 
 When a cutoff is applied, the default folder name now uses the form
-`splitxyz_f847fs` or `splitpdb_f847fs`, where the `f847fs` portion records the
-cutoff time in femtoseconds.
+`splitxyz_f995_t497p5fs` or `splitpdb_f995_t497p5fs`, where `f995` records the
+first exported source-frame index and `t497p5fs` records the first exported
+time in femtoseconds.
 
 ## `xyz2pdb`
 
 Use this only when residue identity matters downstream.
 
-The current CLI can:
+The current UI and CLI support:
 
-- inspect the input and reference library
-- preview residue assignment
-- export converted PDB files
-- list or add reference molecules
+- analyzing one sample frame and detecting the element inventory
+- defining free atoms and reference molecules directly in the UI
+- editing per-bond percentage tolerances and tight/relaxed search windows
+- estimating molecule counts before export
+- converting frames in the background while reusing the first-frame mapping template
+- optional assertion mode for per-molecule geometry checks and reference updates
+- browsing and creating reference molecules in the library
+
+See the dedicated guide for the full interface and workflow:
+
+- [XYZ to PDB Conversion](xyz2pdb-conversion.md)
 
 ## `clusters`
 
@@ -76,9 +84,6 @@ Key outputs:
 - a sortable lifetime table by stoichiometry label
 - saved JSON/CSV datasets that can be reopened later for plotting
 
-See [Cluster Dynamics](cluster-dynamics.md) for the full workflow, timing
-rules, and the definitions of the lifetime/rate columns.
-
 ## `bondanalysis`
 
 Bond analysis is downstream of cluster extraction. Use it to derive bond-pair
@@ -94,3 +99,11 @@ components.
 If you are unsure whether your cluster folder is ready, start in
 **Project Setup** and confirm that the project can discover the expected
 clusters before moving on.
+
+## Related pages
+
+- [Project Setup](../getting-started/project-setup.md)
+- [Project Configuration](project-configuration.md)
+- [Cluster Dynamics](cluster-dynamics.md)
+- [Cluster Dynamics ML](cluster-dynamics-ml.md)
+- [SAXS Prefit](saxs-prefit.md)

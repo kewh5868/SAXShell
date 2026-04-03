@@ -134,9 +134,6 @@ The repository currently includes bundled templates such as:
 - poly-LMA hard-sphere workflows
 - approximate mixed sphere/ellipsoid workflows
 
-For the bundled model equations, variable definitions, and literature links,
-see [Pre-loaded SAXS Models](preloaded-saxs-models.md).
-
 Some older templates now live in a `_deprecated` subfolder. They are hidden by
 default in template dropdowns, but older projects can still load them.
 
@@ -382,3 +379,11 @@ PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshel
 PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs templates validate path/to/template.py
 PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs templates install path/to/template.py
 ```
+
+## Related pages
+
+- [Project Configuration](project-configuration.md)
+- [Pre-loaded SAXS Models](preloaded-saxs-models.md)
+- [SAXS Prefit](saxs-prefit.md)
+- [LMFit Workflow](lmfit-workflow.md)
+- [pyDREAM Workflow](pydream-workflow.md)

@@ -10,10 +10,6 @@ counts into:
 - a sortable lifetime table by stoichiometry label
 - reloadable JSON/CSV datasets for later plotting
 
-If you also want to extrapolate larger clusters from the observed dynamics and
-reference structures, see
-[Cluster Dynamics ML](cluster-dynamics-ml.md).
-
 ## Inputs
 
 The application expects:
@@ -43,22 +39,25 @@ The heatmap binning now uses an integer `frames / colormap timestep` control.
 The UI shows the derived `colormap timestep used (fs)` field so the effective
 heatmap timestep is always an exact multiple of the frame timestep.
 
-`mdtrajectory` cutoff exports now use folder names such as `splitxyz_f847fs`.
-The `f847fs` part records the cutoff time in femtoseconds and is auto-filled
-into the folder/start-time field when it is detected.
+`mdtrajectory` cutoff exports now use folder names such as
+`splitxyz_f995_t497p5fs`. The `f995` part records the first exported
+source-frame index, and `t497p5fs` records the first exported time in
+femtoseconds. The `t...fs` portion is auto-filled into the folder/start-time
+field when it is detected.
 
 ### Important example
 
-If the folder is `splitxyz_f847fs`, the frame timestep is `0.5 fs`, and the
-first file is `frame_1866.xyz`, the resolved frame time is:
+If the folder is `splitxyz_f995_t497p5fs`, the frame timestep is `0.5 fs`, and
+the first file is `frame_0995.xyz`, the resolved frame time is:
 
 ```text
-1866 x 0.5 fs = 933 fs
+995 x 0.5 fs = 497.5 fs
 ```
 
-In that case the preview warns that the folder cutoff/start time (`847 fs`) and
-the first resolved extracted-frame time (`933 fs`) are different. The heatmap
-and lifetime calculations follow the resolved frame times, not the folder label.
+If an older folder such as `splitxyz_f847fs` is loaded, the preview still reads
+that legacy cutoff/start-time tag. When the folder tag and the resolved frame
+times disagree, the heatmap and lifetime calculations follow the resolved frame
+times, not the folder label.
 
 ## Typical UI Workflow
 
@@ -171,9 +170,16 @@ The saved `*_cluster_distribution.csv` file stores one row per
 
 The preview and summary can include warnings when:
 
-- the folder/start-time tag such as `_f847fs` was not found
+- the folder/start-time tag such as `_t497p5fs` was not found
 - `mdtrajectory_export.json` is missing or incomplete
 - the folder/start-time tag and the resolved frame times disagree
 
 These warnings are informational. The analysis still runs, but the UI makes the
 time basis explicit so the heatmap and lifetime interpretation stay transparent.
+
+## Related pages
+
+- [Cluster Extraction](cluster-extraction.md)
+- [Cluster Dynamics ML](cluster-dynamics-ml.md)
+- [Project Configuration](project-configuration.md)
+- [Results and Export](results-and-export.md)

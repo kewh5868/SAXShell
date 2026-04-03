@@ -14,11 +14,12 @@ from matplotlib import rcParams
 from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QWheelEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QComboBox, QScrollArea
 
 import saxshell.clusterdynamicsml.cli as clusterdynamicsml_cli_module
 import saxshell.clusterdynamicsml.workflow as clusterdynamicsml_workflow_module
 from saxshell import saxshell as saxshell_module
+from saxshell.cluster import PDBShellReferenceDefinition
 from saxshell.clusterdynamicsml import (
     ClusterDynamicsMLWorkflow,
     load_cluster_dynamicsai_dataset,
@@ -46,6 +47,9 @@ from saxshell.saxs.project_manager.prior_plot import (
     build_prior_histogram_export_payload,
     list_secondary_filter_elements,
 )
+from saxshell.structure import PDBAtom, PDBStructure
+from saxshell.xyz2pdb import resolve_reference_path
+from saxshell.xyz2pdb.workflow import rotation_matrix_from_to
 
 ATOM_TYPE_DEFINITIONS = {
     "node": [("Pb", None)],
@@ -54,6 +58,22 @@ ATOM_TYPE_DEFINITIONS = {
 PAIR_CUTOFFS = {
     ("Pb", "I"): {0: 1.2},
 }
+PDB_ATOM_TYPE_DEFINITIONS = {
+    "node": [("Pb", "PBN")],
+    "linker": [("I", "LIN")],
+    "shell": [("O", "DMF")],
+}
+PDB_PAIR_CUTOFFS = {
+    ("Pb", "I"): {0: 1.35},
+    ("Pb", "O"): {0: 1.75},
+}
+PDB_SHELL_REFERENCE_DEFINITIONS = (
+    PDBShellReferenceDefinition(
+        shell_element="O",
+        shell_residue="DMF",
+        reference_name="dmf",
+    ),
+)
 
 
 @pytest.fixture(scope="module")
@@ -161,6 +181,218 @@ def _build_clusters_dir(tmp_path: Path) -> Path:
     (clusters_dir / "Pb2I" / "pb2i_0002.xyz").write_text(pair_b)
     (clusters_dir / "Pb3I2" / "pb3i2_0001.xyz").write_text(triple_a)
     (clusters_dir / "Pb3I2" / "pb3i2_0002.xyz").write_text(triple_b)
+    return clusters_dir
+
+
+def _write_pdb_structure(path: Path, atoms: list[PDBAtom]) -> None:
+    structure = PDBStructure(atoms=list(atoms), source_name=path.stem)
+    structure.write_pdb_file(path, list(atoms))
+
+
+def _aligned_reference_atoms(
+    *,
+    reference_name: str,
+    anchor_coordinate: tuple[float, float, float],
+    axis_coordinate: tuple[float, float, float],
+    residue_number: int,
+    starting_atom_id: int,
+) -> list[PDBAtom]:
+    reference_structure = PDBStructure.from_file(
+        resolve_reference_path(reference_name)
+    )
+    atom_lookup = {
+        atom.atom_name: (index, atom)
+        for index, atom in enumerate(reference_structure.atoms)
+    }
+    anchor_index, anchor_atom = atom_lookup["O1"]
+    axis_index, axis_atom = atom_lookup["N1"]
+    reference_coordinates = np.asarray(
+        [atom.coordinates for atom in reference_structure.atoms],
+        dtype=float,
+    )
+    source_anchor = reference_coordinates[anchor_index]
+    source_axis = reference_coordinates[axis_index]
+    target_anchor = np.asarray(anchor_coordinate, dtype=float)
+    target_axis = np.asarray(axis_coordinate, dtype=float)
+    source_vector = source_axis - source_anchor
+    target_vector = target_axis - target_anchor
+    source_length = float(np.linalg.norm(source_vector))
+    target_length = float(np.linalg.norm(target_vector))
+    scale = 1.0 if source_length <= 1.0e-12 else target_length / source_length
+    rotation = (
+        np.eye(3, dtype=float)
+        if target_length <= 1.0e-12 or source_length <= 1.0e-12
+        else rotation_matrix_from_to(source_vector, target_vector)
+    )
+    transformed_coordinates = (
+        ((reference_coordinates - source_anchor) * scale) @ rotation.T
+    ) + target_anchor
+    transformed_atoms: list[PDBAtom] = []
+    for atom_offset, template_atom in enumerate(reference_structure.atoms):
+        copied = template_atom.copy()
+        copied.atom_id = starting_atom_id + atom_offset
+        copied.residue_number = residue_number
+        copied.coordinates = transformed_coordinates[atom_offset].copy()
+        transformed_atoms.append(copied)
+    return transformed_atoms
+
+
+def _pdb_atom(
+    atom_id: int,
+    atom_name: str,
+    residue_name: str,
+    residue_number: int,
+    element: str,
+    coordinates: tuple[float, float, float],
+) -> PDBAtom:
+    return PDBAtom(
+        atom_id=atom_id,
+        atom_name=atom_name,
+        residue_name=residue_name,
+        residue_number=residue_number,
+        coordinates=np.asarray(coordinates, dtype=float),
+        element=element,
+    )
+
+
+def _build_pdb_frames_dir(tmp_path: Path) -> Path:
+    frames_dir = tmp_path / "splitpdb_f0fs"
+    frames_dir.mkdir()
+
+    frame_structures = [
+        [
+            _pdb_atom(1, "PB1", "PBN", 1, "Pb", (0.0, 0.0, 0.0)),
+        ],
+        [
+            _pdb_atom(1, "PB1", "PBN", 1, "Pb", (0.0, 0.0, 0.0)),
+            _pdb_atom(2, "PB2", "PBN", 2, "Pb", (2.0, 0.0, 0.0)),
+            _pdb_atom(3, "I1", "LIN", 3, "I", (1.0, 0.0, 0.0)),
+            *_aligned_reference_atoms(
+                reference_name="dmf",
+                anchor_coordinate=(0.0, 1.2, 0.0),
+                axis_coordinate=(1.2, 1.2, 0.0),
+                residue_number=20,
+                starting_atom_id=20,
+            ),
+        ],
+        [
+            _pdb_atom(1, "PB1", "PBN", 1, "Pb", (0.0, 0.0, 0.0)),
+            _pdb_atom(2, "PB2", "PBN", 2, "Pb", (2.0, 0.0, 0.0)),
+            _pdb_atom(3, "PB3", "PBN", 3, "Pb", (4.0, 0.0, 0.0)),
+            _pdb_atom(4, "I1", "LIN", 4, "I", (1.0, 0.0, 0.0)),
+            _pdb_atom(5, "I2", "LIN", 5, "I", (3.0, 0.0, 0.0)),
+            *_aligned_reference_atoms(
+                reference_name="dmf",
+                anchor_coordinate=(0.0, 1.2, 0.0),
+                axis_coordinate=(1.2, 1.2, 0.0),
+                residue_number=20,
+                starting_atom_id=20,
+            ),
+            *_aligned_reference_atoms(
+                reference_name="dmf",
+                anchor_coordinate=(4.0, 1.2, 0.0),
+                axis_coordinate=(5.2, 1.2, 0.0),
+                residue_number=21,
+                starting_atom_id=40,
+            ),
+        ],
+    ]
+
+    for index, atoms in enumerate(frame_structures):
+        _write_pdb_structure(frames_dir / f"frame_{index:04d}.pdb", atoms)
+    return frames_dir
+
+
+def _build_pdb_clusters_dir(tmp_path: Path) -> Path:
+    clusters_dir = tmp_path / "clusters_training_pdb"
+    for label in ("Pb", "Pb2I", "Pb3I2"):
+        (clusters_dir / label).mkdir(parents=True)
+
+    single_atoms = [
+        _pdb_atom(1, "PB1", "PBN", 1, "Pb", (0.0, 0.0, 0.0)),
+    ]
+    pair_atoms = [
+        _pdb_atom(1, "PB1", "PBN", 1, "Pb", (0.0, 0.0, 0.0)),
+        _pdb_atom(2, "PB2", "PBN", 2, "Pb", (2.0, 0.0, 0.0)),
+        _pdb_atom(3, "I1", "LIN", 3, "I", (1.0, 0.0, 0.0)),
+        *_aligned_reference_atoms(
+            reference_name="dmf",
+            anchor_coordinate=(0.0, 1.2, 0.0),
+            axis_coordinate=(1.2, 1.2, 0.0),
+            residue_number=20,
+            starting_atom_id=20,
+        ),
+    ]
+    pair_atoms_shifted = [
+        _pdb_atom(1, "PB1", "PBN", 1, "Pb", (0.0, 0.1, 0.0)),
+        _pdb_atom(2, "PB2", "PBN", 2, "Pb", (2.1, -0.1, 0.0)),
+        _pdb_atom(3, "I1", "LIN", 3, "I", (1.0, 0.2, 0.1)),
+        *_aligned_reference_atoms(
+            reference_name="dmf",
+            anchor_coordinate=(0.0, 1.3, 0.1),
+            axis_coordinate=(1.2, 1.4, 0.1),
+            residue_number=20,
+            starting_atom_id=20,
+        ),
+    ]
+    triple_atoms = [
+        _pdb_atom(1, "PB1", "PBN", 1, "Pb", (0.0, 0.0, 0.0)),
+        _pdb_atom(2, "PB2", "PBN", 2, "Pb", (2.0, 0.0, 0.0)),
+        _pdb_atom(3, "PB3", "PBN", 3, "Pb", (4.0, 0.0, 0.0)),
+        _pdb_atom(4, "I1", "LIN", 4, "I", (1.0, 0.1, 0.0)),
+        _pdb_atom(5, "I2", "LIN", 5, "I", (3.0, -0.1, 0.0)),
+        *_aligned_reference_atoms(
+            reference_name="dmf",
+            anchor_coordinate=(0.0, 1.2, 0.0),
+            axis_coordinate=(1.2, 1.2, 0.0),
+            residue_number=20,
+            starting_atom_id=20,
+        ),
+        *_aligned_reference_atoms(
+            reference_name="dmf",
+            anchor_coordinate=(4.0, 1.2, 0.0),
+            axis_coordinate=(5.2, 1.2, 0.0),
+            residue_number=21,
+            starting_atom_id=40,
+        ),
+    ]
+    triple_atoms_shifted = [
+        _pdb_atom(1, "PB1", "PBN", 1, "Pb", (0.0, 0.0, 0.0)),
+        _pdb_atom(2, "PB2", "PBN", 2, "Pb", (2.1, 0.1, 0.0)),
+        _pdb_atom(3, "PB3", "PBN", 3, "Pb", (4.2, 0.0, 0.1)),
+        _pdb_atom(4, "I1", "LIN", 4, "I", (1.1, 0.2, 0.0)),
+        _pdb_atom(5, "I2", "LIN", 5, "I", (3.1, -0.2, 0.0)),
+        *_aligned_reference_atoms(
+            reference_name="dmf",
+            anchor_coordinate=(0.1, 1.3, 0.1),
+            axis_coordinate=(1.3, 1.4, 0.1),
+            residue_number=20,
+            starting_atom_id=20,
+        ),
+        *_aligned_reference_atoms(
+            reference_name="dmf",
+            anchor_coordinate=(4.1, 1.2, 0.1),
+            axis_coordinate=(5.3, 1.2, 0.2),
+            residue_number=21,
+            starting_atom_id=40,
+        ),
+    ]
+
+    _write_pdb_structure(clusters_dir / "Pb" / "pb_0001.pdb", single_atoms)
+    _write_pdb_structure(clusters_dir / "Pb" / "pb_0002.pdb", single_atoms)
+    _write_pdb_structure(clusters_dir / "Pb2I" / "pb2i_0001.pdb", pair_atoms)
+    _write_pdb_structure(
+        clusters_dir / "Pb2I" / "pb2i_0002.pdb",
+        pair_atoms_shifted,
+    )
+    _write_pdb_structure(
+        clusters_dir / "Pb3I2" / "pb3i2_0001.pdb",
+        triple_atoms,
+    )
+    _write_pdb_structure(
+        clusters_dir / "Pb3I2" / "pb3i2_0002.pdb",
+        triple_atoms_shifted,
+    )
     return clusters_dir
 
 
@@ -301,13 +533,19 @@ def _write_energy_file(tmp_path: Path, name: str = "traj.ener") -> Path:
 def _build_project_dir(
     tmp_path: Path,
     *,
+    frames_dir: Path | None = None,
     clusters_dir: Path,
     experimental_data_file: Path,
+    energy_file: Path | None = None,
 ) -> Path:
     manager = SAXSProjectManager()
     project_dir = tmp_path / "saxs_project"
     settings = manager.create_project(project_dir)
+    if frames_dir is not None:
+        settings.frames_dir = str(frames_dir)
     settings.clusters_dir = str(clusters_dir)
+    if energy_file is not None:
+        settings.energy_file = str(energy_file)
     settings.experimental_data_path = str(experimental_data_file)
     settings.copied_experimental_data_file = str(experimental_data_file)
     manager.save_project(settings)
@@ -1531,6 +1769,203 @@ def test_clusterdynamicsml_writes_xyz_for_every_prediction(
     }
 
 
+def test_clusterdynamicsml_pdb_mode_counts_shell_anchor_atoms(
+    tmp_path,
+):
+    frames_dir = _build_pdb_frames_dir(tmp_path)
+    clusters_dir = _build_pdb_clusters_dir(tmp_path)
+
+    workflow = ClusterDynamicsMLWorkflow(
+        frames_dir,
+        atom_type_definitions=PDB_ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PDB_PAIR_CUTOFFS,
+        clusters_dir=clusters_dir,
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=1,
+        target_node_counts=(4,),
+        pdb_shell_reference_definitions=PDB_SHELL_REFERENCE_DEFINITIONS,
+    )
+    observations = workflow._build_structure_observations(clusters_dir)
+    counts_by_label = {
+        entry.label: entry.element_counts for entry in observations
+    }
+
+    assert counts_by_label["Pb"] == {"Pb": 1}
+    assert counts_by_label["Pb2I"] == {"I": 1, "O": 1, "Pb": 2}
+    assert counts_by_label["Pb3I2"] == {"I": 2, "O": 2, "Pb": 3}
+
+
+def test_clusterdynamicsml_pdb_mode_writes_full_predicted_pdb_structures(
+    tmp_path,
+):
+    frames_dir = _build_pdb_frames_dir(tmp_path)
+    clusters_dir = _build_pdb_clusters_dir(tmp_path)
+    experimental_data_file = _write_experimental_data_file(tmp_path)
+
+    result = ClusterDynamicsMLWorkflow(
+        frames_dir,
+        atom_type_definitions=PDB_ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PDB_PAIR_CUTOFFS,
+        clusters_dir=clusters_dir,
+        experimental_data_file=experimental_data_file,
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=1,
+        target_node_counts=(4,),
+        pdb_shell_reference_definitions=PDB_SHELL_REFERENCE_DEFINITIONS,
+    ).analyze()
+
+    assert result.saxs_comparison is not None
+    assert result.saxs_comparison.predicted_structure_dir is not None
+    predicted_entries = [
+        entry
+        for entry in result.saxs_comparison.component_weights
+        if entry.source == "predicted"
+    ]
+
+    assert predicted_entries
+    assert all(
+        entry.structure_path is not None
+        and entry.structure_path.suffix == ".pdb"
+        and entry.structure_path.is_file()
+        for entry in predicted_entries
+    )
+    first_pdb = predicted_entries[0].structure_path.read_text(encoding="utf-8")
+    assert " DMF " in first_pdb
+    assert " O1 " in first_pdb
+    assert " N1 " in first_pdb
+    assert " C1 " in first_pdb
+
+
+def test_clusterdynamicsml_pdb_mode_injects_anchored_solvents_away_from_solute_and_avoids_clashes(
+    tmp_path,
+):
+    frames_dir = _build_pdb_frames_dir(tmp_path)
+    workflow = ClusterDynamicsMLWorkflow(
+        frames_dir,
+        atom_type_definitions=PDB_ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PDB_PAIR_CUTOFFS,
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=1,
+        target_node_counts=(2,),
+        pdb_shell_reference_definitions=PDB_SHELL_REFERENCE_DEFINITIONS,
+    )
+    prediction = clusterdynamicsml_workflow_module.PredictedClusterCandidate(
+        target_node_count=2,
+        rank=1,
+        label="PbIO2",
+        element_counts={"Pb": 1, "I": 1, "O": 2},
+        predicted_mean_count_per_frame=1.0,
+        predicted_occupancy_fraction=1.0,
+        predicted_mean_lifetime_fs=10.0,
+        predicted_association_rate_per_ps=0.0,
+        predicted_dissociation_rate_per_ps=0.0,
+        predicted_mean_radius_of_gyration=1.0,
+        predicted_mean_max_radius=1.0,
+        predicted_mean_semiaxis_a=1.0,
+        predicted_mean_semiaxis_b=1.0,
+        predicted_mean_semiaxis_c=1.0,
+        predicted_population_share=1.0,
+        predicted_stability_score=1.0,
+        source_label=None,
+        notes="",
+        generated_elements=("Pb", "I", "O", "O"),
+        generated_coordinates=np.asarray(
+            [
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (0.0, 1.2, 0.0),
+                (1.05, 1.25, 0.7),
+            ],
+            dtype=float,
+        ),
+    )
+
+    atoms = workflow._build_predicted_pdb_atoms(
+        prediction,
+        source_observation=None,
+    )
+    solvent_residues: dict[int, list[PDBAtom]] = {}
+    for atom in atoms:
+        if atom.residue_name != "DMF":
+            continue
+        solvent_residues.setdefault(atom.residue_number, []).append(atom)
+
+    assert len(solvent_residues) == 2
+    solute_centroid = np.mean(
+        np.asarray(
+            [atom.coordinates for atom in atoms if atom.residue_name != "DMF"],
+            dtype=float,
+        ),
+        axis=0,
+    )
+    residue_atoms = list(solvent_residues.values())
+    for residue_atoms_entry in residue_atoms:
+        anchor = next(
+            atom
+            for atom in residue_atoms_entry
+            if atom.atom_name.strip() == "O1"
+        )
+        non_anchor_coordinates = np.asarray(
+            [
+                atom.coordinates
+                for atom in residue_atoms_entry
+                if atom.atom_name.strip() != "O1"
+            ],
+            dtype=float,
+        )
+        assert non_anchor_coordinates.size > 0
+        outward_vector = (
+            np.mean(non_anchor_coordinates, axis=0) - anchor.coordinates
+        )
+        anchor_outward = anchor.coordinates - solute_centroid
+        assert float(np.dot(outward_vector, anchor_outward)) > 0.0
+
+    first_residue_atoms = np.asarray(
+        [atom.coordinates for atom in residue_atoms[0]],
+        dtype=float,
+    )
+    second_residue_atoms = np.asarray(
+        [atom.coordinates for atom in residue_atoms[1]],
+        dtype=float,
+    )
+    residue_distances = np.linalg.norm(
+        first_residue_atoms[:, np.newaxis, :]
+        - second_residue_atoms[np.newaxis, :, :],
+        axis=2,
+    )
+    assert float(np.min(residue_distances)) >= 1.2
+
+
+def test_clusterdynamicsml_main_window_exposes_pdb_shell_reference_editor(
+    qapp,
+):
+    del qapp
+    window = ClusterDynamicsMLMainWindow()
+    window.definitions_panel.set_frame_mode("pdb")
+    window.definitions_panel.load_atom_type_definitions(
+        PDB_ATOM_TYPE_DEFINITIONS,
+        emit_signal=False,
+    )
+
+    table = window.definitions_panel.shell_reference_table
+    assert not window.definitions_panel.shell_reference_group.isHidden()
+    assert table.rowCount() == 1
+    assert table.columnCount() == 3
+
+    reference_combo = table.cellWidget(0, 2)
+    assert isinstance(reference_combo, QComboBox)
+
+    reference_combo.setCurrentText("dmf")
+
+    assert window.definitions_panel.shell_reference_definitions() == (
+        PDBShellReferenceDefinition(
+            shell_element="O",
+            shell_residue="DMF",
+            reference_name="dmf",
+        ),
+    )
+
+
 def test_clusterdynamicsml_dataset_round_trip(tmp_path):
     frames_dir = _build_frames_dir(tmp_path)
     clusters_dir = _build_clusters_dir(tmp_path)
@@ -1642,6 +2077,14 @@ def test_clusterdynamicsml_window_stores_runtime_training_history_and_updates_pr
         initial_clusters_dir=clusters_dir,
         initial_experimental_data_file=experimental_data_file,
     )
+    window.definitions_panel.load_atom_type_definitions(
+        ATOM_TYPE_DEFINITIONS,
+        emit_signal=False,
+    )
+    window.definitions_panel.load_pair_cutoff_definitions(
+        PAIR_CUTOFFS,
+        emit_signal=False,
+    )
     config = window._build_job_config()
     preview = window._build_preview_workflow().preview_selection()
 
@@ -1683,6 +2126,7 @@ def test_clusterdynamicsml_window_autosaves_and_restores_project_result_bundle(
     frames_dir = _build_frames_dir(tmp_path)
     clusters_dir = _build_clusters_dir(tmp_path)
     experimental_data_file = _write_experimental_data_file(tmp_path)
+    energy_file = _write_energy_file(tmp_path)
     project_dir = _build_project_dir(
         tmp_path,
         clusters_dir=clusters_dir,
@@ -1701,12 +2145,21 @@ def test_clusterdynamicsml_window_autosaves_and_restores_project_result_bundle(
 
     window = ClusterDynamicsMLMainWindow(
         initial_frames_dir=frames_dir,
+        initial_energy_file=energy_file,
         initial_project_dir=project_dir,
     )
     window.time_panel.set_frame_timestep_fs(10.0)
     window.time_panel.set_frames_per_colormap_timestep(1)
     window.prediction_panel.set_target_node_counts((4, 5))
     window._on_run_finished(result)
+
+    saved_settings = SAXSProjectManager().load_project(project_dir)
+    assert saved_settings.resolved_frames_dir == frames_dir.resolve()
+    assert saved_settings.resolved_clusters_dir == clusters_dir.resolve()
+    assert saved_settings.resolved_energy_file == energy_file.resolve()
+    assert saved_settings.frames_dir_snapshot is not None
+    assert saved_settings.clusters_dir_snapshot is not None
+    assert saved_settings.energy_file_snapshot is not None
 
     saved_results_dir = (
         build_project_paths(project_dir).exported_data_dir
@@ -1826,6 +2279,34 @@ def test_clusterdynamicsml_window_compares_prediction_history_and_defaults_to_la
     assert reopened._selected_history_dataset_file() == second_dataset
     assert reopened._last_result.preview.target_node_counts == (4, 5)
     reopened.close()
+
+
+def test_clusterdynamicsml_window_history_panel_collapses_and_right_pane_scrolls(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    frames_dir = _build_frames_dir(tmp_path)
+
+    window = ClusterDynamicsMLMainWindow(initial_frames_dir=frames_dir)
+
+    assert isinstance(window.right_scroll_area, QScrollArea)
+    assert window.right_scroll_area.widget() is not None
+    assert not window.history_content.isHidden()
+    assert window.history_toggle_button.text() == "Collapse History"
+
+    window.history_toggle_button.click()
+
+    assert window.history_content.isHidden()
+    assert window.history_toggle_button.text() == "Expand History"
+    assert window.history_group.maximumHeight() == 72
+
+    window.history_toggle_button.click()
+
+    assert not window.history_content.isHidden()
+    assert window.history_toggle_button.text() == "Collapse History"
+    assert window.history_group.minimumHeight() == 180
+    window.close()
 
 
 def test_clusterdynamicsml_window_loads_history_entries_off_ui_thread(
@@ -2088,30 +2569,25 @@ def test_clusterdynamicsml_window_inherits_project_defaults(
     frames_dir = _build_frames_dir(tmp_path)
     clusters_dir = _build_clusters_dir(tmp_path)
     experimental_data_file = _write_experimental_data_file(tmp_path)
+    energy_file = _write_energy_file(tmp_path)
     project_dir = _build_project_dir(
         tmp_path,
+        frames_dir=frames_dir,
         clusters_dir=clusters_dir,
         experimental_data_file=experimental_data_file,
+        energy_file=energy_file,
     )
 
-    window = ClusterDynamicsMLMainWindow(
-        initial_frames_dir=frames_dir,
-        initial_project_dir=project_dir,
-    )
-    window.time_panel.set_frame_timestep_fs(10.0)
-    window.time_panel.set_frames_per_colormap_timestep(1)
-    window.prediction_panel.set_target_node_counts((4, 5))
-    window._refresh_selection_preview()
-    preview_text = window.run_panel.selection_box.toPlainText()
+    window = ClusterDynamicsMLMainWindow(initial_project_dir=project_dir)
 
     assert window.dataset_panel.project_dir() == project_dir
+    assert window.trajectory_panel.get_frames_dir() == frames_dir
     assert window.prediction_panel.clusters_dir() == clusters_dir
     assert (
         window.prediction_panel.experimental_data_file()
         == experimental_data_file
     )
-    assert "Observed node counts: (1, 2, 3)" in preview_text
-    assert "Target node counts: (4, 5)" in preview_text
+    assert window.run_panel.energy_file() == energy_file
     window.close()
 
 
@@ -2217,6 +2693,9 @@ def test_clusterdynamicsml_window_shows_observed_lifetime_tab(
         window.debye_waller_table.item(row, 5).text()
         for row in range(window.debye_waller_table.rowCount())
     ]
+    sigma_sq_header = window.debye_waller_table.horizontalHeaderItem(7).text()
+    sigma_value = float(window.debye_waller_table.item(0, 6).text())
+    sigma_sq_value = float(window.debye_waller_table.item(0, 7).text())
 
     assert tab_titles == [
         "Summary",
@@ -2234,6 +2713,8 @@ def test_clusterdynamicsml_window_shows_observed_lifetime_tab(
     assert "Pb3I2" in lifetime_labels
     assert "Pb-Pb" in debye_pairs
     assert "Predicted" in lifetime_types
+    assert sigma_sq_header == "Sigma^2 (A^2)"
+    assert sigma_sq_value == pytest.approx(sigma_value**2, abs=1e-5)
     assert all(weight != "n/a" for weight in observed_only_weights)
     assert window.lifetime_table.item(0, 8) is not None
     window.close()

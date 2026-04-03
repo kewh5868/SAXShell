@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .base import FrameRecord, TrajectoryBackend
+from .base import FrameMetadata, FrameRecord, TrajectoryBackend
 
 TIME_PATTERNS = (
     re.compile(
@@ -42,11 +42,19 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
         self.file_type = suffix.lstrip(".")
 
     def inspect(self) -> dict[str, object]:
+        frame_metadata = self.load_frame_metadata()
         return {
             "input_file": str(self.input_file),
             "file_type": self.file_type,
-            "n_frames": self._estimate_frame_count(),
+            "n_frames": len(frame_metadata),
         }
+
+    def iter_frame_metadata(self) -> list[FrameMetadata]:
+        if self.file_type == "xyz":
+            return self._parse_xyz_frame_metadata()
+        if self.file_type == "pdb":
+            return self._parse_pdb_frame_metadata()
+        raise ValueError("Unsupported CP2K trajectory file type.")
 
     def iter_frames(self) -> list[FrameRecord]:
         if self.file_type == "xyz":
@@ -97,6 +105,66 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
                         if not handle.readline():
                             break
         return count
+
+    def _parse_xyz_frame_metadata(self) -> list[FrameMetadata]:
+        frames: list[FrameMetadata] = []
+        frame_idx = 0
+
+        with self.input_file.open("r") as handle:
+            while True:
+                line = handle.readline()
+                if not line:
+                    break
+
+                stripped = line.strip()
+                if not stripped:
+                    continue
+
+                if stripped.startswith("frame") or stripped.startswith(
+                    "NSTEP="
+                ):
+                    atom_count_line = handle.readline()
+                    if not atom_count_line:
+                        break
+                    atom_count_text = atom_count_line.strip()
+                    if not atom_count_text.isdigit():
+                        continue
+                    frames.append(
+                        FrameMetadata(
+                            frame_index=frame_idx,
+                            time_fs=self._parse_time_from_header(line),
+                        )
+                    )
+                    frame_idx += 1
+                    for _ in range(int(atom_count_text)):
+                        if not handle.readline():
+                            break
+                    continue
+
+                if not stripped.isdigit():
+                    continue
+
+                atom_count = int(stripped)
+                comment = handle.readline()
+                time_val = (
+                    None
+                    if not comment
+                    else self._parse_time_from_metadata(comment)
+                )
+                frames.append(
+                    FrameMetadata(
+                        frame_index=frame_idx,
+                        time_fs=time_val,
+                    )
+                )
+                frame_idx += 1
+                if not comment:
+                    break
+                for _ in range(atom_count):
+                    if not handle.readline():
+                        break
+
+        return frames
 
     def _parse_xyz_frames(self) -> list[FrameRecord]:
         lines = self.input_file.read_text().splitlines(keepends=True)
@@ -202,6 +270,19 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
                 if line.startswith("MODEL"):
                     count += 1
         return count
+
+    def _parse_pdb_frame_metadata(self) -> list[FrameMetadata]:
+        frames: list[FrameMetadata] = []
+        frame_idx = 0
+        with self.input_file.open("r") as handle:
+            for line in handle:
+                if not line.startswith("MODEL"):
+                    continue
+                frames.append(
+                    FrameMetadata(frame_index=frame_idx, time_fs=None)
+                )
+                frame_idx += 1
+        return frames
 
     def _parse_pdb_frames(self) -> list[FrameRecord]:
         frames: list[FrameRecord] = []

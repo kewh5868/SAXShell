@@ -1,0 +1,50 @@
+{
+  "presets": {
+    "Perovskite (DMF) - Partial Solvent": {
+      "atom_type_definitions": {
+        "node": [
+          {
+            "element": "Pb",
+            "residue": null
+          }
+        ],
+        "linker": [
+          {
+            "element": "I",
+            "residue": null
+          }
+        ],
+        "shell": [
+          {
+            "element": "O",
+            "residue": null
+          }
+        ]
+      },
+      "pair_cutoff_definitions": [
+        {
+          "atom1": "Pb",
+          "atom2": "I",
+          "shell_cutoffs": {
+            "0": 3.36
+          }
+        },
+        {
+          "atom1": "Pb",
+          "atom2": "O",
+          "shell_cutoffs": {
+            "0": 3.36
+          }
+        }
+      ],
+      "options": {
+        "use_pbc": false,
+        "search_mode": "kdtree",
+        "save_state_frequency": 1000,
+        "shell_growth_levels": [],
+        "shared_shells": false,
+        "include_shell_atoms_in_stoichiometry": false
+      }
+    }
+  }
+}

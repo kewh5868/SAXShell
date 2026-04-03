@@ -23,6 +23,7 @@ The documentation is organized by workflow rather than by source file, so the
 best starting points are:
 
 - [Getting Started](https://kewh5868.github.io/SAXSShell/getting-started/installation/)
+- [XYZ to PDB Conversion](https://kewh5868.github.io/SAXSShell/user-guide/xyz2pdb-conversion/)
 - [SAXS Prefit](https://kewh5868.github.io/SAXSShell/user-guide/saxs-prefit/)
 - [pyDREAM Workflow](https://kewh5868.github.io/SAXSShell/user-guide/pydream-workflow/)
 - [Template System](https://kewh5868.github.io/SAXSShell/user-guide/template-system/)

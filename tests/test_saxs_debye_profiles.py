@@ -350,3 +350,72 @@ def test_build_profiles_loads_only_one_single_atom_structure(
     assert debye_counter["count"] == 1
     assert len(components) == 1
     assert components[0].file_count == 4
+
+
+def test_build_profiles_reports_average_kept_atoms_after_exclusion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clusters_dir = tmp_path / "clusters"
+    cluster_dir = clusters_dir / "PbI2"
+    cluster_dir.mkdir(parents=True)
+    for index in range(2):
+        (cluster_dir / f"frame_{index:04d}.xyz").write_text(
+            "4\ncomment\nPb 0.0 0.0 0.0\nI 2.0 0.0 0.0\nO 0.0 2.0 0.0\nH 0.0 0.0 1.0\n",
+            encoding="utf-8",
+        )
+
+    q_values = np.asarray([0.05, 0.15], dtype=float)
+    progress_updates: list[tuple[int, int, str]] = []
+
+    def fake_build_f0_dictionary(elements, q_values):
+        del q_values
+        return {str(element): np.ones(2, dtype=float) for element in elements}
+
+    def fake_compute_debye_intensity(
+        coordinates,
+        elements,
+        q_values,
+        *,
+        exclude_elements=None,
+        f0_dictionary=None,
+    ):
+        del coordinates, elements, exclude_elements, f0_dictionary
+        return np.asarray(q_values, dtype=float) + 1.0
+
+    monkeypatch.setattr(
+        profiles,
+        "build_f0_dictionary",
+        fake_build_f0_dictionary,
+    )
+    monkeypatch.setattr(
+        profiles,
+        "compute_debye_intensity",
+        fake_compute_debye_intensity,
+    )
+
+    builder = DebyeProfileBuilder(
+        q_values=q_values,
+        output_dir=tmp_path / "components",
+        exclude_elements=["O", "H"],
+    )
+
+    components = builder.build_profiles(
+        clusters_dir,
+        progress_callback=lambda processed, total, message: progress_updates.append(
+            (processed, total, message)
+        ),
+    )
+
+    assert len(components) == 1
+    summary_messages = [
+        message
+        for _processed, _total, message in progress_updates
+        if "avg kept N=" in message
+    ]
+    assert summary_messages
+    assert "PbI2" in summary_messages[-1]
+    assert "avg kept N=2.0" in summary_messages[-1]
+    assert "loaded avg 4.0" in summary_messages[-1]
+    assert "50.0% excluded" in summary_messages[-1]
+    assert "avg pairs ~1.0" in summary_messages[-1]

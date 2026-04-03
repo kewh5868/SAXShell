@@ -25,6 +25,6 @@ class MDTrajectoryAppState:
     selected_cutoff_fs: float | None = None
 
     output_dir: Path | None = None
-    use_cutoff_for_export: bool = False
+    use_cutoff_for_export: bool = True
     use_post_cutoff_stride: bool = False
     post_cutoff_stride: int = 1

@@ -439,7 +439,10 @@ def _build_validation_project(
         )
         settings.clusters_dir = str(clusters_dir)
         settings.selected_model_template = spec.name
-        manager.save_project(settings)
+        manager.save_project(
+            settings,
+            refresh_registered_paths=False,
+        )
         if spec.cluster_geometry_support.supported:
             save_cluster_geometry_metadata(
                 paths.cluster_geometry_metadata_file,
@@ -505,7 +508,10 @@ def _build_validation_project(
         persistent_settings.clusters_dir = str(
             persistent_paths.project_dir / "clusters"
         )
-        manager.save_project(persistent_settings)
+        manager.save_project(
+            persistent_settings,
+            refresh_registered_paths=False,
+        )
         return persistent_project_dir
 
 

@@ -9,6 +9,11 @@ preview. It combines:
 - built SAXS components
 - optional cluster geometry metadata
 
+In practice, Prefit assumes the project already points at a usable
+cluster-derived component set and an active template. The supporting
+applications prepare those upstream inputs before the main SAXS UI turns them
+into a model preview.
+
 ## What you can do in Prefit
 
 From the current UI implementation, Prefit supports:
@@ -385,6 +390,15 @@ from a mismatch between:
 - partially pre-subtracted or otherwise inconsistently reduced solvent traces
 - the possible need for a separate empirical solvent-normalization factor in
   addition to the attenuation scaling
+
+## Related pages
+
+- [Project Configuration](project-configuration.md)
+- [Cluster Extraction](cluster-extraction.md)
+- [Template System](template-system.md)
+- [Pre-loaded SAXS Models](preloaded-saxs-models.md)
+- [LMFit Workflow](lmfit-workflow.md)
+- [pyDREAM Workflow](pydream-workflow.md)
 
 ## References
 

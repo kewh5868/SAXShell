@@ -4,6 +4,9 @@ The **SAXS DREAM Fit** tab is the posterior-sampling side of SAXSShell. It uses
 the current project, Prefit parameter table, and active template runtime inputs
 to generate a pyDREAM bundle and launch a Bayesian refinement.
 
+Like Prefit, DREAM depends on the upstream component and geometry inputs
+prepared earlier in the main UI workflow and by the supporting applications.
+
 SAXSShell uses **pyDREAM**, a Python implementation of the
 **MT-DREAM(ZS)** sampler. In plain language, pyDREAM runs several Markov chains
 at once, explores parameter space, and then uses the accepted samples to
@@ -564,6 +567,14 @@ need to be Gaussian for the percentiles themselves to remain meaningful.
   sampler parameters.
 - Rewrite the runtime bundle after changing priors, vary flags, geometry state,
   or template settings.
+
+## Related pages
+
+- [Project Configuration](project-configuration.md)
+- [Cluster Extraction](cluster-extraction.md)
+- [Template System](template-system.md)
+- [SAXS Prefit](saxs-prefit.md)
+- [Results and Export](results-and-export.md)
 
 ## References
 

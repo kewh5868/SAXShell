@@ -21,12 +21,20 @@ EXPORT_METADATA_FILENAME = "mdtrajectory_export.json"
 def suggest_output_dir(
     trajectory_file: str | Path,
     *,
+    preview: FrameSelectionPreview | None = None,
     cutoff_fs: float | None = None,
 ) -> Path:
     """Suggest a new export directory beside the source trajectory."""
     source_path = Path(trajectory_file)
     parent_dir = source_path.parent
-    folder_name = _base_output_dir_name(source_path, cutoff_fs=cutoff_fs)
+    folder_name = _base_output_dir_name(
+        source_path,
+        first_frame_index=(
+            None if preview is None else preview.first_frame_index
+        ),
+        first_time_fs=None if preview is None else preview.first_time_fs,
+        cutoff_fs=cutoff_fs,
+    )
     return next_available_output_dir(parent_dir, folder_name)
 
 
@@ -49,12 +57,14 @@ def format_cutoff_for_dir(cutoff_fs: float) -> str:
     """Format a cutoff value so it is safe to embed in a directory
     name."""
     rounded = f"{cutoff_fs:.3f}".rstrip("0").rstrip(".")
-    return sub(r"[^0-9A-Za-z]+", "_", rounded)
+    return sub(r"[^0-9A-Za-z]+", "p", rounded)
 
 
 def _base_output_dir_name(
     trajectory_file: Path,
     *,
+    first_frame_index: int | None = None,
+    first_time_fs: float | None = None,
     cutoff_fs: float | None = None,
 ) -> str:
     suffix = trajectory_file.suffix.lower()
@@ -65,11 +75,19 @@ def _base_output_dir_name(
     else:
         base_name = "splitframes"
 
+    if first_frame_index is not None and first_time_fs is not None:
+        time_text = format_cutoff_for_dir(first_time_fs)
+        return f"{base_name}_f{first_frame_index}_t{time_text}fs"
+
+    if first_time_fs is not None:
+        time_text = format_cutoff_for_dir(first_time_fs)
+        return f"{base_name}_t{time_text}fs"
+
     if cutoff_fs is None:
         return base_name
 
     cutoff_text = format_cutoff_for_dir(cutoff_fs)
-    return f"{base_name}_f{cutoff_text}fs"
+    return f"{base_name}_t{cutoff_text}fs"
 
 
 @dataclass(slots=True)
@@ -233,6 +251,7 @@ class MDTrajectoryWorkflow:
             if output_dir is not None
             else suggest_output_dir(
                 self.trajectory_file,
+                preview=preview,
                 cutoff_fs=applied_cutoff_fs,
             )
         )

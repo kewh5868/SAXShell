@@ -198,10 +198,10 @@ class ClusterDynamicsTimePanel(QGroupBox):
 
         self.folder_start_time_spin = self._make_optional_time_spin(
             "Auto-populated from mdtrajectory export metadata or a folder "
-            "name such as splitxyz_f847fs. This value is shown as the "
-            "folder/start cutoff metadata and is used as a fallback origin "
-            "when frame filenames do not expose the original source-frame "
-            "indices."
+            "name such as splitxyz_f995_t497p5fs. This value is shown as "
+            "the folder/start cutoff metadata and is used as a fallback "
+            "origin when frame filenames do not expose the original "
+            "source-frame indices."
         )
         self.folder_start_time_spin.valueChanged.connect(
             lambda _value: self.settings_changed.emit()
@@ -735,6 +735,19 @@ class ClusterDynamicsMainWindow(QMainWindow):
             self.run_panel.energy_path_edit.setText(str(initial_energy_file))
         if initial_project_dir is not None:
             self.dataset_panel.set_project_dir(initial_project_dir)
+        self._sync_project_defaults()
+
+    def closeEvent(self, event) -> None:
+        if self._run_thread is not None and self._run_thread.isRunning():
+            QMessageBox.warning(
+                self,
+                "Cluster Dynamics",
+                "Please wait for the current cluster-dynamics analysis to "
+                "finish before closing this window.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell (clusterdynamics)")
@@ -811,6 +824,9 @@ class ClusterDynamicsMainWindow(QMainWindow):
         self.trajectory_panel.settings_changed.connect(
             self._refresh_selection_preview
         )
+        self.trajectory_panel.frames_dir_edit.editingFinished.connect(
+            self._register_project_inputs
+        )
         self.time_panel.settings_changed.connect(
             self._refresh_selection_preview
         )
@@ -819,6 +835,9 @@ class ClusterDynamicsMainWindow(QMainWindow):
         )
         self.run_panel.settings_changed.connect(
             self._refresh_selection_preview
+        )
+        self.run_panel.energy_path_edit.editingFinished.connect(
+            self._register_project_inputs
         )
         self.run_panel.analyze_requested.connect(self.run_analysis)
         self.dataset_panel.save_dataset_requested.connect(self.save_dataset)
@@ -831,6 +850,9 @@ class ClusterDynamicsMainWindow(QMainWindow):
         )
         self.dataset_panel.save_powerpoint_requested.connect(
             self.save_powerpoint_report
+        )
+        self.dataset_panel.settings_changed.connect(
+            self._on_project_dir_changed
         )
 
         self.run_panel.set_selection_summary(
@@ -975,7 +997,14 @@ class ClusterDynamicsMainWindow(QMainWindow):
         )
         self._populate_summary_box(result)
         self._populate_label_table(result)
-        self.statusBar().showMessage("Cluster dynamics analysis complete")
+        registration_message = self._register_project_inputs()
+        if registration_message is not None:
+            self.run_panel.append_log(registration_message)
+        self.statusBar().showMessage(
+            "Cluster dynamics analysis complete"
+            if registration_message is None
+            else "Cluster dynamics analysis complete and project defaults updated"
+        )
 
     def _on_run_failed(self, message: str) -> None:
         self.statusBar().showMessage("Cluster dynamics analysis failed")
@@ -1790,6 +1819,79 @@ class ClusterDynamicsMainWindow(QMainWindow):
         if not levels:
             return "core only"
         return ", ".join(str(level) for level in levels)
+
+    def _on_project_dir_changed(self) -> None:
+        changed = self._sync_project_defaults()
+        if changed:
+            self._refresh_selection_preview()
+
+    def _sync_project_defaults(self) -> bool:
+        project_dir = self.dataset_panel.project_dir()
+        if project_dir is None:
+            return False
+        project_file = build_project_paths(project_dir).project_file
+        if not project_file.is_file():
+            return False
+        try:
+            settings = self._project_manager.load_project(project_dir)
+        except Exception:
+            return False
+        changed = False
+        if (
+            self.trajectory_panel.get_frames_dir() is None
+            and settings.resolved_frames_dir is not None
+        ):
+            self.trajectory_panel.frames_dir_edit.setText(
+                str(settings.resolved_frames_dir)
+            )
+            changed = True
+        if (
+            self.run_panel.energy_file() is None
+            and settings.resolved_energy_file is not None
+        ):
+            self.run_panel.energy_path_edit.setText(
+                str(settings.resolved_energy_file)
+            )
+            changed = True
+        return changed
+
+    def _register_project_inputs(self) -> str | None:
+        project_dir = self.dataset_panel.project_dir()
+        if project_dir is None:
+            return None
+        project_file = build_project_paths(project_dir).project_file
+        if not project_file.is_file():
+            return None
+        try:
+            settings = self._project_manager.load_project(project_dir)
+            frames_dir = self.trajectory_panel.get_frames_dir()
+            energy_file = self.run_panel.energy_file()
+            settings.frames_dir = (
+                None
+                if frames_dir is None
+                else str(Path(frames_dir).expanduser().resolve())
+            )
+            settings.energy_file = (
+                None
+                if energy_file is None
+                else str(Path(energy_file).expanduser().resolve())
+            )
+            self._project_manager.save_project(settings)
+        except Exception as exc:
+            return (
+                "Analysis finished, but the project frames/energy "
+                f"references could not be updated: {exc}"
+            )
+        updates: list[str] = []
+        if frames_dir is not None:
+            updates.append(f"frames={Path(frames_dir).expanduser().resolve()}")
+        if energy_file is not None:
+            updates.append(
+                f"energy={Path(energy_file).expanduser().resolve()}"
+            )
+        if not updates:
+            return None
+        return "Updated project references: " + ", ".join(updates)
 
     def _handle_error(self, title: str, message: str) -> None:
         self.run_panel.append_log(f"{title}: {message}")

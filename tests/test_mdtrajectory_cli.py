@@ -8,6 +8,28 @@ from saxshell.mdtrajectory.cli import main as mdtrajectory_main
 from saxshell.saxshell import main as saxshell_main
 
 
+def _write_uniform_time_xyz(
+    path: Path,
+    *,
+    n_frames: int,
+    timestep_fs: float,
+) -> None:
+    lines: list[str] = []
+    for frame_index in range(n_frames):
+        lines.extend(
+            [
+                "1\n",
+                (
+                    "i = "
+                    f"{frame_index}, time = {frame_index * timestep_fs:.3f}, "
+                    "E = -1.0\n"
+                ),
+                "H 0.0 0.0 0.0\n",
+            ]
+        )
+    path.write_text("".join(lines), encoding="utf-8")
+
+
 def _write_sample_xyz(path: Path) -> None:
     path.write_text(
         "2\n"
@@ -62,7 +84,7 @@ def test_workflow_supports_notebook_style_end_to_end_usage(tmp_path):
 
     assert summary["n_frames"] == 4
     assert suggested.cutoff_time_fs == 50.0
-    assert selection.output_dir == tmp_path / "splitxyz_f50fs"
+    assert selection.output_dir == tmp_path / "splitxyz_f1_t50fs"
     assert selection.preview.selected_frames == 3
     assert export.output_dir == selection.output_dir
     assert (
@@ -115,6 +137,28 @@ def test_workflow_can_keep_every_nth_frame_after_cutoff(tmp_path):
     ]
 
 
+def test_workflow_names_cutoff_exports_from_first_selected_frame_and_time(
+    tmp_path,
+):
+    trajectory_file = tmp_path / "traj.xyz"
+    _write_uniform_time_xyz(
+        trajectory_file,
+        n_frames=1005,
+        timestep_fs=0.5,
+    )
+
+    workflow = MDTrajectoryWorkflow(trajectory_file=trajectory_file)
+
+    selection = workflow.preview_selection(
+        use_cutoff=True,
+        cutoff_fs=497.5,
+    )
+
+    assert selection.preview.first_frame_index == 995
+    assert selection.preview.first_time_fs == 497.5
+    assert selection.output_dir == tmp_path / "splitxyz_f995_t497p5fs"
+
+
 def test_mdtrajectory_cli_export_runs_complete_headless_workflow(
     tmp_path,
     capsys,
@@ -141,7 +185,7 @@ def test_mdtrajectory_cli_export_runs_complete_headless_workflow(
     )
 
     captured = capsys.readouterr()
-    output_dir = tmp_path / "splitxyz_f50fs"
+    output_dir = tmp_path / "splitxyz_f1_t50fs"
 
     assert exit_code == 0
     assert "Frame export complete." in captured.out

@@ -12,9 +12,15 @@ from saxshell.toolbox.blender.common import (
     ATOM_STYLE_DEFAULTS,
     DEFAULT_ATOM_STYLE,
     OrientationSpec,
+    style_atom_color,
+    style_neutral_bond_color,
+    style_split_bond_color,
 )
 from saxshell.toolbox.blender.ui.main_window import (
     BlenderXYZRendererMainWindow,
+    _preview_atom_color,
+    _preview_bond_color,
+    _preview_neutral_bond_color,
 )
 from saxshell.toolbox.blender.workflow import (
     BlenderXYZRenderSettings,
@@ -402,3 +408,17 @@ def test_blender_window_defaults_to_paper_gloss_style(
     )
     assert "Glossy" in window.style_hint_label.text()
     window.close()
+
+
+def test_preview_style_colors_stay_in_sync_with_shared_render_helpers():
+    assert _preview_atom_color("C", atom_style="toon_matte") == pytest.approx(
+        style_atom_color("C", atom_style="toon_matte")[:3]
+    )
+    assert _preview_bond_color(
+        "Se", atom_style="crystal_cartoon"
+    ) == pytest.approx(
+        style_split_bond_color("Se", atom_style="crystal_cartoon")[:3]
+    )
+    assert _preview_neutral_bond_color("soft_studio") == pytest.approx(
+        style_neutral_bond_color("soft_studio")[:3]
+    )

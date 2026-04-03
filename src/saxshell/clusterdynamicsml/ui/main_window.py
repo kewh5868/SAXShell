@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
 
 from saxshell.cluster import (
     ExtractedFrameFolderClusterAnalyzer,
+    PDBShellReferenceDefinition,
     detect_frame_folder_mode,
     format_box_dimensions,
     format_search_mode_label,
@@ -73,6 +74,7 @@ from saxshell.saxs.ui.branding import (
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.xyz2pdb import list_reference_library
 
 from ..dataset import (
     LoadedClusterDynamicsMLDataset,
@@ -95,6 +97,10 @@ _OPEN_WINDOWS: list["ClusterDynamicsMLMainWindow"] = []
 _ML_STATUS_PATTERN = re.compile(r"^Step (\d+)/(\d+): (.+)$")
 _RUNTIME_HISTORY_LIMIT = 200
 _UI_REFRESH_DELAY_MS = 225
+_HISTORY_COLLAPSED_HEIGHT = 72
+_HISTORY_EXPANDED_MIN_HEIGHT = 180
+_HISTORY_EXPANDED_DEFAULT_HEIGHT = 170
+_HISTORY_TABLE_MIN_HEIGHT = 150
 _RUNTIME_FEATURE_NAMES = (
     "selected_frames",
     "time_bins",
@@ -130,6 +136,7 @@ class ClusterDynamicsMLJobConfig:
     shared_shells: bool
     include_shell_atoms_in_stoichiometry: bool
     search_mode: str
+    shell_reference_definitions: tuple[PDBShellReferenceDefinition, ...]
     folder_start_time_fs: float | None
     first_frame_time_fs: float
     frame_timestep_fs: float
@@ -185,6 +192,9 @@ class ClusterDynamicsMLWorker(QObject):
                     self.config.include_shell_atoms_in_stoichiometry
                 ),
                 search_mode=self.config.search_mode,
+                pdb_shell_reference_definitions=(
+                    self.config.shell_reference_definitions
+                ),
                 folder_start_time_fs=self.config.folder_start_time_fs,
                 first_frame_time_fs=self.config.first_frame_time_fs,
                 frame_timestep_fs=self.config.frame_timestep_fs,
@@ -664,6 +674,8 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self._active_job_config: ClusterDynamicsMLJobConfig | None = None
         self._active_job_preview: ClusterDynamicsMLPreview | None = None
         self._auto_detected_energy_file: Path | None = None
+        self._history_panel_expanded = True
+        self._history_expanded_splitter_size = _HISTORY_EXPANDED_DEFAULT_HEIGHT
         self._suspend_preview_refresh = False
         self._initializing = True
         self._restoring_project_dataset = False
@@ -718,6 +730,18 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             self._refresh_selection_preview()
 
     def closeEvent(self, event) -> None:
+        if (self._run_thread is not None and self._run_thread.isRunning()) or (
+            self._dataset_load_thread is not None
+            and self._dataset_load_thread.isRunning()
+        ):
+            QMessageBox.warning(
+                self,
+                "Cluster Dynamics (ML)",
+                "Please wait for the active analysis or dataset load to "
+                "finish before closing this window.",
+            )
+            event.ignore()
+            return
         app = QApplication.instance()
         if self._app_event_filter_installed and app is not None:
             app.removeEventFilter(self)
@@ -816,6 +840,8 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self.trajectory_panel = ClusterTrajectoryPanel()
         self.time_panel = ClusterDynamicsTimePanel()
         self.definitions_panel = ClusterDefinitionsPanel()
+        self.definitions_panel.set_shell_reference_editor_enabled(True)
+        self._load_shell_reference_library_entries()
         self.prediction_panel = ClusterDynamicsMLSettingsPanel()
         self.run_panel = ClusterDynamicsRunPanel()
         self.dataset_panel = ClusterDynamicsDatasetPanel()
@@ -866,12 +892,26 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         history_layout = QVBoxLayout(self.history_group)
         history_layout.setContentsMargins(8, 8, 8, 8)
         history_layout.setSpacing(8)
+        history_header_row = QHBoxLayout()
+        history_header_row.setContentsMargins(0, 0, 0, 0)
+        history_header_row.addStretch(1)
+        self.history_toggle_button = QPushButton("Collapse History")
+        self.history_toggle_button.setToolTip(
+            "Collapse or expand the saved prediction history panel."
+        )
+        self.history_toggle_button.clicked.connect(self._toggle_history_panel)
+        history_header_row.addWidget(self.history_toggle_button)
+        history_layout.addLayout(history_header_row)
+        self.history_content = QWidget()
+        history_content_layout = QVBoxLayout(self.history_content)
+        history_content_layout.setContentsMargins(0, 0, 0, 0)
+        history_content_layout.setSpacing(8)
         self.history_status_label = QLabel(
             "Select a project folder to compare saved prediction runs. "
             "The most recent run is plotted by default."
         )
         self.history_status_label.setWordWrap(True)
-        history_layout.addWidget(self.history_status_label)
+        history_content_layout.addWidget(self.history_status_label)
         self.history_table = self._build_table(
             (
                 "Loaded",
@@ -885,7 +925,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 "Dataset",
             )
         )
-        self.history_table.setMinimumHeight(220)
+        self.history_table.setMinimumHeight(_HISTORY_TABLE_MIN_HEIGHT)
         self.history_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
@@ -914,7 +954,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             8,
             QHeaderView.ResizeMode.Stretch,
         )
-        history_layout.addWidget(self.history_table, stretch=1)
+        history_content_layout.addWidget(self.history_table, stretch=1)
         history_button_row = QHBoxLayout()
         history_button_row.setContentsMargins(0, 0, 0, 0)
         self.history_load_button = QPushButton("Plot Selected Prediction")
@@ -928,7 +968,8 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         )
         history_button_row.addWidget(self.history_refresh_button)
         history_button_row.addStretch(1)
-        history_layout.addLayout(history_button_row)
+        history_content_layout.addLayout(history_button_row)
+        history_layout.addWidget(self.history_content, stretch=1)
         self.lifetime_table = self._build_table(
             (
                 "Type",
@@ -960,6 +1001,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 "Label",
                 "Pair",
                 "Sigma (A)",
+                "Sigma^2 (A^2)",
                 "B (A^2)",
                 "Support",
                 "Aligned pairs",
@@ -980,13 +1022,17 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self.right_splitter.addWidget(self.results_tabs)
         self.right_splitter.addWidget(self.history_group)
         self.right_splitter.setStretchFactor(0, 3)
-        self.right_splitter.setStretchFactor(1, 4)
-        self.right_splitter.setStretchFactor(2, 2)
-        self.right_splitter.setSizes([360, 420, 240])
+        self.right_splitter.setStretchFactor(1, 5)
+        self.right_splitter.setStretchFactor(2, 1)
+        self.right_splitter.setSizes(
+            [360, 480, _HISTORY_EXPANDED_DEFAULT_HEIGHT]
+        )
         right_layout.addWidget(self.right_splitter)
+        self._set_history_panel_expanded(True)
 
         splitter.addWidget(self._wrap_scroll_area(left))
-        splitter.addWidget(right)
+        self.right_scroll_area = self._wrap_scroll_area(right)
+        splitter.addWidget(self.right_scroll_area)
         splitter.setSizes([530, 1110])
         root.addWidget(splitter)
         self.setCentralWidget(central)
@@ -998,6 +1044,9 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self.trajectory_panel.frames_dir_changed.connect(
             self._schedule_frames_dir_change
         )
+        self.trajectory_panel.frames_dir_edit.editingFinished.connect(
+            self._register_project_references
+        )
         self.time_panel.settings_changed.connect(
             self._schedule_selection_preview_refresh
         )
@@ -1007,7 +1056,13 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self.prediction_panel.settings_changed.connect(
             self._schedule_selection_preview_refresh
         )
+        self.prediction_panel.clusters_dir_edit.editingFinished.connect(
+            self._register_project_references
+        )
         self.run_panel.analyze_requested.connect(self.run_analysis)
+        self.run_panel.energy_path_edit.editingFinished.connect(
+            self._register_project_references
+        )
         self.dataset_panel.settings_changed.connect(
             self._schedule_project_dir_change
         )
@@ -1035,6 +1090,16 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         )
         self._set_frame_format(None)
         self._update_history_controls()
+
+    def _load_shell_reference_library_entries(self) -> None:
+        try:
+            entries = list_reference_library()
+        except Exception:
+            entries = []
+        self.definitions_panel.set_shell_reference_library_entries(
+            entries,
+            emit_signal=False,
+        )
 
     def inspect_frames_folder(self) -> None:
         frames_dir = self.trajectory_panel.get_frames_dir()
@@ -1097,6 +1162,9 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         frames_dir = self.trajectory_panel.get_frames_dir()
         if frames_dir is None:
             raise ValueError("No extracted frames folder selected.")
+        frame_format = self._frame_format
+        if frame_format is None:
+            frame_format, _detail = self._detect_frame_format(frames_dir)
         atom_type_definitions = self.definitions_panel.atom_type_definitions()
         if not atom_type_definitions:
             raise ValueError(
@@ -1125,6 +1193,11 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                     "Periodic boundary conditions are enabled, but no box "
                     "dimensions are available."
                 )
+        shell_reference_definitions = (
+            self.definitions_panel.shell_reference_definitions()
+            if frame_format == "pdb"
+            else ()
+        )
         return ClusterDynamicsMLJobConfig(
             frames_dir=frames_dir,
             clusters_dir=self.prediction_panel.clusters_dir(),
@@ -1142,6 +1215,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 self.definitions_panel.include_shell_atoms_in_stoichiometry()
             ),
             search_mode=self.definitions_panel.search_mode(),
+            shell_reference_definitions=shell_reference_definitions,
             folder_start_time_fs=self.time_panel.folder_start_time_fs(),
             first_frame_time_fs=self.time_panel.first_frame_time_fs(),
             frame_timestep_fs=self.time_panel.frame_timestep_fs(),
@@ -1368,6 +1442,9 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 runtime_seconds=elapsed_seconds,
             )
         autosaved = self._autosave_project_result(result)
+        registration_message = self._register_project_references()
+        if registration_message is not None:
+            self.run_panel.append_log(registration_message)
         if autosaved is not None:
             self._refresh_project_history_view(
                 select_dataset=autosaved.dataset_file
@@ -1761,6 +1838,13 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             settings = self._project_manager.load_project(project_dir)
         except Exception:
             return
+        if (
+            self.trajectory_panel.get_frames_dir() is None
+            and settings.resolved_frames_dir is not None
+        ):
+            self.trajectory_panel.frames_dir_edit.setText(
+                str(settings.resolved_frames_dir)
+            )
         if self.prediction_panel.clusters_dir() is None:
             self.prediction_panel.set_clusters_dir(
                 settings.resolved_clusters_dir,
@@ -1771,6 +1855,64 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 settings.resolved_experimental_data_path,
                 emit_signal=False,
             )
+        if (
+            self.run_panel.energy_file() is None
+            and settings.resolved_energy_file is not None
+        ):
+            self.run_panel.energy_path_edit.setText(
+                str(settings.resolved_energy_file)
+            )
+
+    def _register_project_references(self) -> str | None:
+        project_dir = self.dataset_panel.project_dir()
+        if project_dir is None:
+            return None
+        project_file = build_project_paths(project_dir).project_file
+        if not project_file.is_file():
+            return None
+        try:
+            settings = self._project_manager.load_project(project_dir)
+            frames_dir = self.trajectory_panel.get_frames_dir()
+            clusters_dir = self.prediction_panel.clusters_dir()
+            energy_file = self.run_panel.energy_file()
+            if frames_dir is not None:
+                settings.frames_dir = str(
+                    Path(frames_dir).expanduser().resolve()
+                )
+            elif not self.trajectory_panel.frames_dir_edit.text().strip():
+                settings.frames_dir = None
+            if clusters_dir is not None:
+                settings.clusters_dir = str(
+                    Path(clusters_dir).expanduser().resolve()
+                )
+            elif not self.prediction_panel.clusters_dir_edit.text().strip():
+                settings.clusters_dir = None
+            if energy_file is not None:
+                settings.energy_file = str(
+                    Path(energy_file).expanduser().resolve()
+                )
+            elif not self.run_panel.energy_path_edit.text().strip():
+                settings.energy_file = None
+            self._project_manager.save_project(settings)
+        except Exception as exc:
+            return (
+                "Analysis finished, but the project references could "
+                f"not be updated: {exc}"
+            )
+        updates: list[str] = []
+        if frames_dir is not None:
+            updates.append(f"frames={Path(frames_dir).expanduser().resolve()}")
+        if clusters_dir is not None:
+            updates.append(
+                f"clusters={Path(clusters_dir).expanduser().resolve()}"
+            )
+        if energy_file is not None:
+            updates.append(
+                f"energy={Path(energy_file).expanduser().resolve()}"
+            )
+        if not updates:
+            return None
+        return "Updated project references: " + ", ".join(updates)
 
     @staticmethod
     def _predict_energy_file_for_frames_dir(
@@ -1872,6 +2014,9 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         frames_dir = self.trajectory_panel.get_frames_dir()
         if frames_dir is None:
             raise ValueError("No extracted frames folder selected.")
+        frame_format = self._frame_format
+        if frame_format is None:
+            frame_format, _detail = self._detect_frame_format(frames_dir)
         manual_box_dimensions = self.definitions_panel.box_dimensions()
         resolved_box_dimensions = manual_box_dimensions
         if (
@@ -1895,6 +2040,11 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 self.definitions_panel.include_shell_atoms_in_stoichiometry()
             ),
             search_mode=self.definitions_panel.search_mode(),
+            pdb_shell_reference_definitions=(
+                self.definitions_panel.shell_reference_definitions()
+                if frame_format == "pdb"
+                else ()
+            ),
             folder_start_time_fs=self.time_panel.folder_start_time_fs(),
             first_frame_time_fs=self.time_panel.first_frame_time_fs(),
             frame_timestep_fs=self.time_panel.frame_timestep_fs(),
@@ -2289,7 +2439,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 )
             if result.saxs_comparison.predicted_structure_dir is not None:
                 lines.append(
-                    "Predicted Structure XYZ files: "
+                    "Predicted structure files: "
                     f"{result.saxs_comparison.predicted_structure_dir}"
                 )
             if result.saxs_comparison.rmse is not None:
@@ -2349,6 +2499,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         rows = list(result.debye_waller_estimates)
         self.debye_waller_table.setRowCount(len(rows))
         for row_index, entry in enumerate(rows):
+            sigma = float(entry.sigma)
             values = (
                 "Observed" if entry.source == "observed" else "Predicted",
                 "Ensemble" if entry.method == "ensemble" else "Ridge",
@@ -2356,7 +2507,8 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 _format_optional_int(entry.candidate_rank),
                 entry.label,
                 f"{entry.element_a}-{entry.element_b}",
-                f"{float(entry.sigma):.5f}",
+                f"{sigma:.5f}",
+                f"{sigma * sigma:.5f}",
                 f"{float(entry.b_factor):.5f}",
                 str(int(entry.support_count)),
                 str(int(entry.aligned_pair_count)),
@@ -2508,6 +2660,57 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             return
         self.history_status_label.setText(
             "Select a row and click Plot Selected Prediction to compare it."
+        )
+
+    def _toggle_history_panel(self) -> None:
+        self._set_history_panel_expanded(not self._history_panel_expanded)
+
+    def _set_history_panel_expanded(self, expanded: bool) -> None:
+        self._history_panel_expanded = bool(expanded)
+        if not expanded:
+            current_sizes = self.right_splitter.sizes()
+            if (
+                len(current_sizes) >= 3
+                and current_sizes[2] > _HISTORY_COLLAPSED_HEIGHT
+            ):
+                self._history_expanded_splitter_size = current_sizes[2]
+        self.history_content.setVisible(expanded)
+        self.history_toggle_button.setText(
+            "Collapse History" if expanded else "Expand History"
+        )
+        self.history_group.setMinimumHeight(
+            _HISTORY_EXPANDED_MIN_HEIGHT
+            if expanded
+            else _HISTORY_COLLAPSED_HEIGHT
+        )
+        self.history_group.setMaximumHeight(
+            16777215 if expanded else _HISTORY_COLLAPSED_HEIGHT
+        )
+        self.history_table.setMinimumHeight(
+            _HISTORY_TABLE_MIN_HEIGHT if expanded else 0
+        )
+        self._apply_history_splitter_size(expanded)
+
+    def _apply_history_splitter_size(self, expanded: bool) -> None:
+        sizes = self.right_splitter.sizes()
+        if len(sizes) != 3:
+            return
+        top_size, middle_size, history_size = sizes
+        total_lower = middle_size + history_size
+        if total_lower <= 0:
+            return
+        target_history_size = (
+            max(
+                self._history_expanded_splitter_size,
+                _HISTORY_EXPANDED_DEFAULT_HEIGHT,
+            )
+            if expanded
+            else _HISTORY_COLLAPSED_HEIGHT
+        )
+        target_history_size = min(target_history_size, total_lower)
+        target_middle_size = max(total_lower - target_history_size, 0)
+        self.right_splitter.setSizes(
+            [top_size, target_middle_size, target_history_size]
         )
 
     def _load_selected_history_entry(self) -> None:
@@ -2831,6 +3034,14 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 self.definitions_panel.include_shell_atoms_in_stoichiometry()
             ),
             "search_mode": self.definitions_panel.search_mode(),
+            "shell_reference_definitions": [
+                {
+                    "shell_element": definition.shell_element,
+                    "shell_residue": definition.shell_residue,
+                    "reference_name": definition.reference_name,
+                }
+                for definition in self.definitions_panel.shell_reference_definitions()
+            ],
             "folder_start_time_fs": self.time_panel.folder_start_time_fs(),
             "first_frame_time_fs": self.time_panel.first_frame_time_fs(),
             "frame_timestep_fs": self.time_panel.frame_timestep_fs(),
@@ -2915,6 +3126,21 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 pair_cutoff_definitions,
                 emit_signal=False,
             )
+            shell_reference_definitions = tuple(
+                PDBShellReferenceDefinition(
+                    shell_element=str(entry.get("shell_element", "")),
+                    shell_residue=_optional_str(entry.get("shell_residue")),
+                    reference_name=str(entry.get("reference_name", "")),
+                    backbone_atom1_name=_optional_str(
+                        entry.get("backbone_atom1_name")
+                    ),
+                    backbone_atom2_name=_optional_str(
+                        entry.get("backbone_atom2_name")
+                    ),
+                )
+                for entry in payload.get("shell_reference_definitions", [])
+                if isinstance(entry, dict)
+            )
             self.definitions_panel.set_box_dimensions(
                 _optional_box_dimensions(payload.get("box_dimensions")),
                 emit_signal=False,
@@ -2943,6 +3169,10 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             )
             self.definitions_panel.set_search_mode(
                 str(payload.get("search_mode", "kdtree")),
+                emit_signal=False,
+            )
+            self.definitions_panel.load_shell_reference_definitions(
+                shell_reference_definitions,
                 emit_signal=False,
             )
             self.time_panel.set_folder_start_time_fs(
@@ -3069,6 +3299,13 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
 
 def _optional_float(value: object) -> float | None:
     return None if value is None else float(value)
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return None if not text else text
 
 
 def _format_optional_float(value: float | None) -> str:

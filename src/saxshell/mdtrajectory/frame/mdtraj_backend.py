@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import mdtraj as md
 
-from .base import FrameRecord, TrajectoryBackend
+from .base import FrameMetadata, FrameRecord, TrajectoryBackend
 
 
 class MDTrajBackend(TrajectoryBackend):
@@ -18,6 +18,18 @@ class MDTrajBackend(TrajectoryBackend):
             "n_frames": traj.n_frames,
             "n_atoms": traj.n_atoms,
         }
+
+    def iter_frame_metadata(self) -> list[FrameMetadata]:
+        traj = self._load()
+        return [
+            FrameMetadata(
+                frame_index=i,
+                time_fs=(
+                    float(traj.time[i]) if traj.time is not None else None
+                ),
+            )
+            for i in range(traj.n_frames)
+        ]
 
     def iter_frames(self) -> list[FrameRecord]:
         traj = self._load()

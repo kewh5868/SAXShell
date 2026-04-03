@@ -117,6 +117,7 @@ class PrefitTab(QWidget):
     PARAMETER_VARY_MEMORY_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 
     template_changed = Signal(str)
+    change_template_requested = Signal(str)
     show_deprecated_templates_changed = Signal(bool)
     autosave_toggled = Signal(bool)
     sequence_history_toggled = Signal(bool)
@@ -218,10 +219,16 @@ class PrefitTab(QWidget):
         self._prefit_execution_enabled = True
         self._updating_parameter_table = False
         self._updating_parameter_scrollbar = False
+        self._parameter_entries_dirty = True
+        self._cached_parameter_entries: list[PrefitParameterEntry] | None = (
+            None
+        )
         self._last_cluster_geometry_radii_type = DEFAULT_RADIUS_TYPE
         self._last_cluster_geometry_ionic_radius_type = (
             DEFAULT_IONIC_RADIUS_TYPE
         )
+        self._active_template_name: str | None = None
+        self._suspend_template_selection_signal = False
         self._build_ui()
         self._install_field_interaction_watchers()
 
@@ -360,18 +367,33 @@ class PrefitTab(QWidget):
         layout.addWidget(self.template_help_button, 0, 2)
         layout.addWidget(self.show_deprecated_templates_checkbox, 0, 3)
 
+        self.active_template_edit = QLineEdit()
+        self.active_template_edit.setReadOnly(True)
+        self.change_template_button = QPushButton("Change Template")
+        self.change_template_button.setEnabled(False)
+        self.change_template_button.clicked.connect(
+            self._emit_change_template_requested
+        )
+        active_row = QWidget()
+        active_layout = QHBoxLayout(active_row)
+        active_layout.setContentsMargins(0, 0, 0, 0)
+        active_layout.addWidget(self.active_template_edit, stretch=1)
+        active_layout.addWidget(self.change_template_button)
+        layout.addWidget(QLabel("Active Template"), 1, 0)
+        layout.addWidget(active_row, 1, 1, 1, 3)
+
         self.method_combo = QComboBox()
         self.method_combo.addItems(
             ["leastsq", "nelder", "powell", "differential_evolution"]
         )
-        layout.addWidget(QLabel("Minimizer"), 1, 0)
-        layout.addWidget(self.method_combo, 1, 1, 1, 2)
+        layout.addWidget(QLabel("Minimizer"), 2, 0)
+        layout.addWidget(self.method_combo, 2, 1, 1, 2)
 
         self.nfev_spin = QSpinBox()
         self.nfev_spin.setRange(100, 10_000_000)
         self.nfev_spin.setValue(10_000)
-        layout.addWidget(QLabel("Max nfev"), 2, 0)
-        layout.addWidget(self.nfev_spin, 2, 1, 1, 2)
+        layout.addWidget(QLabel("Max nfev"), 3, 0)
+        layout.addWidget(self.nfev_spin, 3, 1, 1, 2)
 
         self.sequence_history_checkbox = QCheckBox("Sequence history logger")
         self.sequence_history_checkbox.setChecked(False)
@@ -383,7 +405,7 @@ class PrefitTab(QWidget):
         self.sequence_history_checkbox.toggled.connect(
             self.sequence_history_toggled.emit
         )
-        layout.addWidget(self.sequence_history_checkbox, 3, 0, 1, 3)
+        layout.addWidget(self.sequence_history_checkbox, 4, 0, 1, 3)
 
         self.saved_state_combo = QComboBox()
         self.saved_state_combo.setToolTip(
@@ -404,15 +426,15 @@ class PrefitTab(QWidget):
         restore_layout.setContentsMargins(0, 0, 0, 0)
         restore_layout.addWidget(self.saved_state_combo, stretch=1)
         restore_layout.addWidget(self.restore_state_button)
-        layout.addWidget(QLabel("Saved states"), 4, 0)
-        layout.addWidget(restore_row, 4, 1, 1, 2)
+        layout.addWidget(QLabel("Saved states"), 5, 0)
+        layout.addWidget(restore_row, 5, 1, 1, 2)
 
         self.stoichiometry_status_label = QLabel(
             "Stoichiometry monitor: configure target elements and ratio in "
             "DREAM > Posterior Filtering."
         )
         self.stoichiometry_status_label.setWordWrap(True)
-        layout.addWidget(self.stoichiometry_status_label, 5, 0, 1, 3)
+        layout.addWidget(self.stoichiometry_status_label, 6, 0, 1, 3)
 
         button_grid = QGridLayout()
         self.update_button = QPushButton("Update Model")
@@ -809,8 +831,11 @@ class PrefitTab(QWidget):
         self,
         template_specs: list[TemplateSpec],
         selected_name: str | None,
+        *,
+        active_name: str | None = None,
     ) -> None:
         current_name = selected_name or self.selected_template_name()
+        self._suspend_template_selection_signal = True
         self.template_combo.blockSignals(True)
         self.template_combo.clear()
         for spec in template_specs:
@@ -826,10 +851,29 @@ class PrefitTab(QWidget):
             if index >= 0:
                 self.template_combo.setCurrentIndex(index)
         self.template_combo.blockSignals(False)
+        self.set_active_template(active_name or self._active_template_name)
         self._update_template_tooltip()
+        self._suspend_template_selection_signal = False
 
     def selected_template_name(self) -> str | None:
         return str(self.template_combo.currentData() or "").strip() or None
+
+    def active_template_name(self) -> str | None:
+        return str(self._active_template_name or "").strip() or None
+
+    def set_active_template(
+        self,
+        template_name: str | None,
+        *,
+        sync_selected: bool = False,
+    ) -> None:
+        self._active_template_name = str(template_name or "").strip() or None
+        active_text = self._template_display_text(self._active_template_name)
+        self.active_template_edit.setText(active_text)
+        self.active_template_edit.setToolTip(active_text)
+        if sync_selected and self._active_template_name:
+            self.set_selected_template(self._active_template_name)
+        self._update_template_change_state()
 
     def show_deprecated_templates(self) -> bool:
         return self.show_deprecated_templates_checkbox.isChecked()
@@ -866,15 +910,22 @@ class PrefitTab(QWidget):
 
     def set_saved_states(
         self,
-        state_names: list[str],
+        state_names: list[str] | list[tuple[str, str]],
         selected_name: str | None = None,
     ) -> None:
         current_name = selected_name or self.selected_saved_state_name()
         self.saved_state_combo.blockSignals(True)
         self.saved_state_combo.clear()
-        self.saved_state_combo.addItems(state_names)
+        for state_option in state_names:
+            if isinstance(state_option, tuple):
+                label, state_name = state_option
+            else:
+                label = state_name = state_option
+            self.saved_state_combo.addItem(label, userData=state_name)
         if current_name:
-            index = self.saved_state_combo.findText(current_name)
+            index = self.saved_state_combo.findData(current_name)
+            if index < 0:
+                index = self.saved_state_combo.findText(current_name)
             if index >= 0:
                 self.saved_state_combo.setCurrentIndex(index)
         if self.saved_state_combo.currentIndex() < 0 and state_names:
@@ -889,6 +940,11 @@ class PrefitTab(QWidget):
         )
 
     def selected_saved_state_name(self) -> str | None:
+        data = self.saved_state_combo.currentData()
+        if data is not None:
+            text = str(data).strip()
+            if text:
+                return text
         text = self.saved_state_combo.currentText().strip()
         return text or None
 
@@ -896,6 +952,10 @@ class PrefitTab(QWidget):
         self,
         entries: list[PrefitParameterEntry],
     ) -> None:
+        cached_entries = [
+            PrefitParameterEntry.from_dict(entry.to_dict())
+            for entry in entries
+        ]
         self._updating_parameter_table = True
         self.parameter_table.blockSignals(True)
         try:
@@ -951,6 +1011,8 @@ class PrefitTab(QWidget):
             self.parameter_table.blockSignals(False)
             self._updating_parameter_table = False
         self.parameter_table.resizeRowsToContents()
+        self._cached_parameter_entries = cached_entries
+        self._parameter_entries_dirty = False
         self._refresh_parameter_scroll_panel()
 
     def set_cluster_geometry_visible(self, visible: bool) -> None:
@@ -1198,6 +1260,14 @@ class PrefitTab(QWidget):
         self._update_cluster_geometry_ionic_radius_type_enabled_state()
 
     def parameter_entries(self) -> list[PrefitParameterEntry]:
+        if (
+            not self._parameter_entries_dirty
+            and self._cached_parameter_entries is not None
+        ):
+            return [
+                PrefitParameterEntry.from_dict(entry.to_dict())
+                for entry in self._cached_parameter_entries
+            ]
         entries: list[PrefitParameterEntry] = []
         for row in range(self.parameter_table.rowCount()):
             value_text = self._item_text(row, 3)
@@ -1254,6 +1324,11 @@ class PrefitTab(QWidget):
         finally:
             self.parameter_table.blockSignals(False)
             self._updating_parameter_table = False
+        self._cached_parameter_entries = [
+            PrefitParameterEntry.from_dict(entry.to_dict())
+            for entry in resolved_entries
+        ]
+        self._parameter_entries_dirty = False
         return resolved_entries
 
     def find_parameter_row(self, parameter_name: str) -> int:
@@ -1332,6 +1407,7 @@ class PrefitTab(QWidget):
         finally:
             self.parameter_table.blockSignals(False)
             self._updating_parameter_table = False
+        self._invalidate_parameter_entries_cache()
         self._refresh_parameter_scroll_panel()
 
     def auto_update_on_parameter_change(self) -> bool:
@@ -1344,6 +1420,8 @@ class PrefitTab(QWidget):
         self,
         item: QTableWidgetItem,
     ) -> None:
+        if item.column() in {3, 4, 5, 6}:
+            self._invalidate_parameter_entries_cache()
         if item.column() in {3, 4}:
             self._sync_parameter_row_link_state(item.row())
         if not self._updating_parameter_table and item.column() in {
@@ -1353,9 +1431,11 @@ class PrefitTab(QWidget):
             6,
         }:
             self.parameter_table_edited.emit()
+        resolved_entries_valid = False
         if not self._updating_parameter_table and item.column() in {3, 4}:
             try:
                 self.parameter_entries()
+                resolved_entries_valid = True
             except Exception:
                 pass
         self._refresh_parameter_scroll_panel()
@@ -1363,9 +1443,7 @@ class PrefitTab(QWidget):
             return
         if not self.auto_update_on_parameter_change():
             return
-        try:
-            self.parameter_entries()
-        except Exception:
+        if not resolved_entries_valid:
             return
         self.update_model_requested.emit()
 
@@ -1935,6 +2013,10 @@ class PrefitTab(QWidget):
         finally:
             self.parameter_table.blockSignals(False)
             self._updating_parameter_table = was_updating
+
+    def _invalidate_parameter_entries_cache(self) -> None:
+        self._parameter_entries_dirty = True
+        self._cached_parameter_entries = None
 
     def _redraw_current_plot(self) -> None:
         self.plot_evaluation(self._current_evaluation)
@@ -2610,10 +2692,13 @@ class PrefitTab(QWidget):
         if emit_signal:
             self.template_combo.setCurrentIndex(index)
             return
+        self._suspend_template_selection_signal = True
         self.template_combo.blockSignals(True)
         self.template_combo.setCurrentIndex(index)
         self.template_combo.blockSignals(False)
+        self._suspend_template_selection_signal = False
         self._update_template_tooltip()
+        self._update_template_change_state()
 
     def _render_output(self, *, scroll_to_end: bool = False) -> None:
         del scroll_to_end
@@ -2677,8 +2762,9 @@ class PrefitTab(QWidget):
 
     def _on_template_index_changed(self) -> None:
         self._update_template_tooltip()
+        self._update_template_change_state()
         selected_name = self.selected_template_name()
-        if selected_name:
+        if selected_name and not self._suspend_template_selection_signal:
             self.template_changed.emit(selected_name)
 
     def _update_template_tooltip(self) -> None:
@@ -2686,6 +2772,30 @@ class PrefitTab(QWidget):
             self.template_combo.currentData(Qt.ItemDataRole.ToolTipRole) or ""
         ).strip()
         self.template_combo.setToolTip(description)
+
+    def _template_display_text(self, template_name: str | None) -> str:
+        normalized_name = str(template_name or "").strip()
+        if not normalized_name:
+            return ""
+        index = self._find_template_index(normalized_name)
+        if index >= 0:
+            return self.template_combo.itemText(index).strip()
+        return normalized_name
+
+    def _update_template_change_state(self) -> None:
+        selected_name = self.selected_template_name()
+        active_name = self.active_template_name()
+        self.change_template_button.setEnabled(
+            bool(
+                active_name and selected_name and selected_name != active_name
+            )
+        )
+
+    def _emit_change_template_requested(self) -> None:
+        selected_name = self.selected_template_name()
+        if not selected_name:
+            return
+        self.change_template_requested.emit(selected_name)
 
     def _find_template_index(self, template_name: str) -> int:
         for index in range(self.template_combo.count()):

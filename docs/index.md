@@ -56,7 +56,15 @@ to create your first project quickly.
 ### User guide
 
 Use this section when you already know the rough workflow and need details
-about GUI tabs, file layout, template behavior, or export paths.
+about GUI tabs, file layout, template behavior, export paths, or the
+supporting applications that feed data into the main SAXS UI.
+
+The user guide is split into:
+
+- **Main UI workflow elements** for the `saxshell saxs` application and its
+  project, Prefit, DREAM, template, and export behavior
+- **Supporting applications** for trajectory preparation, cluster analysis,
+  predictive cluster expansion, and PDF calculations that support the main UI
 
 ### Tutorials
 

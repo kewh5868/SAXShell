@@ -66,18 +66,23 @@ nav:
       - Quickstart: getting-started/quickstart.md
       - Project Setup: getting-started/project-setup.md
   - User Guide:
-      - GUI Overview: user-guide/gui-overview.md
-      - Project Configuration: user-guide/project-configuration.md
-      - Cluster Extraction: user-guide/cluster-extraction.md
-      - Cluster Dynamics: user-guide/cluster-dynamics.md
-      - Cluster Dynamics ML: user-guide/cluster-dynamics-ml.md
-      - PDF Calculation: user-guide/pdf-calculation.md
-      - SAXS Prefit: user-guide/saxs-prefit.md
-      - Pre-loaded SAXS Models: user-guide/preloaded-saxs-models.md
-      - LMFit Workflow: user-guide/lmfit-workflow.md
-      - pyDREAM Workflow: user-guide/pydream-workflow.md
-      - Results and Export: user-guide/results-and-export.md
-      - Template System: user-guide/template-system.md
+      - Main UI Workflow Elements:
+          - GUI Overview: user-guide/gui-overview.md
+          - Project Configuration: user-guide/project-configuration.md
+          - Template System: user-guide/template-system.md
+          - Pre-loaded SAXS Models: user-guide/preloaded-saxs-models.md
+          - SAXS Contrast Mode: user-guide/saxs-contrast-mode.md
+          - SAXS Prefit: user-guide/saxs-prefit.md
+          - LMFit Workflow: user-guide/lmfit-workflow.md
+          - pyDREAM Workflow: user-guide/pydream-workflow.md
+          - Results and Export: user-guide/results-and-export.md
+      - Supporting Applications:
+          - Blender Structure Renderer: user-guide/blender-structure-renderer.md
+          - Cluster Extraction: user-guide/cluster-extraction.md
+          - Cluster Dynamics: user-guide/cluster-dynamics.md
+          - Cluster Dynamics ML: user-guide/cluster-dynamics-ml.md
+          - PDF Calculation: user-guide/pdf-calculation.md
+          - XYZ to PDB Conversion: user-guide/xyz2pdb-conversion.md
   - Tutorials:
       - Example Workflow: tutorials/example-workflow.md
       - MD to SAXS Pipeline: tutorials/md-to-saxs-pipeline.md
@@ -85,4 +90,5 @@ nav:
       - Overview: api/overview.md
   - Development:
       - Repo Structure: development/repo-structure.md
+      - SAXS Contrast Mode: development/saxs-contrast-mode.md
       - Contributing: development/contributing.md

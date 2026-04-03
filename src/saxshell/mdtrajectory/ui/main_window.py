@@ -7,7 +7,6 @@ from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
-    QHBoxLayout,
     QMainWindow,
     QMessageBox,
     QScrollArea,
@@ -17,17 +16,26 @@ from PySide6.QtWidgets import (
 )
 
 from saxshell.mdtrajectory.frame.cp2k_ener import CP2KEnergyData
-from saxshell.mdtrajectory.frame.manager import TrajectoryManager
+from saxshell.mdtrajectory.frame.manager import (
+    FrameSelectionPreview,
+    TrajectoryManager,
+)
 from saxshell.mdtrajectory.ui.cutoff_panel import CutoffPanel
 from saxshell.mdtrajectory.ui.export_panel import ExportPanel
 from saxshell.mdtrajectory.ui.state import MDTrajectoryAppState
 from saxshell.mdtrajectory.ui.trajectory_panel import TrajectoryPanel
 from saxshell.mdtrajectory.workflow import suggest_output_dir
+from saxshell.saxs.project_manager import (
+    ProjectSettings,
+    SAXSProjectManager,
+    build_project_paths,
+)
 from saxshell.saxs.ui.branding import (
     configure_saxshell_application,
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.saxs.ui.project_status_label import CompactProjectStatusLabel
 
 
 @dataclass(slots=True)
@@ -39,9 +47,20 @@ class InspectionResult:
     energy_data: CP2KEnergyData | None
 
 
+@dataclass(slots=True)
+class ExportResult:
+    """Result payload for background frame export."""
+
+    output_dir: Path
+    written_files: list[Path]
+    preview: FrameSelectionPreview
+    applied_cutoff_fs: float | None
+
+
 class InspectionWorker(QObject):
     """Background worker for trajectory metadata and energy loading."""
 
+    progress = Signal(int, int, str)
     metadata_ready = Signal(object)
     finished = Signal(object)
     failed = Signal(str)
@@ -69,13 +88,40 @@ class InspectionWorker(QObject):
         try:
             manager = self.manager
             summary = self.summary
+            total_steps = (
+                2
+                if self.reload_trajectory and self.energy_file is not None
+                else 1
+            )
+            completed_steps = 0
             if self.reload_trajectory:
+                self.progress.emit(
+                    completed_steps,
+                    total_steps,
+                    "Inspection progress: loading trajectory metadata...",
+                )
                 manager = TrajectoryManager(
                     input_file=self.trajectory_file,
                     topology_file=self.topology_file,
                     backend="auto",
                 )
                 summary = manager.inspect()
+                completed_steps += 1
+                self.progress.emit(
+                    completed_steps,
+                    total_steps,
+                    (
+                        "Inspection progress: loading CP2K energy profile..."
+                        if self.energy_file is not None
+                        else "Inspection progress: complete."
+                    ),
+                )
+            elif self.energy_file is not None:
+                self.progress.emit(
+                    completed_steps,
+                    total_steps,
+                    "Inspection progress: loading CP2K energy profile...",
+                )
 
             if manager is None or summary is None:
                 raise ValueError(
@@ -93,23 +139,143 @@ class InspectionWorker(QObject):
                 energy_data = CP2KEnergyData.from_file(self.energy_file)
             else:
                 energy_data = None
+            if self.energy_file is not None:
+                self.progress.emit(
+                    total_steps,
+                    total_steps,
+                    "Inspection progress: complete.",
+                )
             self.finished.emit(energy_data)
         except Exception as exc:
             self.failed.emit(str(exc))
 
 
+class ExportWorker(QObject):
+    """Background worker for frame export."""
+
+    progress = Signal(int, int, str)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        manager: TrajectoryManager,
+        output_dir: Path,
+        preview: FrameSelectionPreview,
+        *,
+        start: int | None,
+        stop: int | None,
+        stride: int,
+        min_time_fs: float | None,
+        post_cutoff_stride: int,
+    ) -> None:
+        super().__init__()
+        self.manager = manager
+        self.output_dir = output_dir
+        self.preview = preview
+        self.start = start
+        self.stop = stop
+        self.stride = stride
+        self.min_time_fs = min_time_fs
+        self.post_cutoff_stride = post_cutoff_stride
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.progress.emit(
+                0,
+                0,
+                "Export progress: loading selected trajectory frames...",
+            )
+            written_files = self.manager.export_frames(
+                output_dir=self.output_dir,
+                start=self.start,
+                stop=self.stop,
+                stride=self.stride,
+                min_time_fs=self.min_time_fs,
+                post_cutoff_stride=self.post_cutoff_stride,
+                progress_callback=self._emit_progress,
+            )
+            total_frames = max(
+                self.preview.selected_frames,
+                len(written_files),
+                1,
+            )
+            self.progress.emit(
+                total_frames,
+                total_frames,
+                "Export progress: complete.",
+            )
+            self.finished.emit(
+                ExportResult(
+                    output_dir=self.output_dir,
+                    written_files=written_files,
+                    preview=self.preview,
+                    applied_cutoff_fs=self.min_time_fs,
+                )
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _emit_progress(
+        self,
+        processed: int,
+        total: int,
+        message: str,
+    ) -> None:
+        self.progress.emit(processed, total, message)
+
+
 class MDTrajectoryMainWindow(QMainWindow):
     """Main Qt window for the mdtrajectory application."""
 
-    def __init__(self) -> None:
+    project_paths_registered = Signal(object)
+
+    def __init__(
+        self,
+        initial_project_dir: Path | None = None,
+        initial_trajectory_file: Path | None = None,
+        initial_topology_file: Path | None = None,
+        initial_energy_file: Path | None = None,
+    ) -> None:
         super().__init__()
+        self._project_manager = SAXSProjectManager()
+        self._project_dir = (
+            None
+            if initial_project_dir is None
+            else Path(initial_project_dir).expanduser().resolve()
+        )
         self.state = MDTrajectoryAppState()
         self.manager: TrajectoryManager | None = None
         self._last_summary: dict[str, object] | None = None
         self._active_reload_trajectory = True
         self._inspect_thread: QThread | None = None
         self._inspect_worker: InspectionWorker | None = None
+        self._export_thread: QThread | None = None
+        self._export_worker: ExportWorker | None = None
         self._build_ui()
+        self._apply_initial_project_defaults(
+            trajectory_file=initial_trajectory_file,
+            topology_file=initial_topology_file,
+            energy_file=initial_energy_file,
+        )
+
+    def closeEvent(self, event) -> None:
+        if (
+            self._inspect_thread is not None
+            and self._inspect_thread.isRunning()
+        ) or (
+            self._export_thread is not None and self._export_thread.isRunning()
+        ):
+            QMessageBox.warning(
+                self,
+                "MD Trajectory",
+                "Please wait for the current trajectory inspection or frame "
+                "export to finish before closing this window.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell (mdtrajectory)")
@@ -117,8 +283,11 @@ class MDTrajectoryMainWindow(QMainWindow):
         self.resize(1280, 780)
 
         central = QWidget()
-        root = QHBoxLayout(central)
+        root = QVBoxLayout(central)
         root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+
+        self.project_banner = None
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -141,6 +310,9 @@ class MDTrajectoryMainWindow(QMainWindow):
 
         root.addWidget(splitter)
         self.setCentralWidget(central)
+        self.project_status_label = self._build_project_status_label()
+        if self.project_status_label is not None:
+            self.statusBar().addPermanentWidget(self.project_status_label)
         self.statusBar().showMessage("Ready")
 
         self.trajectory_panel.inspect_requested.connect(
@@ -151,6 +323,15 @@ class MDTrajectoryMainWindow(QMainWindow):
         )
         self.trajectory_panel.trajectory_path_changed.connect(
             self._suggest_output_dir_from_trajectory
+        )
+        self.trajectory_panel.trajectory_edit.editingFinished.connect(
+            self._register_project_file_inputs
+        )
+        self.trajectory_panel.topology_edit.editingFinished.connect(
+            self._register_project_file_inputs
+        )
+        self.trajectory_panel.energy_edit.editingFinished.connect(
+            self._register_project_file_inputs
         )
         self.export_panel.export_requested.connect(self.export_frames)
         self.export_panel.settings_changed.connect(
@@ -166,10 +347,125 @@ class MDTrajectoryMainWindow(QMainWindow):
         self.export_panel.set_selection_summary(
             "Inspect a trajectory to preview the export selection."
         )
+        self.export_panel.reset_progress()
+
+    def _load_project_settings(self) -> ProjectSettings | None:
+        if self._project_dir is None:
+            return None
+        project_file = build_project_paths(self._project_dir).project_file
+        if not project_file.is_file():
+            return None
+        try:
+            return self._project_manager.load_project(self._project_dir)
+        except Exception:
+            return None
+
+    def _project_status_text(self) -> str | None:
+        if self._project_dir is None:
+            return None
+        return f"Active project: {self._project_dir}"
+
+    def _project_status_tooltip(self) -> str | None:
+        if self._project_dir is None:
+            return None
+        settings = self._load_project_settings()
+        project_name = (
+            self._project_dir.name
+            if settings is None
+            else settings.project_name.strip() or self._project_dir.name
+        )
+        return (
+            f"Active project: {project_name}\n"
+            f"{self._project_dir}\n\n"
+            "This window is linked to the active SAXS project, so "
+            "trajectory, topology, energy, and exported frames references "
+            "are saved back to that project."
+        )
+
+    def _build_project_status_label(
+        self,
+    ) -> CompactProjectStatusLabel | None:
+        status_text = self._project_status_text()
+        if status_text is None:
+            return None
+        label = CompactProjectStatusLabel(self.statusBar())
+        label.setToolTip(self._project_status_tooltip() or "")
+        label.set_full_text(status_text)
+        return label
+
+    def _apply_initial_project_defaults(
+        self,
+        *,
+        trajectory_file: Path | None,
+        topology_file: Path | None,
+        energy_file: Path | None,
+    ) -> None:
+        settings = self._load_project_settings()
+        resolved_trajectory = (
+            trajectory_file
+            if trajectory_file is not None
+            else (
+                None if settings is None else settings.resolved_trajectory_file
+            )
+        )
+        resolved_topology = (
+            topology_file
+            if topology_file is not None
+            else (
+                None if settings is None else settings.resolved_topology_file
+            )
+        )
+        resolved_energy = (
+            energy_file
+            if energy_file is not None
+            else (None if settings is None else settings.resolved_energy_file)
+        )
+        if resolved_trajectory is not None:
+            self.trajectory_panel.trajectory_edit.setText(
+                str(resolved_trajectory)
+            )
+        if resolved_topology is not None:
+            self.trajectory_panel.topology_edit.setText(str(resolved_topology))
+        if resolved_energy is not None:
+            self.trajectory_panel.energy_edit.setText(str(resolved_energy))
+
+    def _register_project_file_inputs(self) -> str | None:
+        settings = self._load_project_settings()
+        if settings is None:
+            return None
+        try:
+            trajectory_file = self.trajectory_panel.get_trajectory_path()
+            topology_file = self.trajectory_panel.get_topology_path()
+            energy_file = self.trajectory_panel.get_energy_path()
+            settings.trajectory_file = (
+                None
+                if trajectory_file is None
+                else str(trajectory_file.expanduser().resolve())
+            )
+            settings.topology_file = (
+                None
+                if topology_file is None
+                else str(topology_file.expanduser().resolve())
+            )
+            settings.energy_file = (
+                None
+                if energy_file is None
+                else str(energy_file.expanduser().resolve())
+            )
+            self._project_manager.save_project(settings)
+        except Exception as exc:
+            return (
+                "The project trajectory/topology/energy references could "
+                f"not be updated: {exc}"
+            )
+        return None
 
     def inspect_trajectory(self) -> None:
         try:
-            if self._inspect_thread is not None:
+            if (
+                self._inspect_thread is not None
+                or self._export_thread is not None
+            ):
                 return
 
             trajectory_file = self.trajectory_panel.get_trajectory_path()
@@ -196,6 +492,9 @@ class MDTrajectoryMainWindow(QMainWindow):
             self.state.stop = self.trajectory_panel.get_stop()
             self.state.stride = self.trajectory_panel.get_stride()
             self._update_suggested_output_dir()
+            registration_message = self._register_project_file_inputs()
+            if registration_message is not None:
+                self.export_panel.append_log(registration_message)
 
             if trajectory_changed:
                 self.state.selected_cutoff_fs = None
@@ -285,6 +584,11 @@ class MDTrajectoryMainWindow(QMainWindow):
 
     def export_frames(self) -> None:
         try:
+            if (
+                self._inspect_thread is not None
+                or self._export_thread is not None
+            ):
+                return
             if self.manager is None:
                 raise ValueError(
                     "Inspect a trajectory before exporting frames."
@@ -311,49 +615,20 @@ class MDTrajectoryMainWindow(QMainWindow):
                     "No frames match the current selection settings."
                 )
 
-            written_files = self.manager.export_frames(
+            self.export_panel.set_log(
+                "Frame export started.\n"
+                f"Output directory: {output_dir}\n"
+                f"Frames queued: {preview.selected_frames}"
+            )
+            self._start_export_worker(
+                manager=self.manager,
                 output_dir=output_dir,
-                start=self.state.start,
-                stop=self.state.stop,
-                stride=self.state.stride,
+                preview=preview,
                 min_time_fs=min_time_fs,
                 post_cutoff_stride=self._resolved_post_cutoff_stride(
                     min_time_fs=min_time_fs
                 ),
             )
-
-            lines = [
-                "Frame export complete.",
-                f"Output directory: {output_dir}",
-                f"Frames written: {len(written_files)}",
-                f"Start: {self.state.start}",
-                f"Stop: {self.state.stop}",
-                f"Stride: {self.state.stride}",
-            ]
-            if min_time_fs is not None:
-                lines.append(f"Applied cutoff: {min_time_fs:.3f} fs")
-                lines.append(
-                    "Post-cutoff frame interval: "
-                    f"{self._resolved_post_cutoff_stride(min_time_fs=min_time_fs)}"
-                )
-            else:
-                lines.append("Applied cutoff: None")
-            if preview.first_frame_index is not None:
-                lines.append(
-                    "Frame index range: "
-                    f"{preview.first_frame_index} to "
-                    f"{preview.last_frame_index}"
-                )
-            if preview.first_time_fs is not None:
-                lines.append(
-                    "Time range: "
-                    f"{preview.first_time_fs:.3f} fs to "
-                    f"{preview.last_time_fs:.3f} fs"
-                )
-
-            self.export_panel.set_log("\n".join(lines))
-            self._update_suggested_output_dir()
-            self._refresh_selection_preview()
 
         except Exception as exc:
             self._show_error(str(exc))
@@ -383,10 +658,6 @@ class MDTrajectoryMainWindow(QMainWindow):
     def _resolved_export_cutoff(self) -> float | None:
         if not self.state.use_cutoff_for_export:
             return None
-        if self.state.selected_cutoff_fs is None:
-            raise ValueError(
-                "Cutoff export is enabled, but no cutoff time is selected."
-            )
         return self.state.selected_cutoff_fs
 
     def _resolved_post_cutoff_stride(
@@ -400,9 +671,9 @@ class MDTrajectoryMainWindow(QMainWindow):
 
     def _refresh_selection_preview(self) -> None:
         self._sync_state_from_controls()
-        self._update_suggested_output_dir()
 
         if self.manager is None:
+            self._update_suggested_output_dir()
             self.export_panel.set_selection_summary(
                 "Inspect a trajectory to preview the export selection."
             )
@@ -422,10 +693,12 @@ class MDTrajectoryMainWindow(QMainWindow):
                     min_time_fs=min_time_fs
                 ),
             )
+            self._update_suggested_output_dir(preview=preview)
             self.export_panel.set_selection_summary(
                 self._format_selection_summary(preview)
             )
         except Exception as exc:
+            self._update_suggested_output_dir()
             self.export_panel.set_selection_summary(
                 f"Selection preview unavailable:\n{exc}"
             )
@@ -447,7 +720,8 @@ class MDTrajectoryMainWindow(QMainWindow):
         summary: dict[str, object] | None = None,
         reload_trajectory: bool = True,
     ) -> None:
-        self._set_inspection_busy(True)
+        self._set_operation_busy(True, "Inspecting trajectory...")
+        self.export_panel.set_busy_progress("Inspection progress: starting...")
         self._active_reload_trajectory = reload_trajectory
         self._inspect_thread = QThread(self)
         self._inspect_worker = InspectionWorker(
@@ -460,6 +734,7 @@ class MDTrajectoryMainWindow(QMainWindow):
         )
         self._inspect_worker.moveToThread(self._inspect_thread)
         self._inspect_thread.started.connect(self._inspect_worker.run)
+        self._inspect_worker.progress.connect(self._handle_inspection_progress)
         self._inspect_worker.metadata_ready.connect(
             self._handle_inspection_metadata
         )
@@ -470,16 +745,52 @@ class MDTrajectoryMainWindow(QMainWindow):
         self._inspect_thread.finished.connect(self._cleanup_inspection_worker)
         self._inspect_thread.start()
 
-    def _set_inspection_busy(self, is_busy: bool) -> None:
+    def _start_export_worker(
+        self,
+        *,
+        manager: TrajectoryManager,
+        output_dir: Path,
+        preview: FrameSelectionPreview,
+        min_time_fs: float | None,
+        post_cutoff_stride: int,
+    ) -> None:
+        self._set_operation_busy(True, "Exporting frames...")
+        self.export_panel.set_busy_progress("Export progress: starting...")
+        self._export_thread = QThread(self)
+        self._export_worker = ExportWorker(
+            manager=manager,
+            output_dir=output_dir,
+            preview=preview,
+            start=self.state.start,
+            stop=self.state.stop,
+            stride=self.state.stride,
+            min_time_fs=min_time_fs,
+            post_cutoff_stride=post_cutoff_stride,
+        )
+        self._export_worker.moveToThread(self._export_thread)
+        self._export_thread.started.connect(self._export_worker.run)
+        self._export_worker.progress.connect(self._handle_export_progress)
+        self._export_worker.finished.connect(self._handle_export_finished)
+        self._export_worker.failed.connect(self._handle_export_error)
+        self._export_worker.finished.connect(self._export_thread.quit)
+        self._export_worker.failed.connect(self._export_thread.quit)
+        self._export_thread.finished.connect(self._cleanup_export_worker)
+        self._export_thread.start()
+
+    def _set_operation_busy(
+        self,
+        is_busy: bool,
+        status_message: str,
+    ) -> None:
         if is_busy:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            self.statusBar().showMessage("Inspecting trajectory...")
+            self.statusBar().showMessage(status_message)
         else:
             while QApplication.overrideCursor() is not None:
                 QApplication.restoreOverrideCursor()
         self.trajectory_panel.setEnabled(not is_busy)
         self.cutoff_panel.setEnabled(not is_busy)
-        self.export_panel.setEnabled(not is_busy)
+        self.export_panel.set_controls_enabled(not is_busy)
 
     def _suggest_output_dir_from_trajectory(
         self,
@@ -488,6 +799,16 @@ class MDTrajectoryMainWindow(QMainWindow):
         if trajectory_path is None:
             return
         self._update_suggested_output_dir(trajectory_path=trajectory_path)
+
+    @Slot(int, int, str)
+    def _handle_inspection_progress(
+        self,
+        processed: int,
+        total: int,
+        message: str,
+    ) -> None:
+        self.export_panel.update_progress(processed, total, message)
+        self.statusBar().showMessage(message)
 
     @Slot(object)
     def _handle_inspection_metadata(self, result: InspectionResult) -> None:
@@ -530,6 +851,10 @@ class MDTrajectoryMainWindow(QMainWindow):
             self.export_panel.append_log(
                 "Inspection complete. No CP2K energy file was loaded."
             )
+        self.export_panel.set_progress_complete(
+            "Inspection progress: complete.",
+            total=2 if self.state.energy_file is not None else 1,
+        )
         self._refresh_selection_preview()
         self.statusBar().showMessage(
             f"Loaded trajectory metadata for {self.state.trajectory_file}",
@@ -548,11 +873,12 @@ class MDTrajectoryMainWindow(QMainWindow):
         else:
             self._refresh_selection_preview()
         self.export_panel.append_log(f"Inspection failed: {message}")
+        self.export_panel.set_progress_failed("Inspection progress: failed.")
         self.statusBar().showMessage("Inspection failed.", 5000)
         self._show_error(message)
 
     def _cleanup_inspection_worker(self) -> None:
-        self._set_inspection_busy(False)
+        self._set_operation_busy(False, "")
         self._active_reload_trajectory = True
         if self._inspect_worker is not None:
             self._inspect_worker.deleteLater()
@@ -560,6 +886,81 @@ class MDTrajectoryMainWindow(QMainWindow):
         if self._inspect_thread is not None:
             self._inspect_thread.deleteLater()
             self._inspect_thread = None
+
+    @Slot(int, int, str)
+    def _handle_export_progress(
+        self,
+        processed: int,
+        total: int,
+        message: str,
+    ) -> None:
+        self.export_panel.update_progress(processed, total, message)
+        self.statusBar().showMessage(message)
+
+    @Slot(object)
+    def _handle_export_finished(self, result: ExportResult) -> None:
+        preview = result.preview
+        lines = [
+            "Frame export complete.",
+            f"Output directory: {result.output_dir}",
+            f"Frames written: {len(result.written_files)}",
+            f"Start: {self.state.start}",
+            f"Stop: {self.state.stop}",
+            f"Stride: {self.state.stride}",
+        ]
+        if result.applied_cutoff_fs is not None:
+            lines.append(f"Applied cutoff: {result.applied_cutoff_fs:.3f} fs")
+            lines.append(
+                "Post-cutoff frame interval: "
+                f"{self._resolved_post_cutoff_stride(min_time_fs=result.applied_cutoff_fs)}"
+            )
+        else:
+            lines.append("Applied cutoff: None")
+        if preview.first_frame_index is not None:
+            lines.append(
+                "Frame index range: "
+                f"{preview.first_frame_index} to "
+                f"{preview.last_frame_index}"
+            )
+        if preview.first_time_fs is not None:
+            lines.append(
+                "Time range: "
+                f"{preview.first_time_fs:.3f} fs to "
+                f"{preview.last_time_fs:.3f} fs"
+            )
+
+        self.export_panel.set_log("\n".join(lines))
+        registration_message = self._register_exported_frames_folder(
+            result.output_dir
+        )
+        if registration_message is not None:
+            self.export_panel.append_log(registration_message)
+        self.export_panel.set_progress_complete(
+            "Export progress: complete.",
+            total=max(preview.selected_frames, 1),
+        )
+        self._update_suggested_output_dir()
+        self._refresh_selection_preview()
+        self.statusBar().showMessage(
+            f"Frame export complete: {result.output_dir}",
+            5000,
+        )
+
+    @Slot(str)
+    def _handle_export_error(self, message: str) -> None:
+        self.export_panel.append_log(f"Frame export failed: {message}")
+        self.export_panel.set_progress_failed("Export progress: failed.")
+        self.statusBar().showMessage("Frame export failed.", 5000)
+        self._show_error(message)
+
+    def _cleanup_export_worker(self) -> None:
+        self._set_operation_busy(False, "")
+        if self._export_worker is not None:
+            self._export_worker.deleteLater()
+            self._export_worker = None
+        if self._export_thread is not None:
+            self._export_thread.deleteLater()
+            self._export_thread = None
 
     def _format_selection_summary(self, preview) -> str:
         output_dir = self.export_panel.get_output_dir()
@@ -610,9 +1011,11 @@ class MDTrajectoryMainWindow(QMainWindow):
         self,
         *,
         trajectory_path: Path | None = None,
+        preview: FrameSelectionPreview | None = None,
     ) -> None:
         target_dir = self._build_suggested_output_dir(
             trajectory_path=trajectory_path,
+            preview=preview,
         )
         if target_dir is None:
             return
@@ -622,6 +1025,7 @@ class MDTrajectoryMainWindow(QMainWindow):
         self,
         *,
         trajectory_path: Path | None = None,
+        preview: FrameSelectionPreview | None = None,
     ) -> Path | None:
         self._sync_state_from_controls()
         source_path = (
@@ -639,18 +1043,90 @@ class MDTrajectoryMainWindow(QMainWindow):
         ):
             min_time_fs = self.cutoff_panel.get_selected_cutoff()
 
-        return suggest_output_dir(source_path, cutoff_fs=min_time_fs)
+        return suggest_output_dir(
+            source_path,
+            preview=preview,
+            cutoff_fs=min_time_fs,
+        )
 
     def _show_error(self, message: str) -> None:
         QMessageBox.critical(self, "Error", message)
 
+    def _emit_project_paths_registered(
+        self,
+        *,
+        frames_dir: Path | None = None,
+    ) -> None:
+        if self._project_dir is None:
+            return
+        payload: dict[str, object] = {
+            "project_dir": Path(self._project_dir).expanduser().resolve(),
+        }
+        if frames_dir is not None:
+            payload["frames_dir"] = Path(frames_dir).expanduser().resolve()
+        self.project_paths_registered.emit(payload)
 
-def launch_mdtrajectory_app() -> MDTrajectoryMainWindow:
+    def _register_exported_frames_folder(
+        self,
+        output_dir: Path,
+    ) -> str | None:
+        if self._project_dir is None:
+            return None
+        project_file = build_project_paths(self._project_dir).project_file
+        if not project_file.is_file():
+            return (
+                "Frames export succeeded, but the associated project could "
+                f"not be found: {self._project_dir}"
+            )
+        try:
+            settings = self._project_manager.load_project(self._project_dir)
+            settings.frames_dir = str(Path(output_dir).expanduser().resolve())
+            self._project_manager.save_project(settings)
+            self._emit_project_paths_registered(frames_dir=output_dir)
+        except Exception as exc:
+            return (
+                "Frames export succeeded, but the project frames folder "
+                f"reference could not be updated: {exc}"
+            )
+        return (
+            "Registered the exported frames folder with project "
+            f"{self._project_dir.name}: {Path(output_dir).expanduser().resolve()}"
+        )
+
+
+def launch_mdtrajectory_app(
+    project_dir: str | Path | None = None,
+    *,
+    trajectory_file: str | Path | None = None,
+    topology_file: str | Path | None = None,
+    energy_file: str | Path | None = None,
+) -> MDTrajectoryMainWindow:
     app = QApplication.instance()
     if app is None:
         prepare_saxshell_application_identity()
         app = QApplication([])
     configure_saxshell_application(app)
-    window = MDTrajectoryMainWindow()
+    window = MDTrajectoryMainWindow(
+        initial_project_dir=(
+            None
+            if project_dir is None
+            else Path(project_dir).expanduser().resolve()
+        ),
+        initial_trajectory_file=(
+            None
+            if trajectory_file is None
+            else Path(trajectory_file).expanduser().resolve()
+        ),
+        initial_topology_file=(
+            None
+            if topology_file is None
+            else Path(topology_file).expanduser().resolve()
+        ),
+        initial_energy_file=(
+            None
+            if energy_file is None
+            else Path(energy_file).expanduser().resolve()
+        ),
+    )
     window.show()
     return window

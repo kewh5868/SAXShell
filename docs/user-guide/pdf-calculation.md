@@ -3,6 +3,9 @@
 SAXSShell includes a Debyer-backed PDF application exposed as `pdfsetup` and as
 `Tools > Open PDF Calculation` from the main SAXS UI.
 
+When the tool is opened from the main UI, its saved calculations become part of
+the same project-backed workflow state used by the SAXS tabs.
+
 ## What the application does
 
 The PDF tool is designed for trajectory-average work, not only one-off single
@@ -202,3 +205,9 @@ The first Debyer integration focuses on trajectory-averaged total and partial
 PDF traces. It does not yet replace every legacy notebook-era Debyer helper, but
 it provides a stable project-backed path for repeated Debyer calculations inside
 SAXSShell.
+
+## Related pages
+
+- [Project Configuration](project-configuration.md)
+- [Results and Export](results-and-export.md)
+- [GUI Overview](gui-overview.md)

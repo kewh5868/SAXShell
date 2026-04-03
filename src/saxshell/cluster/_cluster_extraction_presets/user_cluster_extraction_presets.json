@@ -1,0 +1,97 @@
+{
+  "presets": {
+    "Perovskite (DMF) - Full Solvent": {
+      "atom_type_definitions": {
+        "node": [
+          {
+            "element": "Pb",
+            "residue": "PBI"
+          }
+        ],
+        "linker": [
+          {
+            "element": "I",
+            "residue": "PBI"
+          }
+        ],
+        "shell": [
+          {
+            "element": "O",
+            "residue": "DMF"
+          }
+        ]
+      },
+      "pair_cutoff_definitions": [
+        {
+          "atom1": "Pb",
+          "atom2": "I",
+          "shell_cutoffs": {
+            "0": 3.36
+          }
+        },
+        {
+          "atom1": "Pb",
+          "atom2": "O",
+          "shell_cutoffs": {
+            "0": 3.36
+          }
+        }
+      ],
+      "options": {
+        "use_pbc": false,
+        "search_mode": "kdtree",
+        "save_state_frequency": 1000,
+        "shell_growth_levels": [],
+        "shared_shells": false,
+        "include_shell_atoms_in_stoichiometry": false
+      }
+    },
+    "Perovskite (DMF) - Full Solvent (Multishell)": {
+      "atom_type_definitions": {
+        "node": [
+          {
+            "element": "Pb",
+            "residue": "PBI"
+          }
+        ],
+        "linker": [
+          {
+            "element": "I",
+            "residue": "PBI"
+          }
+        ],
+        "shell": [
+          {
+            "element": "O",
+            "residue": "DMF"
+          }
+        ]
+      },
+      "pair_cutoff_definitions": [
+        {
+          "atom1": "Pb",
+          "atom2": "I",
+          "shell_cutoffs": {
+            "0": 3.36
+          }
+        },
+        {
+          "atom1": "Pb",
+          "atom2": "O",
+          "shell_cutoffs": {
+            "0": 3.36,
+            "1": 7.0
+          }
+        }
+      ],
+      "options": {
+        "use_pbc": true,
+        "search_mode": "kdtree",
+        "save_state_frequency": 1000,
+        "shell_growth_levels": [1],
+        "shared_shells": true,
+        "include_shell_atoms_in_stoichiometry": false
+      }
+    }
+  }
+}
