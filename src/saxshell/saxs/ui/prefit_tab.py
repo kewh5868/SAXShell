@@ -514,7 +514,7 @@ class PrefitTab(QWidget):
         button_grid.addWidget(self.reset_button, 1, 1)
         button_grid.addWidget(self.set_best_button, 2, 0)
         button_grid.addWidget(self.reset_best_button, 2, 1)
-        layout.addLayout(button_grid, 6, 0, 1, 3)
+        layout.addLayout(button_grid, 7, 0, 1, 3)
         return group
 
     def _build_solute_volume_fraction_group(self) -> QGroupBox:
