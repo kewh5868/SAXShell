@@ -1473,6 +1473,15 @@ class SAXSMainWindow(QMainWindow):
         )
         self.tools_menu.addAction(self.contrast_mode_action)
 
+        self.electron_density_mapping_action = QAction(
+            "Open Electron Density Mapping",
+            self,
+        )
+        self.electron_density_mapping_action.triggered.connect(
+            self._open_electron_density_mapping_tool
+        )
+        self.tools_menu.addAction(self.electron_density_mapping_action)
+
         self.estimation_menu = self.tools_menu.addMenu("Estimation")
         self.volume_fraction_action = QAction(
             "Open Volume Fraction Estimate", self
@@ -9758,6 +9767,39 @@ class SAXSMainWindow(QMainWindow):
             )
         else:
             self.statusBar().showMessage("Opened SAXS contrast-mode workflow")
+
+    def _open_electron_density_mapping_tool(self) -> None:
+        from saxshell.saxs.electron_density_mapping.ui.main_window import (
+            launch_electron_density_mapping_ui,
+        )
+
+        settings = self._active_project_launch_settings()
+        project_dir = None
+        input_path = None
+        if settings is not None:
+            project_dir = Path(settings.project_dir).resolve()
+            for candidate in (
+                settings.resolved_pdb_frames_dir,
+                settings.resolved_frames_dir,
+            ):
+                if candidate is not None and candidate.exists():
+                    input_path = candidate
+                    break
+        window = launch_electron_density_mapping_ui(
+            initial_project_dir=project_dir,
+            initial_input_path=input_path,
+        )
+        self._track_child_tool_window(window)
+        if input_path is not None:
+            self.statusBar().showMessage(
+                f"Opened electron density mapping for {input_path}"
+            )
+        elif project_dir is not None:
+            self.statusBar().showMessage(
+                f"Opened electron density mapping for {project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened electron density mapping")
 
     @Slot(object)
     def _on_contrast_components_built(self, payload: object) -> None:

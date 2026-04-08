@@ -724,6 +724,8 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             )
         self._sync_project_defaults()
         restored = self._restore_latest_project_result(announce=False)
+        self._frames_dir_change_timer.stop()
+        self._project_dir_change_timer.stop()
         self._initializing = False
         if not restored:
             self._refresh_project_history_view()
