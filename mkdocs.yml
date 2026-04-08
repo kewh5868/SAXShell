@@ -81,6 +81,7 @@ nav:
           - Cluster Extraction: user-guide/cluster-extraction.md
           - Cluster Dynamics: user-guide/cluster-dynamics.md
           - Cluster Dynamics ML: user-guide/cluster-dynamics-ml.md
+          - Electron Density Mapping: user-guide/electron-density-mapping.md
           - PDF Calculation: user-guide/pdf-calculation.md
           - XYZ to PDB Conversion: user-guide/xyz2pdb-conversion.md
   - Tutorials:
