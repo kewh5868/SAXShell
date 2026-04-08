@@ -2721,6 +2721,10 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert window.fullrmc_action.text() == "Open fullrmc Setup"
     assert window.contrast_mode_action.text() == "Open SAXS Contrast Mode"
     assert (
+        window.electron_density_mapping_action.text()
+        == "Open Electron Density Mapping"
+    )
+    assert (
         window.volume_fraction_action.text() == "Open Volume Fraction Estimate"
     )
     assert (
@@ -4007,6 +4011,45 @@ def test_contrast_mode_tool_open_starts_clean_even_with_saved_distribution(
     assert launched["initial_distribution_id"] is None
     assert launched["initial_distribution_root_dir"] is None
     assert launched["initial_contrast_artifact_dir"] is None
+    window.close()
+
+
+def test_electron_density_mapping_tool_uses_active_structure_folder(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    pdb_frames_dir = tmp_path / "pdb_frames"
+    pdb_frames_dir.mkdir()
+    xyz_frames_dir = tmp_path / "xyz_frames"
+    xyz_frames_dir.mkdir()
+    window.current_settings.pdb_frames_dir = str(pdb_frames_dir.resolve())
+    window.current_settings.frames_dir = str(xyz_frames_dir.resolve())
+    window.project_manager.save_project(window.current_settings)
+    launched: dict[str, object] = {}
+
+    class FakeElectronDensityWindow(QWidget):
+        def __init__(self):
+            super().__init__()
+            launched["instance"] = self
+
+    def fake_launch_electron_density_mapping_ui(**kwargs):
+        launched.update(kwargs)
+        return FakeElectronDensityWindow()
+
+    monkeypatch.setattr(
+        "saxshell.saxs.electron_density_mapping.ui.main_window.launch_electron_density_mapping_ui",
+        fake_launch_electron_density_mapping_ui,
+    )
+
+    window._open_electron_density_mapping_tool()
+
+    assert launched["initial_project_dir"] == Path(project_dir).resolve()
+    assert launched["initial_input_path"] == pdb_frames_dir.resolve()
+    assert launched["instance"] in window._child_tool_windows
     window.close()
 
 
