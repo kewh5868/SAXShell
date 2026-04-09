@@ -79,6 +79,24 @@ def _disconnected_frame_lines() -> list[str]:
     ]
 
 
+def _smart_shell_frame_lines(
+    *,
+    residue10_y: float,
+    residue11_y: float,
+) -> list[str]:
+    return [
+        "MODEL        1\n",
+        _pdb_atom_line(1, "PB1", "SOL", 1, 0.0, 0.0, 0.0, "Pb"),
+        _pdb_atom_line(2, "I1", "SOL", 1, 1.0, 0.0, 0.0, "I"),
+        _pdb_atom_line(3, "PB2", "SOL", 2, 2.0, 0.0, 0.0, "Pb"),
+        _pdb_atom_line(4, "O1", "WAT", 10, 0.2, residue10_y, 0.0, "O"),
+        _pdb_atom_line(5, "H1", "WAT", 10, 0.2, residue10_y + 0.7, 0.0, "H"),
+        _pdb_atom_line(6, "O1", "WAT", 11, 2.2, residue11_y, 0.0, "O"),
+        _pdb_atom_line(7, "H1", "WAT", 11, 2.2, residue11_y + 0.7, 0.0, "H"),
+        "ENDMDL\n",
+    ]
+
+
 def _connected_xyz_lines() -> list[str]:
     return [
         "5\n",
@@ -357,6 +375,102 @@ def test_shell_atoms_can_control_stoichiometry_bins(tmp_path):
     assert _relative_names(export.written_files) == [
         "Pb2IO/frame_0000_AAA.pdb"
     ]
+
+
+def test_smart_solvation_shells_keep_union_across_contiguous_pdb_frames(
+    tmp_path,
+):
+    frames_dir = tmp_path / "splitpdb0001"
+    frames_dir.mkdir()
+    (frames_dir / "frame_0000.pdb").write_text(
+        "".join(
+            _smart_shell_frame_lines(
+                residue10_y=1.0,
+                residue11_y=4.0,
+            )
+        )
+    )
+    (frames_dir / "frame_0001.pdb").write_text(
+        "".join(
+            _smart_shell_frame_lines(
+                residue10_y=4.0,
+                residue11_y=1.0,
+            )
+        )
+    )
+
+    analyzer = ExtractedFrameFolderClusterAnalyzer(
+        frames_dir=frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoffs_def=PAIR_CUTOFFS,
+        smart_solvation_shells=True,
+    )
+
+    export = analyzer.export_cluster_pdbs(
+        tmp_path / "clusters_from_folder",
+        shell_levels=(1,),
+        include_shell_levels=(0, 1),
+    )
+
+    assert _relative_names(export.written_files) == [
+        "Pb2I/frame_0000_AAA.pdb",
+        "Pb2I/frame_0001_AAA.pdb",
+    ]
+    for path in export.written_files:
+        structure = PDBStructure.from_file(path)
+        assert {
+            atom.residue_number
+            for atom in structure.atoms
+            if atom.residue_name == "WAT"
+        } == {10, 11}
+
+
+def test_legacy_solvation_shells_preserve_per_frame_pdb_cutoffs(tmp_path):
+    frames_dir = tmp_path / "splitpdb0001"
+    frames_dir.mkdir()
+    (frames_dir / "frame_0000.pdb").write_text(
+        "".join(
+            _smart_shell_frame_lines(
+                residue10_y=1.0,
+                residue11_y=4.0,
+            )
+        )
+    )
+    (frames_dir / "frame_0001.pdb").write_text(
+        "".join(
+            _smart_shell_frame_lines(
+                residue10_y=4.0,
+                residue11_y=1.0,
+            )
+        )
+    )
+
+    analyzer = ExtractedFrameFolderClusterAnalyzer(
+        frames_dir=frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoffs_def=PAIR_CUTOFFS,
+        smart_solvation_shells=False,
+    )
+
+    export = analyzer.export_cluster_pdbs(
+        tmp_path / "clusters_from_folder",
+        shell_levels=(1,),
+        include_shell_levels=(0, 1),
+    )
+
+    residues_by_name = {
+        path.name: {
+            atom.residue_number
+            for atom in PDBStructure.from_file(path).atoms
+            if atom.residue_name == "WAT"
+        }
+        for path in export.written_files
+    }
+
+    assert residues_by_name == {
+        "frame_0000_AAA.pdb": {10},
+        "frame_0001_AAA.pdb": {11},
+    }
 
 
 def test_extracted_xyz_frame_folder_cluster_analyzer_runs_and_exports(

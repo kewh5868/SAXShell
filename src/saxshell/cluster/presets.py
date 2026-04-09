@@ -36,6 +36,7 @@ class ClusterExtractionPreset:
     default_cutoff: float | None = None
     shell_growth_levels: tuple[int, ...] = ()
     shared_shells: bool = False
+    smart_solvation_shells: bool = True
     include_shell_atoms_in_stoichiometry: bool = False
     builtin: bool = False
 
@@ -48,6 +49,7 @@ class ClusterExtractionPreset:
                 int(level) for level in self.shell_growth_levels
             ],
             "shared_shells": bool(self.shared_shells),
+            "smart_solvation_shells": bool(self.smart_solvation_shells),
             "include_shell_atoms_in_stoichiometry": bool(
                 self.include_shell_atoms_in_stoichiometry
             ),
@@ -103,6 +105,9 @@ class ClusterExtractionPreset:
                 options_payload.get("shell_growth_levels")
             ),
             shared_shells=bool(options_payload.get("shared_shells", False)),
+            smart_solvation_shells=bool(
+                options_payload.get("smart_solvation_shells", True)
+            ),
             include_shell_atoms_in_stoichiometry=bool(
                 options_payload.get(
                     "include_shell_atoms_in_stoichiometry",

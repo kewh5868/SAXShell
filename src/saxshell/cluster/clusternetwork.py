@@ -485,6 +485,7 @@ class ClusterRecord:
     shell_atom_ids: tuple[int, ...]
     stoichiometry: dict[str, int]
     shell_levels: dict[int, int | str | None]
+    detected_shell_atom_ids: tuple[int, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -494,6 +495,7 @@ class ClusterRecord:
             "node_atom_ids": list(self.node_atom_ids),
             "linker_atom_ids": list(self.linker_atom_ids),
             "shell_atom_ids": list(self.shell_atom_ids),
+            "detected_shell_atom_ids": list(self.detected_shell_atom_ids),
             "stoichiometry": dict(self.stoichiometry),
             "shell_levels": dict(self.shell_levels),
         }
@@ -524,6 +526,13 @@ class ClusterRecord:
             ),
             shell_atom_ids=tuple(
                 int(value) for value in payload.get("shell_atom_ids", [])
+            ),
+            detected_shell_atom_ids=tuple(
+                int(value)
+                for value in payload.get(
+                    "detected_shell_atom_ids",
+                    payload.get("shell_atom_ids", []),
+                )
             ),
             stoichiometry={
                 str(element): int(count)
@@ -583,6 +592,56 @@ class TrajectoryClusterExport:
     already_complete: bool = False
     previously_completed_frames: int = 0
     newly_processed_frames: int = 0
+
+
+@dataclass(slots=True)
+class _SmartShellRunState:
+    """Tracked solvent-shell union for one contiguous solute cluster."""
+
+    solute_atom_ids: tuple[int, ...]
+    last_frame_index: int
+    frame_refs: list[tuple[str, str]]
+    shell_levels: dict[int, int]
+
+
+def _cluster_shell_level_payload(
+    cluster: ClusterRecord,
+) -> dict[int, int]:
+    """Return exported shell levels with integer shell indices only."""
+    return {
+        atom_id: int(level)
+        for atom_id in cluster.shell_atom_ids
+        if isinstance((level := cluster.shell_levels.get(atom_id)), int)
+    }
+
+
+def _update_cluster_record_shell_union(
+    cluster: ClusterRecord,
+    shell_levels: Mapping[int, int],
+    *,
+    elements: Mapping[int, str],
+    include_shell_atoms_in_stoichiometry: bool,
+) -> None:
+    """Replace one cluster record's exported shell union in place."""
+    cluster.shell_atom_ids = tuple(
+        sorted(int(atom_id) for atom_id in shell_levels)
+    )
+    cluster.atom_ids = tuple(
+        sorted(set(cluster.solute_atom_ids).union(cluster.shell_atom_ids))
+    )
+    updated_shell_levels = {
+        atom_id: cluster.shell_levels.get(atom_id)
+        for atom_id in cluster.solute_atom_ids
+    }
+    for atom_id in cluster.shell_atom_ids:
+        updated_shell_levels[atom_id] = int(shell_levels[atom_id])
+    cluster.shell_levels = updated_shell_levels
+    stoichiometry_atom_ids = list(cluster.solute_atom_ids)
+    if include_shell_atoms_in_stoichiometry:
+        stoichiometry_atom_ids.extend(cluster.shell_atom_ids)
+    cluster.stoichiometry = dict(
+        Counter(elements[atom_id] for atom_id in stoichiometry_atom_ids)
+    )
 
 
 @dataclass(slots=True)
@@ -877,11 +936,18 @@ class ClusterNetwork:
         self.clusters: list[set[int]] = []
         self.cluster_labels: list[str] = []
         self.atom_virtual_positions: dict[int, np.ndarray] = {}
+        self._persistent_shell_atom_ids_by_cluster_label: dict[
+            str, set[int]
+        ] = {}
 
         for atom in self.atom_id_map.values():
             atom.cluster_id = None
             atom.shell_level = "free" if atom.atom_type == "shell" else None
             atom.shell_history.clear()
+
+    @staticmethod
+    def _solute_atom_ids_for_cluster(cluster: set[int]) -> tuple[int, ...]:
+        return tuple(sorted(atom_id for atom_id in cluster))
 
     def _pair_cutoff(
         self,
@@ -1205,13 +1271,44 @@ class ClusterNetwork:
                 shell_level=self.shell_levels[atom_id],
             )
 
-    def create_cluster(self, start_id: int) -> set[int]:
+    def _cluster_id_for_solute_atoms(
+        self,
+        solute_atom_ids: tuple[int, ...],
+        preferred_cluster_ids_by_solute_key: (
+            Mapping[tuple[int, ...], str] | None
+        ),
+    ) -> str:
+        """Return one preferred or generated cluster identifier."""
+        if preferred_cluster_ids_by_solute_key is not None:
+            preferred = preferred_cluster_ids_by_solute_key.get(
+                solute_atom_ids
+            )
+            if preferred:
+                if preferred in self.cluster_ids:
+                    raise ValueError(
+                        f"Cluster identifier {preferred!r} is already in use."
+                    )
+                self.cluster_ids.add(preferred)
+                return preferred
+        return self.generate_cluster_id()
+
+    def create_cluster(
+        self,
+        start_id: int,
+        *,
+        core_allowed_atom_types: set[str] | None = None,
+    ) -> set[int]:
         """Build a connected solute cluster starting from one seed
         atom."""
         current_cluster: set[int] = set()
         start_index = self.atom_index_map[start_id]
         start_position = self.original_coordinates[start_index]
         self.atom_virtual_positions[start_id] = start_position
+        allowed_atom_types = (
+            {"node", "linker", "shell"}
+            if core_allowed_atom_types is None
+            else set(core_allowed_atom_types)
+        )
 
         search_stack: deque[tuple[int, np.ndarray]] = deque(
             [(start_id, start_position)]
@@ -1229,7 +1326,7 @@ class ClusterNetwork:
                 parent_id=current_id,
                 parent_virtual_pos=current_virt_pos,
                 shell_level=0,
-                allowed_atom_types={"node", "linker", "shell"},
+                allowed_atom_types=allowed_atom_types,
             ):
                 if self.found_status[neighbor_id]:
                     continue
@@ -1241,6 +1338,49 @@ class ClusterNetwork:
                     search_stack.append((neighbor_id, neighbor_virtual_pos))
 
         return current_cluster
+
+    def include_persistent_shells_for_cluster(
+        self,
+        cluster: set[int],
+        cluster_id: str,
+        shell_levels: Mapping[int, int],
+        *,
+        shared_shells: bool = False,
+    ) -> None:
+        """Inject already-owned shell atoms without rechecking
+        cutoffs."""
+        persistent_ids = (
+            self._persistent_shell_atom_ids_by_cluster_label.setdefault(
+                cluster_id,
+                set(),
+            )
+        )
+        for atom_id, shell_level in sorted(shell_levels.items()):
+            atom_id = int(atom_id)
+            if self.base_atom_types.get(atom_id) != "shell":
+                continue
+            if atom_id in cluster:
+                persistent_ids.add(atom_id)
+                if self.shell_levels.get(atom_id) is None:
+                    self.shell_levels[atom_id] = int(shell_level)
+                continue
+            if not shared_shells and self.found_status.get(atom_id, False):
+                continue
+            if not shared_shells:
+                self.found_status[atom_id] = True
+            cluster.add(atom_id)
+            self.atom_types[atom_id] = "shell"
+            self.shell_levels[atom_id] = int(shell_level)
+            atom_index = self.atom_index_map.get(atom_id)
+            if atom_index is not None:
+                self.atom_virtual_positions[atom_id] = (
+                    self.original_coordinates[atom_index].copy()
+                )
+            self.atom_id_map[atom_id].update_cluster_assignment(
+                cluster_id,
+                shell_level=int(shell_level),
+            )
+            persistent_ids.add(atom_id)
 
     def process_shell_level_for_cluster(
         self,
@@ -1294,25 +1434,102 @@ class ClusterNetwork:
         *,
         shell_levels: Sequence[int] = (1, 2),
         shared_shells: bool = False,
+        core_includes_shell_atoms: bool = True,
+        persistent_shells_by_solute_key: (
+            Mapping[
+                tuple[int, ...],
+                Mapping[int, int],
+            ]
+            | None
+        ) = None,
+        preferred_cluster_ids_by_solute_key: (
+            Mapping[
+                tuple[int, ...],
+                str,
+            ]
+            | None
+        ) = None,
     ) -> list[ClusterRecord]:
         """Find cluster networks for the current structure."""
         self._reset_state()
+        core_allowed_atom_types = (
+            {"node", "linker", "shell"}
+            if core_includes_shell_atoms
+            else {"node", "linker"}
+        )
 
         for atom_id, atom_type in self.base_atom_types.items():
             if atom_type == "node" and not self.found_status[atom_id]:
-                cluster = self.create_cluster(atom_id)
-                cluster_id = self.generate_cluster_id()
+                cluster = self.create_cluster(
+                    atom_id,
+                    core_allowed_atom_types=core_allowed_atom_types,
+                )
+                solute_atom_ids = tuple(
+                    sorted(
+                        member_id
+                        for member_id in cluster
+                        if self.base_atom_types.get(member_id)
+                        in {"node", "linker"}
+                    )
+                )
+                cluster_id = self._cluster_id_for_solute_atoms(
+                    solute_atom_ids,
+                    preferred_cluster_ids_by_solute_key,
+                )
                 self.assign_cluster_id_and_shell_level(cluster, cluster_id)
                 self.clusters.append(cluster)
                 self.cluster_labels.append(cluster_id)
 
         for atom_id, atom_type in self.base_atom_types.items():
             if atom_type == "linker" and not self.found_status[atom_id]:
-                cluster = self.create_cluster(atom_id)
-                cluster_id = self.generate_cluster_id()
+                cluster = self.create_cluster(
+                    atom_id,
+                    core_allowed_atom_types=core_allowed_atom_types,
+                )
+                solute_atom_ids = tuple(
+                    sorted(
+                        member_id
+                        for member_id in cluster
+                        if self.base_atom_types.get(member_id)
+                        in {"node", "linker"}
+                    )
+                )
+                cluster_id = self._cluster_id_for_solute_atoms(
+                    solute_atom_ids,
+                    preferred_cluster_ids_by_solute_key,
+                )
                 self.assign_cluster_id_and_shell_level(cluster, cluster_id)
                 self.clusters.append(cluster)
                 self.cluster_labels.append(cluster_id)
+
+        if not core_includes_shell_atoms:
+            for cluster, cluster_id in zip(self.clusters, self.cluster_labels):
+                solute_atom_ids = tuple(
+                    sorted(
+                        member_id
+                        for member_id in cluster
+                        if self.base_atom_types.get(member_id)
+                        in {"node", "linker"}
+                    )
+                )
+                if persistent_shells_by_solute_key is not None:
+                    persistent_shells = persistent_shells_by_solute_key.get(
+                        solute_atom_ids,
+                        {},
+                    )
+                    if persistent_shells:
+                        self.include_persistent_shells_for_cluster(
+                            cluster,
+                            cluster_id,
+                            persistent_shells,
+                            shared_shells=shared_shells,
+                        )
+                self.process_shell_level_for_cluster(
+                    cluster,
+                    cluster_id,
+                    0,
+                    shared_shells=shared_shells,
+                )
 
         for shell_level in shell_levels:
             if shell_level <= 0:
@@ -1497,6 +1714,17 @@ class ClusterNetwork:
                 and atom_id not in node_atom_ids
                 and atom_id not in linker_atom_ids
             )
+            persistent_shell_atom_ids = (
+                self._persistent_shell_atom_ids_by_cluster_label.get(
+                    cluster_id,
+                    set(),
+                )
+            )
+            detected_shell_atom_ids = tuple(
+                atom_id
+                for atom_id in shell_atom_ids
+                if atom_id not in persistent_shell_atom_ids
+            )
             solute_atom_ids = tuple(sorted(node_atom_ids + linker_atom_ids))
             stoichiometry_atom_ids = list(solute_atom_ids)
             if self.include_shell_atoms_in_stoichiometry:
@@ -1520,6 +1748,7 @@ class ClusterNetwork:
                     shell_atom_ids=shell_atom_ids,
                     stoichiometry=stoichiometry,
                     shell_levels=shell_level_map,
+                    detected_shell_atom_ids=detected_shell_atom_ids,
                 )
             )
         return records
@@ -2265,6 +2494,7 @@ class ExtractedFrameFolderClusterAnalyzer:
         box_dimensions: Sequence[float] | None = None,
         default_cutoff: float | None = None,
         use_pbc: bool = False,
+        smart_solvation_shells: bool = True,
         include_shell_atoms_in_stoichiometry: bool = False,
         search_mode: str = SEARCH_MODE_KDTREE,
         save_state_frequency: int = DEFAULT_SAVE_STATE_FREQUENCY,
@@ -2275,6 +2505,7 @@ class ExtractedFrameFolderClusterAnalyzer:
         self.box_dimensions = box_dimensions
         self.default_cutoff = default_cutoff
         self.use_pbc = bool(use_pbc)
+        self.smart_solvation_shells = bool(smart_solvation_shells)
         self.include_shell_atoms_in_stoichiometry = bool(
             include_shell_atoms_in_stoichiometry
         )
@@ -2374,6 +2605,16 @@ class ExtractedFrameFolderClusterAnalyzer:
         """Analyze extracted frames and write per-cluster output
         files."""
         frame_format, frame_paths = self._validated_frame_paths()
+        if frame_format == "pdb" and self.smart_solvation_shells:
+            return self._export_cluster_pdb_files_with_smart_shells(
+                output_dir,
+                frame_paths=frame_paths,
+                shell_levels=shell_levels,
+                include_shell_levels=include_shell_levels,
+                shared_shells=shared_shells,
+                progress_callback=progress_callback,
+                phase_callback=phase_callback,
+            )
         summary = self.inspect()
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -2615,6 +2856,423 @@ class ExtractedFrameFolderClusterAnalyzer:
             newly_processed_frames=newly_processed_frames,
         )
 
+    def _export_cluster_pdb_files_with_smart_shells(
+        self,
+        output_dir: str | Path,
+        *,
+        frame_paths: Sequence[Path],
+        shell_levels: Sequence[int],
+        include_shell_levels: Sequence[int],
+        shared_shells: bool,
+        progress_callback: Callable[[int, int, str], None] | None,
+        phase_callback: Callable[[str, int, int], None] | None,
+    ) -> TrajectoryClusterExport:
+        """Run the PDB-only smart-shell export path."""
+        summary = self.inspect()
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        metadata_path = _metadata_file_path(output_dir)
+        total_frames = len(frame_paths)
+
+        metadata = self._load_or_initialize_metadata(
+            metadata_path=metadata_path,
+            output_dir=output_dir,
+            summary=summary,
+            frame_format="pdb",
+            frame_paths=frame_paths,
+            shell_levels=shell_levels,
+            include_shell_levels=include_shell_levels,
+            shared_shells=shared_shells,
+        )
+        frame_entries = {
+            str(entry["frame_name"]): dict(entry)
+            for entry in metadata.get("frames", [])
+        }
+        previously_processed_frames = sum(
+            1
+            for entry in frame_entries.values()
+            if _frame_entry_is_processed(entry)
+        )
+        previously_completed_frames = sum(
+            1
+            for entry in frame_entries.values()
+            if _frame_entry_is_completed(entry)
+        )
+        resumed = previously_processed_frames > 0
+
+        if progress_callback is not None:
+            progress_callback(
+                previously_processed_frames,
+                total_frames,
+                "resume",
+            )
+        if phase_callback is not None:
+            phase_callback(
+                "extracting",
+                previously_processed_frames,
+                total_frames,
+            )
+
+        if previously_completed_frames >= total_frames:
+            metadata["state"] = "completed"
+            metadata["updated_at"] = _utc_timestamp()
+            metadata["last_error"] = None
+            self._refresh_metadata_progress(
+                metadata, frame_entries, total_frames
+            )
+            self._store_metadata(metadata_path, metadata, frame_entries)
+            frame_results = self._frame_results_from_entries(frame_entries)
+            written_files = self._written_files_from_metadata(
+                output_dir,
+                metadata,
+                frame_entries,
+            )
+            self.last_results = frame_results
+            return TrajectoryClusterExport(
+                written_files=written_files,
+                frame_results=frame_results,
+                metadata_path=metadata_path,
+                resumed=resumed,
+                already_complete=True,
+                previously_completed_frames=previously_processed_frames,
+                newly_processed_frames=0,
+            )
+
+        metadata["state"] = "in_progress"
+        metadata["updated_at"] = _utc_timestamp()
+        metadata["completed_at"] = None
+        metadata["last_error"] = None
+        self._refresh_metadata_progress(
+            metadata,
+            frame_entries,
+            total_frames,
+        )
+        self._store_metadata(metadata_path, metadata, frame_entries)
+
+        newly_processed_frames = 0
+        frames_since_checkpoint = 0
+        last_checkpoint_time = monotonic()
+        sorting_completed_frames = previously_completed_frames
+        stoichiometry_dir_cache: dict[str, Path] = {}
+        atom_elements: dict[int, str] = {}
+        active_runs = self._rebuild_smart_shell_run_states(frame_entries)
+
+        def checkpoint_metadata(*, force: bool = False) -> None:
+            nonlocal frames_since_checkpoint, last_checkpoint_time
+            if not force:
+                if (
+                    frames_since_checkpoint < self.save_state_frequency
+                    and (monotonic() - last_checkpoint_time)
+                    < METADATA_CHECKPOINT_SECONDS
+                ):
+                    return
+            metadata["updated_at"] = _utc_timestamp()
+            self._store_metadata(metadata_path, metadata, frame_entries)
+            frames_since_checkpoint = 0
+            last_checkpoint_time = monotonic()
+
+        try:
+            for frame_index, frame_path in enumerate(frame_paths):
+                existing_entry = frame_entries.get(frame_path.name)
+                if existing_entry is not None and _frame_entry_is_processed(
+                    existing_entry
+                ):
+                    continue
+
+                network = self._build_network(frame_path)
+                if not isinstance(network, ClusterNetwork):
+                    raise ValueError(
+                        "Smart Solvation Shell mode requires PDB frames."
+                    )
+                atom_elements.update(network.elements)
+                clusters = network.find_clusters(
+                    shell_levels=shell_levels,
+                    shared_shells=shared_shells,
+                    core_includes_shell_atoms=False,
+                    persistent_shells_by_solute_key={
+                        run.solute_atom_ids: dict(run.shell_levels)
+                        for run in active_runs.values()
+                    },
+                )
+                frame_result = FrameClusterResult(
+                    frame_index=frame_index,
+                    time_fs=None,
+                    clusters=clusters,
+                )
+                frame_entries[frame_path.name] = {
+                    "frame_name": frame_path.name,
+                    "frame_label": frame_path.stem,
+                    "frame_index": frame_index,
+                    "status": FRAME_STATUS_PROCESSED,
+                    "processed_at": _utc_timestamp(),
+                    "completed_at": None,
+                    "temporary_files": [],
+                    "written_files": [],
+                    "result": frame_result.to_dict(),
+                }
+
+                current_runs: dict[tuple[int, ...], _SmartShellRunState] = {}
+                for cluster in frame_result.clusters:
+                    solute_atom_ids = cluster.solute_atom_ids
+                    prior_run = active_runs.get(solute_atom_ids)
+                    if (
+                        prior_run is not None
+                        and prior_run.last_frame_index == frame_index - 1
+                    ):
+                        run = prior_run
+                    else:
+                        run = _SmartShellRunState(
+                            solute_atom_ids=solute_atom_ids,
+                            last_frame_index=frame_index,
+                            frame_refs=[],
+                            shell_levels={},
+                        )
+                    run.last_frame_index = frame_index
+                    run.frame_refs.append(
+                        (frame_path.name, cluster.cluster_id)
+                    )
+                    for atom_id, shell_level in _cluster_shell_level_payload(
+                        cluster
+                    ).items():
+                        if atom_id not in run.shell_levels:
+                            run.shell_levels[atom_id] = shell_level
+                    current_runs[solute_atom_ids] = run
+
+                for run in current_runs.values():
+                    self._apply_smart_shell_union_to_run(
+                        run,
+                        frame_entries,
+                        elements=atom_elements,
+                    )
+
+                active_runs = current_runs
+                newly_processed_frames += 1
+                metadata["last_error"] = None
+                frames_since_checkpoint += 1
+                checkpoint_metadata()
+
+                if progress_callback is not None:
+                    progress_callback(
+                        previously_processed_frames + newly_processed_frames,
+                        total_frames,
+                        frame_path.stem,
+                    )
+
+            metadata["state"] = "sorting"
+            checkpoint_metadata(force=True)
+            if phase_callback is not None:
+                phase_callback(
+                    "sorting",
+                    sorting_completed_frames,
+                    total_frames,
+                )
+
+            for frame_index, frame_path in enumerate(frame_paths):
+                entry = frame_entries.get(frame_path.name)
+                if entry is None or _frame_entry_is_completed(entry):
+                    continue
+
+                frame_label = str(entry.get("frame_label", frame_path.stem))
+                frame_result = FrameClusterResult.from_dict(
+                    dict(entry["result"])
+                )
+                network = self._build_network(frame_path)
+                if not isinstance(network, ClusterNetwork):
+                    raise ValueError(
+                        "Smart Solvation Shell mode requires PDB frames."
+                    )
+                rerun_clusters = network.find_clusters(
+                    shell_levels=shell_levels,
+                    shared_shells=shared_shells,
+                    core_includes_shell_atoms=False,
+                    persistent_shells_by_solute_key={
+                        cluster.solute_atom_ids: {
+                            atom_id: shell_level
+                            for atom_id, shell_level in _cluster_shell_level_payload(
+                                cluster
+                            ).items()
+                            if atom_id
+                            not in set(cluster.detected_shell_atom_ids)
+                        }
+                        for cluster in frame_result.clusters
+                    },
+                    preferred_cluster_ids_by_solute_key={
+                        cluster.solute_atom_ids: cluster.cluster_id
+                        for cluster in frame_result.clusters
+                    },
+                )
+                self._validate_smart_shell_rerun(
+                    expected_clusters=frame_result.clusters,
+                    actual_clusters=rerun_clusters,
+                    frame_name=frame_path.name,
+                )
+                frame_dir = output_dir / frame_label
+                network.write_cluster_pdb_files(
+                    frame_dir,
+                    frame_label=frame_label,
+                    include_shell_levels=include_shell_levels,
+                )
+                moved_files = _move_cluster_files_to_stoichiometry_dirs(
+                    output_dir,
+                    frame_dir,
+                    frame_label,
+                    frame_result.clusters,
+                    suffix=".pdb",
+                    stoichiometry_dir_cache=stoichiometry_dir_cache,
+                )
+                entry.update(
+                    {
+                        "frame_name": frame_path.name,
+                        "frame_label": frame_label,
+                        "frame_index": frame_index,
+                        "status": FRAME_STATUS_COMPLETED,
+                        "processed_at": entry.get("processed_at"),
+                        "completed_at": _utc_timestamp(),
+                        "temporary_files": [],
+                        "written_files": _relative_output_paths(
+                            output_dir,
+                            moved_files,
+                        ),
+                        "result": frame_result.to_dict(),
+                    }
+                )
+                sorting_completed_frames += 1
+                frames_since_checkpoint += 1
+                checkpoint_metadata()
+                if progress_callback is not None:
+                    progress_callback(
+                        sorting_completed_frames,
+                        total_frames,
+                        frame_label,
+                    )
+        except Exception as exc:
+            metadata["state"] = "failed"
+            metadata["updated_at"] = _utc_timestamp()
+            metadata["last_error"] = str(exc)
+            checkpoint_metadata(force=True)
+            raise
+
+        metadata["state"] = "completed"
+        metadata["updated_at"] = _utc_timestamp()
+        metadata["completed_at"] = _utc_timestamp()
+        metadata["last_error"] = None
+        checkpoint_metadata(force=True)
+
+        frame_results = self._frame_results_from_entries(frame_entries)
+        written_files = self._written_files_from_metadata(
+            output_dir,
+            metadata,
+            frame_entries,
+        )
+        self.last_results = frame_results
+        return TrajectoryClusterExport(
+            written_files=written_files,
+            frame_results=frame_results,
+            metadata_path=metadata_path,
+            resumed=resumed,
+            already_complete=False,
+            previously_completed_frames=previously_processed_frames,
+            newly_processed_frames=newly_processed_frames,
+        )
+
+    def _rebuild_smart_shell_run_states(
+        self,
+        frame_entries: Mapping[str, Mapping[str, object]],
+    ) -> dict[tuple[int, ...], _SmartShellRunState]:
+        """Reconstruct the active contiguous smart-shell runs."""
+        active_runs: dict[tuple[int, ...], _SmartShellRunState] = {}
+        for entry in sorted(frame_entries.values(), key=_entry_sort_key):
+            if not _frame_entry_is_processed(entry) or "result" not in entry:
+                continue
+            frame_result = FrameClusterResult.from_dict(dict(entry["result"]))
+            frame_index = int(
+                entry.get("frame_index", frame_result.frame_index)
+            )
+            frame_name = str(entry["frame_name"])
+            current_runs: dict[tuple[int, ...], _SmartShellRunState] = {}
+            for cluster in frame_result.clusters:
+                solute_atom_ids = cluster.solute_atom_ids
+                prior_run = active_runs.get(solute_atom_ids)
+                if (
+                    prior_run is not None
+                    and prior_run.last_frame_index == frame_index - 1
+                ):
+                    run = prior_run
+                else:
+                    run = _SmartShellRunState(
+                        solute_atom_ids=solute_atom_ids,
+                        last_frame_index=frame_index,
+                        frame_refs=[],
+                        shell_levels={},
+                    )
+                run.last_frame_index = frame_index
+                run.frame_refs.append((frame_name, cluster.cluster_id))
+                run.shell_levels = _cluster_shell_level_payload(cluster)
+                current_runs[solute_atom_ids] = run
+            active_runs = current_runs
+        return active_runs
+
+    def _apply_smart_shell_union_to_run(
+        self,
+        run: _SmartShellRunState,
+        frame_entries: dict[str, dict[str, object]],
+        *,
+        elements: Mapping[int, str],
+    ) -> None:
+        """Update all frame results in one contiguous run to the latest
+        solvent union."""
+        for frame_name, cluster_id in run.frame_refs:
+            entry = frame_entries.get(frame_name)
+            if entry is None or "result" not in entry:
+                continue
+            frame_result = FrameClusterResult.from_dict(dict(entry["result"]))
+            for cluster in frame_result.clusters:
+                if cluster.cluster_id != cluster_id:
+                    continue
+                _update_cluster_record_shell_union(
+                    cluster,
+                    run.shell_levels,
+                    elements=elements,
+                    include_shell_atoms_in_stoichiometry=(
+                        self.include_shell_atoms_in_stoichiometry
+                    ),
+                )
+                break
+            entry["result"] = frame_result.to_dict()
+
+    @staticmethod
+    def _validate_smart_shell_rerun(
+        *,
+        expected_clusters: Sequence[ClusterRecord],
+        actual_clusters: Sequence[ClusterRecord],
+        frame_name: str,
+    ) -> None:
+        """Ensure one smart-shell rerun recreated the stored
+        clusters."""
+        expected_by_id = {
+            cluster.cluster_id: cluster for cluster in expected_clusters
+        }
+        actual_by_id = {
+            cluster.cluster_id: cluster for cluster in actual_clusters
+        }
+        if expected_by_id.keys() != actual_by_id.keys():
+            raise ValueError(
+                "Smart Solvation Shell rerun did not reproduce the stored "
+                f"cluster ids for {frame_name}."
+            )
+        for cluster_id, expected in expected_by_id.items():
+            actual = actual_by_id[cluster_id]
+            if expected.solute_atom_ids != actual.solute_atom_ids:
+                raise ValueError(
+                    "Smart Solvation Shell rerun changed the solute cluster "
+                    f"assignment for {frame_name} ({cluster_id})."
+                )
+            if expected.shell_atom_ids != actual.shell_atom_ids:
+                raise ValueError(
+                    "Smart Solvation Shell rerun changed the solvent shell "
+                    f"membership for {frame_name} ({cluster_id})."
+                )
+
     def export_cluster_pdbs(
         self,
         output_dir: str | Path,
@@ -2796,6 +3454,7 @@ class ExtractedFrameFolderClusterAnalyzer:
                 ),
                 "default_cutoff": self.default_cutoff,
                 "use_pbc": self.use_pbc,
+                "smart_solvation_shells": self.smart_solvation_shells,
                 "include_shell_atoms_in_stoichiometry": (
                     self.include_shell_atoms_in_stoichiometry
                 ),

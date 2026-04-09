@@ -57,6 +57,7 @@ def test_cluster_workflow_supports_notebook_style_end_to_end_usage(tmp_path):
     assert summary["estimated_box_dimensions"] == (2.0, 1.7, 0.0)
     assert selection.search_mode == "kdtree"
     assert selection.save_state_frequency == DEFAULT_SAVE_STATE_FREQUENCY
+    assert not selection.smart_solvation_shells
     assert selection.resolved_box_dimensions == (2.0, 1.7, 0.0)
     assert selection.output_dir == tmp_path / "clusters_splitxyz0001"
     assert export.output_dir == selection.output_dir
@@ -111,6 +112,7 @@ def test_clusters_cli_export_runs_complete_headless_workflow(
 
     assert exit_code == 0
     assert "Mode: XYZ frames" in captured.out
+    assert "Smart solvation shells: off" in captured.out
     assert "Search mode: KDTree" in captured.out
     assert (
         "Save-state frequency: every "

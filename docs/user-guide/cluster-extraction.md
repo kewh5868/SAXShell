@@ -1,4 +1,4 @@
-# Cluster Extraction
+# MD Extraction and Cluster Preparation
 
 Cluster extraction is the bridge between raw trajectory data and the SAXS model.
 In this repository, that bridge spans more than one tool.
@@ -10,8 +10,11 @@ In this repository, that bridge spans more than one tool.
 3. Use `clusters` to extract stoichiometry-sorted cluster files.
 4. Use `clusterdynamics` to build time-dependent cluster-distribution heatmaps
    and lifetime tables from the extracted frames.
-5. Use `bondanalysis` to measure bond or angle distributions on those clusters.
-6. Feed the resulting cluster folder into the SAXS project.
+5. Optionally use `bondanalysis` to measure bond or angle distributions on
+   those clusters.
+6. Optionally use **Debye-Waller Analysis** to estimate project-backed
+   pairwise disorder coefficients from sorted PDB cluster folders.
+7. Feed the resulting cluster folder into the SAXS project.
 
 ## `mdtrajectory`
 
@@ -84,11 +87,15 @@ Key outputs:
 - a sortable lifetime table by stoichiometry label
 - saved JSON/CSV datasets that can be reopened later for plotting
 
-## `bondanalysis`
+## Downstream structure analysis
 
-Bond analysis is downstream of cluster extraction. Use it to derive bond-pair
-and angle-triplet distributions from the stoichiometry folders produced by the
-cluster workflow.
+After the sorted cluster folders have been produced, the main UI exposes two
+structure-analysis tools that reuse them:
+
+- [Bond Analysis](bond-analysis.md) for bond-pair and angle-triplet
+  distributions
+- [Debye-Waller Analysis](debye-waller-analysis.md) for pairwise
+  thermal-displacement coefficients from sorted `PDB` cluster folders
 
 ## What SAXS expects from this stage
 
@@ -103,6 +110,8 @@ clusters before moving on.
 ## Related pages
 
 - [Project Setup](../getting-started/project-setup.md)
+- [Bond Analysis](bond-analysis.md)
+- [Debye-Waller Analysis](debye-waller-analysis.md)
 - [Project Configuration](project-configuration.md)
 - [Cluster Dynamics](cluster-dynamics.md)
 - [Cluster Dynamics ML](cluster-dynamics-ml.md)

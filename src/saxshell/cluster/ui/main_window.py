@@ -73,6 +73,7 @@ class ClusterJobConfig:
     shell_levels: tuple[int, ...]
     include_shell_levels: tuple[int, ...]
     shared_shells: bool
+    smart_solvation_shells: bool
     include_shell_atoms_in_stoichiometry: bool
     output_dir: Path
 
@@ -207,6 +208,7 @@ class ClusterExportWorker(QObject):
                 box_dimensions=self.config.box_dimensions,
                 default_cutoff=self.config.default_cutoff,
                 use_pbc=self.config.use_pbc,
+                smart_solvation_shells=self.config.smart_solvation_shells,
                 include_shell_atoms_in_stoichiometry=(
                     self.config.include_shell_atoms_in_stoichiometry
                 ),
@@ -248,6 +250,10 @@ class ClusterExportWorker(QObject):
                 self.progress.emit("Running core-only cluster analysis.")
             self.progress.emit(
                 f"Stoichiometry bins: {stoichiometry_bins_text}."
+            )
+            self.progress.emit(
+                "Smart solvation shells: "
+                f"{'on' if self.config.smart_solvation_shells and frame_format == 'pdb' else 'off'}."
             )
             self.progress.emit(
                 "Periodic boundary conditions: "
@@ -703,6 +709,8 @@ class ClusterMainWindow(QMainWindow):
                 f"Frames folder: {config.frames_dir}\n"
                 f"Mode: {mode_text}\n"
                 f"PBC: {'on' if config.use_pbc else 'off'}\n"
+                "Smart solvation shells: "
+                f"{'on' if config.smart_solvation_shells else 'off'}\n"
                 "Search mode: "
                 f"{format_search_mode_label(config.search_mode)}\n"
                 "Save-state frequency: "
@@ -785,6 +793,10 @@ class ClusterMainWindow(QMainWindow):
             shell_levels=self.definitions_panel.shell_growth_levels(),
             include_shell_levels=self.definitions_panel.include_shell_levels(),
             shared_shells=self.definitions_panel.shared_shells(),
+            smart_solvation_shells=(
+                self._frame_format == "pdb"
+                and self.definitions_panel.smart_solvation_shells()
+            ),
             include_shell_atoms_in_stoichiometry=(
                 self.definitions_panel.include_shell_atoms_in_stoichiometry()
             ),
@@ -1134,6 +1146,8 @@ class ClusterMainWindow(QMainWindow):
                 "of extracted frame files.\n"
                 f"Mode: {mode_text}\n"
                 f"PBC: {'on' if self.definitions_panel.use_pbc() else 'off'}\n"
+                "Smart solvation shells: "
+                f"{'on' if self._frame_format == 'pdb' and self.definitions_panel.smart_solvation_shells() else 'off'}\n"
                 f"Search mode: {search_mode_label}\n"
                 "Save-state frequency: every "
                 f"{self.definitions_panel.save_state_frequency()} frames\n"
@@ -1176,6 +1190,8 @@ class ClusterMainWindow(QMainWindow):
             f"{summary_text}\nAtom-type rules: {atom_rule_count}\n"
             f"Pair-cutoff rules: {pair_rule_count}\n"
             f"Shell levels to grow: {self._shell_growth_text()}\n"
+            "Smart solvation shells: "
+            f"{'on' if self._frame_format == 'pdb' and self.definitions_panel.smart_solvation_shells() else 'off'}\n"
             f"Shared shells: {shared_shells_text}"
         )
         if rule_warning is not None:
@@ -1218,6 +1234,8 @@ class ClusterMainWindow(QMainWindow):
             ),
             f"Mode: {mode_text}",
             f"PBC: {'on' if self.definitions_panel.use_pbc() else 'off'}",
+            "Smart solvation shells: "
+            f"{'on' if self._frame_format == 'pdb' and self.definitions_panel.smart_solvation_shells() else 'off'}",
             f"Search mode: {search_mode_label}",
             "Save-state frequency: every "
             f"{self.definitions_panel.save_state_frequency()} frames",
