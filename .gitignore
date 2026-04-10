@@ -81,6 +81,8 @@ site/
 
 # pytest
 .pytest_cache/
+tests/edm_contiguous_mode_report/
+tests/smearing_analysis_*/
 
 # PyBuilder
 target/

@@ -208,8 +208,10 @@ class ContrastModeMainWindow(QMainWindow):
         initial_distribution_id: str | None = None,
         initial_distribution_root_dir: Path | None = None,
         initial_contrast_artifact_dir: Path | None = None,
+        preview_mode: bool = True,
     ) -> None:
         super().__init__()
+        self._preview_mode = bool(preview_mode)
         self._launch_context = ContrastModeLaunchContext.from_values(
             project_dir=initial_project_dir,
             clusters_dir=initial_clusters_dir,
@@ -259,7 +261,7 @@ class ContrastModeMainWindow(QMainWindow):
         self.apply_launch_context(self._launch_context)
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("SAXSShell (Contrast Debye Workflow)")
+        self._apply_preview_mode_title()
         self.setWindowIcon(load_saxshell_icon())
         self.resize(1600, 980)
 
@@ -268,12 +270,8 @@ class ContrastModeMainWindow(QMainWindow):
         root_layout.setContentsMargins(10, 10, 10, 10)
         root_layout.setSpacing(10)
 
-        intro = QLabel(
-            "This dedicated workspace hosts the future contrast-enabled Debye "
-            "workflow. The existing no-contrast SAXS component builder remains "
-            "unchanged while the contrast pipeline is developed in separate "
-            "modules and tested here."
-        )
+        intro = QLabel()
+        self.preview_mode_banner = intro
         intro.setWordWrap(True)
         intro.setFrameShape(QFrame.Shape.StyledPanel)
         root_layout.addWidget(intro)
@@ -293,7 +291,46 @@ class ContrastModeMainWindow(QMainWindow):
         self._reload_solvent_presets(selected_name="Water")
         self._sync_density_method_controls()
         self._update_trace_control_state()
-        self.statusBar().showMessage("Contrast-mode workspace ready")
+        self._refresh_preview_mode_banner()
+        self.statusBar().showMessage(
+            "Contrast-mode preview ready"
+            if self._preview_mode
+            else "Contrast-mode workspace ready"
+        )
+
+    def _apply_preview_mode_title(self) -> None:
+        title = "SAXSShell (Contrast Debye Workflow)"
+        if self._preview_mode:
+            title += " (Preview)"
+        self.setWindowTitle(title)
+
+    def _refresh_preview_mode_banner(self) -> None:
+        if self._preview_mode:
+            self.preview_mode_banner.setText(
+                "Preview Mode: this window is for checking representative "
+                "selection, density settings, and contrast Debye traces before "
+                "building model components. To save component outputs under a "
+                "computed distribution, launch it from Build SAXS Components."
+            )
+            self.preview_mode_banner.setToolTip(
+                "Preview mode does not directly save model components to the "
+                "active computed distribution."
+            )
+        else:
+            self.preview_mode_banner.setText(
+                "Computed Distribution Mode: this window is linked to the "
+                "active computed distribution and can save component artifacts "
+                "back into that distribution."
+            )
+            self.preview_mode_banner.setToolTip(
+                "This workflow was launched from Build SAXS Components and is "
+                "working inside the active computed distribution."
+            )
+
+    def set_preview_mode(self, preview_mode: bool) -> None:
+        self._preview_mode = bool(preview_mode)
+        self._apply_preview_mode_title()
+        self._refresh_preview_mode_banner()
 
     def _build_left_pane(self) -> QScrollArea:
         content = QWidget()
@@ -4502,6 +4539,7 @@ def launch_contrast_mode_ui(
     initial_distribution_id: str | None = None,
     initial_distribution_root_dir: str | Path | None = None,
     initial_contrast_artifact_dir: str | Path | None = None,
+    preview_mode: bool = True,
 ) -> ContrastModeMainWindow:
     app = QApplication.instance()
     if app is None:
@@ -4538,6 +4576,7 @@ def launch_contrast_mode_ui(
             if initial_contrast_artifact_dir is None
             else Path(initial_contrast_artifact_dir).expanduser().resolve()
         ),
+        preview_mode=preview_mode,
     )
     window.show()
     window.raise_()

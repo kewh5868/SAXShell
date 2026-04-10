@@ -1,4 +1,6 @@
 from .workflow import (
+    ElectronDensityDebyeScatteringAverageResult,
+    ElectronDensityDebyeWallerPairTerm,
     ElectronDensityInputInspection,
     ElectronDensityMeshGeometry,
     ElectronDensityMeshSettings,
@@ -6,6 +8,7 @@ from .workflow import (
     ElectronDensityProfileResult,
     ElectronDensityStructure,
     build_electron_density_mesh,
+    compute_average_debye_scattering_profile_for_input,
     compute_electron_density_profile,
     inspect_structure_input,
     load_electron_density_structure,
@@ -15,6 +18,8 @@ from .workflow import (
 )
 
 __all__ = [
+    "ElectronDensityDebyeScatteringAverageResult",
+    "ElectronDensityDebyeWallerPairTerm",
     "ElectronDensityInputInspection",
     "ElectronDensityMeshGeometry",
     "ElectronDensityMeshSettings",
@@ -22,6 +27,7 @@ __all__ = [
     "ElectronDensityProfileResult",
     "ElectronDensityStructure",
     "build_electron_density_mesh",
+    "compute_average_debye_scattering_profile_for_input",
     "compute_electron_density_profile",
     "inspect_structure_input",
     "load_electron_density_structure",
