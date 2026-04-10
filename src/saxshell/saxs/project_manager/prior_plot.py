@@ -116,6 +116,7 @@ def build_prior_histogram_export_payload(
     mode: str = "structure_fraction",
     value_mode: str = "percent",
     secondary_element: str | None = None,
+    custom_label_order: list[tuple[str, str]] | None = None,
 ) -> dict[str, object]:
     payload = _load_prior_payload(json_path)
     normalized_mode = _normalize_prior_mode(mode)
@@ -124,6 +125,20 @@ def build_prior_histogram_export_payload(
         plot_mode=normalized_mode,
     )
     labels = sort_stoich_labels(structures)
+    if custom_label_order is not None:
+        available = set(structures.keys())
+        ordered = [raw for raw, _ in custom_label_order if raw in available]
+        remaining = [
+            lbl
+            for lbl in labels
+            if lbl not in {r for r, _ in custom_label_order}
+        ]
+        labels = ordered + remaining
+    _custom_display: dict[str, str] = (
+        {raw: display for raw, display in custom_label_order}
+        if custom_label_order is not None
+        else {}
+    )
     if normalized_mode not in {
         "structure_fraction",
         "atom_fraction",
@@ -225,7 +240,10 @@ def build_prior_histogram_export_payload(
         "plot_mode": normalized_mode,
         "value_mode": value_mode,
         "labels": labels,
-        "axis_labels": [format_stoich_for_axis(label) for label in labels],
+        "axis_labels": [
+            _custom_display.get(label, format_stoich_for_axis(label))
+            for label in labels
+        ],
         "segments": [str(segment) for segment in segments],
         "segment_labels": segment_labels,
         "secondary_element": secondary_element,
@@ -320,6 +338,7 @@ def plot_md_prior_histogram(
     cmap: str = "summer",
     structure_motif_colors: dict[str, str] | None = None,
     show_percent: bool = True,
+    custom_label_order: list[tuple[str, str]] | None = None,
     ax=None,
 ):
     small_total_threshold = 1.0
@@ -328,8 +347,10 @@ def plot_md_prior_histogram(
         mode=mode,
         value_mode="percent",
         secondary_element=secondary_element,
+        custom_label_order=custom_label_order,
     )
     labels = [str(label) for label in export_payload["labels"]]
+    axis_labels = [str(label) for label in export_payload["axis_labels"]]
     segments = [str(segment) for segment in export_payload["segments"]]
     segment_labels = [str(label) for label in export_payload["segment_labels"]]
     plot_mode = str(export_payload["plot_mode"])
@@ -413,7 +434,7 @@ def plot_md_prior_histogram(
     ax.set_title(_prior_plot_title(plot_mode, secondary_element))
     ax.set_xticks(range(len(labels)))
     ax.set_xticklabels(
-        [format_stoich_for_axis(label) for label in labels],
+        axis_labels,
         rotation=45,
         ha="right",
     )

@@ -58,6 +58,12 @@ class ClusterSelectionPreview:
     last_frame_name: str | None
 
 
+def _save_state_frequency_label(frequency: int) -> str:
+    if frequency >= 10**8:
+        return "end of run only"
+    return f"every {frequency} frame(s)"
+
+
 @dataclass(slots=True)
 class ClusterJobConfig:
     """Cluster-analysis settings assembled from the UI."""
@@ -265,7 +271,7 @@ class ClusterExportWorker(QObject):
             )
             self.progress.emit(
                 "Save-state frequency: "
-                f"every {self.config.save_state_frequency} frame(s)."
+                f"{_save_state_frequency_label(self.config.save_state_frequency)}."
             )
             self.progress.emit(
                 f"Writing cluster {output_suffix} files under: "
@@ -714,7 +720,7 @@ class ClusterMainWindow(QMainWindow):
                 "Search mode: "
                 f"{format_search_mode_label(config.search_mode)}\n"
                 "Save-state frequency: "
-                f"every {config.save_state_frequency} frames\n"
+                f"{_save_state_frequency_label(config.save_state_frequency)}\n"
                 f"Stoichiometry bins: {stoichiometry_bins_text}\n"
                 f"Output directory: {config.output_dir}"
             )
@@ -1149,8 +1155,8 @@ class ClusterMainWindow(QMainWindow):
                 "Smart solvation shells: "
                 f"{'on' if self._frame_format == 'pdb' and self.definitions_panel.smart_solvation_shells() else 'off'}\n"
                 f"Search mode: {search_mode_label}\n"
-                "Save-state frequency: every "
-                f"{self.definitions_panel.save_state_frequency()} frames\n"
+                "Save-state frequency: "
+                f"{_save_state_frequency_label(self.definitions_panel.save_state_frequency())}\n"
                 f"Stoichiometry bins: {stoichiometry_bins_text}\n"
                 f"{self._box_dimensions_label()}: {estimated_box_text}\n"
                 f"Atom-type rules: {atom_rule_count}\n"
@@ -1237,8 +1243,8 @@ class ClusterMainWindow(QMainWindow):
             "Smart solvation shells: "
             f"{'on' if self._frame_format == 'pdb' and self.definitions_panel.smart_solvation_shells() else 'off'}",
             f"Search mode: {search_mode_label}",
-            "Save-state frequency: every "
-            f"{self.definitions_panel.save_state_frequency()} frames",
+            "Save-state frequency: "
+            f"{_save_state_frequency_label(self.definitions_panel.save_state_frequency())}",
             f"Stoichiometry bins: {stoichiometry_bins_text}",
             f"Frames in folder: {preview.total_frames}",
             f"Frames selected: {preview.selected_frames}",

@@ -50,6 +50,7 @@ from saxshell.saxs.prefit.cluster_geometry import (
     STRUCTURE_FACTOR_RECOMMENDATIONS,
     synchronize_cluster_geometry_row,
 )
+from saxshell.saxs.ui._pane_snap import PaneSnapFilter
 from saxshell.saxs.ui.solute_volume_fraction_widget import (
     SOLUTE_VOLUME_FRACTION_HELP_TEXT as SOLUTE_VOLUME_FRACTION_HELP_MESSAGE,
 )
@@ -201,6 +202,7 @@ class PrefitTab(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._auto_snap_enabled = True
         self._console_autoscroll_enabled = True
         self._current_evaluation: PrefitEvaluation | None = None
         self._summary_text = ""
@@ -293,6 +295,13 @@ class PrefitTab(QWidget):
         self._main_splitter.setStretchFactor(0, 4)
         self._main_splitter.setStretchFactor(1, 2)
         self._main_splitter.setSizes([760, 260])
+        self._auto_snap_filter = PaneSnapFilter(
+            self._pane_splitter,
+            self._left_scroll_area,
+            self._plot_group,
+            parent=self,
+        )
+        self.set_auto_snap_enabled(self._auto_snap_enabled)
         content_layout.addWidget(self._main_splitter, stretch=1)
 
         self._scroll_area.setWidget(content)
@@ -1913,6 +1922,10 @@ class PrefitTab(QWidget):
         self._console_autoscroll_enabled = bool(enabled)
         if self._console_autoscroll_enabled:
             self._scroll_output_to_end()
+
+    def set_auto_snap_enabled(self, enabled: bool) -> None:
+        self._auto_snap_enabled = bool(enabled)
+        self._auto_snap_filter.set_enabled(self._auto_snap_enabled)
 
     def _item_text(self, row: int, column: int) -> str:
         item = self.parameter_table.item(row, column)

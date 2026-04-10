@@ -227,6 +227,18 @@ class ClusterDefinitionsPanel(QGroupBox):
         )
         options_layout.addRow("Search mode", self.search_mode_combo)
 
+        self.periodic_save_state_checkbox = QCheckBox("Periodic save-state")
+        self.periodic_save_state_checkbox.setChecked(True)
+        self.periodic_save_state_checkbox.setToolTip(
+            "When enabled, metadata checkpoints are written periodically "
+            "during the run. Disable to only save at the end of the run, "
+            "which can significantly speed up extraction on large datasets."
+        )
+        self.periodic_save_state_checkbox.toggled.connect(
+            self._on_periodic_save_state_toggled
+        )
+        options_layout.addRow("", self.periodic_save_state_checkbox)
+
         self.save_state_frequency_spin = QSpinBox()
         self.save_state_frequency_spin.setRange(1, 10**9)
         self.save_state_frequency_spin.setValue(DEFAULT_SAVE_STATE_FREQUENCY)
@@ -931,7 +943,16 @@ class ClusterDefinitionsPanel(QGroupBox):
         if emit_signal:
             self.settings_changed.emit()
 
+    def _on_periodic_save_state_toggled(self, checked: bool) -> None:
+        self.save_state_frequency_spin.setEnabled(checked)
+        self.settings_changed.emit()
+
+    def periodic_save_state_enabled(self) -> bool:
+        return bool(self.periodic_save_state_checkbox.isChecked())
+
     def save_state_frequency(self) -> int:
+        if not self.periodic_save_state_enabled():
+            return 10**9
         return int(self.save_state_frequency_spin.value())
 
     def set_save_state_frequency(

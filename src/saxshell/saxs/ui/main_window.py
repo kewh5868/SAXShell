@@ -75,6 +75,7 @@ from saxshell.saxs._model_templates import (
     load_template_spec,
 )
 from saxshell.saxs.contrast.settings import (
+    COMPONENT_BUILD_MODE_BORN_APPROXIMATION,
     COMPONENT_BUILD_MODE_CONTRAST,
     component_build_mode_label,
     normalize_component_build_mode,
@@ -165,6 +166,7 @@ GITHUB_REPOSITORY_URL = "https://github.com/kewh5868/SAXSShell"
 CONTACT_EMAIL = "keith.white@colorado.edu"
 RECENT_PROJECTS_KEY = "recent_project_dirs"
 CONSOLE_AUTOSCROLL_KEY = "console_autoscroll_enabled"
+AUTO_SNAP_PANES_KEY = "auto_snap_panes_enabled"
 MAX_RECENT_PROJECTS = 10
 PROJECT_LOAD_PREP_STEPS = 4
 PROJECT_LOAD_TOTAL_STEPS = 12
@@ -1105,6 +1107,7 @@ class SAXSMainWindow(QMainWindow):
         self._prefit_missing_components_warning_shown = False
         self._updating_deprecated_template_visibility = False
         self._show_deprecated_templates = False
+        self._auto_snap_panes_enabled = self._load_auto_snap_panes_setting()
         self._console_autoscroll_enabled = (
             self._load_console_autoscroll_setting()
         )
@@ -1175,12 +1178,17 @@ class SAXSMainWindow(QMainWindow):
         self.project_setup_tab.set_console_autoscroll_enabled(
             self._console_autoscroll_enabled
         )
+        self.project_setup_tab.set_auto_snap_enabled(
+            self._auto_snap_panes_enabled
+        )
         self.prefit_tab.set_console_autoscroll_enabled(
             self._console_autoscroll_enabled
         )
+        self.prefit_tab.set_auto_snap_enabled(self._auto_snap_panes_enabled)
         self.dream_tab.set_console_autoscroll_enabled(
             self._console_autoscroll_enabled
         )
+        self.dream_tab.set_auto_snap_enabled(self._auto_snap_panes_enabled)
         self.tabs.addTab(self.project_setup_tab, "Project Setup")
         self.tabs.addTab(self.prefit_tab, "SAXS Prefit")
         self.tabs.addTab(self.dream_tab, "SAXS DREAM Fit")
@@ -1204,6 +1212,12 @@ class SAXSMainWindow(QMainWindow):
         )
         self.project_setup_tab.open_cluster_requested.connect(
             self._open_cluster_tool
+        )
+        self.project_setup_tab.open_clusterdynamicsml_requested.connect(
+            self._open_clusterdynamicsml_tool
+        )
+        self.project_setup_tab.open_debye_waller_requested.connect(
+            self._open_debye_waller_analysis_tool
         )
         self.project_setup_tab.model_only_mode_changed.connect(
             self._on_model_only_mode_changed
@@ -1405,27 +1419,42 @@ class SAXSMainWindow(QMainWindow):
         self.file_menu.addAction(self.save_project_as_action)
 
         self.tools_menu = menu_bar.addMenu("Tools")
+        self.md_extraction_menu = self.tools_menu.addMenu("MD Extraction")
         self.mdtrajectory_action = QAction(
             "Open MD Trajectory Extraction", self
         )
         self.mdtrajectory_action.triggered.connect(
             self._open_mdtrajectory_tool
         )
-        self.tools_menu.addAction(self.mdtrajectory_action)
+        self.md_extraction_menu.addAction(self.mdtrajectory_action)
 
         self.xyz2pdb_action = QAction("Open XYZ -> PDB Conversion", self)
         self.xyz2pdb_action.triggered.connect(self._open_xyz2pdb_tool)
-        self.tools_menu.addAction(self.xyz2pdb_action)
+        self.md_extraction_menu.addAction(self.xyz2pdb_action)
 
         self.cluster_action = QAction("Open Cluster Extraction", self)
         self.cluster_action.triggered.connect(self._open_cluster_tool)
-        self.tools_menu.addAction(self.cluster_action)
+        self.md_extraction_menu.addAction(self.cluster_action)
 
+        self.structure_analysis_menu = self.tools_menu.addMenu(
+            "Structure Analysis"
+        )
         self.bondanalysis_action = QAction("Open Bond Analysis", self)
         self.bondanalysis_action.triggered.connect(
             self._open_bondanalysis_tool
         )
-        self.tools_menu.addAction(self.bondanalysis_action)
+        self.structure_analysis_menu.addAction(self.bondanalysis_action)
+
+        self.debye_waller_analysis_action = QAction(
+            "Open Debye-Waller Analysis",
+            self,
+        )
+        self.debye_waller_analysis_action.triggered.connect(
+            self._open_debye_waller_analysis_tool
+        )
+        self.structure_analysis_menu.addAction(
+            self.debye_waller_analysis_action
+        )
 
         self.cluster_dynamics_menu = self.tools_menu.addMenu(
             "Cluster Dynamics"
@@ -1457,46 +1486,68 @@ class SAXSMainWindow(QMainWindow):
         self.fullrmc_action.triggered.connect(self._open_fullrmc_tool)
         self.pdf_menu.addAction(self.fullrmc_action)
 
+        self.visualization_menu = self.tools_menu.addMenu("Visualization")
+        self.structure_viewer_action = QAction(
+            "Structure Viewer",
+            self,
+        )
+        self.structure_viewer_action.triggered.connect(
+            self._open_structure_viewer_tool
+        )
+        self.visualization_menu.addAction(self.structure_viewer_action)
+
         self.blenderxyz_action = QAction(
             "Open Blender XYZ Renderer",
             self,
         )
         self.blenderxyz_action.triggered.connect(self._open_blenderxyz_tool)
-        self.tools_menu.addAction(self.blenderxyz_action)
+        self.visualization_menu.addAction(self.blenderxyz_action)
 
+        self.component_calculation_preview_menu = self.tools_menu.addMenu(
+            "SAXS Calculation Preview"
+        )
         self.contrast_mode_action = QAction(
             "Open SAXS Contrast Mode",
             self,
         )
         self.contrast_mode_action.triggered.connect(
-            self._open_contrast_mode_tool
+            lambda _checked=False: self._open_contrast_mode_tool(
+                preview_mode=True
+            )
         )
-        self.tools_menu.addAction(self.contrast_mode_action)
+        self.component_calculation_preview_menu.addAction(
+            self.contrast_mode_action
+        )
 
         self.electron_density_mapping_action = QAction(
             "Open Electron Density Mapping",
             self,
         )
         self.electron_density_mapping_action.triggered.connect(
-            self._open_electron_density_mapping_tool
+            lambda _checked=False: self._open_electron_density_mapping_tool(
+                preview_mode=True
+            )
         )
-        self.tools_menu.addAction(self.electron_density_mapping_action)
+        self.component_calculation_preview_menu.addAction(
+            self.electron_density_mapping_action
+        )
 
-        self.estimation_menu = self.tools_menu.addMenu("Estimation")
+        self.xray_toolkit_menu = self.tools_menu.addMenu("X-ray Toolkit")
+        self.estimation_menu = self.xray_toolkit_menu
         self.volume_fraction_action = QAction(
             "Open Volume Fraction Estimate", self
         )
         self.volume_fraction_action.triggered.connect(
             self._open_solute_volume_fraction_tool
         )
-        self.estimation_menu.addAction(self.volume_fraction_action)
+        self.xray_toolkit_menu.addAction(self.volume_fraction_action)
         self.number_density_action = QAction(
             "Open Number Density Estimate", self
         )
         self.number_density_action.triggered.connect(
             self._open_number_density_tool
         )
-        self.estimation_menu.addAction(self.number_density_action)
+        self.xray_toolkit_menu.addAction(self.number_density_action)
         self.attenuation_estimate_action = QAction(
             "Open Attenuation Estimate",
             self,
@@ -1504,7 +1555,7 @@ class SAXSMainWindow(QMainWindow):
         self.attenuation_estimate_action.triggered.connect(
             self._open_attenuation_tool
         )
-        self.estimation_menu.addAction(self.attenuation_estimate_action)
+        self.xray_toolkit_menu.addAction(self.attenuation_estimate_action)
         self.fluorescence_estimate_action = QAction(
             "Open Fluorescence Estimate",
             self,
@@ -1512,7 +1563,7 @@ class SAXSMainWindow(QMainWindow):
         self.fluorescence_estimate_action.triggered.connect(
             self._open_fluorescence_tool
         )
-        self.estimation_menu.addAction(self.fluorescence_estimate_action)
+        self.xray_toolkit_menu.addAction(self.fluorescence_estimate_action)
         self.settings_menu = menu_bar.addMenu("Settings")
         self.console_autoscroll_action = QAction(
             "Autoscroll Console Output",
@@ -1526,6 +1577,15 @@ class SAXSMainWindow(QMainWindow):
             self._toggle_console_autoscroll
         )
         self.settings_menu.addAction(self.console_autoscroll_action)
+        self.auto_snap_panes_action = QAction("Auto-Snap Panes", self)
+        self.auto_snap_panes_action.setCheckable(True)
+        self.auto_snap_panes_action.setChecked(
+            bool(self._auto_snap_panes_enabled)
+        )
+        self.auto_snap_panes_action.triggered.connect(
+            self._toggle_auto_snap_panes
+        )
+        self.settings_menu.addAction(self.auto_snap_panes_action)
         self.main_ui_settings_action = QAction(
             "Main UI Settings...",
             self,
@@ -1767,6 +1827,24 @@ class SAXSMainWindow(QMainWindow):
         self.tabs.setCurrentWidget(self.project_setup_tab)
         self.create_project_from_tab()
 
+    def _preferred_project_browser_start_dir(self) -> str:
+        if self.current_settings is not None:
+            project_dir = (
+                Path(self.current_settings.project_dir).expanduser().resolve()
+            )
+            if project_dir.parent.exists():
+                return str(project_dir.parent)
+            return str(project_dir)
+        recent_paths = self._recent_project_paths()
+        if recent_paths:
+            recent_project_dir = Path(recent_paths[0]).expanduser()
+            if recent_project_dir.exists():
+                resolved_dir = recent_project_dir.resolve()
+                if resolved_dir.parent.exists():
+                    return str(resolved_dir.parent)
+                return str(resolved_dir)
+        return str(Path.home())
+
     def open_project_from_dialog(self) -> None:
         try:
             selected_path = self.project_setup_tab.open_project_dir()
@@ -1776,7 +1854,7 @@ class SAXSMainWindow(QMainWindow):
             selected = QFileDialog.getExistingDirectory(
                 self,
                 "Open SAXS project folder",
-                str(Path.home()),
+                self._preferred_project_browser_start_dir(),
             )
             if selected:
                 self.load_project(self._validated_project_dir(selected))
@@ -1785,15 +1863,10 @@ class SAXSMainWindow(QMainWindow):
 
     def _open_project_from_menu(self) -> None:
         try:
-            start_dir = (
-                self.current_settings.project_dir
-                if self.current_settings is not None
-                else str(Path.home())
-            )
             selected = QFileDialog.getExistingDirectory(
                 self,
                 "Open SAXS project folder",
-                start_dir,
+                self._preferred_project_browser_start_dir(),
             )
             if selected:
                 self.tabs.setCurrentWidget(self.project_setup_tab)
@@ -2152,18 +2225,41 @@ class SAXSMainWindow(QMainWindow):
                 )
                 self.current_settings = settings
                 self.project_setup_tab.append_summary(
-                    "Build SAXS Components requested in Contrast Mode.\n"
+                    "Build SAXS Components requested in Contrast (Debye).\n"
                     "Launching the separate contrast-mode workflow window "
-                    "with the current project context.\n"
+                    "with the current computed-distribution context.\n"
                     "Run the representative analysis, electron-density step, "
-                    "and contrast Debye build from that window when you are "
-                    "ready.\n"
-                    "Switch Component Build Mode back to No Contrast Mode to "
-                    "use the existing SAXS component builder."
+                    "and contrast Debye build from that window when you are ready."
                 )
-                self._open_contrast_mode_tool()
+                self._open_contrast_mode_tool(preview_mode=False)
                 self.statusBar().showMessage(
                     "Opened SAXS contrast-mode workflow"
+                )
+                return
+            if (
+                settings.component_build_mode
+                == COMPONENT_BUILD_MODE_BORN_APPROXIMATION
+            ):
+                self._save_settings(
+                    settings,
+                    status_message=(
+                        "Project auto-saved before launching the Born "
+                        "Approximation electron-density workflow"
+                    ),
+                )
+                self.current_settings = settings
+                self.project_setup_tab.append_summary(
+                    "Build SAXS Components requested in Born Approximation "
+                    "(Average).\n"
+                    "Launching the electron-density mapping workflow with the "
+                    "active computed-distribution context.\n"
+                    "Use that workspace to calculate per-stoichiometry "
+                    "electron-density profiles and Fourier-transformed Born "
+                    "Approximation traces."
+                )
+                self._open_electron_density_mapping_tool(preview_mode=False)
+                self.statusBar().showMessage(
+                    "Opened electron-density Born Approximation workflow"
                 )
                 return
             self._save_settings(
@@ -2266,7 +2362,10 @@ class SAXSMainWindow(QMainWindow):
             settings = self._settings_from_project_tab()
             self._save_settings(
                 settings,
-                status_message="Project auto-saved before generating prior weights",
+                status_message=(
+                    "Project auto-saved before creating the computed "
+                    "distribution"
+                ),
             )
             self.current_settings = settings
             self._start_project_task(
@@ -2278,11 +2377,11 @@ class SAXSMainWindow(QMainWindow):
                         progress_callback=progress,
                     ),
                 ),
-                start_message="Generating prior weights...",
+                start_message="Creating computed distribution...",
                 settings=settings,
             )
         except Exception as exc:
-            self._show_error("Generate prior weights failed", str(exc))
+            self._show_error("Create computed distribution failed", str(exc))
 
     def install_model_template(self) -> None:
         try:
@@ -2968,23 +3067,24 @@ class SAXSMainWindow(QMainWindow):
             )
             if build_result.used_predicted_structure_weights:
                 self.project_setup_tab.append_summary(
-                    "Generated observed + Predicted Structures prior weights.\n"
+                    "Created computed distribution with observed + Predicted "
+                    "Structures prior weights.\n"
                     f"Predicted Structures included: {build_result.predicted_component_count}\n"
                     f"Saved prior weights: {build_result.md_prior_weights_path}\n"
                     f"Saved prior plot data: {build_result.prior_plot_data_path}"
                 )
             else:
                 self.project_setup_tab.append_summary(
-                    "Generated prior weights for "
+                    "Created computed distribution and generated prior weights for "
                     f"{len(build_result.component_entries)} cluster bins.\n"
                     f"Saved prior weights: {build_result.md_prior_weights_path}\n"
                     f"Saved prior plot data: {build_result.prior_plot_data_path}"
                 )
             self._refresh_prior_plot()
             self.project_setup_tab.finish_activity_progress(
-                "Prior-weight generation complete."
+                "Computed-distribution creation complete."
             )
-            self.statusBar().showMessage("Prior weights generated")
+            self.statusBar().showMessage("Computed distribution created")
         self._close_progress_dialog()
 
     @Slot(str, str)
@@ -7866,12 +7966,15 @@ class SAXSMainWindow(QMainWindow):
         active_settings = settings or self.current_settings
         if active_settings is None:
             self.project_setup_tab.set_available_distributions([])
+            self.project_setup_tab.set_current_distribution_details(None)
             self._update_active_contrast_distribution_view_state(None)
             return 0
         records = self.project_manager.list_saved_distributions(
             active_settings.project_dir
         )
         labels = []
+        tooltips: dict[str, str] = {}
+        details: dict[str, str] = {}
         for record in records:
             readiness = []
             if record.component_artifacts_ready:
@@ -7889,6 +7992,12 @@ class SAXSMainWindow(QMainWindow):
                     record.distribution_id,
                 )
             )
+            tooltips[record.distribution_id] = (
+                self._distribution_tooltip_for_record(record)
+            )
+            details[record.distribution_id] = (
+                self._distribution_details_for_record(record)
+            )
         selected_id = None
         if labels:
             selected_id = project_artifact_paths(
@@ -7897,9 +8006,221 @@ class SAXSMainWindow(QMainWindow):
         self.project_setup_tab.set_available_distributions(
             labels,
             selected_distribution_id=selected_id,
+            distribution_tooltips=tooltips,
+            distribution_details=details,
+        )
+        self.project_setup_tab.set_current_distribution_details(
+            self._current_distribution_details_text(active_settings)
         )
         self._update_active_contrast_distribution_view_state(active_settings)
         return len(records)
+
+    @staticmethod
+    def _distribution_q_range_text(
+        q_min: float | None,
+        q_max: float | None,
+    ) -> str:
+        if q_min is None or q_max is None:
+            return "default experimental range"
+        return f"{float(q_min):.6g} to {float(q_max):.6g} A^-1"
+
+    @staticmethod
+    def _distribution_grid_text(
+        *,
+        use_experimental_grid: bool,
+        q_points: int | None,
+    ) -> str:
+        if use_experimental_grid:
+            return "experimental grid"
+        return f"resampled grid ({int(q_points or 0)} points)"
+
+    @staticmethod
+    def _distribution_time_text(value: str | None) -> str:
+        text = str(value or "").strip()
+        return text or "Unavailable"
+
+    @staticmethod
+    def _distribution_prefit_summary(
+        distribution_dir: Path,
+    ) -> tuple[int, str]:
+        prefit_dir = distribution_dir / "prefit"
+        if not prefit_dir.is_dir():
+            return 0, "Unavailable"
+        snapshot_dirs = sorted(
+            path
+            for path in prefit_dir.iterdir()
+            if path.is_dir() and (path / "prefit_state.json").is_file()
+        )
+        state_path = prefit_dir / "prefit_state.json"
+        best_r_squared = "Unavailable"
+        if state_path.is_file():
+            try:
+                payload = json.loads(state_path.read_text(encoding="utf-8"))
+            except Exception:
+                payload = {}
+            statistics = payload.get("statistics", {})
+            if isinstance(statistics, dict):
+                value = statistics.get("r_squared")
+                if isinstance(value, (int, float)):
+                    best_r_squared = f"{float(value):.6g}"
+        return len(snapshot_dirs), best_r_squared
+
+    @staticmethod
+    def _distribution_dream_run_count(distribution_dir: Path) -> int:
+        runtime_dir = distribution_dir / "dream" / "runtime_scripts"
+        if not runtime_dir.is_dir():
+            return 0
+        return len([path for path in runtime_dir.iterdir() if path.is_dir()])
+
+    @staticmethod
+    def _distribution_component_count(distribution_dir: Path) -> int:
+        for candidate in (
+            distribution_dir / "md_saxs_map_predicted_structures.json",
+            distribution_dir / "md_saxs_map.json",
+        ):
+            if not candidate.is_file():
+                continue
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            saxs_map = payload.get("saxs_map", {})
+            if not isinstance(saxs_map, dict):
+                continue
+            return sum(
+                len(motif_map)
+                for motif_map in saxs_map.values()
+                if isinstance(motif_map, dict)
+            )
+        return 0
+
+    def _distribution_tooltip_for_record(self, record) -> str:
+        return "\n".join(
+            [
+                record.label,
+                f"Distribution ID: {record.distribution_id}",
+                "Build mode: "
+                + component_build_mode_label(record.component_build_mode),
+                "Template: " + str(record.template_name or "Unspecified"),
+                "q-range: "
+                + self._distribution_q_range_text(
+                    record.q_min,
+                    record.q_max,
+                ),
+                "Grid: "
+                + self._distribution_grid_text(
+                    use_experimental_grid=record.use_experimental_grid,
+                    q_points=record.q_points,
+                ),
+                "Updated: " + self._distribution_time_text(record.updated_at),
+            ]
+        )
+
+    def _distribution_details_for_record(self, record) -> str:
+        component_count = self._distribution_component_count(
+            record.distribution_dir
+        )
+        prefit_count, best_prefit_r_squared = (
+            self._distribution_prefit_summary(record.distribution_dir)
+        )
+        dream_count = self._distribution_dream_run_count(
+            record.distribution_dir
+        )
+        excluded_text = ", ".join(record.exclude_elements) or "None"
+        return "\n".join(
+            [
+                f"Distribution ID: {record.distribution_id}",
+                "Template: " + str(record.template_name or "Unspecified"),
+                "Build mode: "
+                + component_build_mode_label(record.component_build_mode),
+                "Structure weighting: "
+                + (
+                    "Observed + Predicted Structures"
+                    if record.use_predicted_structure_weights
+                    else "Observed Only"
+                ),
+                "Clusters folder: "
+                + str(record.clusters_dir or "Unavailable"),
+                "Excluded elements: " + excluded_text,
+                "q-range: "
+                + self._distribution_q_range_text(record.q_min, record.q_max),
+                "Grid: "
+                + self._distribution_grid_text(
+                    use_experimental_grid=record.use_experimental_grid,
+                    q_points=record.q_points,
+                ),
+                "Saved components: "
+                + (
+                    f"ready ({component_count} traces)"
+                    if record.component_artifacts_ready
+                    else "not built yet"
+                ),
+                "Saved prior weights: "
+                + (
+                    "ready"
+                    if record.prior_artifacts_ready
+                    else "not built yet"
+                ),
+                f"Saved prefits: {prefit_count}",
+                f"Best Prefit R^2: {best_prefit_r_squared}",
+                f"Saved DREAM runs: {dream_count}",
+                "Best DREAM R^2: Available after loading a DREAM run",
+                "Created: " + self._distribution_time_text(record.created_at),
+                "Updated: " + self._distribution_time_text(record.updated_at),
+                "Folder: " + str(record.distribution_dir),
+            ]
+        )
+
+    def _current_distribution_details_text(
+        self,
+        settings: ProjectSettings,
+    ) -> str:
+        artifact_paths = project_artifact_paths(
+            settings,
+            storage_mode="distribution",
+        )
+        excluded_text = (
+            ", ".join(sorted(set(settings.exclude_elements))) or "None"
+        )
+        return "\n".join(
+            [
+                "Current Project Setup Snapshot",
+                "This is the configuration that will be saved when you click "
+                "Create Computed Distribution.",
+                "",
+                "Pending distribution ID: "
+                + str(artifact_paths.distribution_id or "Unavailable"),
+                "Template: "
+                + str(settings.selected_model_template or "Unspecified"),
+                "Build mode: "
+                + component_build_mode_label(settings.component_build_mode),
+                "Structure weighting: "
+                + (
+                    "Observed + Predicted Structures"
+                    if settings.use_predicted_structure_weights
+                    else "Observed Only"
+                ),
+                "Clusters folder: "
+                + str(
+                    settings.resolved_clusters_dir
+                    if settings.resolved_clusters_dir is not None
+                    else "Unavailable"
+                ),
+                "Excluded elements: " + excluded_text,
+                "q-range: "
+                + self._distribution_q_range_text(
+                    settings.q_min,
+                    settings.q_max,
+                ),
+                "Grid: "
+                + self._distribution_grid_text(
+                    use_experimental_grid=settings.use_experimental_grid,
+                    q_points=settings.q_points,
+                ),
+                "Model only mode: "
+                + ("on" if settings.model_only_mode else "off"),
+            ]
+        )
 
     def _set_dream_tab_enabled(self, enabled: bool) -> None:
         dream_index = self.tabs.indexOf(self.dream_tab)
@@ -8100,6 +8421,9 @@ class SAXSMainWindow(QMainWindow):
         )
         base.component_build_mode = (
             self.project_setup_tab.component_build_mode()
+        )
+        base.prior_histogram_x_axis_order = (
+            self.project_setup_tab.prior_histogram_x_axis_order()
         )
         return base
 
@@ -8538,6 +8862,7 @@ class SAXSMainWindow(QMainWindow):
     ) -> str:
         active_settings = settings or self.current_settings
         if active_settings is None:
+            self.project_setup_tab.set_predicted_structure_availability(False)
             status_text = (
                 self.project_setup_tab._default_predicted_structure_status_text()
             )
@@ -8545,10 +8870,35 @@ class SAXSMainWindow(QMainWindow):
                 status_text
             )
             return status_text
+        predicted_state = self.project_manager.inspect_predicted_structures(
+            active_settings.project_dir
+        )
+        predicted_available = bool(
+            predicted_state.dataset_file is not None
+            and predicted_state.prediction_count > 0
+        )
+        self.project_setup_tab.set_predicted_structure_availability(
+            predicted_available,
+            prediction_count=predicted_state.prediction_count,
+        )
         if not active_settings.use_predicted_structure_weights:
-            status_text = (
-                self.project_setup_tab._default_predicted_structure_status_text()
-            )
+            if (
+                predicted_available
+                and predicted_state.dataset_file is not None
+            ):
+                status_text = (
+                    "Predicted Structures mode is off.\n"
+                    f"Found {predicted_state.prediction_count} predicted "
+                    "structure"
+                    f"{'' if predicted_state.prediction_count == 1 else 's'} "
+                    f"in {predicted_state.dataset_file.name}. Enable Use "
+                    "Predicted Structure Weights to bring them into Project "
+                    "Setup, Prefit, and DREAM."
+                )
+            else:
+                status_text = (
+                    self.project_setup_tab._default_predicted_structure_status_text()
+                )
             self.project_setup_tab.set_predicted_structure_status_text(
                 status_text
             )
@@ -8562,9 +8912,6 @@ class SAXSMainWindow(QMainWindow):
         prior_artifacts_ready = bool(
             artifact_paths.prior_weights_file.is_file()
         )
-        predicted_state = self.project_manager.inspect_predicted_structures(
-            active_settings.project_dir
-        )
         if component_artifacts_ready and prior_artifacts_ready:
             status_text = (
                 "Predicted Structures mode is on.\n"
@@ -8575,14 +8922,24 @@ class SAXSMainWindow(QMainWindow):
                 status_text
             )
             return status_text
-        if predicted_state.dataset_file is None:
-            status_text = (
-                "Predicted Structures mode is on, but no Cluster Dynamics ML "
-                "prediction bundle was found in this project.\n"
-                "Open Tools > Cluster Dynamics > Open Cluster Dynamics (ML), "
-                "run a prediction, "
-                "then rebuild SAXS components and prior weights."
-            )
+        if not predicted_available:
+            if predicted_state.dataset_file is None:
+                status_text = (
+                    "Predicted Structures mode is on, but no Cluster "
+                    "Dynamics ML prediction bundle was found in this project.\n"
+                    "Open Tools > Cluster Dynamics > Open Cluster Dynamics "
+                    "(ML), run a prediction, then rebuild SAXS components "
+                    "and prior weights."
+                )
+            else:
+                status_text = (
+                    "Predicted Structures mode is on, but the latest "
+                    "Cluster Dynamics ML result bundle does not contain any "
+                    "predicted structures.\n"
+                    "Open Tools > Cluster Dynamics > Open Cluster Dynamics "
+                    "(ML), run a prediction, then rebuild SAXS components "
+                    "and prior weights."
+                )
             self.project_setup_tab.set_predicted_structure_status_text(
                 status_text
             )
@@ -9064,8 +9421,26 @@ class SAXSMainWindow(QMainWindow):
             "off",
         }
 
+    def _load_auto_snap_panes_setting(self) -> bool:
+        raw_value = self._recent_projects_settings().value(
+            AUTO_SNAP_PANES_KEY,
+            True,
+        )
+        if isinstance(raw_value, bool):
+            return raw_value
+        return str(raw_value).strip().lower() not in {
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+
     def _toggle_console_autoscroll(self, enabled: bool) -> None:
         self._set_console_autoscroll_enabled(enabled, persist=True)
+
+    def _toggle_auto_snap_panes(self, enabled: bool) -> None:
+        self._set_auto_snap_panes_enabled(enabled, persist=True)
 
     def _set_console_autoscroll_enabled(
         self,
@@ -9104,6 +9479,39 @@ class SAXSMainWindow(QMainWindow):
                     if self._console_autoscroll_enabled
                     else "disabled"
                 )
+            )
+
+    def _set_auto_snap_panes_enabled(
+        self,
+        enabled: bool,
+        *,
+        persist: bool,
+    ) -> None:
+        self._auto_snap_panes_enabled = bool(enabled)
+        if hasattr(self, "auto_snap_panes_action"):
+            self.auto_snap_panes_action.blockSignals(True)
+            self.auto_snap_panes_action.setChecked(
+                self._auto_snap_panes_enabled
+            )
+            self.auto_snap_panes_action.blockSignals(False)
+        if hasattr(self, "project_setup_tab"):
+            self.project_setup_tab.set_auto_snap_enabled(
+                self._auto_snap_panes_enabled
+            )
+        if hasattr(self, "prefit_tab"):
+            self.prefit_tab.set_auto_snap_enabled(
+                self._auto_snap_panes_enabled
+            )
+        if hasattr(self, "dream_tab"):
+            self.dream_tab.set_auto_snap_enabled(self._auto_snap_panes_enabled)
+        if persist:
+            self._recent_projects_settings().setValue(
+                AUTO_SNAP_PANES_KEY,
+                self._auto_snap_panes_enabled,
+            )
+            self.statusBar().showMessage(
+                "Auto-snap panes "
+                + ("enabled" if self._auto_snap_panes_enabled else "disabled")
             )
 
     def _recent_projects_settings(self) -> QSettings:
@@ -9306,7 +9714,10 @@ class SAXSMainWindow(QMainWindow):
                 "contrast-mode representative outputs to reopen.",
             )
             return
-        self._open_contrast_mode_tool(load_saved_distribution_view=True)
+        self._open_contrast_mode_tool(
+            preview_mode=False,
+            load_saved_distribution_view=True,
+        )
 
     def _connect_project_path_updates(self, window: object) -> None:
         signal = getattr(window, "project_paths_registered", None)
@@ -9319,6 +9730,18 @@ class SAXSMainWindow(QMainWindow):
         if signal is None or not hasattr(signal, "connect"):
             return
         signal.connect(self._on_contrast_components_built)
+
+    def _connect_born_approximation_updates(self, window: object) -> None:
+        signal = getattr(window, "born_components_built", None)
+        if signal is None or not hasattr(signal, "connect"):
+            return
+        signal.connect(self._on_born_components_built)
+
+    def _connect_debye_waller_updates(self, window: object) -> None:
+        signal = getattr(window, "project_analysis_saved", None)
+        if signal is None or not hasattr(signal, "connect"):
+            return
+        signal.connect(self._on_debye_waller_project_saved)
 
     def _track_child_tool_window(self, window: object) -> None:
         if window in self._child_tool_windows:
@@ -9438,6 +9861,10 @@ class SAXSMainWindow(QMainWindow):
 
         if "clusters_dir" in payload:
             self.project_setup_tab.request_cluster_scan()
+            self.project_setup_tab.refresh_debye_waller_controls()
+            self.project_setup_tab.refresh_debye_waller_project_status(
+                project_dir
+            )
 
         if updated_labels:
             summary = ", ".join(updated_labels)
@@ -9447,6 +9874,27 @@ class SAXSMainWindow(QMainWindow):
             )
             self.statusBar().showMessage(
                 "Updated project folder references from linked tool"
+            )
+
+    @Slot(object)
+    def _on_debye_waller_project_saved(self, payload: object) -> None:
+        if self.current_settings is None or not isinstance(payload, dict):
+            return
+        project_dir_value = payload.get("project_dir")
+        if project_dir_value is None:
+            return
+        project_dir = Path(project_dir_value).expanduser().resolve()
+        active_project_dir = (
+            Path(self.current_settings.project_dir).expanduser().resolve()
+        )
+        if project_dir != active_project_dir:
+            return
+        ready = self.project_setup_tab.refresh_debye_waller_project_status(
+            project_dir
+        )
+        if ready:
+            self.statusBar().showMessage(
+                "Debye-Waller factors saved to active project"
             )
 
     def _open_mdtrajectory_tool(self) -> None:
@@ -9547,6 +9995,82 @@ class SAXSMainWindow(QMainWindow):
             )
         else:
             self.statusBar().showMessage("Opened bond analysis")
+
+    def _open_debye_waller_analysis_tool(self) -> None:
+        from saxshell.saxs.debye_waller.ui.main_window import (
+            DEBYE_WALLER_WINDOW_LOAD_TOTAL_STEPS,
+            launch_debye_waller_analysis_ui,
+        )
+
+        settings = self._active_project_launch_settings()
+        clusters_dir = None
+        project_dir = None
+        if settings is not None:
+            clusters_dir = settings.resolved_clusters_dir
+            project_dir = Path(settings.project_dir).resolve()
+        startup_progress_callback = None
+        startup_log_callback = None
+        if project_dir is not None:
+            start_message = (
+                f"Opening Debye-Waller analysis for {project_dir.name}..."
+            )
+            self._show_progress_dialog(
+                DEBYE_WALLER_WINDOW_LOAD_TOTAL_STEPS,
+                start_message,
+                unit_label="steps",
+                title="Opening Debye-Waller Analysis",
+            )
+            if self._progress_dialog is not None:
+                self._progress_dialog.append_output(
+                    f"Loading Debye-Waller analysis from {project_dir}"
+                )
+            self.statusBar().showMessage(start_message)
+            QApplication.processEvents()
+
+            def on_startup_progress(
+                processed: int,
+                total: int,
+                message: str,
+            ) -> None:
+                if self._progress_dialog is not None:
+                    self._progress_dialog.update_progress(
+                        processed,
+                        total,
+                        message,
+                        unit_label="steps",
+                    )
+                self.statusBar().showMessage(message)
+                QApplication.processEvents()
+
+            def on_startup_log(message: str) -> None:
+                stripped = str(message).strip()
+                if not stripped:
+                    return
+                if self._progress_dialog is not None:
+                    self._progress_dialog.append_output(stripped)
+                QApplication.processEvents()
+
+            startup_progress_callback = on_startup_progress
+            startup_log_callback = on_startup_log
+        try:
+            window = launch_debye_waller_analysis_ui(
+                initial_project_dir=project_dir,
+                initial_clusters_dir=clusters_dir,
+                startup_progress_callback=startup_progress_callback,
+                startup_log_callback=startup_log_callback,
+            )
+        finally:
+            if project_dir is not None:
+                self._close_progress_dialog()
+        self._connect_project_path_updates(window)
+        self._connect_debye_waller_updates(window)
+        self._track_child_tool_window(window)
+        if clusters_dir is not None:
+            self.statusBar().showMessage(
+                f"Opened Debye-Waller analysis for {clusters_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened Debye-Waller analysis")
 
     def _open_clusterdynamics_tool(self) -> None:
         from saxshell.clusterdynamics.ui.main_window import (
@@ -9659,9 +10183,19 @@ class SAXSMainWindow(QMainWindow):
         self._track_child_tool_window(window)
         self.statusBar().showMessage("Opened Blender XYZ renderer")
 
+    def _open_structure_viewer_tool(self) -> None:
+        from saxshell.saxs.structure_viewer.ui.main_window import (
+            launch_structure_viewer_ui,
+        )
+
+        window = launch_structure_viewer_ui()
+        self._track_child_tool_window(window)
+        self.statusBar().showMessage("Opened Structure Viewer")
+
     def _open_contrast_mode_tool(
         self,
         *,
+        preview_mode: bool = True,
         load_saved_distribution_view: bool = False,
     ) -> None:
         existing_window = self._contrast_mode_tool_window
@@ -9700,10 +10234,16 @@ class SAXSMainWindow(QMainWindow):
                         contrast_artifact_dir=contrast_artifact_dir,
                     )
                 )
+            if hasattr(existing_window, "set_preview_mode"):
+                existing_window.set_preview_mode(preview_mode)
             existing_window.show()
             existing_window.raise_()
             existing_window.activateWindow()
-            self.statusBar().showMessage("Opened SAXS contrast-mode workflow")
+            self.statusBar().showMessage(
+                "Opened SAXS contrast-mode preview"
+                if preview_mode
+                else "Opened SAXS contrast-mode workflow"
+            )
             return
 
         from saxshell.saxs.contrast.ui.main_window import (
@@ -9745,6 +10285,7 @@ class SAXSMainWindow(QMainWindow):
             initial_distribution_id=distribution_id,
             initial_distribution_root_dir=distribution_root_dir,
             initial_contrast_artifact_dir=contrast_artifact_dir,
+            preview_mode=preview_mode,
         )
         self._connect_project_path_updates(window)
         self._connect_contrast_mode_updates(window)
@@ -9763,12 +10304,22 @@ class SAXSMainWindow(QMainWindow):
         self._track_child_tool_window(window)
         if project_dir is not None:
             self.statusBar().showMessage(
-                f"Opened SAXS contrast-mode workflow for {project_dir}"
+                ("Opened SAXS contrast-mode preview for " f"{project_dir}")
+                if preview_mode
+                else f"Opened SAXS contrast-mode workflow for {project_dir}"
             )
         else:
-            self.statusBar().showMessage("Opened SAXS contrast-mode workflow")
+            self.statusBar().showMessage(
+                "Opened SAXS contrast-mode preview"
+                if preview_mode
+                else "Opened SAXS contrast-mode workflow"
+            )
 
-    def _open_electron_density_mapping_tool(self) -> None:
+    def _open_electron_density_mapping_tool(
+        self,
+        *,
+        preview_mode: bool = True,
+    ) -> None:
         from saxshell.saxs.electron_density_mapping.ui.main_window import (
             launch_electron_density_mapping_ui,
         )
@@ -9776,30 +10327,86 @@ class SAXSMainWindow(QMainWindow):
         settings = self._active_project_launch_settings()
         project_dir = None
         input_path = None
+        output_dir = None
+        q_min = None
+        q_max = None
+        distribution_id = None
+        distribution_root_dir = None
+        use_predicted_structure_weights = False
         if settings is not None:
             project_dir = Path(settings.project_dir).resolve()
-            for candidate in (
-                settings.resolved_pdb_frames_dir,
-                settings.resolved_frames_dir,
-            ):
+            q_min = settings.q_min
+            q_max = settings.q_max
+            use_predicted_structure_weights = bool(
+                settings.use_predicted_structure_weights
+            )
+            candidate_paths = (
+                (
+                    settings.resolved_pdb_frames_dir,
+                    settings.resolved_frames_dir,
+                )
+                if preview_mode
+                else (
+                    settings.resolved_clusters_dir,
+                    settings.resolved_pdb_frames_dir,
+                    settings.resolved_frames_dir,
+                )
+            )
+            for candidate in candidate_paths:
                 if candidate is not None and candidate.exists():
                     input_path = candidate
                     break
+            if not preview_mode:
+                artifact_paths = project_artifact_paths(
+                    settings,
+                    storage_mode="distribution",
+                )
+                distribution_id = artifact_paths.distribution_id
+                distribution_root_dir = artifact_paths.root_dir
+                output_dir = (
+                    artifact_paths.root_dir / "electron_density_mapping"
+                )
         window = launch_electron_density_mapping_ui(
             initial_project_dir=project_dir,
             initial_input_path=input_path,
+            initial_output_dir=output_dir,
+            initial_project_q_min=q_min,
+            initial_project_q_max=q_max,
+            initial_distribution_id=distribution_id,
+            initial_distribution_root_dir=distribution_root_dir,
+            initial_use_predicted_structure_weights=(
+                use_predicted_structure_weights
+            ),
+            preview_mode=preview_mode,
         )
+        if hasattr(window, "set_auto_snap_enabled"):
+            window.set_auto_snap_enabled(self._auto_snap_panes_enabled)
+        self._connect_born_approximation_updates(window)
         self._track_child_tool_window(window)
         if input_path is not None:
             self.statusBar().showMessage(
-                f"Opened electron density mapping for {input_path}"
+                (
+                    "Opened electron density mapping preview for "
+                    f"{input_path}"
+                )
+                if preview_mode
+                else f"Opened electron density mapping for {input_path}"
             )
         elif project_dir is not None:
             self.statusBar().showMessage(
-                f"Opened electron density mapping for {project_dir}"
+                (
+                    "Opened electron density mapping preview for "
+                    f"{project_dir}"
+                )
+                if preview_mode
+                else f"Opened electron density mapping for {project_dir}"
             )
         else:
-            self.statusBar().showMessage("Opened electron density mapping")
+            self.statusBar().showMessage(
+                "Opened electron density mapping preview"
+                if preview_mode
+                else "Opened electron density mapping"
+            )
 
     @Slot(object)
     def _on_contrast_components_built(self, payload: object) -> None:
@@ -9818,6 +10425,25 @@ class SAXSMainWindow(QMainWindow):
         self._load_saved_distribution(distribution_id)
         self.statusBar().showMessage(
             "Contrast SAXS components built and loaded"
+        )
+
+    @Slot(object)
+    def _on_born_components_built(self, payload: object) -> None:
+        if self.current_settings is None or not isinstance(payload, dict):
+            return
+        distribution_id = str(payload.get("distribution_id") or "").strip()
+        project_dir_value = str(payload.get("project_dir") or "").strip()
+        if not distribution_id or not project_dir_value:
+            return
+        active_project_dir = (
+            Path(self.current_settings.project_dir).expanduser().resolve()
+        )
+        payload_project_dir = Path(project_dir_value).expanduser().resolve()
+        if payload_project_dir != active_project_dir:
+            return
+        self._load_saved_distribution(distribution_id)
+        self.statusBar().showMessage(
+            "Born-approximation components built and loaded"
         )
 
     def _open_solution_scattering_tool_window(
@@ -10121,6 +10747,9 @@ class SAXSMainWindow(QMainWindow):
             cmap=self.project_setup_tab.prior_cmap(),
             structure_motif_colors=(
                 self.project_setup_tab.prior_structure_motif_colors()
+            ),
+            custom_label_order=(
+                self.project_setup_tab._active_prior_x_axis_order()
             ),
             parent=None,
         )

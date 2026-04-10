@@ -45,6 +45,7 @@ from saxshell.saxs.dream import (
     DreamSummary,
     DreamViolinPlotData,
 )
+from saxshell.saxs.ui._pane_snap import PaneSnapFilter
 
 DREAM_SEARCH_FILTER_PRESETS: dict[str, dict[str, object]] = {
     "less_aggressive": {
@@ -146,6 +147,7 @@ class DreamTab(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._auto_snap_enabled = True
         self._console_autoscroll_enabled = True
         self._summary_text = ""
         self._base_log_text = ""
@@ -217,6 +219,13 @@ class DreamTab(QWidget):
         self._top_splitter.setStretchFactor(0, 4)
         self._top_splitter.setStretchFactor(1, 7)
         self._top_splitter.setSizes([420, 760])
+        self._auto_snap_filter = PaneSnapFilter(
+            self._top_splitter,
+            self._settings_scroll_area,
+            self._plot_scroll_area,
+            parent=self,
+        )
+        self.set_auto_snap_enabled(self._auto_snap_enabled)
         content_layout.addWidget(self._top_splitter)
 
         self._outer_scroll_area.setWidget(content)
@@ -1823,6 +1832,10 @@ class DreamTab(QWidget):
         self._console_autoscroll_enabled = bool(enabled)
         if self._console_autoscroll_enabled:
             self._scroll_output_to_end()
+
+    def set_auto_snap_enabled(self, enabled: bool) -> None:
+        self._auto_snap_enabled = bool(enabled)
+        self._auto_snap_filter.set_enabled(self._auto_snap_enabled)
 
     def append_runtime_output(self, message: str) -> None:
         stripped = message.rstrip()
