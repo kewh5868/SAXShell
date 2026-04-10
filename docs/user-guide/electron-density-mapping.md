@@ -1,8 +1,23 @@
 # Electron Density Mapping
 
-The **Electron Density Mapping** tool is a supporting application that computes
-radial electron-density profiles from XYZ or PDB molecular structures. It can
-be launched directly from the `saxshell` main UI or from the terminal.
+The **Electron Density Mapping** tool is SAXSShell's supporting application for
+building radial electron-density profiles from XYZ or PDB inputs and, when
+needed, turning those profiles into q-space scattering estimates. The current
+UI supports three working styles:
+
+- Single-structure inspection from one XYZ or PDB file.
+- Folder averaging across many structures in one directory.
+- Cluster-folder workflows for Born-approximation component building, where each
+  stoichiometry gets its own density, solvent, Fourier, and saved-output state.
+
+In Project Setup, this is the linked component-build workspace for
+**Born Approximation (Average)**.
+
+In the main SAXS workflow the tool can run either in **Preview Mode** or in
+**Computed Distribution Mode**. Preview mode is for exploratory work. Computed
+distribution mode is the linked workflow launched from **Build SAXS Components**
+and is the only mode that can push Born-approximation components back into the
+active distribution.
 
 ## Launching the application
 
@@ -12,160 +27,172 @@ be launched directly from the `saxshell` main UI or from the terminal.
 PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs.electron_density_mapping
 ```
 
-### From the SAXSShell main UI
+### From the main SAXS UI
 
-Open the main SAXSShell application and select **Electron Density Mapping** from the supporting applications menu. When launched this way the tool inherits the active project directory and will default its output path to `exported_results/data/` within that project.
+- **Tools > SAXS Calculation Preview > Open Electron Density Mapping** opens
+  the tool in **Preview Mode**. The window title shows
+  `Electron Density Mapping (Preview)`, and the banner explains that pushed
+  model components are disabled in this mode.
+- **Build SAXS Components** with the
+  **Born Approximation (Average)** build mode opens the tool in
+  **Computed Distribution Mode**. The tool inherits the active project q-range,
+  the active computed distribution, the preferred input folder, and the
+  distribution output directory.
 
----
+## Operating modes
 
-The tool takes one or more structure files, centers each structure at a chosen
-origin, bins the atomic electron counts onto a spherical mesh, and returns an
-orientation-averaged radial profile ρ(r). An optional Gaussian-smearing step
-and a Fourier-transform stage can convert the real-space profile into a
-q-space scattering estimate.
-
----
+| Mode                 | What is loaded                                     | What the tool does                                                                                                                                                                                                 |
+| -------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Single file**      | One `.xyz` or `.pdb` file                          | Computes one radial electron-density profile, optional solvent subtraction, and optional Born-approximation Fourier transform.                                                                                     |
+| **Structure folder** | One folder of `.xyz` / `.pdb` files                | Averages the profiles across the folder, tracks variance, and can optionally use contiguous-frame grouping when filenames follow `frame_<NNNN>`.                                                                   |
+| **Cluster folder**   | One folder whose subfolders are stoichiometry bins | Builds one state row per stoichiometry, lets you inspect each row independently, and supports batch or manual per-row workflows. Single-atom rows skip density generation and use direct Debye scattering instead. |
 
 ## What the tool computes
 
-For each structure, the workflow:
+For density-based rows, the workflow:
 
-1. Loads atom positions and element symbols from an XYZ or PDB file.
-2. Computes the mass-weighted center of mass using atomic masses from `xraydb`.
-3. Centers all atom positions relative to the chosen active origin.
-4. Partitions the structure domain into a spherical mesh of radial shells
-   and angular cells.
-5. Accumulates the atomic number of each atom (used as its electron count) into
-   the mesh cell it falls into.
-6. Averages the electron density over all angular directions within each radial
-   shell, yielding the orientation-averaged profile ρ(r).
-7. Optionally applies a Gaussian-smearing kernel to ρ(r).
-8. Optionally evaluates a spherical Born-approximation Fourier transform of the
-   smeared profile to produce a scattering amplitude and intensity I(q).
+1. Loads atom positions and element symbols from XYZ or PDB files.
+2. Computes the mass-weighted center of mass using atomic data from `xraydb`.
+3. Re-centers each structure using the active center mode.
+4. Partitions the structure into a spherical mesh of radial shells and angular
+   cells.
+5. Accumulates each atom's atomic number as its electron count on that mesh.
+6. Averages angular contributions into a radial profile `rho(r)`.
+7. Optionally applies Gaussian smearing.
+8. Optionally applies a flat solvent electron-density contrast and finds the
+   highest-r cutoff crossing.
+9. Optionally evaluates a spherical Born-approximation transform into `I(q)`.
 
-When a **folder** is provided instead of a single file, the workflow repeats
-steps 2–6 for every valid structure in the folder and averages the resulting
-profiles across the ensemble, also tracking inter-member variance.
+!!! note "Raw density versus shell bookkeeping"
+The plotted `rho(r)` and the derived Fourier/scattering outputs use a
+finite-radius shell-overlap density profile. Exported
+`electrons_in_shell` / `shell_electron_counts` values remain point-tagged
+shell bookkeeping totals. This distinction matters when an atom sits near
+the active origin: the finite-radius profile avoids an artificial
+near-origin spike that would otherwise exaggerate the perceived electron
+density and distort the scattering estimate.
 
----
+For single-atom stoichiometry rows in cluster-folder mode, the density step is
+skipped and the tool evaluates a direct Debye scattering profile instead.
 
-## Panels and input fields
+When folder averaging uses **Use Contiguous Frame Evaluation**, the tool groups
+filenames by `frame_<NNNN>` sequences when available and locks each contiguous
+set to a shared center offset relative to the heaviest-element anchor. If the
+expected naming pattern is not present, the run falls back to complete
+averaging and records that fallback in the status log.
 
-The window is split into a left-hand control panel and a right-hand plot area.
+## Left-panel controls
 
 ### Input
 
-| Field                 | Description                                                                                                                                                      |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Path field**        | Type or paste the path to an XYZ or PDB file, or to a folder of such files. Press Enter or click **Load Input** to apply.                                        |
-| **Choose File**       | Opens a file-browser dialog pre-filtered for `.xyz` and `.pdb` files.                                                                                            |
-| **Choose Folder**     | Opens a folder-browser dialog. All valid structure files in the folder are discovered automatically.                                                             |
-| **Load Input**        | Inspects the selected path, determines the input mode, loads the reference structure, and populates the status fields below.                                     |
-| **Input mode**        | Read-only. Shows `file` when a single structure is loaded, or `folder` when a directory is active.                                                               |
-| **Reference file**    | Read-only. Shows the file that is used for the 3D structure preview and center-of-mass calculation. In folder mode this is the first file in natural sort order. |
-| **Structure summary** | Read-only. Shows atom count, element composition, center of mass, active center, and the domain radius rmax after a structure is loaded.                         |
+| Field                               | Description                                                                                               |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| **Path field**                      | Path to a single XYZ/PDB file, a folder of structures, or a folder of stoichiometry subfolders.           |
+| **Choose File** / **Choose Folder** | Open file-system pickers for the active input.                                                            |
+| **Load Input**                      | Inspects the selected path and populates the window state.                                                |
+| **Input mode**                      | Shows whether the current input is a file, a folder, or cluster folders with an active stoichiometry row. |
+| **Reference file**                  | The structure file shown in the viewer for the currently active row.                                      |
+| **Structure summary**               | Reports atom counts, element counts, center information, and domain size for the active structure.        |
 
-!!! note "Folder mode"
-When a folder is loaded, the **structure viewer** and **center** displays
-reflect only the reference (first) file. The **Run** step averages over
-every file in the folder and produces ensemble variance bands in the plots.
-
----
+!!! note "Cluster folders"
+When a cluster-folder input is loaded, the stoichiometry table becomes the
+main navigation surface for the tool. Clicking a row updates the plots,
+mesh controls, Fourier controls, and viewer to that row's state.
 
 ### Output
 
-| Field                | Description                                                                                                                                                                                                |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Output directory** | Folder where the CSV profile and JSON summary are written after a successful calculation run. Leave blank to skip file output and inspect results interactively only. Click **Browse** to choose a folder. |
-| **Output basename**  | Filename stem used for all output files. Defaults to `electron_density_profile`. The tool appends `_profile.csv` and `_summary.json` automatically.                                                        |
-
----
+| Field                | Description                                                                                                                                                                                                                                                                                                |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Output directory** | Where run outputs are written when file export is enabled. In preview mode the default is inferred from the loaded input, or from `<project>/electron_density_mapping` when a project-linked launch is available. In computed-distribution mode, the default is `<distribution>/electron_density_mapping`. |
+| **Output basename**  | Stem for exported density files. File and folder runs write `<basename>.csv` and `<basename>.json`. Cluster-folder runs append a stoichiometry suffix, for example `<basename>_PbI2.csv`.                                                                                                                  |
 
 ### Mesh Settings
 
-The spherical mesh controls how the structure domain is discretised before
-electron counts are binned.
+The mesh controls define the radial sampling domain before density accumulation.
 
-| Field                           | Description                                                                                                                                                                                                                                                                                              |
-| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **rstep (Å)**                   | Width of each radial shell in ångströms. Smaller values give a finer radial resolution at the cost of a larger mesh. Default: 0.1 Å.                                                                                                                                                                     |
-| **Theta divisions**             | Number of equal-angle bins along the polar (θ) axis from 0 to π. Higher values improve angular coverage. Default: 120.                                                                                                                                                                                   |
-| **Phi divisions**               | Number of equal-angle bins along the azimuthal (φ) axis from 0 to 2π. Default: 60.                                                                                                                                                                                                                       |
-| **rmax (Å)**                    | Maximum radial extent of the mesh in ångströms. Atoms beyond this radius are excluded from the profile and counted in the excluded-atom summary. Set this to at least the structural domain radius reported in the structure summary. Default: 8.0 Å (updated automatically when a structure is loaded). |
-| **Center mode**                 | Read-only label showing whether the active origin is the `Calculated center of mass` or the `Nearest atom` to the center of mass.                                                                                                                                                                        |
-| **Calculated center**           | Read-only. The mass-weighted center of mass of the reference structure in Cartesian coordinates (Å).                                                                                                                                                                                                     |
-| **Active center**               | Read-only. The origin actually used for centering. Matches the calculated center unless the center has been snapped to the nearest atom.                                                                                                                                                                 |
-| **Nearest atom**                | Read-only. The element symbol, atom index, and distance (Å) of the atom closest to the calculated center of mass.                                                                                                                                                                                        |
-| **Snap Center to Nearest Atom** | Moves the active origin from the calculated center of mass to the position of the nearest atom. Useful when the center of mass falls in an empty space between atoms and you prefer a physically grounded lattice site as the origin. The profile and viewer update immediately.                         |
-| **Reset to Calculated Center**  | Restores the active origin to the mass-weighted center of mass.                                                                                                                                                                                                                                          |
-| **Update Mesh Settings**        | Applies the current rstep, theta, phi, and rmax values to the active mesh and regenerates the profile if a calculation result is already loaded.                                                                                                                                                         |
-| **Active mesh**                 | Read-only summary of the mesh that was used for the most recent calculation: rstep, theta divisions, phi divisions, rmax.                                                                                                                                                                                |
-| **Pending fields**              | Read-only. If any mesh field has been changed since the last **Update Mesh Settings**, the changed fields are listed here as a reminder that the active mesh and the control values are out of sync.                                                                                                     |
+| Field                                                            | Description                                                                                               |
+| ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| **rstep (A)**                                                    | Width of the radial shells. Smaller values increase radial resolution.                                    |
+| **Theta divisions** / **Phi divisions**                          | Angular subdivision of the spherical mesh.                                                                |
+| **rmax (A)**                                                     | Maximum radial extent of the mesh. Atoms outside this radius are excluded and reported in the status log. |
+| **Center mode**                                                  | Read-only summary of the active centering choice.                                                         |
+| **Calculated center**                                            | Mass-weighted center of mass.                                                                             |
+| **Active center**                                                | The origin currently used by the calculation and viewer.                                                  |
+| **Nearest atom**                                                 | The atom nearest to the calculated center of mass.                                                        |
+| **Reference element**                                            | Element used for the reference-element geometric center when that center mode is selected.                |
+| **Total-atom geometric center**                                  | Geometric center of all atoms in the active reference structure.                                          |
+| **Reference-element geometric center**                           | Geometric center of only the chosen reference element.                                                    |
+| **Reference-center offset**                                      | Offset between the total-atom and reference-element geometric centers.                                    |
+| **Calculated Center** / **Nearest Atom** / **Reference Element** | The three center-snap buttons. Exactly one is active at a time.                                           |
+| **Update Mesh Settings**                                         | Applies the pending mesh values to the active row.                                                        |
+| **Active mesh**                                                  | Summary of the currently applied mesh.                                                                    |
+| **Pending fields**                                               | Highlights which mesh fields differ from the applied mesh.                                                |
 
----
+!!! warning "Mesh locking in manual cluster runs"
+In cluster-folder **Manual Mode**, once a manual density calculation has
+succeeded, mesh settings remain locked until **Reset Calculated Densities**
+is used.
 
 ### Actions
 
-| Control                              | Description                                                                                                                                                                                                                   |
-| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Run Electron Density Calculation** | Starts a background worker that processes all structure files under the active input path using the current mesh settings, center mode, and smearing settings. The progress bar and message update as each file is processed. |
-| **Progress bar / message**           | Shows the number of structures processed and a human-readable stage description during the calculation. Reads "Idle" when no calculation is running.                                                                          |
+The **Actions** group now covers both simple runs and cluster-folder workflows.
 
-!!! warning "Mesh rmax and atom exclusion"
-If **rmax** is smaller than the actual domain of the structure, atoms that
-fall outside the mesh will be excluded from the profile. The number of
-excluded atoms and their total electron count are reported in the status log
-after the run completes. This is expected if you deliberately want to
-restrict the profile to a sub-domain, but will produce an incomplete profile
-if rmax is simply left at a default value smaller than the structure.
-
----
+| Control                                       | Description                                                                                                                                                                                                                       |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Stoichiometry Table**                       | Appears for cluster-folder inputs. Columns report stoichiometry, file count, average atoms, density status, Fourier status, trace color, smearing, solvent density, solvent cutoff, Fourier settings summary, and reference file. |
+| **Use Contiguous Frame Evaluation**           | Enables contiguous-frame grouping for multi-structure folder and cluster-folder runs.                                                                                                                                             |
+| **Manual Mode (selected stoichiometry only)** | Runs only the selected row instead of the whole cluster table.                                                                                                                                                                    |
+| **Computed stoichiometries indicator**        | Shows overall completion state for cluster-folder work.                                                                                                                                                                           |
+| **Run Electron Density Calculation**          | Runs the active file/folder input, or the active row / entire table in cluster mode depending on Manual Mode.                                                                                                                     |
+| **Stop Active Calculation**                   | Cancels the active background calculation.                                                                                                                                                                                        |
+| **Reset Calculated Densities**                | Clears density, solvent, Fourier, saved-output, and session-restore state after secondary confirmation.                                                                                                                           |
+| **Overall progress**                          | Visible during cluster-folder batch runs and reports completed stoichiometry groups.                                                                                                                                              |
+| **Progress bar / message**                    | Shows detailed stage progress for the active run or workspace load.                                                                                                                                                               |
 
 ### Smearing
 
-The smearing section applies a Gaussian kernel to the raw radial profile.
-This is useful for softening the sharp step transitions between shells when
-comparing to experimental SAXS data or preparing a profile for Fourier
-transformation.
+The **Smearing** section applies a Gaussian kernel to the active density
+profile. The Debye-Waller factor is live and does not require rerunning the
+density calculation.
 
-<!-- prettier-ignore-start -->
+| Field                                             | Description                                                                                               |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| **Debye-Waller factor (A^2)**                     | Smearing strength. `0` disables smearing.                                                                 |
+| **Gaussian sigma**                                | Read-only sigma derived from the Debye-Waller factor.                                                     |
+| **Behavior**                                      | Read-only summary of the active smearing state.                                                           |
+| **Apply Smearing**                                | Applies the current smearing to the active row.                                                           |
+| **Apply to All**                                  | In cluster-folder mode, applies the current smearing setting to every selected or all stoichiometry rows. |
+| **Auto-save smearing snapshots to Saved Outputs** | When enabled, each smearing re-evaluation is captured as a reloadable Saved Outputs entry.                |
 
-| Field | Description |
-|---|---|
-| **Debye-Waller factor (Å²)** | Controls the width of the Gaussian kernel via $\sigma = \sqrt{B}$, where $B$ is this value. A value of 0 disables smearing entirely. Default: 0.006 Å². |
-| **Gaussian sigma** | Read-only. Shows the equivalent Gaussian standard deviation $\sigma$ in ångströms derived from the Debye-Waller factor. |
-| **Behavior** | Read-only. Confirms whether smearing is active or disabled and summarises the active σ value. |
+### Electron Density Contrast
 
-The smearing is applied live whenever the Debye-Waller factor is changed. It
-does not require re-running the full calculation.
+The **Electron Density Contrast** section estimates a flat solvent density and
+subtracts it from the smeared profile.
 
-The relation between the Debye-Waller factor $B$ and the Gaussian standard
-deviation $\sigma$ is:
-
-$$
-\sigma = \sqrt{B}
-$$
-
-<!-- prettier-ignore-end -->
-
----
+| Field                                    | Description                                                                                                          |
+| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| **Compute option**                       | Choose between solvent formula plus density, reference solvent structure, or a direct electron-density value.        |
+| **Saved solvents**                       | Preset selector plus save/delete controls for custom solvent presets.                                                |
+| **Solvent formula** / **Density (g/mL)** | Used for the solvent-formula method.                                                                                 |
+| **Direct density (e-/ A^3)**             | Used for the direct-value method.                                                                                    |
+| **Reference solvent file**               | Used for the reference-structure method.                                                                             |
+| **Apply Electron Density Contrast**      | Applies the active contrast settings to the current profile.                                                         |
+| **Apply to All**                         | Reuses the same solvent settings across the target stoichiometry rows while preserving each row's own cutoff result. |
+| **Active contrast**                      | Read-only summary of the active solvent subtraction.                                                                 |
+| **Notes**                                | Read-only status for cutoff detection and residual behavior.                                                         |
 
 ### Fourier Transform
 
-The Fourier Transform section converts the smeared radial density profile into
-a q-space scattering estimate using a spherical Born approximation for a
-radially averaged density. In this implementation the transform is evaluated on
-the selected real-space interval after the profile is resampled onto a uniform
-grid. The preview plot shows exactly what profile enters the numerical
-integration.
+The **Fourier Transform** section converts the active density profile into a
+Born-approximation scattering estimate. The preview panel always shows the
+resampled and windowed real-space data that will be used.
 
-The transform assumes spherical symmetry at the level of the plotted profile,
-so it should be interpreted as a first-pass reciprocal-space estimate rather
-than a full anisotropic scattering calculation.
+The default transform domain is **mirrored mode**, which reflects the profile
+about `r = 0` and evaluates the windowed transform over `-rmax` to `rmax`.
+The UI also keeps a **legacy r min to r max transform** toggle for historical
+behavior.
 
-The transform evaluates:
-
-<!-- prettier-ignore-start -->
+The evaluated transform is:
 
 $$
 F(q) =
@@ -176,134 +203,202 @@ F(q) =
 \,\mathrm{d}r
 $$
 
-where $W(r)$ is the optional real-space window function and
-$I(q) = |F(q)|^2$.
+with `I(q) = |F(q)|^2`.
 
-The code explicitly supports $r_\min = 0$. This is numerically well behaved
-for the spherical kernel above because the sinc factor approaches 1 as
-$r \to 0$, while the additional $r^2$ factor keeps the origin contribution
-finite.
+| Field                                            | Description                                                                                                                                                                                |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **r min / r max**                                | Real-space bounds used for the transform.                                                                                                                                                  |
+| **Legacy r min to r max transform**              | Switches from the default mirrored-domain transform back to the historical one-sided `r min` to `r max` behavior. In mirrored mode, the left bound is shown as `-r max`.                   |
+| **q min / q max / q step**                       | Requested q grid for the output scattering profile.                                                                                                                                        |
+| **Window**                                       | Real-space apodization window. Options are `None`, `Lorch`, `Cosine`, `Hanning`, `Parzen`, `Welch`, `Gaussian`, `Sine`, and `Kaiser-Bessel`.                                               |
+| **Resample pts**                                 | Number of resampled real-space points used by the transform.                                                                                                                               |
+| **Use solvent-subtracted profile**               | Uses the solvent-subtracted smeared density when available.                                                                                                                                |
+| **Log q axis** / **Log intensity axis**          | Plot scaling preferences for the scattering plot.                                                                                                                                          |
+| **Evaluate Fourier Transform**                   | Evaluates the current transform for the active row, or the target batch in cluster mode.                                                                                                   |
+| **Apply to All**                                 | In cluster-folder mode, switches the Fourier settings table into the shared-edit workflow. q settings stay shared while each stoichiometry keeps its own r range and source profile state. |
+| **Fourier settings table**                       | Per-stoichiometry summary and edit surface for Fourier settings in cluster mode.                                                                                                           |
+| **Available r range** / **Sampling** / **Notes** | Read-only diagnostics for transform support, Nyquist limits, oversampling, clamping, and solvent-profile fallback notes.                                                                   |
 
-Window functions are applied over the selected transform interval. The
-interval-centered families such as Hanning, Welch, Gaussian, Parzen, Sine, and
-Kaiser-Bessel are peaked at the midpoint of the chosen range and taper toward
-the interval boundaries. This mirrors the conventional finite-range
-apodisation strategy used in EXAFS workflows, while the Lorch option provides
-the familiar sinc-like damping often used to reduce truncation ripples.
+!!! note "Single-atom cluster rows"
+Single-atom stoichiometry rows do not build an electron-density profile.
+Their Fourier action evaluates a direct Debye scattering trace instead.
 
-A **preview plot** shows the resampled and windowed profile before the
-integral is evaluated. This is useful for checking that the r-range and window
-settings are appropriate before committing to a full transform.
+!!! note "Inherited q-range versus pushed q-range"
+In computed-distribution mode, the tool inherits the project's q-range.
+If you intentionally evaluate a different q-range here, SAXSShell warns
+before push, but the pushed model components still use the transform grid
+exactly as written.
 
-| Field | Description |
-|---|---|
-| **r min (Å)** | Lower bound of the r-range used for the transform. The portion of the profile below this value is excluded. Default: 0.0 Å. |
-| **r max (Å)** | Upper bound of the r-range used for the transform. Should not exceed the mesh rmax or the structural domain. Default: 1.0 Å (auto-updated from the mesh). |
-| **Transform window** | Apodisation function applied to the profile before transformation to reduce truncation ringing. Options: `None` (rectangular, no tapering), `Lorch`, `Cosine`, `Hanning`, `Parzen`, `Welch`, `Gaussian`, `Sine`, and `Kaiser-Bessel`. Default: `None`. |
-| **Resampling points** | Number of uniformly-spaced r points used when interpolating the profile before the numerical integration. Higher values improve transform accuracy. Default: 1024. |
-| **q min (Å⁻¹)** | Minimum q value of the output scattering profile. Default: 0.02 Å⁻¹. |
-| **q max (Å⁻¹)** | Maximum q value of the output scattering profile. The tool may clamp this to the Nyquist limit determined by the resampling step. Default: 10.0 Å⁻¹. |
-| **q step (Å⁻¹)** | Spacing between q grid points in the output profile. Default: 0.02 Å⁻¹. |
-| **Use solvent-subtracted profile** | When checked, the transform uses the solvent-subtracted smeared density if a solvent electron density has already been computed. If no solvent contrast is active, the tool falls back to the ordinary smeared profile and notes that fallback in the preview. |
-| **Log q axis** | When checked, the q axis of the scattering plot uses a logarithmic scale. |
-| **Log intensity axis** | When checked, the intensity axis of the scattering plot uses a logarithmic scale. |
-| **Evaluate Fourier Transform** | Evaluates the transform using the current settings and updates the scattering plot. Requires a completed density calculation. |
-| **Available r range** | Read-only. Reports the r range available from the current profile result, i.e., the actual mesh domain after extending the transform support to the origin. |
-| **Sampling** | Read-only. Reports the resampling step size, the Nyquist q limit derived from that step, and the independent q step size. Warns if the q grid is oversampled relative to the Nyquist limit. |
-| **Notes** | Read-only. Flags any conditions that may affect the transform quality, such as a clamped q max, a q grid that is significantly oversampled, or a fallback from solvent-subtracted to ordinary smeared density. |
+### Push to Model
 
-#### Window guidance
+The **Push to Model** group sits directly below **Fourier Transform** and above
+**Saved Outputs**. It is available only in computed-distribution mode.
 
-- `None` is the sharp-cutoff choice. It preserves the selected interval exactly but is the most prone to ringing from finite-range truncation.
-- `Lorch` is useful when you want a sinc-like damping toward the upper bound and are specifically trying to suppress termination ripples.
-- `Hanning`, `Welch`, `Parzen`, `Gaussian`, `Sine`, and `Kaiser-Bessel` are centered interval windows. They are strongest in the middle of the selected range and taper toward both ends.
-- `Kaiser-Bessel` is often a good general-purpose compromise when you want stronger sidelobe suppression than a simple cosine-family window.
-- If you need low-r features preserved as strongly as possible, keep the transform range physically justified and compare more than one window in the preview before committing to an interpretation.
+| Control           | Description                                                                                                                     |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| **Status text**   | Explains why push is enabled or disabled.                                                                                       |
+| **Push to Model** | Writes the current Born-approximation component traces into the linked computed distribution so the main SAXS UI can load them. |
 
-#### Sampling guidance
+Push remains disabled when:
 
-- Increasing **Resampling points** decreases the uniform $\Delta r$ used in the transform and therefore raises the Nyquist-limited maximum usable q.
-- Decreasing the real-space interval width increases the independent q spacing, so a very fine requested **q step** may oversample the plotted curve without adding independent information.
-- Starting the transform at $r = 0$ is supported, but if the low-r bins are dominated by a center-snapped atom or by strong solvent subtraction, compare the preview carefully before interpreting the high-q tail.
+- The tool is in preview mode.
+- The window is not linked to a computed distribution.
+- Any cluster row is still missing its Fourier transform.
+- The linked distribution already has saved prefit snapshots.
+- The linked distribution already has saved DREAM runs.
 
-<!-- prettier-ignore-end -->
+The push step is independent from calculation and transform persistence. In
+computed-distribution mode, reopening the tool restores saved densities and
+Fourier transforms even if **Push to Model** has never been used.
 
----
+### Debye Scattering Calculation
+
+The **Debye Scattering Calculation** group is a validation workspace for
+comparing the current Born-approximation traces against averaged direct Debye
+scattering traces on the same q-grid.
+
+| Control                        | Description                                                                                                                       |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| **Status text**                | Summarizes which active row or target rows already have Debye averages that match the current Born q-grid.                        |
+| **Calculate Debye Scattering** | Computes an averaged direct Debye scattering trace on the exact q-grid of the current Born transform.                             |
+| **Apply to All Rows**          | In cluster-folder mode, computes Debye averages for every eligible stoichiometry row instead of only the current selection.       |
+| **Open Comparison Plot**       | Opens a separate overlay dialog. Born traces use the left axis and solid lines; Debye traces use the right axis and dashed lines. |
+
+Rows are eligible only when they already have a Born-approximation Fourier
+trace. Single-atom rows are skipped here because they already use direct Debye
+scattering as their main scattering result.
+
+### Saved Output Sets
+
+The **Saved Output Sets** section captures intermediate and final states for
+reload and comparison.
+
+| Control                     | Description                                                                                                                             |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| **Saved Output Sets table** | Records density, solvent-subtraction, and Fourier entries with context, averaging mode, mesh, smearing, solvent, and Fourier summaries. |
+| **Load Selected**           | Restores one saved entry back into the main UI state.                                                                                   |
+| **Compare Selected**        | Opens a comparison dialog for one or more saved entries with PNG and CSV export tools.                                                  |
+
+Saved Outputs track density, solvent-subtraction, and Fourier snapshots. In
+computed-distribution mode, Debye comparison traces are restored from the
+workspace session state instead of from the Saved Outputs history.
+
+Persistence paths:
+
+- Preview-mode history is stored in the chosen output directory as
+  `electron_density_saved_output_history.json`.
+- Computed-distribution history is stored in the linked distribution as
+  `electron_density_mapping/saved_output_history.json`.
+- Computed-distribution session restore state is stored separately as
+  `electron_density_mapping/workspace_state.json`.
+
+That session state preserves calculated densities, Fourier transforms, and
+Debye scattering comparison traces even if they have not been pushed to the
+model yet. It is cleared only by
+**Reset Calculated Densities**.
 
 ### Status
 
-A scrollable log box that records loaded structures, settings applied, progress
-messages, and any warnings about excluded atoms or transform quality. Useful for
-reviewing what settings were active during a calculation.
+The **Status** panel is the persistent log for:
 
----
+- Input and workspace loading.
+- Contiguous-frame grouping or fallback notes.
+- Calculation progress and completion summaries.
+- Solvent subtraction and Fourier warnings.
+- Export, persistence, and push-to-model messages.
 
-## Right-panel plots
+## Right panel and viewer
 
-The right side of the window contains six stacked panels.
+The right-hand side contains shared plot controls followed by the plot panels
+and the structure viewer.
 
-| Plot                                                  | Description                                                                                                                                                                                    |
-| ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Orientation-Averaged Radial Electron Density ρ(r)** | Raw binned profile before smearing. Displayed as a step trace with an optional variance shading band (one standard deviation across ensemble members).                                         |
-| **Gaussian-Smeared Radial Electron Density ρ(r)**     | The same profile after the Gaussian-smearing kernel has been applied. Displayed as a smooth curve with optional variance shading.                                                              |
-| **Solvent-Subtracted Residual**                       | The smeared profile minus the active flat solvent electron density, shown after solvent contrast has been computed. The highest-r crossing used for the solvent cutoff is marked here as well. |
-| **Fourier Transform Preview**                         | Shows the resampled and windowed density data that will be fed into the transform integral. Updates live when the Fourier Transform settings change.                                           |
-| **Scattering Profile I(q)**                           | The resulting Born-approximation intensity after **Evaluate Fourier Transform** is clicked.                                                                                                    |
-| **Structure Viewer**                                  | A 2D projected scatter plot of atom positions from the reference structure, coloured by element. The active center of mass origin is shown as a reference point.                               |
+### Global plot controls
 
-The **Show Variance Shading** checkbox above the plots toggles the standard-deviation
-band on both the raw and smeared profile plots simultaneously.
+- **Show Variance Shading** toggles variance bands on density plots.
+- **Auto-expand plots** expands panels automatically when their data updates.
+- **Show All Cluster Transforms** overlays every ready cluster transform on the
+  active scattering plot.
+- **Expand All / Collapse All** toggles every plot section.
+- **Export Plot Traces** writes the currently displayed raw density, smeared
+  density, Fourier preview, and scattering traces into one CSV export.
 
----
+### Plot panels
 
-## Typical workflow
+| Panel                                                   | Description                                                                                                     |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| **Orientation-Averaged Radial Electron Density rho(r)** | Finite-radius shell-averaged raw density profile used as the basis for the displayed real-space interpretation. |
+| **Gaussian-Smeared Radial Electron Density rho(r)**     | Smoothed density profile after the active smearing setting.                                                     |
+| **Solvent-Subtracted Residual**                         | Residual curve after solvent subtraction, including the active cutoff marker when present.                      |
+| **Fourier Transform Preview**                           | Resampled and windowed density source that will be used for the scattering transform.                           |
+| **Scattering Profile I(q)**                             | Born-approximation or direct Debye scattering result evaluated from the corrected density source.               |
 
-1. Open the tool from the main SAXSShell UI or launch `saxshell` with the
-   `electron-density-mapping` subcommand.
-2. In **Input**, choose a single XYZ or PDB file or a folder of structures.
-   Click **Load Input**.
-3. Review the **Structure summary** field: check the element composition,
-   center of mass, and domain rmax.
-4. In **Mesh Settings**, set **rmax** to at least the reported domain radius.
-   Adjust **rstep**, **Theta divisions**, and **Phi divisions** as needed for
-   the desired resolution.
-5. Choose a **Center mode**. If the center of mass falls in an interstitial
-   void, use **Snap Center to Nearest Atom** to anchor the origin to a real
-   atomic site.
-6. Click **Update Mesh Settings** to apply any field changes.
-7. Set the **Output directory** and **Output basename** if you want to save
-   results to disk.
-8. Click **Run Electron Density Calculation** and wait for the progress bar to
-   complete.
-9. Inspect the raw and smeared ρ(r) plots. Adjust the **Debye-Waller factor**
-   under **Smearing** to control profile smoothness.
-10. If a q-space estimate is needed, configure the **Fourier Transform** section
-    and click **Evaluate Fourier Transform**.
+### Structure Viewer
 
----
+The structure viewer is an interactive **3D** Matplotlib viewer, not a static
+2D preview. It supports:
 
-## Output files
+- Rotate, pan, and zoom interactions.
+- Reset View.
+- Mesh overlay toggling.
+- Mesh contrast, line width, and color controls.
+- Point-atom display mode.
+- Active-origin and zoom readouts over the scene.
+- Preserved zoom and camera state while switching between stoichiometry rows in
+  cluster-folder mode.
 
-When an output directory is specified, two files are written after a successful
-run.
+## Typical workflows
 
-| File                      | Contents                                                                                                                                                                                                             |
-| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `<basename>_profile.csv`  | Radial centers, orientation-averaged density, smeared density, and per-shell electron counts and volumes.                                                                                                            |
-| `<basename>_summary.json` | Metadata including the input path, input mode, element counts, center of mass, active center, center mode, mesh settings, smearing settings, excluded atom/electron counts, and per-member summaries in folder mode. |
+### Standalone preview
 
----
+1. Launch **Open Electron Density Mapping** from the main UI or start the tool
+   from the terminal.
+2. Load a single structure file or a folder of structures.
+3. Review the structure summary and set the mesh.
+4. Run the density calculation.
+5. Adjust smearing, optional solvent subtraction, and optional Fourier settings.
+6. Optionally compute a matching Debye scattering average and open the
+   comparison plot.
+7. Use **Saved Output Sets** to reload or compare intermediate states.
+
+### Computed distribution / Born approximation
+
+1. Open the tool from **Build SAXS Components** with the
+   **Born Approximation (Average)** workflow.
+2. Confirm that the inherited cluster folder, output directory, and q-range are
+   correct.
+3. Review the stoichiometry table and choose whether to run the full batch or
+   **Manual Mode**.
+4. Run the density calculation.
+5. Apply smearing, solvent subtraction, and Fourier settings row-by-row or with
+   **Apply to All**.
+6. Evaluate Fourier transforms for every required row.
+7. Optionally compute Debye scattering averages for the active or target rows
+   and inspect the Born-vs-Debye comparison plot.
+8. Use **Push to Model** only after all desired transforms are complete.
+
+## Output and persistence files
+
+| File                                                                      | When it appears                                                     | Contents                                                                                                                           |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `<basename>.csv` / `<basename>.json`                                      | File and folder runs with an output directory                       | Density profile export and JSON summary for the run.                                                                               |
+| `<basename>_<stoichiometry>.csv` / `<basename>_<stoichiometry>.json`      | Cluster-folder runs with an output directory                        | One density export pair per density-based stoichiometry row. Direct-Debye-only rows do not write this pair during the density run. |
+| `electron_density_saved_output_history.json`                              | Preview mode with a writable output directory                       | Saved-output history for reload and comparison.                                                                                    |
+| `saved_output_history.json`                                               | Computed-distribution mode                                          | Distribution-linked saved-output history.                                                                                          |
+| `workspace_state.json`                                                    | Computed-distribution mode after a density or Fourier result exists | Restorable session state for non-pushed calculations.                                                                              |
+| `born_approximation_component_summary.json`                               | After **Push to Model**                                             | Saved pushed component summary for the linked distribution.                                                                        |
+| `md_saxs_map.json` or `md_saxs_map_predicted_structures.json`             | After **Push to Model**                                             | SAXS component registry for the linked distribution.                                                                               |
+| `scattering_components/` or `scattering_components_predicted_structures/` | After **Push to Model**                                             | Per-component Born-approximation scattering traces written as `.txt` files.                                                        |
 
 ## Related pages
 
 - [SAXS Contrast Mode](saxs-contrast-mode.md)
-- [XYZ to PDB Conversion](xyz2pdb-conversion.md)
 - [Cluster Extraction](cluster-extraction.md)
 - [Results and Export](results-and-export.md)
+- [XYZ to PDB Conversion](xyz2pdb-conversion.md)
 
 ## References
 
 - [Larch XAFS Fourier-transform documentation: practical window definitions including Hanning, Parzen, Welch, Gaussian, Sine, and Kaiser-Bessel.](https://xraypy.github.io/xraylarch/xafs_fourier.html)
-- [ORNL X-ray and neutron reflectivity tutorial: kinematic “master formula” discussion linking reciprocal-space scattering to Fourier transforms of real-space interfacial structure.](https://neutrons.ornl.gov/sites/default/files/beamline_04A_xray_neutron_reflectivity_tutorial.pdf)
-- [Steinrück H.-G., Han H.-L., et al. _Fluoroethylene Carbonate Induces Ordered Electrolyte Interface on Silicon and Sapphire Surfaces as Revealed by Sum Frequency Generation Vibrational Spectroscopy and X-ray Reflectivity_. Nano Letters (2018).](https://pubs.acs.org/doi/abs/10.1021/acs.nanolett.8b00298)
+- [ORNL X-ray and neutron reflectivity tutorial: kinematic "master formula" discussion linking reciprocal-space scattering to Fourier transforms of real-space interfacial structure.](https://neutrons.ornl.gov/sites/default/files/beamline_04A_xray_neutron_reflectivity_tutorial.pdf)
+- [Steinruck H.-G., Han H.-L., et al. _Fluoroethylene Carbonate Induces Ordered Electrolyte Interface on Silicon and Sapphire Surfaces as Revealed by Sum Frequency Generation Vibrational Spectroscopy and X-ray Reflectivity_. Nano Letters (2018).](https://pubs.acs.org/doi/abs/10.1021/acs.nanolett.8b00298)
 - [Elam W. T., Ravel B. D., Sieber J. R. _A new atomic database for X-ray spectroscopic calculations_. Radiation Physics and Chemistry (2002). Background reference for the `xraydb` atomic quantities used elsewhere in this tool.](<https://doi.org/10.1016/S0969-806X(01)00327-4>)

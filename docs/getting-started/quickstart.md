@@ -64,9 +64,27 @@ Inside the UI, the normal path is:
 
 1. Create or open a SAXS project.
 2. Point the project at your experimental data and cluster folder.
-3. Build the SAXS components in **Project Setup**.
-4. Review the model in **SAXS Prefit**.
-5. Run **SAXS DREAM Fit** if you need Bayesian refinement.
+3. In **Project Setup**, choose the template, q-range, grid behavior, excluded
+   elements, and SAXS component build mode.
+4. Click **Create Computed Distribution** to save that Project Setup snapshot
+   and generate the matching prior-weight inputs.
+5. Optionally click **Compute Debye-Waller Factors** when the active clusters
+   folder contains PDB files and you want saved disorder terms for later
+   workflows.
+6. Click **Build SAXS Components**.
+7. If the build mode is `No Contrast (Debye)`, the main UI runs the direct
+   component builder.
+8. If the build mode is `Contrast (Debye)`, the linked SAXS Contrast Mode
+   window opens.
+9. If the build mode is `Born Approximation (Average)`, the linked Electron
+   Density Mapping window opens in computed-distribution mode.
+10. Review the model in **SAXS Prefit**.
+11. Run **SAXS DREAM Fit** if you need Bayesian refinement.
+
+A computed distribution is the saved Project Setup configuration for one SAXS
+modeling branch. In practice it tracks the active template, component-build
+mode, cluster source, q-range and grid choices, excluded elements, and whether
+the run uses observed structures only or observed plus predicted structures.
 
 ## 6. If you are starting from an existing project
 

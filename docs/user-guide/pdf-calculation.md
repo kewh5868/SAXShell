@@ -1,7 +1,7 @@
 # PDF Calculation
 
 SAXSShell includes a Debyer-backed PDF application exposed as `pdfsetup` and as
-`Tools > Open PDF Calculation` from the main SAXS UI.
+`Tools > PDF > Open PDF Calculation` from the main SAXS UI.
 
 When the tool is opened from the main UI, its saved calculations become part of
 the same project-backed workflow state used by the SAXS tabs.

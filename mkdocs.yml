@@ -77,13 +77,24 @@ nav:
           - pyDREAM Workflow: user-guide/pydream-workflow.md
           - Results and Export: user-guide/results-and-export.md
       - Supporting Applications:
-          - Blender Structure Renderer: user-guide/blender-structure-renderer.md
-          - Cluster Extraction: user-guide/cluster-extraction.md
-          - Cluster Dynamics: user-guide/cluster-dynamics.md
-          - Cluster Dynamics ML: user-guide/cluster-dynamics-ml.md
-          - Electron Density Mapping: user-guide/electron-density-mapping.md
-          - PDF Calculation: user-guide/pdf-calculation.md
-          - XYZ to PDB Conversion: user-guide/xyz2pdb-conversion.md
+          - MD Extraction:
+              - MD Extraction and Cluster Preparation: user-guide/cluster-extraction.md
+              - XYZ to PDB Conversion: user-guide/xyz2pdb-conversion.md
+          - Structure Analysis:
+              - Bond Analysis: user-guide/bond-analysis.md
+              - Debye-Waller Analysis: user-guide/debye-waller-analysis.md
+          - Cluster Dynamics:
+              - Cluster Dynamics: user-guide/cluster-dynamics.md
+              - Cluster Dynamics ML: user-guide/cluster-dynamics-ml.md
+          - PDF:
+              - PDF Calculation: user-guide/pdf-calculation.md
+          - Visualization:
+              - Blender Structure Renderer: user-guide/blender-structure-renderer.md
+          - SAXS Calculation Preview:
+              - SAXS Contrast Mode: user-guide/saxs-contrast-mode.md
+              - Electron Density Mapping: user-guide/electron-density-mapping.md
+          - X-ray Toolkit:
+              - X-ray Toolkit: user-guide/xray-toolkit.md
   - Tutorials:
       - Example Workflow: tutorials/example-workflow.md
       - MD to SAXS Pipeline: tutorials/md-to-saxs-pipeline.md

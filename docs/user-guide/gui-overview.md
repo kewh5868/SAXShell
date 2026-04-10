@@ -13,8 +13,20 @@ The primary SAXS workflow lives in `saxshell saxs`. Its tabs are not isolated:
 the active template, component list, geometry metadata, and saved state all
 move between them.
 
-The new contrast-enabled component build path also adds a linked supporting
-application that can be launched from Project Setup and from the Tools menu.
+Project Setup now separates two linked actions:
+
+- **Create Computed Distribution** saves the current Project Setup snapshot for
+  a specific modeling branch.
+- **Build SAXS Components** follows the selected build mode for that saved
+  distribution.
+
+The linked supporting-application launches are build-mode aware:
+
+- `No Contrast (Debye)` stays in the main SAXS UI and runs the direct Debye
+  component builder.
+- `Contrast (Debye)` opens the contrast workflow window.
+- `Born Approximation (Average)` opens Electron Density Mapping in
+  computed-distribution mode.
 
 ### `saxshell saxs`
 
@@ -23,11 +35,19 @@ template-driven workflows.
 
 ### Project Setup
 
-Defines the project inputs and template choice.
+Defines the project inputs, computed distributions, and component-build choice.
 
-This is the point where the main UI expects cluster-derived SAXS inputs from
-the supporting applications. In practice, that usually means a cluster folder
-prepared through the trajectory, conversion, and cluster-extraction tools.
+This is where you:
+
+- choose the project, datasets, clusters folder, and template
+- set q-range, grid, and excluded-element controls
+- create or load computed distributions
+- optionally compute Debye-Waller factors from PDB cluster folders
+- build SAXS components with the current build mode
+
+The **Active Computed Distribution** panel on this tab summarizes the saved
+distribution identity and whether component, prior, Prefit, and DREAM artifacts
+already exist for that branch.
 
 ### SAXS Prefit
 
@@ -52,6 +72,7 @@ Several newer SAXS UI surfaces follow the same patterns:
 
 - progress bars with text status
 - long-running background tasks
+- distribution or readiness indicators next to optional project-backed steps
 - table-based editing for parameters or cluster geometry metadata
 - plot control toggles for experimental, model, and solvent traces
 
@@ -69,57 +90,104 @@ Several newer SAXS UI surfaces follow the same patterns:
 ## Supporting applications
 
 These applications prepare, analyze, or extend the data that the main SAXS UI
-consumes.
+consumes. The documentation below is grouped the same way as the main
+`Tools` menu.
 
-### `mdtrajectory`
+### MD Extraction
 
-Use this when you need to inspect trajectories, choose an equilibration cutoff,
-and export frames for downstream analysis.
+Use these tools when you need to move from a raw trajectory to a sorted cluster
+folder that the rest of the SAXSShell workflow can consume.
 
-### `xyz2pdb`
+- `mdtrajectory` inspects trajectories, helps choose an equilibration cutoff,
+  and exports frames for downstream analysis.
+- `xyz2pdb` converts extracted XYZ frames into residue-aware PDB files when
+  molecule identity matters downstream.
+- `clusters` builds the stoichiometry-sorted cluster exports used by later
+  workflows.
 
-Use this when exported XYZ frames need molecule identification or residue-aware
-PDB conversion before clustering.
+### Structure Analysis
 
-### `clusters`
+Use these tools when you want to analyze the sorted clusters themselves.
 
-Use this when you need to build cluster-network exports from extracted frames.
+- `bondanalysis` measures bond-pair and angle distributions from the cluster
+  folders.
+- `Debye-Waller Analysis` estimates intra-molecular and inter-molecular
+  Debye-Waller coefficients from sorted PDB cluster folders and saves them in
+  the active project when requested from Project Setup or the Tools menu.
 
-### `clusterdynamics`
+### Cluster Dynamics
 
-Use this when you need time-binned cluster-distribution heatmaps, optional
-energy overlays, and lifetime / association / dissociation summaries from an
-extracted XYZ or PDB frame folder.
+Use these tools when you need time-resolved cluster populations or want to
+extend the observed structure series.
 
-### `clusterdynamicsml`
+- `clusterdynamics` builds time-binned cluster-distribution heatmaps, optional
+  energy overlays, and lifetime / association / dissociation summaries.
+- `clusterdynamicsml` extrapolates larger cluster candidates, generates
+  predicted structures, and compares observed-only versus
+  observed-plus-predicted SAXS models.
 
-Use this when you want to extrapolate larger cluster candidates from the
-observed smaller-cluster dynamics and structure library, generate predicted
-structure files, and compare observed-only versus observed-plus-predicted SAXS
-models.
+### PDF
 
-### `bondanalysis`
+Use this section for pair-distribution workflows tied to the active project.
 
-Use this when you need bond-pair and angle-distribution measurements on the
-cluster folders.
+- `pdfsetup` runs Debyer-backed trajectory-averaged PDF and partial-PDF
+  calculations and stores the saved calculation sets in the project.
+- `saxshell fullrmc` remains the downstream setup path for fullrmc-oriented
+  project artifacts.
 
-### `pdfsetup`
+### Visualization
 
-Use this when you need Debyer-backed trajectory-averaged PDF or partial-PDF
-calculations, saved PDF calculation sets inside a SAXSShell project, and quick
-switching between little `g(r)`, big `G(r)`, and `R(r)` representations.
+Use `blenderxyz` when you need publication-style structure renders that go
+beyond the inline previewer.
 
-### `saxshell fullrmc`
+### SAXS Calculation Preview
 
-Use this when you want to prepare downstream fullrmc or Packmol-oriented
-artifacts from a SAXS project.
+Use these preview-mode tools when you want to inspect SAXS component-building
+settings outside the main computed-distribution flow.
+
+- `SAXS Contrast Mode` is the `Contrast (Debye)` representative-structure
+  workflow.
+- `Electron Density Mapping` is the
+  `Born Approximation (Average)` density-profile and Fourier-transform workflow.
+
+### X-ray Toolkit
+
+Use this section for smaller estimate windows such as volume-fraction, number
+density, attenuation, and fluorescence calculators.
 
 ## Supporting application references
 
-- [Cluster Extraction](cluster-extraction.md)
+### MD Extraction
+
+- [MD Extraction and Cluster Preparation](cluster-extraction.md)
+- [XYZ to PDB Conversion](xyz2pdb-conversion.md)
+
+### Structure Analysis
+
+- [Bond Analysis](bond-analysis.md)
+- [Debye-Waller Analysis](debye-waller-analysis.md)
+
+### Cluster Dynamics
+
 - [Cluster Dynamics](cluster-dynamics.md)
 - [Cluster Dynamics ML](cluster-dynamics-ml.md)
+
+### PDF
+
 - [PDF Calculation](pdf-calculation.md)
+
+### Visualization
+
+- [Blender Structure Renderer](blender-structure-renderer.md)
+
+### SAXS Calculation Preview
+
+- [SAXS Contrast Mode](saxs-contrast-mode.md)
+- [Electron Density Mapping](electron-density-mapping.md)
+
+### X-ray Toolkit
+
+- [X-ray Toolkit](xray-toolkit.md)
 
 ## TODO
 
