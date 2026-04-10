@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, field
 
 import numpy as np
 from matplotlib.backend_bases import MouseButton
@@ -11,7 +12,7 @@ from matplotlib.backends.backend_qtagg import (
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QSignalBlocker, Qt, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -60,6 +62,27 @@ _POINT_ATOM_SIZE = 26.0
 _ACTIVE_READOUT_COLOR = "#9ad8ff"
 _ACTIVE_READOUT_BACKGROUND = (0.05, 0.10, 0.17, 0.78)
 _VIEW_UPDATE_INTERVAL_MS = 16
+_DEFAULT_VIEW_RADIUS_REBASE = 0.5
+_SCENE_CACHE_MAX_BYTES = 96 * 1024 * 1024
+_SCENE_CACHE_MAX_ENTRIES = 20
+_SCENE_CACHE_BYTES_PER_PIXEL = 8
+_SCENE_KEY_SENTINEL = object()
+
+
+def _integrated_electron_total(
+    density_values: np.ndarray,
+    shell_volumes: np.ndarray,
+) -> float | None:
+    density_array = np.asarray(density_values, dtype=float)
+    shell_volume_array = np.asarray(shell_volumes, dtype=float)
+    if (
+        density_array.ndim != 1
+        or shell_volume_array.ndim != 1
+        or density_array.size == 0
+        or density_array.size != shell_volume_array.size
+    ):
+        return None
+    return float(np.sum(density_array * shell_volume_array))
 
 
 @dataclass(slots=True)
@@ -70,6 +93,39 @@ class ElectronDensityProfileOverlay:
     cutoff_label: str | None = None
     solvent_subtracted_density: np.ndarray | None = None
     solvent_subtracted_label: str | None = None
+
+
+@dataclass(slots=True)
+class ElectronDensityStructureViewerDisplayState:
+    view_center: np.ndarray = field(
+        default_factory=lambda: np.zeros(3, dtype=float)
+    )
+    view_radius: float = 1.0
+    scene_rotation: np.ndarray = field(
+        default_factory=lambda: np.eye(3, dtype=float)
+    )
+    mesh_visible: bool = True
+    atom_contrast: float = _DEFAULT_ATOM_CONTRAST
+    mesh_contrast: float = _DEFAULT_MESH_CONTRAST
+    mesh_linewidth: float = _DEFAULT_MESH_LINEWIDTH
+    mesh_color: str = _DEFAULT_MESH_COLOR
+    atom_render_mode: str = "points"
+    interaction_mode: str = "rotate"
+
+
+@dataclass(slots=True)
+class _ViewerSceneCacheEntry:
+    scene_key: str
+    figure: Figure
+    canvas: FigureCanvas
+    axis: object | None = None
+    axis_reference: object | None = None
+    active_settings_artist: object | None = None
+    structure: ElectronDensityStructure | None = None
+    mesh_geometry: ElectronDensityMeshGeometry | None = None
+    content_signature: tuple[int, int] | None = None
+    estimated_bytes: int = 0
+    complexity_score: float = 0.0
 
 
 def _clamp_fraction(value: float) -> float:
@@ -151,6 +207,7 @@ class ElectronDensityProfilePlot(QWidget):
         super().__init__(parent)
         self.current_result: ElectronDensityProfileResult | None = None
         self.current_overlay: ElectronDensityProfileOverlay | None = None
+        self.current_integrated_electron_count: float | None = None
         self._title = str(title)
         self._legend_label = str(legend_label)
         self._trace_color = str(trace_color)
@@ -178,6 +235,7 @@ class ElectronDensityProfilePlot(QWidget):
     def draw_placeholder(self) -> None:
         self.current_result = None
         self.current_overlay = None
+        self.current_integrated_electron_count = None
         self.figure.clear()
         axis = self.figure.add_subplot(111)
         axis.text(
@@ -227,6 +285,10 @@ class ElectronDensityProfilePlot(QWidget):
                 getattr(result, self._spread_attribute),
                 dtype=float,
             )
+        self.current_integrated_electron_count = _integrated_electron_total(
+            density_values,
+            np.asarray(result.shell_volumes, dtype=float),
+        )
         if self._as_step_trace:
             axis.step(
                 radial_values,
@@ -346,6 +408,23 @@ class ElectronDensityProfilePlot(QWidget):
                 linestyle="--",
                 alpha=0.95,
                 label=overlay.cutoff_label or "Cutoff",
+            )
+        if self.current_integrated_electron_count is not None:
+            axis.text(
+                0.015,
+                0.985,
+                "Integrated electrons: "
+                f"{self.current_integrated_electron_count:.6f}",
+                ha="left",
+                va="top",
+                fontsize=9,
+                transform=axis.transAxes,
+                bbox={
+                    "boxstyle": "round,pad=0.25",
+                    "facecolor": "#ffffff",
+                    "edgecolor": "#cbd5e1",
+                    "alpha": 0.92,
+                },
             )
         axis.set_xlabel("r (Å)")
         axis.set_ylabel("ρ(r) (e/Å³)")
@@ -507,14 +586,39 @@ class ElectronDensityFourierPreviewPlot(QWidget):
         self.canvas.setMinimumHeight(280)
         layout.addWidget(self.canvas, stretch=1)
 
+    @staticmethod
+    def _style_axis(axis) -> None:
+        axis.set_facecolor("#fbfcfe")
+        axis.grid(
+            True, which="major", color="#cbd5e1", alpha=0.45, linewidth=0.8
+        )
+        axis.grid(
+            True, which="minor", color="#e2e8f0", alpha=0.30, linewidth=0.55
+        )
+        axis.minorticks_on()
+        axis.axhline(0.0, color="#64748b", linewidth=0.9, alpha=0.35, zorder=0)
+        axis.axvline(0.0, color="#64748b", linewidth=1.1, alpha=0.55, zorder=0)
+        axis.spines["top"].set_visible(False)
+        axis.spines["right"].set_visible(False)
+        axis.spines["left"].set_color("#94a3b8")
+        axis.spines["bottom"].set_color("#94a3b8")
+        axis.tick_params(
+            axis="both",
+            which="both",
+            colors="#475569",
+            labelsize=8.5,
+            width=0.8,
+        )
+
     def draw_placeholder(self) -> None:
         self.current_preview = None
         self.figure.clear()
         axis = self.figure.add_subplot(111)
+        self._style_axis(axis)
         axis.text(
             0.5,
             0.60,
-            "Run the electron-density calculation to prepare the Fourier-transform preview.",
+            "Run the electron-density calculation to prepare the mirrored Fourier-transform preview.",
             ha="center",
             va="center",
             wrap=True,
@@ -523,8 +627,8 @@ class ElectronDensityFourierPreviewPlot(QWidget):
         axis.text(
             0.5,
             0.40,
-            "This panel will show the smeared ρ(r), the selected transform bounds, "
-            "the resampled points, and the active modification window.",
+            "This panel will show the real-space trace that is actually sent "
+            "into the transform over the active r domain.",
             ha="center",
             va="center",
             wrap=True,
@@ -544,100 +648,61 @@ class ElectronDensityFourierPreviewPlot(QWidget):
         self.current_preview = preview
         self.figure.clear()
         axis = self.figure.add_subplot(111)
+        self._style_axis(axis)
         settings = preview.settings
-        full_r = np.asarray(preview.source_radial_values, dtype=float)
-        full_density = np.asarray(preview.source_density_values, dtype=float)
-        resampled_r = np.asarray(preview.resampled_r_values, dtype=float)
-        resampled_density = np.asarray(
-            preview.resampled_density_values, dtype=float
+        plot_r = np.asarray(preview.resampled_r_values, dtype=float)
+        plot_density = np.asarray(preview.windowed_density_values, dtype=float)
+        plot_r_max = float(np.max(np.abs(plot_r))) if plot_r.size else 0.0
+        plot_r_max = max(plot_r_max, float(settings.r_max), 1.0e-6)
+        trace_label = (
+            f"Windowed {preview.source_profile_label}"
+            if settings.window_function != "none"
+            else preview.source_profile_label
         )
-        windowed_density = np.asarray(
-            preview.windowed_density_values, dtype=float
+        mirrored_mode = (
+            getattr(settings, "domain_mode", "legacy") == "mirrored"
         )
-        window_values = np.asarray(preview.window_values, dtype=float)
 
-        axis.plot(
-            full_r,
-            full_density,
-            color="#9bd5a6",
-            linewidth=1.6,
-            alpha=0.95,
-            label=preview.source_profile_label,
-        )
-        axis.axvspan(
-            float(settings.r_min),
-            float(settings.r_max),
-            color="#dbeafe",
-            alpha=0.45,
-            label="Transform bounds",
+        axis.fill_between(
+            plot_r,
+            plot_density,
+            0.0,
+            color="#99f6e4",
+            alpha=0.28,
+            linewidth=0.0,
+            zorder=1,
         )
         axis.plot(
-            resampled_r,
-            resampled_density,
-            color="#22c55e",
-            linewidth=1.3,
-            alpha=0.70,
-            label=f"Resampled {preview.source_profile_label}",
+            plot_r,
+            plot_density,
+            color="#0f766e",
+            linewidth=2.25,
+            label=trace_label,
+            zorder=2,
         )
-        axis.plot(
-            resampled_r,
-            windowed_density,
-            color="#15803d",
-            linewidth=2.2,
-            label=f"Windowed {preview.source_profile_label}",
-        )
-        sample_stride = max(int(np.ceil(len(resampled_r) / 80.0)), 1)
-        axis.scatter(
-            resampled_r[::sample_stride],
-            resampled_density[::sample_stride],
-            s=10,
-            color="#14532d",
-            alpha=0.55,
-            label="Resampled points",
-            zorder=3,
-        )
-        window_axis = axis.twinx()
-        window_axis.plot(
-            resampled_r,
-            window_values,
-            color="#7c3aed",
-            linewidth=1.5,
-            linestyle="--",
-            alpha=0.95,
-            label=f"Window ({settings.window_function})",
-        )
-        window_axis.set_ylabel("Window")
-        window_axis.set_ylim(-0.05, 1.10)
-        axis.set_xlabel("r (Å)")
+        if mirrored_mode:
+            axis.set_xlim(-plot_r_max * 1.02, plot_r_max * 1.02)
+        else:
+            axis.set_xlim(float(np.min(plot_r)), float(np.max(plot_r)) * 1.02)
+        axis.set_xlabel("Mirrored r (Å)" if mirrored_mode else "r (Å)")
         axis.set_ylabel("ρ(r) (e/Å³)")
-        axis.set_title("Fourier-Transform Preparation")
-        axis.grid(True, alpha=0.28)
-        handles, labels = axis.get_legend_handles_labels()
-        window_handles, window_labels = window_axis.get_legend_handles_labels()
-        axis.legend(
-            handles + window_handles,
-            labels + window_labels,
-            loc="upper right",
-            frameon=True,
-            fontsize=8.1,
-        )
+        axis.set_title("Fourier-Transform Preparation", loc="left", pad=10)
         axis.text(
-            0.02,
-            0.02,
-            (
-                f"Δr={preview.resampling_step_a:.4f} Å | "
-                f"Nyquist qmax≈{preview.nyquist_q_max_a_inverse:.3f} Å⁻¹ | "
-                f"Independent Δq≈{preview.independent_q_step_a_inverse:.3f} Å⁻¹"
-            ),
+            0.99,
+            0.98,
+            "source: "
+            f"{preview.source_profile_label}  ·  "
+            f"window: {settings.window_function}  ·  "
+            f"points: {settings.resampling_points}",
+            ha="right",
+            va="top",
             transform=axis.transAxes,
-            ha="left",
-            va="bottom",
             fontsize=8.0,
-            color="#334155",
+            color="#475569",
             bbox={
-                "facecolor": "#f8fafc",
+                "boxstyle": "round,pad=0.25",
+                "facecolor": "#ffffff",
                 "edgecolor": "#cbd5e1",
-                "boxstyle": "round,pad=0.28",
                 "alpha": 0.92,
             },
         )
@@ -698,6 +763,9 @@ class ElectronDensityScatteringPlot(QWidget):
         *,
         log_q_axis: bool,
         log_intensity_axis: bool,
+        additional_series: list[dict[str, object]] | None = None,
+        primary_label: str = "Born-approximation intensity",
+        primary_color: str = "#b45309",
     ) -> None:
         if result is None:
             self.draw_placeholder()
@@ -730,10 +798,31 @@ class ElectronDensityScatteringPlot(QWidget):
         axis.plot(
             plot_q,
             plot_intensity,
-            color="#b45309",
+            color=str(primary_color),
             linewidth=2.2,
-            label="Born-approximation intensity",
+            label=str(primary_label),
         )
+        for series in additional_series or []:
+            raw_q = np.asarray(series.get("q_values"), dtype=float)
+            raw_intensity = np.asarray(series.get("intensity"), dtype=float)
+            overlay_mask = np.ones_like(raw_q, dtype=bool)
+            if log_q_axis:
+                overlay_mask &= raw_q > 0.0
+            if log_intensity_axis:
+                overlay_mask &= raw_intensity > 0.0
+            overlay_q = raw_q[overlay_mask]
+            overlay_intensity = raw_intensity[overlay_mask]
+            if overlay_q.size == 0 or overlay_intensity.size == 0:
+                continue
+            axis.plot(
+                overlay_q,
+                overlay_intensity,
+                color=str(series.get("color") or "#64748b"),
+                linewidth=1.3,
+                alpha=0.78,
+                linestyle="--",
+                label=str(series.get("label") or "Additional transform"),
+            )
         if log_q_axis:
             axis.set_xscale("log")
         if log_intensity_axis:
@@ -743,28 +832,7 @@ class ElectronDensityScatteringPlot(QWidget):
         axis.set_title("q-Space Scattering Profile")
         axis.grid(True, which="both", alpha=0.28)
         axis.legend(loc="upper right", frameon=True)
-        settings = result.preview.settings
-        axis.text(
-            0.02,
-            0.02,
-            (
-                f"Window={settings.window_function} | "
-                f"r={settings.r_min:.3f} to {settings.r_max:.3f} Å | "
-                f"{len(result.q_values)} q points"
-            ),
-            transform=axis.transAxes,
-            ha="left",
-            va="bottom",
-            fontsize=8.0,
-            color="#7c2d12",
-            bbox={
-                "facecolor": "#fff7ed",
-                "edgecolor": "#fdba74",
-                "boxstyle": "round,pad=0.28",
-                "alpha": 0.92,
-            },
-        )
-        self.figure.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
+        self.figure.tight_layout()
         self.canvas.draw_idle()
 
 
@@ -782,6 +850,7 @@ class ElectronDensityStructureViewer(QWidget):
         self.canvas = _PassiveWheelFigureCanvas(self.figure)
         self._axis = None
         self._axis_reference = None
+        self._active_settings_artist = None
         self._view_center = np.zeros(3, dtype=float)
         self._view_radius = 1.0
         self._interaction_mode = "rotate"
@@ -796,15 +865,26 @@ class ElectronDensityStructureViewer(QWidget):
         self._mesh_contrast = _DEFAULT_MESH_CONTRAST
         self._mesh_linewidth = _DEFAULT_MESH_LINEWIDTH
         self._mesh_color = _DEFAULT_MESH_COLOR
-        self._atom_render_mode = "balls"
+        self._atom_render_mode = "points"
         self._pending_view_update = False
         self._pending_axis_reference_refresh = False
+        self._scene_cache: OrderedDict[str, _ViewerSceneCacheEntry] = (
+            OrderedDict()
+        )
+        self._scene_display_states: dict[
+            str,
+            ElectronDensityStructureViewerDisplayState,
+        ] = {}
+        self._active_scene_key: str | None = None
+        self._scratch_scene: _ViewerSceneCacheEntry | None = None
+        self._scene_cache_max_bytes = _SCENE_CACHE_MAX_BYTES
+        self._scene_cache_max_entries = _SCENE_CACHE_MAX_ENTRIES
+        self._scene_cache_bytes_per_pixel = _SCENE_CACHE_BYTES_PER_PIXEL
         self._view_update_timer = QTimer(self)
         self._view_update_timer.setSingleShot(True)
         self._view_update_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._view_update_timer.timeout.connect(self._flush_view_update)
         self._build_ui()
-        self._connect_canvas_events()
         self.draw_placeholder()
 
     def _build_ui(self) -> None:
@@ -898,6 +978,7 @@ class ElectronDensityStructureViewer(QWidget):
         contrast_row.addWidget(self.mesh_color_button)
 
         self.point_atoms_checkbox = QCheckBox("Point Atoms")
+        self.point_atoms_checkbox.setChecked(True)
         self.point_atoms_checkbox.toggled.connect(
             self._handle_point_atoms_toggle
         )
@@ -906,15 +987,30 @@ class ElectronDensityStructureViewer(QWidget):
         layout.addLayout(contrast_row)
         self._update_mesh_color_button_style()
 
-        self.canvas.setMinimumHeight(520)
-        layout.addWidget(self.canvas, stretch=1)
+        self._canvas_stack = QStackedWidget(self)
+        self._canvas_stack.setMinimumHeight(380)
+        layout.addWidget(self._canvas_stack, stretch=1)
         self.setMinimumHeight(self.minimumSizeHint().height())
+        self._scratch_scene = self._create_scene_entry("__scratch__")
+        self._activate_scene_entry(self._scratch_scene, scene_key=None)
         self._set_interaction_mode("rotate")
 
-    def _connect_canvas_events(self) -> None:
-        self.canvas.mpl_connect("button_press_event", self._handle_press)
-        self.canvas.mpl_connect("button_release_event", self._handle_release)
-        self.canvas.mpl_connect("motion_notify_event", self._handle_motion)
+    def _connect_canvas_events(self, canvas: FigureCanvas) -> None:
+        canvas.mpl_connect("button_press_event", self._handle_press)
+        canvas.mpl_connect("button_release_event", self._handle_release)
+        canvas.mpl_connect("motion_notify_event", self._handle_motion)
+
+    def _create_scene_entry(self, scene_key: str) -> _ViewerSceneCacheEntry:
+        figure = Figure(figsize=(8.4, 6.2))
+        canvas = _PassiveWheelFigureCanvas(figure)
+        canvas.setMinimumHeight(520)
+        self._connect_canvas_events(canvas)
+        self._canvas_stack.addWidget(canvas)
+        return _ViewerSceneCacheEntry(
+            scene_key=str(scene_key),
+            figure=figure,
+            canvas=canvas,
+        )
 
     def _set_interaction_mode(self, mode: str) -> None:
         if mode not in {"rotate", "pan", "zoom"}:
@@ -937,9 +1033,321 @@ class ElectronDensityStructureViewer(QWidget):
             cursor = Qt.CursorShape.OpenHandCursor
         self.canvas.setCursor(cursor)
 
+    def _capture_display_state(
+        self,
+    ) -> ElectronDensityStructureViewerDisplayState:
+        return ElectronDensityStructureViewerDisplayState(
+            view_center=np.asarray(self._view_center, dtype=float).copy(),
+            view_radius=max(float(self._view_radius), 0.2),
+            scene_rotation=np.asarray(
+                self._scene_rotation,
+                dtype=float,
+            ).copy(),
+            mesh_visible=bool(self._mesh_visible),
+            atom_contrast=_clamp_fraction(self._atom_contrast),
+            mesh_contrast=_clamp_fraction(self._mesh_contrast),
+            mesh_linewidth=max(float(self._mesh_linewidth), 0.2),
+            mesh_color=str(self._mesh_color),
+            atom_render_mode=str(self._atom_render_mode),
+            interaction_mode=str(self._interaction_mode),
+        )
+
+    def _apply_display_state(
+        self,
+        state: ElectronDensityStructureViewerDisplayState,
+        *,
+        sync_controls: bool,
+    ) -> None:
+        self._view_center = np.asarray(state.view_center, dtype=float).copy()
+        self._view_radius = max(float(state.view_radius), 0.2)
+        self._scene_rotation = _orthonormalize_rotation(
+            np.asarray(state.scene_rotation, dtype=float)
+        )
+        self._mesh_visible = bool(state.mesh_visible)
+        self._atom_contrast = _clamp_fraction(state.atom_contrast)
+        self._mesh_contrast = _clamp_fraction(state.mesh_contrast)
+        self._mesh_linewidth = max(float(state.mesh_linewidth), 0.2)
+        self._mesh_color = str(state.mesh_color)
+        self._atom_render_mode = (
+            "points" if str(state.atom_render_mode) == "points" else "balls"
+        )
+        self._interaction_mode = (
+            str(state.interaction_mode)
+            if str(state.interaction_mode) in {"rotate", "pan", "zoom"}
+            else "rotate"
+        )
+        self._update_mesh_color_button_style()
+        if not sync_controls:
+            return
+        blockers = [
+            QSignalBlocker(widget)
+            for widget in (
+                self.rotate_button,
+                self.pan_button,
+                self.zoom_button,
+                self.show_mesh_checkbox,
+                self.atom_contrast_spin,
+                self.mesh_contrast_spin,
+                self.mesh_linewidth_spin,
+                self.point_atoms_checkbox,
+            )
+        ]
+        try:
+            self.rotate_button.setChecked(self._interaction_mode == "rotate")
+            self.pan_button.setChecked(self._interaction_mode == "pan")
+            self.zoom_button.setChecked(self._interaction_mode == "zoom")
+            self.show_mesh_checkbox.setChecked(self._mesh_visible)
+            self.atom_contrast_spin.setValue(self._atom_contrast * 100.0)
+            self.mesh_contrast_spin.setValue(self._mesh_contrast * 100.0)
+            self.mesh_linewidth_spin.setValue(self._mesh_linewidth)
+            self.point_atoms_checkbox.setChecked(
+                self._atom_render_mode == "points"
+            )
+        finally:
+            del blockers
+        self._update_canvas_cursor()
+
+    def _scene_signature(
+        self,
+        structure: ElectronDensityStructure,
+        mesh_geometry: ElectronDensityMeshGeometry | None,
+    ) -> tuple[int, int]:
+        return (
+            id(structure),
+            0 if mesh_geometry is None else id(mesh_geometry),
+        )
+
+    def _estimated_scene_bytes(self, canvas: FigureCanvas) -> int:
+        width = max(int(canvas.width()), int(canvas.minimumWidth()), 1)
+        height = max(int(canvas.height()), int(canvas.minimumHeight()), 1)
+        return int(width * height * self._scene_cache_bytes_per_pixel)
+
+    def _activate_scene_entry(
+        self,
+        entry: _ViewerSceneCacheEntry,
+        *,
+        scene_key: str | None,
+    ) -> None:
+        self.figure = entry.figure
+        self.canvas = entry.canvas
+        self._axis = entry.axis
+        self._axis_reference = entry.axis_reference
+        self._active_settings_artist = entry.active_settings_artist
+        self.current_structure = entry.structure
+        self.current_mesh_geometry = entry.mesh_geometry
+        self._active_scene_key = scene_key
+        self._canvas_stack.setCurrentWidget(entry.canvas)
+        if scene_key is not None:
+            state = self._scene_display_states.get(scene_key)
+            if state is not None:
+                self._apply_display_state(state, sync_controls=True)
+        self._update_canvas_cursor()
+
+    def _default_scene_state(
+        self,
+        structure: ElectronDensityStructure,
+        *,
+        mesh_geometry: ElectronDensityMeshGeometry | None,
+        reset_view: bool,
+        preserve_zoom_percentage: float | None,
+    ) -> ElectronDensityStructureViewerDisplayState:
+        if reset_view:
+            view_center = np.zeros(3, dtype=float)
+            scene_rotation = np.eye(3, dtype=float)
+            view_radius = self._view_radius_for_zoom_percentage(
+                structure,
+                preserve_zoom_percentage,
+                mesh_geometry=mesh_geometry,
+            )
+        else:
+            view_center = np.asarray(self._view_center, dtype=float).copy()
+            scene_rotation = np.asarray(
+                self._scene_rotation,
+                dtype=float,
+            ).copy()
+            view_radius = max(float(self._view_radius), 0.2)
+        return ElectronDensityStructureViewerDisplayState(
+            view_center=view_center,
+            view_radius=view_radius,
+            scene_rotation=scene_rotation,
+            mesh_visible=bool(self._mesh_visible),
+            atom_contrast=_clamp_fraction(self._atom_contrast),
+            mesh_contrast=_clamp_fraction(self._mesh_contrast),
+            mesh_linewidth=max(float(self._mesh_linewidth), 0.2),
+            mesh_color=str(self._mesh_color),
+            atom_render_mode=str(self._atom_render_mode),
+            interaction_mode=str(self._interaction_mode),
+        )
+
+    def _sync_active_scene_cache_entry(self) -> None:
+        if self._active_scene_key is None:
+            return
+        entry = self._scene_cache.get(self._active_scene_key)
+        if entry is None:
+            return
+        entry.axis = self._axis
+        entry.axis_reference = self._axis_reference
+        entry.active_settings_artist = self._active_settings_artist
+        entry.structure = self.current_structure
+        entry.mesh_geometry = self.current_mesh_geometry
+        if self.current_structure is not None:
+            entry.content_signature = self._scene_signature(
+                self.current_structure,
+                self.current_mesh_geometry,
+            )
+        else:
+            entry.content_signature = None
+        entry.estimated_bytes = self._estimated_scene_bytes(entry.canvas)
+        self._scene_display_states[self._active_scene_key] = (
+            self._capture_display_state()
+        )
+
+    def _mark_scene_recent(self, scene_key: str) -> None:
+        if scene_key not in self._scene_cache:
+            return
+        entry = self._scene_cache.pop(scene_key)
+        self._scene_cache[scene_key] = entry
+
+    def _remove_cached_scene(self, scene_key: str) -> None:
+        entry = self._scene_cache.pop(scene_key, None)
+        if entry is None:
+            return
+        self._canvas_stack.removeWidget(entry.canvas)
+        entry.figure.clear()
+        entry.canvas.setParent(None)
+        entry.canvas.deleteLater()
+
+    def _enforce_scene_cache_budget(self) -> None:
+        if not self._scene_cache:
+            return
+        total_bytes = sum(
+            max(int(entry.estimated_bytes), 1)
+            for entry in self._scene_cache.values()
+        )
+        while (
+            len(self._scene_cache) > self._scene_cache_max_entries
+            or total_bytes > self._scene_cache_max_bytes
+        ):
+            evicted_key = None
+            for candidate_key in self._scene_cache:
+                if candidate_key != self._active_scene_key:
+                    evicted_key = candidate_key
+                    break
+            if evicted_key is None:
+                break
+            evicted = self._scene_cache.get(evicted_key)
+            total_bytes -= (
+                0 if evicted is None else max(int(evicted.estimated_bytes), 1)
+            )
+            self._remove_cached_scene(evicted_key)
+
+    def clear_scene_cache(self, *, clear_display_states: bool = True) -> None:
+        self._clear_pending_view_update()
+        if self._scratch_scene is not None:
+            self._activate_scene_entry(self._scratch_scene, scene_key=None)
+        for scene_key in list(self._scene_cache):
+            self._remove_cached_scene(scene_key)
+        self._scene_cache.clear()
+        if clear_display_states:
+            self._scene_display_states.clear()
+        self._active_scene_key = None
+
+    def _render_cached_scene(
+        self,
+        entry: _ViewerSceneCacheEntry,
+        *,
+        scene_key: str,
+        structure: ElectronDensityStructure,
+        mesh_geometry: ElectronDensityMeshGeometry | None,
+        display_state: ElectronDensityStructureViewerDisplayState,
+        complexity_score: float,
+        activate: bool,
+        persist_display_state: bool,
+    ) -> None:
+        previous_context = None
+        if not activate:
+            previous_context = (
+                self.figure,
+                self.canvas,
+                self._axis,
+                self._axis_reference,
+                self._active_settings_artist,
+                self.current_structure,
+                self.current_mesh_geometry,
+                self._active_scene_key,
+                self._capture_display_state(),
+                self._canvas_stack.currentWidget(),
+            )
+        try:
+            if activate:
+                self._activate_scene_entry(entry, scene_key=scene_key)
+            else:
+                self.figure = entry.figure
+                self.canvas = entry.canvas
+                self._axis = entry.axis
+                self._axis_reference = entry.axis_reference
+                self._active_settings_artist = entry.active_settings_artist
+                self.current_structure = structure
+                self.current_mesh_geometry = mesh_geometry
+                self._active_scene_key = (
+                    scene_key if persist_display_state else None
+                )
+            self.current_structure = structure
+            self.current_mesh_geometry = mesh_geometry
+            self._apply_display_state(
+                display_state,
+                sync_controls=activate,
+            )
+            self._draw_view(reset_view=False)
+            if not activate:
+                entry.canvas.draw()
+            entry.axis = self._axis
+            entry.axis_reference = self._axis_reference
+            entry.active_settings_artist = self._active_settings_artist
+            entry.structure = structure
+            entry.mesh_geometry = mesh_geometry
+            entry.content_signature = self._scene_signature(
+                structure,
+                mesh_geometry,
+            )
+            entry.complexity_score = float(complexity_score)
+            entry.estimated_bytes = self._estimated_scene_bytes(entry.canvas)
+            if persist_display_state:
+                self._scene_display_states[scene_key] = (
+                    self._capture_display_state()
+                )
+            else:
+                self._scene_display_states.pop(scene_key, None)
+            self._mark_scene_recent(scene_key)
+            self._enforce_scene_cache_budget()
+        finally:
+            if previous_context is not None:
+                (
+                    self.figure,
+                    self.canvas,
+                    self._axis,
+                    self._axis_reference,
+                    self._active_settings_artist,
+                    self.current_structure,
+                    self.current_mesh_geometry,
+                    self._active_scene_key,
+                    previous_display_state,
+                    current_widget,
+                ) = previous_context
+                self._apply_display_state(
+                    previous_display_state,
+                    sync_controls=False,
+                )
+                if current_widget is not None:
+                    self._canvas_stack.setCurrentWidget(current_widget)
+                self._update_canvas_cursor()
+
     def draw_placeholder(self) -> None:
+        if self._scratch_scene is not None:
+            self._activate_scene_entry(self._scratch_scene, scene_key=None)
         self.current_structure = None
         self._clear_pending_view_update()
+        self._active_settings_artist = None
         self.figure.clear()
         axis = self.figure.add_subplot(111)
         axis.text(
@@ -965,6 +1373,8 @@ class ElectronDensityStructureViewer(QWidget):
         )
         axis.set_axis_off()
         self.canvas.draw_idle()
+        self._axis = axis
+        self._axis_reference = None
 
     def set_structure(
         self,
@@ -972,13 +1382,79 @@ class ElectronDensityStructureViewer(QWidget):
         *,
         mesh_geometry: ElectronDensityMeshGeometry | None = None,
         reset_view: bool = True,
+        preserve_zoom_percentage: float | None = None,
+        scene_key: str | None | object = _SCENE_KEY_SENTINEL,
+        render_complexity: float | None = None,
     ) -> None:
         if structure is None:
             self.draw_placeholder()
             return
-        self.current_structure = structure
-        self.current_mesh_geometry = mesh_geometry
-        self._draw_view(reset_view=reset_view)
+        self._sync_active_scene_cache_entry()
+        resolved_scene_key = (
+            self._active_scene_key
+            if scene_key is _SCENE_KEY_SENTINEL
+            else (None if scene_key is None else str(scene_key))
+        )
+        if resolved_scene_key is None:
+            if self._scratch_scene is not None:
+                self._activate_scene_entry(self._scratch_scene, scene_key=None)
+            self.current_structure = structure
+            self.current_mesh_geometry = mesh_geometry
+            self._draw_view(
+                reset_view=reset_view,
+                preserve_zoom_percentage=preserve_zoom_percentage,
+            )
+            return
+        signature = self._scene_signature(structure, mesh_geometry)
+        cached_entry = self._scene_cache.get(resolved_scene_key)
+        persisted_display_state = self._scene_display_states.get(
+            resolved_scene_key
+        )
+        if (
+            cached_entry is not None
+            and cached_entry.content_signature == signature
+            and persisted_display_state is not None
+        ):
+            self._activate_scene_entry(
+                cached_entry,
+                scene_key=resolved_scene_key,
+            )
+            self.current_structure = structure
+            self.current_mesh_geometry = mesh_geometry
+            self._mark_scene_recent(resolved_scene_key)
+            self.canvas.update()
+            return
+        if persisted_display_state is None:
+            display_state = self._default_scene_state(
+                structure,
+                mesh_geometry=mesh_geometry,
+                reset_view=reset_view,
+                preserve_zoom_percentage=preserve_zoom_percentage,
+            )
+        else:
+            display_state = persisted_display_state
+        if display_state is None:
+            display_state = self._default_scene_state(
+                structure,
+                mesh_geometry=mesh_geometry,
+                reset_view=reset_view,
+                preserve_zoom_percentage=preserve_zoom_percentage,
+            )
+        if cached_entry is None:
+            cached_entry = self._create_scene_entry(resolved_scene_key)
+            self._scene_cache[resolved_scene_key] = cached_entry
+        self._render_cached_scene(
+            cached_entry,
+            scene_key=resolved_scene_key,
+            structure=structure,
+            mesh_geometry=mesh_geometry,
+            display_state=display_state,
+            complexity_score=(
+                0.0 if render_complexity is None else float(render_complexity)
+            ),
+            activate=True,
+            persist_display_state=True,
+        )
 
     def set_structure_preserving_display(
         self,
@@ -989,19 +1465,12 @@ class ElectronDensityStructureViewer(QWidget):
         if structure is None:
             self.draw_placeholder()
             return
+        self._sync_active_scene_cache_entry()
         self.current_structure = structure
         self.current_mesh_geometry = mesh_geometry
-        self._atom_contrast = _clamp_fraction(
-            float(self.atom_contrast_spin.value()) / 100.0
-        )
-        self._mesh_contrast = _clamp_fraction(
-            float(self.mesh_contrast_spin.value()) / 100.0
-        )
-        self._mesh_linewidth = max(
-            float(self.mesh_linewidth_spin.value()), 0.2
-        )
-        self._atom_render_mode = (
-            "points" if self.point_atoms_checkbox.isChecked() else "balls"
+        self._apply_display_state(
+            self._capture_display_state(),
+            sync_controls=True,
         )
         self._draw_view(reset_view=False)
 
@@ -1012,6 +1481,69 @@ class ElectronDensityStructureViewer(QWidget):
         self.current_mesh_geometry = mesh_geometry
         if self.current_structure is not None:
             self._draw_view(reset_view=False)
+
+    def prewarm_scene(
+        self,
+        scene_key: str,
+        *,
+        structure: ElectronDensityStructure,
+        mesh_geometry: ElectronDensityMeshGeometry | None = None,
+        complexity_score: float = 0.0,
+    ) -> bool:
+        resolved_scene_key = str(scene_key)
+        self._sync_active_scene_cache_entry()
+        signature = self._scene_signature(structure, mesh_geometry)
+        cached_entry = self._scene_cache.get(resolved_scene_key)
+        if (
+            cached_entry is not None
+            and cached_entry.content_signature == signature
+        ):
+            cached_entry.complexity_score = float(complexity_score)
+            self._mark_scene_recent(resolved_scene_key)
+            self._enforce_scene_cache_budget()
+            return False
+        if (
+            cached_entry is None
+            and len(self._scene_cache) >= self._scene_cache_max_entries
+        ):
+            evictable_entries = [
+                entry
+                for key, entry in self._scene_cache.items()
+                if key != self._active_scene_key
+            ]
+            if evictable_entries:
+                lowest_complexity_entry = min(
+                    evictable_entries,
+                    key=lambda entry: float(entry.complexity_score),
+                )
+                if float(complexity_score) <= float(
+                    lowest_complexity_entry.complexity_score
+                ):
+                    return False
+                self._remove_cached_scene(lowest_complexity_entry.scene_key)
+        display_state = self._scene_display_states.get(resolved_scene_key)
+        persist_display_state = display_state is not None
+        if display_state is None:
+            display_state = self._default_scene_state(
+                structure,
+                mesh_geometry=mesh_geometry,
+                reset_view=True,
+                preserve_zoom_percentage=100.0,
+            )
+        if cached_entry is None:
+            cached_entry = self._create_scene_entry(resolved_scene_key)
+            self._scene_cache[resolved_scene_key] = cached_entry
+        self._render_cached_scene(
+            cached_entry,
+            scene_key=resolved_scene_key,
+            structure=structure,
+            mesh_geometry=mesh_geometry,
+            display_state=display_state,
+            complexity_score=complexity_score,
+            activate=False,
+            persist_display_state=persist_display_state,
+        )
+        return True
 
     def autoscale_view(self) -> None:
         if self.current_structure is None:
@@ -1028,14 +1560,36 @@ class ElectronDensityStructureViewer(QWidget):
     def _default_view_radius(
         self,
         structure: ElectronDensityStructure,
+        *,
+        mesh_geometry: ElectronDensityMeshGeometry | None = None,
+    ) -> float:
+        legacy_radius = self._legacy_default_view_radius(
+            structure,
+            mesh_geometry=mesh_geometry,
+        )
+        return max(
+            legacy_radius * _DEFAULT_VIEW_RADIUS_REBASE,
+            0.2,
+        )
+
+    def _legacy_default_view_radius(
+        self,
+        structure: ElectronDensityStructure,
+        *,
+        mesh_geometry: ElectronDensityMeshGeometry | None = None,
     ) -> float:
         max_structure_radius = float(
             np.max(np.linalg.norm(structure.centered_coordinates, axis=1))
         )
+        active_mesh_geometry = (
+            self.current_mesh_geometry
+            if mesh_geometry is None
+            else mesh_geometry
+        )
         mesh_radius = (
             0.0
-            if self.current_mesh_geometry is None
-            else float(self.current_mesh_geometry.domain_max_radius)
+            if active_mesh_geometry is None
+            else float(active_mesh_geometry.domain_max_radius)
         )
         return max(
             max_structure_radius * 1.55,
@@ -1043,13 +1597,44 @@ class ElectronDensityStructureViewer(QWidget):
             1.2,
         )
 
-    def _draw_view(self, *, reset_view: bool) -> None:
+    def _view_radius_for_zoom_percentage(
+        self,
+        structure: ElectronDensityStructure,
+        zoom_percentage: float | None,
+        *,
+        mesh_geometry: ElectronDensityMeshGeometry | None = None,
+    ) -> float:
+        if zoom_percentage is None:
+            return self._default_view_radius(
+                structure,
+                mesh_geometry=mesh_geometry,
+            )
+        normalized_zoom = max(float(zoom_percentage) / 100.0, 1.0e-3)
+        return float(
+            np.clip(
+                self._default_view_radius(
+                    structure,
+                    mesh_geometry=mesh_geometry,
+                )
+                / normalized_zoom,
+                0.2,
+                1.0e6,
+            )
+        )
+
+    def _draw_view(
+        self,
+        *,
+        reset_view: bool,
+        preserve_zoom_percentage: float | None = None,
+    ) -> None:
         structure = self.current_structure
         if structure is None:
             self.draw_placeholder()
             return
 
         self._clear_pending_view_update()
+        self._active_settings_artist = None
         self.figure.clear()
         axis = self.figure.add_subplot(
             111,
@@ -1100,7 +1685,10 @@ class ElectronDensityStructureViewer(QWidget):
         if reset_view:
             self._scene_rotation = np.eye(3, dtype=float)
             self._view_center = np.zeros(3, dtype=float)
-            self._view_radius = self._default_view_radius(structure)
+            self._view_radius = self._view_radius_for_zoom_percentage(
+                structure,
+                preserve_zoom_percentage,
+            )
         self._apply_view_to_axes(refresh_axis_reference=True)
         axis.set_title(structure.display_label)
         axis.axis("off")
@@ -1111,6 +1699,7 @@ class ElectronDensityStructureViewer(QWidget):
             top=0.94,
         )
         self.canvas.draw_idle()
+        self._sync_active_scene_cache_entry()
 
     def _clear_pending_view_update(self) -> None:
         self._pending_view_update = False
@@ -1478,18 +2067,10 @@ class ElectronDensityStructureViewer(QWidget):
                 )
 
     def _draw_active_settings_readout(self, axis) -> None:
-        readout = "\n".join(
-            (
-                f"ATOM {self._atom_contrast * 100.0:05.1f}%",
-                f"MESH {self._mesh_contrast * 100.0:05.1f}%",
-                f"LINE {self._mesh_linewidth:04.2f}px",
-                f"COLOR {self._mesh_color.upper()}",
-            )
-        )
         artist = axis.text2D(
             0.02,
             0.98,
-            readout,
+            self._active_settings_readout_text(),
             transform=axis.transAxes,
             ha="left",
             va="top",
@@ -1505,6 +2086,37 @@ class ElectronDensityStructureViewer(QWidget):
             zorder=14,
         )
         artist.set_gid("active-visual-settings")
+        self._active_settings_artist = artist
+
+    def _active_settings_readout_text(self) -> str:
+        zoom_percentage = self._current_zoom_percentage()
+        zoom_text = (
+            "--.-%" if zoom_percentage is None else f"{zoom_percentage:05.1f}%"
+        )
+        return "\n".join(
+            (
+                f"ZOOM {zoom_text}",
+                f"ATOM {self._atom_contrast * 100.0:05.1f}%",
+                f"MESH {self._mesh_contrast * 100.0:05.1f}%",
+                f"LINE {self._mesh_linewidth:04.2f}px",
+                f"COLOR {self._mesh_color.upper()}",
+            )
+        )
+
+    def _current_zoom_percentage(self) -> float | None:
+        structure = self.current_structure
+        if structure is None:
+            return None
+        reference_radius = max(self._default_view_radius(structure), 1.0e-6)
+        current_radius = max(float(self._view_radius), 1.0e-6)
+        return max(reference_radius / current_radius * 100.0, 0.1)
+
+    def _refresh_active_settings_readout(self) -> None:
+        if self._active_settings_artist is None:
+            return
+        self._active_settings_artist.set_text(
+            self._active_settings_readout_text()
+        )
 
     def _update_mesh_color_button_style(self) -> None:
         self.mesh_color_button.setStyleSheet(
@@ -1560,6 +2172,7 @@ class ElectronDensityStructureViewer(QWidget):
         self._pending_axis_reference_refresh = False
         self._apply_view_to_axes(refresh_axis_reference=refresh_axis_reference)
         self.canvas.draw_idle()
+        self._sync_active_scene_cache_entry()
 
     def _apply_view_to_axes(
         self,
@@ -1581,6 +2194,7 @@ class ElectronDensityStructureViewer(QWidget):
             self._view_center[2] + self._view_radius,
         )
         self._axis.view_init(elev=_CAMERA_ELEV, azim=_CAMERA_AZIM)
+        self._refresh_active_settings_readout()
         if refresh_axis_reference:
             self._draw_axis_reference()
 
@@ -1703,6 +2317,8 @@ class ElectronDensityStructureViewer(QWidget):
         if self._view_update_timer.isActive():
             self._view_update_timer.stop()
             self._flush_view_update()
+        else:
+            self._sync_active_scene_cache_entry()
         self._update_canvas_cursor()
 
     def _handle_motion(self, event) -> None:

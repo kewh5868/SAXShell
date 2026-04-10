@@ -2,7 +2,8 @@
 
 The Blender tool is SAXSShell's publication-rendering application for atomistic
 structures. It is exposed as the standalone `blenderxyz` program and from the
-main SAXSShell window through `Tools > Open Blender XYZ Renderer`.
+main SAXSShell window through
+`Tools > Visualization > Open Blender XYZ Renderer`.
 
 ## Purpose
 

@@ -30,6 +30,7 @@ from .representatives import (
     analyze_contrast_representatives,
 )
 from .settings import (
+    COMPONENT_BUILD_MODE_BORN_APPROXIMATION,
     COMPONENT_BUILD_MODE_CONTRAST,
     COMPONENT_BUILD_MODE_NO_CONTRAST,
     ContrastModeLaunchContext,
@@ -40,6 +41,7 @@ from .settings import (
 from .workflow import ContrastWorkflowPreview, build_contrast_workflow_preview
 
 __all__ = [
+    "COMPONENT_BUILD_MODE_BORN_APPROXIMATION",
     "COMPONENT_BUILD_MODE_CONTRAST",
     "COMPONENT_BUILD_MODE_NO_CONTRAST",
     "CONTRAST_SOLVENT_METHOD_NEAT",

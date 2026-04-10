@@ -114,6 +114,7 @@ class ClusterSelectionResult:
     resolved_box_dimensions: tuple[float, float, float] | None
     using_auto_box: bool
     use_pbc: bool
+    smart_solvation_shells: bool
     include_shell_atoms_in_stoichiometry: bool
     search_mode: str
     save_state_frequency: int
@@ -168,6 +169,7 @@ class ClusterSelectionResult:
             "resolved_box_dimensions": self.resolved_box_dimensions,
             "using_auto_box": self.using_auto_box,
             "use_pbc": self.use_pbc,
+            "smart_solvation_shells": self.smart_solvation_shells,
             "include_shell_atoms_in_stoichiometry": (
                 self.include_shell_atoms_in_stoichiometry
             ),
@@ -229,6 +231,7 @@ class ClusterWorkflow:
         shell_levels: tuple[int, ...] = (),
         include_shell_levels: tuple[int, ...] = (0,),
         shared_shells: bool = False,
+        smart_solvation_shells: bool = True,
         include_shell_atoms_in_stoichiometry: bool = False,
         search_mode: str = SEARCH_MODE_KDTREE,
         save_state_frequency: int = DEFAULT_SAVE_STATE_FREQUENCY,
@@ -242,6 +245,7 @@ class ClusterWorkflow:
         self.shell_levels = shell_levels
         self.include_shell_levels = include_shell_levels
         self.shared_shells = shared_shells
+        self.smart_solvation_shells = bool(smart_solvation_shells)
         self.include_shell_atoms_in_stoichiometry = bool(
             include_shell_atoms_in_stoichiometry
         )
@@ -297,6 +301,10 @@ class ClusterWorkflow:
         """Preview the selected frames, output directory, and box
         settings."""
         summary = self.inspect()
+        smart_solvation_shells = (
+            str(summary.get("frame_format", "")).lower() == "pdb"
+            and self.smart_solvation_shells
+        )
         resolved_use_pbc = self.use_pbc if use_pbc is None else bool(use_pbc)
         resolved_box = self.resolve_box_dimensions(
             box_dimensions=box_dimensions,
@@ -317,6 +325,7 @@ class ClusterWorkflow:
                 and self.box_dimensions is None
             ),
             use_pbc=resolved_use_pbc,
+            smart_solvation_shells=smart_solvation_shells,
             include_shell_atoms_in_stoichiometry=(
                 self.include_shell_atoms_in_stoichiometry
             ),
@@ -333,6 +342,7 @@ class ClusterWorkflow:
         shell_levels: tuple[int, ...] | None = None,
         include_shell_levels: tuple[int, ...] | None = None,
         shared_shells: bool | None = None,
+        smart_solvation_shells: bool | None = None,
     ) -> ClusterExportResult:
         """Analyze the extracted frames and write cluster files."""
         selection = self.preview_selection(
@@ -346,6 +356,11 @@ class ClusterWorkflow:
         analyzer = self._build_analyzer(
             box_dimensions=selection.resolved_box_dimensions,
             use_pbc=(self.use_pbc if use_pbc is None else bool(use_pbc)),
+            smart_solvation_shells=(
+                self.smart_solvation_shells
+                if smart_solvation_shells is None
+                else bool(smart_solvation_shells)
+            ),
         )
         export = analyzer.export_cluster_files(
             selection.output_dir,
@@ -384,6 +399,7 @@ class ClusterWorkflow:
         *,
         box_dimensions: tuple[float, float, float] | None = None,
         use_pbc: bool | None = None,
+        smart_solvation_shells: bool | None = None,
     ) -> ExtractedFrameFolderClusterAnalyzer:
         return ExtractedFrameFolderClusterAnalyzer(
             frames_dir=self.frames_dir,
@@ -392,6 +408,11 @@ class ClusterWorkflow:
             box_dimensions=box_dimensions,
             default_cutoff=self.default_cutoff,
             use_pbc=self.use_pbc if use_pbc is None else bool(use_pbc),
+            smart_solvation_shells=(
+                self.smart_solvation_shells
+                if smart_solvation_shells is None
+                else bool(smart_solvation_shells)
+            ),
             include_shell_atoms_in_stoichiometry=(
                 self.include_shell_atoms_in_stoichiometry
             ),

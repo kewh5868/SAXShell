@@ -202,6 +202,14 @@ def _add_common_cluster_arguments(parser: argparse.ArgumentParser) -> None:
         help="Allow shell atoms to be shared between clusters.",
     )
     parser.add_argument(
+        "--legacy-solvation-shells",
+        action="store_true",
+        help=(
+            "Disable Smart Solvation Shell mode and use the legacy "
+            "per-frame solvent shell extraction path."
+        ),
+    )
+    parser.add_argument(
         "--include-shell-atoms-in-stoichiometry",
         action="store_true",
         help="Include shell atoms when assigning stoichiometry folders.",
@@ -235,6 +243,9 @@ def _build_workflow(args: argparse.Namespace) -> ClusterWorkflow:
             )
         ),
         shared_shells=bool(getattr(args, "shared_shells", False)),
+        smart_solvation_shells=not bool(
+            getattr(args, "legacy_solvation_shells", False)
+        ),
         include_shell_atoms_in_stoichiometry=bool(
             getattr(args, "include_shell_atoms_in_stoichiometry", False)
         ),
@@ -348,6 +359,8 @@ def _format_selection_result(selection: ClusterSelectionResult) -> str:
         f"Frames folder: {selection.summary['input_dir']}",
         f"Mode: {selection.mode_label}",
         f"PBC: {'on' if selection.use_pbc else 'off'}",
+        "Smart solvation shells: "
+        f"{'on' if selection.smart_solvation_shells else 'off'}",
         f"Search mode: {selection.search_mode_label}",
         "Save-state frequency: "
         f"every {selection.save_state_frequency} frames",

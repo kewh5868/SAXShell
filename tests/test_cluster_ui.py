@@ -117,6 +117,7 @@ def test_definitions_panel_switches_to_xyz_mode(qapp):
     assert not panel.use_pbc()
     assert panel.search_mode() == "kdtree"
     assert panel.save_state_frequency() == DEFAULT_SAVE_STATE_FREQUENCY
+    assert not panel.smart_solvation_shells_box.isEnabled()
     assert not panel.include_shell_atoms_in_stoichiometry()
 
 
@@ -148,6 +149,7 @@ def test_definitions_panel_starts_blank_with_builtin_preset_available(qapp):
     assert not panel.use_pbc()
     assert panel.search_mode() == "kdtree"
     assert panel.save_state_frequency() == DEFAULT_SAVE_STATE_FREQUENCY
+    assert panel.smart_solvation_shells()
     assert not panel.include_shell_atoms_in_stoichiometry()
 
 
@@ -165,6 +167,7 @@ def test_definitions_panel_saves_and_recalls_custom_presets_without_box(
     panel.set_default_cutoff(4.25)
     panel.set_shell_growth_levels((1, 2))
     panel.set_shared_shells(True)
+    panel.set_smart_solvation_shells(False)
     panel.set_include_shell_atoms_in_stoichiometry(True)
     panel.set_box_dimensions((10.0, 11.0, 12.0))
 
@@ -187,6 +190,7 @@ def test_definitions_panel_saves_and_recalls_custom_presets_without_box(
     panel.set_default_cutoff(None, emit_signal=False)
     panel.set_shell_growth_levels((), emit_signal=False)
     panel.set_shared_shells(False, emit_signal=False)
+    panel.set_smart_solvation_shells(True, emit_signal=False)
     panel.set_include_shell_atoms_in_stoichiometry(False, emit_signal=False)
 
     panel.load_preset("Custom solvent shell")
@@ -199,6 +203,7 @@ def test_definitions_panel_saves_and_recalls_custom_presets_without_box(
     assert panel.default_cutoff() == 4.25
     assert panel.shell_growth_levels() == (1, 2)
     assert panel.shared_shells()
+    assert not panel.smart_solvation_shells()
     assert panel.include_shell_atoms_in_stoichiometry()
     assert panel.box_dimensions() == (21.0, 22.0, 23.0)
 
@@ -442,6 +447,7 @@ def test_cluster_export_worker_emits_frame_progress(qapp, tmp_path):
         shell_levels=(1,),
         include_shell_levels=(0, 1),
         shared_shells=False,
+        smart_solvation_shells=False,
         include_shell_atoms_in_stoichiometry=False,
         output_dir=source_dir / "clusters_splitxyz0001",
     )

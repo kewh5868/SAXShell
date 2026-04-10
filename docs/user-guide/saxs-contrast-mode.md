@@ -15,9 +15,9 @@ Use contrast mode when you want the SAXS component build to be tied to:
 
 You can open the contrast workflow in two ways:
 
-- **Project Setup > Component build mode > Contrast Mode**, then click
+- **Project Setup > Component build mode > Contrast (Debye)**, then click
   **Build SAXS Components**
-- **Tools > Open SAXS Contrast Mode**
+- **Tools > SAXS Calculation Preview > Open SAXS Contrast Mode**
 
 When a saved contrast-mode distribution is active, Project Setup also exposes
 **View Representative Structures** below **Build SAXS Components** so you can
@@ -25,7 +25,7 @@ reopen the saved representative-selection, mesh, density, and trace context.
 
 ## Typical workflow
 
-1. In **Project Setup**, choose **Contrast Mode** above
+1. In **Project Setup**, choose **Contrast (Debye)** above
    **Build SAXS Components**.
 2. Open the contrast tool from **Build SAXS Components** or from **Tools**.
 3. Confirm the inherited project folder, cluster folder, template, and q-range.
@@ -58,7 +58,7 @@ distribution is active.
 
 The SAXS component build mode is part of computed-distribution identity. That
 means two distributions can coexist even if everything else matches, as long as
-one is **No Contrast Mode** and the other is **Contrast Mode**.
+one is **No Contrast (Debye)** and the other is **Contrast (Debye)**.
 
 Within contrast mode:
 

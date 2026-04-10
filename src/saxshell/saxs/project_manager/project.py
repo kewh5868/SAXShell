@@ -565,6 +565,7 @@ class ProjectSettings:
     powerpoint_export_settings: PowerPointExportSettings = field(
         default_factory=PowerPointExportSettings
     )
+    prior_histogram_x_axis_order: list[list[str]] = field(default_factory=list)
 
     @property
     def resolved_project_dir(self) -> Path:
@@ -850,7 +851,20 @@ class ProjectSettings:
             powerpoint_export_settings=PowerPointExportSettings.from_dict(
                 payload.get("powerpoint_export_settings", {})
             ),
+            prior_histogram_x_axis_order=_normalized_prior_x_axis_order(
+                payload.get("prior_histogram_x_axis_order", [])
+            ),
         )
+
+
+def _normalized_prior_x_axis_order(raw: object) -> list[list[str]]:
+    if not isinstance(raw, list):
+        return []
+    result: list[list[str]] = []
+    for entry in raw:
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            result.append([str(entry[0]), str(entry[1])])
+    return result
 
 
 def _distribution_id_for_settings(

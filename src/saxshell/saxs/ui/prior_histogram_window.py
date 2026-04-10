@@ -36,6 +36,7 @@ class PriorHistogramWindow(QMainWindow):
         secondary_element: str | None = None,
         cmap: str = "summer",
         structure_motif_colors: dict[str, str] | None = None,
+        custom_label_order: list[tuple[str, str]] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -48,6 +49,7 @@ class PriorHistogramWindow(QMainWindow):
             if structure_motif_colors is not None
             else None
         )
+        self.custom_label_order = custom_label_order
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowFlag(Qt.WindowType.Window, True)
         self._build_ui()
@@ -92,6 +94,7 @@ class PriorHistogramWindow(QMainWindow):
             secondary_element=self.secondary_element,
             cmap=self.cmap,
             structure_motif_colors=self.structure_motif_colors,
+            custom_label_order=self.custom_label_order,
             ax=axis,
         )
         self.canvas.draw()

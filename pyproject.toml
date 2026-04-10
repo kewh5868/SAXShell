@@ -46,6 +46,7 @@ clusters = "saxshell.cluster.cli:main"
 mdtrajectory = "saxshell.mdtrajectory.cli:main"
 saxshell = "saxshell.saxshell:main"
 pdfsetup = "saxshell.pdfsetup:main"
+structureviewer = "saxshell.saxs.structure_viewer.cli:main"
 xyz2pdb = "saxshell.xyz2pdb.cli:main"
 
 [tool.setuptools-git-versioning]

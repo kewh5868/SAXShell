@@ -2269,7 +2269,7 @@ class SAXSPrefitWorkflow:
                 raise FileNotFoundError(
                     "Predicted Structures mode is enabled, but the "
                     "predicted-structure prior weights have not been "
-                    "generated for this project. Generate Prior Weights in "
+                    "generated for this project. Create Computed Distribution in "
                     "Project Setup with Use Predicted Structure Weights enabled."
                 )
             raise FileNotFoundError(

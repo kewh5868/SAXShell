@@ -13,13 +13,15 @@ from matplotlib.backends.backend_qtagg import (
 )
 from matplotlib.colors import to_hex
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -51,14 +53,21 @@ from saxshell.saxs.contrast.settings import (
     normalize_component_build_mode,
 )
 from saxshell.saxs.debye import discover_cluster_bins
+from saxshell.saxs.debye_waller.workflow import (
+    find_saved_project_debye_waller_analysis,
+    inspect_debye_waller_input,
+    load_debye_waller_analysis_result,
+)
 from saxshell.saxs.project_manager import (
     ExperimentalDataSummary,
     ProjectSettings,
+    build_prior_histogram_export_payload,
     build_project_paths,
     load_experimental_data_file,
     plot_md_prior_histogram,
 )
 from saxshell.saxs.stoichiometry import parse_stoich_label
+from saxshell.saxs.ui._pane_snap import PaneSnapFilter
 from saxshell.saxs.ui.experimental_data_loader import (
     ExperimentalDataHeaderDialog,
 )
@@ -66,6 +75,99 @@ from saxshell.saxs.ui.template_help import (
     TEMPLATE_HELP_TEXT,
     show_template_help,
 )
+
+
+class _XAxisOrderDialog(QDialog):
+    def __init__(
+        self,
+        entries: list[tuple[str, str]],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Edit Custom X-Axis Order")
+        self.resize(520, 400)
+        self._build_ui(entries)
+
+    def _build_ui(self, entries: list[tuple[str, str]]) -> None:
+        layout = QVBoxLayout(self)
+        note = QLabel(
+            "Rearrange rows to set the x-axis order. Edit Display Text to "
+            "customise axis labels. Use $_{n}$ for subscript and $^{n}$ for "
+            "superscript (matplotlib mathtext)."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        content = QHBoxLayout()
+        self._table = QTableWidget(len(entries), 2)
+        self._table.setHorizontalHeaderLabels(["Structure", "Display Text"])
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self._table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        for row, (raw, display) in enumerate(entries):
+            raw_item = QTableWidgetItem(raw)
+            raw_item.setFlags(raw_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self._table.setItem(row, 0, raw_item)
+            self._table.setItem(row, 1, QTableWidgetItem(display))
+        self._table.resizeColumnToContents(0)
+        content.addWidget(self._table, stretch=1)
+
+        btn_col = QVBoxLayout()
+        up_btn = QPushButton("Up")
+        up_btn.clicked.connect(self._move_up)
+        dn_btn = QPushButton("Down")
+        dn_btn.clicked.connect(self._move_down)
+        btn_col.addWidget(up_btn)
+        btn_col.addWidget(dn_btn)
+        btn_col.addStretch(1)
+        content.addLayout(btn_col)
+        layout.addLayout(content)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _move_up(self) -> None:
+        row = self._table.currentRow()
+        if row <= 0:
+            return
+        self._swap_rows(row, row - 1)
+        self._table.selectRow(row - 1)
+
+    def _move_down(self) -> None:
+        row = self._table.currentRow()
+        if row < 0 or row >= self._table.rowCount() - 1:
+            return
+        self._swap_rows(row, row + 1)
+        self._table.selectRow(row + 1)
+
+    def _swap_rows(self, a: int, b: int) -> None:
+        for col in range(self._table.columnCount()):
+            item_a = self._table.takeItem(a, col)
+            item_b = self._table.takeItem(b, col)
+            if item_a is not None:
+                self._table.setItem(b, col, item_a)
+            if item_b is not None:
+                self._table.setItem(a, col, item_b)
+
+    def result_entries(self) -> list[tuple[str, str]]:
+        entries: list[tuple[str, str]] = []
+        for row in range(self._table.rowCount()):
+            raw_item = self._table.item(row, 0)
+            display_item = self._table.item(row, 1)
+            raw = raw_item.text() if raw_item is not None else ""
+            display = display_item.text() if display_item is not None else ""
+            entries.append((raw, display))
+        return entries
+
 
 HISTOGRAM_COLORMAP_NAMES = [
     "summer",
@@ -78,6 +180,7 @@ HISTOGRAM_COLORMAP_NAMES = [
 ]
 COMPONENT_PLOT_MIN_HEIGHT = 320
 PRIOR_PLOT_MIN_HEIGHT = 240
+RECENT_PROJECTS_KEY = "recent_project_dirs"
 
 
 class ProjectSetupTab(QWidget):
@@ -87,6 +190,8 @@ class ProjectSetupTab(QWidget):
     open_mdtrajectory_requested = Signal()
     open_xyz2pdb_requested = Signal()
     open_cluster_requested = Signal()
+    open_clusterdynamicsml_requested = Signal()
+    open_debye_waller_requested = Signal()
     scan_clusters_requested = Signal()
     build_components_requested = Signal()
     build_prior_weights_requested = Signal()
@@ -105,6 +210,7 @@ class ProjectSetupTab(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._auto_snap_enabled = True
         self._console_autoscroll_enabled = True
         self._summary_text = ""
         self._experimental_header_rows = 0
@@ -136,7 +242,19 @@ class ProjectSetupTab(QWidget):
         self._pending_saxs_preview_redraw = False
         self._pending_prior_preview_redraw = False
         self._active_template_name: str | None = None
+        self._project_selected = False
+        self._debye_waller_ready = False
+        self._debye_waller_status_note: str | None = None
+        self._predicted_structures_available = False
+        self._predicted_structure_count = 0
+        self._distribution_tooltips: dict[str, str] = {}
+        self._distribution_details: dict[str, str] = {}
+        self._current_distribution_details_text = (
+            "Create or load a computed distribution to review its saved "
+            "build attributes here."
+        )
         self._suspend_template_selection_signal = False
+        self._prior_x_axis_custom_order: list[tuple[str, str]] = []
         self._build_ui()
         self._update_data_trace_control_state()
         self._update_component_trace_control_state()
@@ -179,6 +297,13 @@ class ProjectSetupTab(QWidget):
         self._pane_splitter.setStretchFactor(0, 6)
         self._pane_splitter.setStretchFactor(1, 7)
         self._pane_splitter.setSizes([780, 680])
+        self._auto_snap_filter = PaneSnapFilter(
+            self._pane_splitter,
+            self._left_scroll_area,
+            self._right_scroll_area,
+            parent=self,
+        )
+        self.set_auto_snap_enabled(self._auto_snap_enabled)
         root.addWidget(self._pane_splitter)
 
     @staticmethod
@@ -284,7 +409,7 @@ class ProjectSetupTab(QWidget):
         self.use_predicted_structure_weights_checkbox.toggled.connect(
             self._on_predicted_structure_weights_toggled
         )
-        layout.addRow("", self.use_predicted_structure_weights_checkbox)
+        layout.addRow("", self._predicted_structure_controls_row())
 
         self.predicted_structure_status_label = QLabel(
             self._default_predicted_structure_status_text()
@@ -330,63 +455,31 @@ class ProjectSetupTab(QWidget):
         )
         layout.addRow("", self.solvent_status_label)
 
-        self.qmin_edit = QLineEdit()
-        self.qmax_edit = QLineEdit()
-        self.qmin_edit.textChanged.connect(self._redraw_saxs_preview)
-        self.qmax_edit.textChanged.connect(self._redraw_saxs_preview)
-        q_row = QHBoxLayout()
-        q_row.addWidget(QLabel("q min"))
-        q_row.addWidget(self.qmin_edit)
-        q_row.addWidget(QLabel("q max"))
-        q_row.addWidget(self.qmax_edit)
-        layout.addRow("q-range", q_row)
-
-        self.use_experimental_grid_checkbox = QCheckBox(
-            "Use experimental grid"
-        )
-        self.use_experimental_grid_checkbox.setChecked(True)
-        self.use_experimental_grid_checkbox.setToolTip(
-            "Use the experimental q-grid directly inside the selected q-range. "
-            "Disable this option to resample the experimental data onto a "
-            "custom evenly spaced grid for the forward model."
-        )
-        self.use_experimental_grid_checkbox.toggled.connect(
-            self._update_resample_grid_state
-        )
-        self.resample_points_spin = QSpinBox()
-        self.resample_points_spin.setRange(2, 50000)
-        self.resample_points_spin.setValue(500)
-        self.resample_points_spin.setToolTip(
-            "Number of evenly spaced q-points to generate between q min and "
-            "q max when resampling the model and experimental data."
-        )
-        grid_row = QHBoxLayout()
-        grid_row.addWidget(self.use_experimental_grid_checkbox)
-        grid_row.addStretch(1)
-        grid_row.addWidget(QLabel("Resample grid"))
-        grid_row.addWidget(self.resample_points_spin)
-        layout.addRow("Grid", grid_row)
-        self._update_resample_grid_state()
-
-        self.available_elements_list = QListWidget()
-        self.available_elements_list.setSelectionMode(
-            QAbstractItemView.SelectionMode.ExtendedSelection
-        )
-        self.available_elements_list.setMinimumHeight(104)
-        self.available_elements_list.setMaximumHeight(132)
-        self.available_elements_list.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Fixed,
-        )
-        layout.addRow("Recognized elements", self._elements_row())
-
-        self.exclude_elements_edit = QLineEdit()
-        self.exclude_elements_edit.setPlaceholderText("Example: H O")
-        self.exclude_elements_edit.textChanged.connect(
-            self._sync_available_element_selection
-        )
-        layout.addRow("Exclude elements", self.exclude_elements_edit)
         return group
+
+    def _predicted_structure_controls_row(self) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(
+            self.use_predicted_structure_weights_checkbox,
+            stretch=1,
+        )
+        self.predicted_structure_ready_indicator = QLabel()
+        self.predicted_structure_ready_indicator.setFixedSize(14, 14)
+        self._refresh_predicted_structure_indicator()
+        layout.addWidget(self.predicted_structure_ready_indicator)
+        self.predict_structures_button = QPushButton("Predict Structures")
+        self.predict_structures_button.setToolTip(
+            "Open Cluster Dynamics (ML) to compute predicted structures "
+            "for this project."
+        )
+        self.predict_structures_button.clicked.connect(
+            self.open_clusterdynamicsml_requested.emit
+        )
+        layout.addWidget(self.predict_structures_button)
+        return row
 
     def _build_model_group(self) -> QGroupBox:
         group = QGroupBox("Model and Build")
@@ -443,25 +536,35 @@ class ProjectSetupTab(QWidget):
         button_layout = QVBoxLayout(button_widget)
         button_layout.setContentsMargins(0, 0, 0, 0)
         button_layout.setSpacing(8)
-        self.build_prior_weights_button = QPushButton("Generate Prior Weights")
+        self.build_prior_weights_button = QPushButton(
+            "Create Computed Distribution"
+        )
         self.build_prior_weights_button.clicked.connect(
             self.build_prior_weights_requested.emit
+        )
+        self.debye_waller_button = QPushButton("Compute Debye-Waller Factors")
+        self.debye_waller_button.clicked.connect(
+            self.open_debye_waller_requested.emit
+        )
+        self.debye_waller_help_button = self._prep_help_button(
+            self._debye_waller_help_tooltip_text()
         )
         self.component_build_mode_label = QLabel("Component build mode")
         self.component_build_mode_combo = QComboBox()
         self.component_build_mode_combo.setMinimumWidth(220)
         self.component_build_mode_combo.setToolTip(
-            "Choose whether Build SAXS Components uses the current "
-            "no-contrast Debye builder or launches the separate "
-            "contrast-mode workflow."
+            "Choose how this computed distribution will prepare SAXS "
+            "components. Debye modes use the direct component builders, "
+            "while Born Approximation launches the electron-density mapping workflow."
         )
         for mode, label in component_build_mode_choices():
             self.component_build_mode_combo.addItem(label, userData=mode)
-        self.component_build_mode_hint_label = QLabel(
-            "No Contrast Mode keeps the existing builder. Contrast Mode "
-            "opens the separate contrast workflow scaffold."
+        self.component_build_mode_help_button = self._prep_help_button(
+            "Create Computed Distribution saves the active template, q-range, "
+            "grid, excluded elements, cluster source, predicted-structure mode, "
+            "and build mode together. Build SAXS Components then opens the "
+            "matching component workflow for that saved distribution."
         )
-        self.component_build_mode_hint_label.setWordWrap(True)
         self.build_components_button = QPushButton("Build SAXS Components")
         self.build_components_button.clicked.connect(
             self.build_components_requested.emit
@@ -484,6 +587,9 @@ class ProjectSetupTab(QWidget):
         self.computed_distribution_combo = QComboBox()
         self.computed_distribution_combo.setMinimumWidth(420)
         self.computed_distribution_combo.setEnabled(False)
+        self.computed_distribution_combo.currentIndexChanged.connect(
+            self._update_distribution_details_panel
+        )
         self.load_distribution_button = QPushButton("Load Distribution")
         self.load_distribution_button.setEnabled(False)
         self.load_distribution_button.clicked.connect(
@@ -493,11 +599,45 @@ class ProjectSetupTab(QWidget):
             "Computed distribution",
             self._distribution_row(),
         )
-        button_layout.addWidget(self.build_prior_weights_button)
-        button_layout.addWidget(self.component_build_mode_label)
+        header_layout.addRow(
+            "Build attributes",
+            self._model_build_configuration_group(),
+        )
+        mode_label_row = QWidget()
+        mode_label_row_layout = QHBoxLayout(mode_label_row)
+        mode_label_row_layout.setContentsMargins(0, 0, 0, 0)
+        mode_label_row_layout.setSpacing(4)
+        mode_label_row_layout.addWidget(
+            self.component_build_mode_label, stretch=1
+        )
+        mode_label_row_layout.addWidget(self.component_build_mode_help_button)
+        button_layout.addWidget(mode_label_row)
         button_layout.addWidget(self.component_build_mode_combo)
-        button_layout.addWidget(self.component_build_mode_hint_label)
-        button_layout.addWidget(self.build_components_button)
+        button_layout.addWidget(self.build_prior_weights_button)
+        debye_waller_row = QWidget()
+        debye_waller_row_layout = QHBoxLayout(debye_waller_row)
+        debye_waller_row_layout.setContentsMargins(0, 0, 0, 0)
+        debye_waller_row_layout.setSpacing(6)
+        debye_waller_row_layout.addWidget(
+            self.debye_waller_button,
+            stretch=1,
+        )
+        self.debye_waller_ready_indicator = QLabel()
+        self.debye_waller_ready_indicator.setFixedSize(14, 14)
+        self._refresh_debye_waller_indicator()
+        debye_waller_row_layout.addWidget(self.debye_waller_ready_indicator)
+        debye_waller_row_layout.addWidget(self.debye_waller_help_button)
+        button_layout.addWidget(debye_waller_row)
+        build_btn_row = QWidget()
+        build_btn_row_layout = QHBoxLayout(build_btn_row)
+        build_btn_row_layout.setContentsMargins(0, 0, 0, 0)
+        build_btn_row_layout.setSpacing(6)
+        build_btn_row_layout.addWidget(self.build_components_button, stretch=1)
+        self.components_built_indicator = QLabel()
+        self.components_built_indicator.setFixedSize(14, 14)
+        self._refresh_components_built_indicator()
+        build_btn_row_layout.addWidget(self.components_built_indicator)
+        button_layout.addWidget(build_btn_row)
         button_layout.addWidget(self.view_contrast_distribution_button)
         button_layout.addStretch(1)
         button_widget.setSizePolicy(
@@ -561,6 +701,133 @@ class ProjectSetupTab(QWidget):
         clusters_layout.addWidget(self.recognized_clusters_table)
         lower_layout.addWidget(clusters_group, stretch=1)
         layout.addLayout(lower_layout, stretch=1)
+        layout.addWidget(self._distribution_details_group())
+        return group
+
+    def _model_build_configuration_group(self) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        self.qmin_edit = QLineEdit()
+        self.qmax_edit = QLineEdit()
+        self.qmin_edit.textChanged.connect(self._redraw_saxs_preview)
+        self.qmax_edit.textChanged.connect(self._redraw_saxs_preview)
+        q_row = QWidget()
+        q_layout = QHBoxLayout(q_row)
+        q_layout.setContentsMargins(0, 0, 0, 0)
+        q_layout.addWidget(QLabel("q min"))
+        q_layout.addWidget(self.qmin_edit)
+        q_layout.addWidget(QLabel("q max"))
+        q_layout.addWidget(self.qmax_edit)
+        layout.addWidget(q_row)
+
+        self.use_experimental_grid_checkbox = QCheckBox(
+            "Use experimental grid"
+        )
+        self.use_experimental_grid_checkbox.setChecked(True)
+        self.use_experimental_grid_checkbox.setToolTip(
+            "Use the experimental q-grid directly inside the selected q-range. "
+            "Disable this option to resample the experimental data onto a "
+            "custom evenly spaced grid for the forward model."
+        )
+        self.use_experimental_grid_checkbox.toggled.connect(
+            self._update_resample_grid_state
+        )
+        self.resample_points_spin = QSpinBox()
+        self.resample_points_spin.setRange(2, 50000)
+        self.resample_points_spin.setValue(500)
+        self.resample_points_spin.setToolTip(
+            "Number of evenly spaced q-points to generate between q min and "
+            "q max when resampling the model and experimental data."
+        )
+        grid_row = QWidget()
+        grid_layout = QHBoxLayout(grid_row)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+        grid_layout.addWidget(self.use_experimental_grid_checkbox)
+        grid_layout.addStretch(1)
+        grid_layout.addWidget(QLabel("Resample grid"))
+        grid_layout.addWidget(self.resample_points_spin)
+        layout.addWidget(grid_row)
+        self._update_resample_grid_state()
+
+        self.available_elements_list = QListWidget()
+        self.available_elements_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.available_elements_list.setMinimumHeight(104)
+        self.available_elements_list.setMaximumHeight(132)
+        self.available_elements_list.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        recognized_group = QGroupBox("Recognized Elements")
+        recognized_layout = QVBoxLayout(recognized_group)
+        recognized_layout.setContentsMargins(8, 8, 8, 8)
+        recognized_layout.addWidget(self._elements_row())
+        layout.addWidget(recognized_group)
+
+        self.exclude_elements_edit = QLineEdit()
+        self.exclude_elements_edit.setPlaceholderText("Example: H O")
+        self.exclude_elements_edit.textChanged.connect(
+            self._sync_available_element_selection
+        )
+        exclude_group = QGroupBox("Exclude Elements")
+        exclude_layout = QVBoxLayout(exclude_group)
+        exclude_layout.setContentsMargins(8, 8, 8, 8)
+        exclude_layout.addWidget(self.exclude_elements_edit)
+        layout.addWidget(exclude_group)
+        return container
+
+    def _distribution_details_group(self) -> QWidget:
+        group = QGroupBox("Active Computed Distribution")
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        header_row = QWidget()
+        header_layout = QHBoxLayout(header_row)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(6)
+        self.distribution_details_toggle_button = QToolButton()
+        self.distribution_details_toggle_button.setCheckable(True)
+        self.distribution_details_toggle_button.setChecked(True)
+        self.distribution_details_toggle_button.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        self.distribution_details_toggle_button.setArrowType(
+            Qt.ArrowType.DownArrow
+        )
+        self.distribution_details_toggle_button.setText("Show details")
+        self.distribution_details_toggle_button.clicked.connect(
+            self._toggle_distribution_details_visibility
+        )
+        header_layout.addWidget(self.distribution_details_toggle_button)
+        self.distribution_details_hint_label = QLabel(
+            "The active distribution summary tracks the identifying settings "
+            "for the selected computed distribution and whether its saved "
+            "artifacts are ready."
+        )
+        self.distribution_details_hint_label.setWordWrap(True)
+        header_layout.addWidget(
+            self.distribution_details_hint_label,
+            stretch=1,
+        )
+        layout.addWidget(header_row)
+
+        self.distribution_details_scroll = QScrollArea()
+        self.distribution_details_scroll.setWidgetResizable(True)
+        self.distribution_details_scroll.setMinimumHeight(180)
+        self.distribution_details_text = QTextEdit()
+        self.distribution_details_text.setReadOnly(True)
+        self.distribution_details_text.setPlainText(
+            self._current_distribution_details_text
+        )
+        self.distribution_details_scroll.setWidget(
+            self.distribution_details_text
+        )
+        layout.addWidget(self.distribution_details_scroll)
         return group
 
     def _template_row(self) -> QWidget:
@@ -767,8 +1034,22 @@ class ProjectSetupTab(QWidget):
         self.save_prior_plot_data_button.clicked.connect(
             self.save_prior_plot_data_requested.emit
         )
+        self.prior_x_axis_order_combo = QComboBox()
+        self.prior_x_axis_order_combo.addItem("Auto", userData="auto")
+        self.prior_x_axis_order_combo.addItem("Custom", userData="custom")
+        self.prior_x_axis_order_combo.currentIndexChanged.connect(
+            self._on_prior_x_axis_order_changed
+        )
+        self.edit_prior_x_axis_button = QPushButton("Edit Custom")
+        self.edit_prior_x_axis_button.setEnabled(False)
+        self.edit_prior_x_axis_button.clicked.connect(
+            self._on_edit_prior_x_axis_order
+        )
         controls.addWidget(QLabel("Mode"))
         controls.addWidget(self.prior_mode_combo)
+        controls.addWidget(QLabel("X-Axis Ordering"))
+        controls.addWidget(self.prior_x_axis_order_combo)
+        controls.addWidget(self.edit_prior_x_axis_button)
         controls.addWidget(self.secondary_filter_label)
         controls.addWidget(self.secondary_filter_combo)
         controls.addWidget(self.generate_prior_plot_button)
@@ -836,6 +1117,18 @@ class ProjectSetupTab(QWidget):
             "resulting folders below."
         )
 
+    @staticmethod
+    def _debye_waller_help_tooltip_text() -> str:
+        return (
+            "Debye-Waller factors capture thermal/disorder smearing from "
+            "the active PDB cluster ensemble. This step is optional and is "
+            "not enforced, but compute these factors before building SAXS "
+            "components if you plan to use them in downstream SAXS "
+            "workflows. The linked Debye-Waller tool inherits the active "
+            "project folder and clusters folder, and stays disabled until "
+            "the active clusters folder resolves to PDB cluster files."
+        )
+
     def _prep_help_button(self, tooltip: str) -> QToolButton:
         button = QToolButton()
         button.setText("?")
@@ -901,9 +1194,9 @@ class ProjectSetupTab(QWidget):
         return row
 
     def set_project_selected(self, selected: bool) -> None:
+        self._project_selected = bool(selected)
         self.forward_model_group.setEnabled(selected)
         self.model_group.setEnabled(selected)
-        self.use_predicted_structure_weights_checkbox.setEnabled(selected)
         self.computed_distribution_combo.setEnabled(
             selected and self.computed_distribution_combo.count() > 0
         )
@@ -916,6 +1209,11 @@ class ProjectSetupTab(QWidget):
             bool(selected and self._active_contrast_view_available)
         )
         self.prior_mode_combo.setEnabled(selected)
+        self.prior_x_axis_order_combo.setEnabled(selected)
+        self.edit_prior_x_axis_button.setEnabled(
+            selected
+            and self.prior_x_axis_order_combo.currentData() == "custom"
+        )
         self.generate_prior_plot_button.setEnabled(selected)
         self.save_prior_png_button.setEnabled(selected)
         self.save_component_plot_data_button.setEnabled(selected)
@@ -925,8 +1223,13 @@ class ProjectSetupTab(QWidget):
         if not selected:
             self._experimental_summary = None
             self._solvent_summary = None
+            self.set_predicted_structure_availability(False)
         self._refresh_data_status_labels()
         self._apply_model_only_mode_state()
+        self._refresh_debye_waller_controls()
+        if not selected:
+            self._debye_waller_status_note = None
+            self.set_debye_waller_ready(False)
 
     @contextmanager
     def batch_preview_updates(self):
@@ -1039,6 +1342,9 @@ class ProjectSetupTab(QWidget):
                 active_name=settings.selected_model_template,
             )
             self.set_component_build_mode(settings.component_build_mode)
+            self.set_prior_histogram_x_axis_order(
+                settings.prior_histogram_x_axis_order
+            )
 
             if settings.cluster_inventory_rows:
                 self._recognized_cluster_rows = list(
@@ -1058,6 +1364,8 @@ class ProjectSetupTab(QWidget):
                 settings.available_elements,
                 self._recognized_cluster_rows,
             )
+            self._refresh_debye_waller_controls()
+            self.refresh_debye_waller_project_status(settings.project_dir)
 
             if loadable_data_path:
                 try:
@@ -1235,7 +1543,17 @@ class ProjectSetupTab(QWidget):
         distributions: list[tuple[str, str]],
         *,
         selected_distribution_id: str | None = None,
+        distribution_tooltips: dict[str, str] | None = None,
+        distribution_details: dict[str, str] | None = None,
     ) -> None:
+        self._distribution_tooltips = {
+            str(key): str(value)
+            for key, value in (distribution_tooltips or {}).items()
+        }
+        self._distribution_details = {
+            str(key): str(value)
+            for key, value in (distribution_details or {}).items()
+        }
         current_id = (
             selected_distribution_id or self.selected_distribution_id()
         )
@@ -1246,6 +1564,14 @@ class ProjectSetupTab(QWidget):
                 str(label),
                 userData=str(distribution_id),
             )
+            item_index = self.computed_distribution_combo.count() - 1
+            tooltip = self._distribution_tooltips.get(str(distribution_id))
+            if tooltip:
+                self.computed_distribution_combo.setItemData(
+                    item_index,
+                    tooltip,
+                    Qt.ItemDataRole.ToolTipRole,
+                )
         if current_id:
             for index in range(self.computed_distribution_combo.count()):
                 if str(
@@ -1266,6 +1592,16 @@ class ProjectSetupTab(QWidget):
             self.model_group.isEnabled()
             and self._active_contrast_view_available
         )
+        self._update_distribution_details_panel()
+
+    def set_current_distribution_details(self, text: str | None) -> None:
+        details_text = str(text or "").strip()
+        self._current_distribution_details_text = (
+            details_text
+            or "Create or load a computed distribution to review its saved "
+            "build attributes here."
+        )
+        self._update_distribution_details_panel()
 
     def set_active_contrast_distribution_view_available(
         self,
@@ -1306,6 +1642,31 @@ class ProjectSetupTab(QWidget):
         self.component_build_mode_combo.blockSignals(False)
         self.component_build_mode_label.setText(
             f"Component build mode ({component_build_mode_label(normalized_mode)})"
+        )
+
+    def _toggle_distribution_details_visibility(self) -> None:
+        self._set_distribution_details_expanded(
+            self.distribution_details_toggle_button.isChecked()
+        )
+
+    def _set_distribution_details_expanded(self, expanded: bool) -> None:
+        self.distribution_details_toggle_button.blockSignals(True)
+        self.distribution_details_toggle_button.setChecked(bool(expanded))
+        self.distribution_details_toggle_button.blockSignals(False)
+        self.distribution_details_toggle_button.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self.distribution_details_scroll.setVisible(bool(expanded))
+
+    def _update_distribution_details_panel(self) -> None:
+        distribution_id = self.selected_distribution_id()
+        details_text = (
+            self._distribution_details.get(distribution_id or "")
+            if distribution_id is not None
+            else None
+        )
+        self.distribution_details_text.setPlainText(
+            details_text or self._current_distribution_details_text
         )
 
     def show_deprecated_templates(self) -> bool:
@@ -1349,7 +1710,19 @@ class ProjectSetupTab(QWidget):
         self.use_predicted_structure_weights_checkbox.blockSignals(True)
         self.use_predicted_structure_weights_checkbox.setChecked(bool(enabled))
         self.use_predicted_structure_weights_checkbox.blockSignals(False)
+        self._refresh_predicted_structure_controls()
         self._update_component_trace_control_state()
+
+    def set_predicted_structure_availability(
+        self,
+        available: bool,
+        *,
+        prediction_count: int = 0,
+    ) -> None:
+        self._predicted_structures_available = bool(available)
+        self._predicted_structure_count = max(int(prediction_count), 0)
+        self._refresh_predicted_structure_indicator()
+        self._refresh_predicted_structure_controls()
 
     def _default_predicted_structure_status_text(self) -> str:
         return (
@@ -1363,6 +1736,51 @@ class ProjectSetupTab(QWidget):
         self.predicted_structure_status_label.setText(
             normalized or self._default_predicted_structure_status_text()
         )
+
+    def _refresh_predicted_structure_indicator(self) -> None:
+        if self._predicted_structures_available:
+            self.predicted_structure_ready_indicator.setStyleSheet(
+                "background-color: #16a34a; border-radius: 7px;"
+            )
+            self.predicted_structure_ready_indicator.setToolTip(
+                f"{self._predicted_structure_count} predicted structure"
+                f"{'' if self._predicted_structure_count == 1 else 's'} "
+                f"{'is' if self._predicted_structure_count == 1 else 'are'} "
+                "available in this project."
+            )
+        else:
+            self.predicted_structure_ready_indicator.setStyleSheet(
+                "background-color: #6b7280; border-radius: 7px;"
+            )
+            self.predicted_structure_ready_indicator.setToolTip(
+                "Predicted structures have not been computed for this "
+                "project yet."
+            )
+
+    def _refresh_predicted_structure_controls(self) -> None:
+        checkbox_enabled = bool(
+            self._project_selected
+            and (
+                self._predicted_structures_available
+                or self.use_predicted_structure_weights()
+            )
+        )
+        self.use_predicted_structure_weights_checkbox.setEnabled(
+            checkbox_enabled
+        )
+        if self._predicted_structures_available:
+            self.use_predicted_structure_weights_checkbox.setToolTip(
+                "Include Cluster Dynamics ML Predicted Structures in the "
+                "SAXS component build, prior weights, Prefit, and DREAM "
+                "workflows. When disabled, the project uses observed "
+                "structures only."
+            )
+        else:
+            self.use_predicted_structure_weights_checkbox.setToolTip(
+                "Run Cluster Dynamics (ML) to compute predicted structures "
+                "for this project before enabling this option."
+            )
+        self.predict_structures_button.setEnabled(self._project_selected)
 
     def open_project_dir(self) -> Path | None:
         text = self.open_project_dir_edit.text().strip()
@@ -1557,6 +1975,75 @@ class ProjectSetupTab(QWidget):
             return None
         return int(self.resample_points_spin.value())
 
+    def prior_histogram_x_axis_order(self) -> list[list[str]]:
+        return [list(entry) for entry in self._prior_x_axis_custom_order]
+
+    def set_prior_histogram_x_axis_order(
+        self, order: list[list[str]] | None
+    ) -> None:
+        if order:
+            self._prior_x_axis_custom_order = [
+                (str(entry[0]), str(entry[1]))
+                for entry in order
+                if len(entry) >= 2
+            ]
+            idx = self.prior_x_axis_order_combo.findData("custom")
+            self.prior_x_axis_order_combo.blockSignals(True)
+            self.prior_x_axis_order_combo.setCurrentIndex(idx)
+            self.prior_x_axis_order_combo.blockSignals(False)
+            self.edit_prior_x_axis_button.setEnabled(True)
+        else:
+            self._prior_x_axis_custom_order = []
+            idx = self.prior_x_axis_order_combo.findData("auto")
+            self.prior_x_axis_order_combo.blockSignals(True)
+            self.prior_x_axis_order_combo.setCurrentIndex(idx)
+            self.prior_x_axis_order_combo.blockSignals(False)
+            self.edit_prior_x_axis_button.setEnabled(False)
+
+    def _active_prior_x_axis_order(self) -> list[tuple[str, str]] | None:
+        if (
+            self.prior_x_axis_order_combo.currentData() == "custom"
+            and self._prior_x_axis_custom_order
+        ):
+            return self._prior_x_axis_custom_order
+        return None
+
+    def _on_prior_x_axis_order_changed(self, _index: int) -> None:
+        is_custom = self.prior_x_axis_order_combo.currentData() == "custom"
+        self.edit_prior_x_axis_button.setEnabled(is_custom)
+        self._redraw_prior_preview_if_needed()
+
+    def _on_edit_prior_x_axis_order(self) -> None:
+        if not self._prior_x_axis_custom_order:
+            if self._current_prior_json_path is not None:
+                try:
+                    payload = build_prior_histogram_export_payload(
+                        self._current_prior_json_path,
+                        mode=self.prior_mode(),
+                        secondary_element=self.prior_secondary_element(),
+                    )
+                    entries = [
+                        (str(raw), str(display))
+                        for raw, display in zip(
+                            payload["labels"], payload["axis_labels"]
+                        )
+                    ]
+                except Exception:
+                    entries = []
+            else:
+                entries = []
+        else:
+            entries = list(self._prior_x_axis_custom_order)
+
+        dialog = _XAxisOrderDialog(entries, parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._prior_x_axis_custom_order = dialog.result_entries()
+            self.autosave_project_requested.emit(
+                "updated prior histogram x-axis order"
+            )
+            if self.prior_x_axis_order_combo.currentData() == "custom":
+                self._redraw_prior_preview_if_needed()
+
     def prior_mode(self) -> str:
         return str(self.prior_mode_combo.currentData() or "structure_fraction")
 
@@ -1702,6 +2189,10 @@ class ProjectSetupTab(QWidget):
         if self._console_autoscroll_enabled:
             self._scroll_summary_to_end()
 
+    def set_auto_snap_enabled(self, enabled: bool) -> None:
+        self._auto_snap_enabled = bool(enabled)
+        self._auto_snap_filter.set_enabled(self._auto_snap_enabled)
+
     def _render_summary_text(self) -> None:
         scrollbar = self.summary_box.verticalScrollBar()
         previous_value = scrollbar.value()
@@ -1737,8 +2228,153 @@ class ProjectSetupTab(QWidget):
         scrollbar = self.summary_box.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
+    def _refresh_components_built_indicator(self) -> None:
+        built = bool(self._component_paths)
+        if built:
+            self.components_built_indicator.setStyleSheet(
+                "background-color: #16a34a; border-radius: 7px;"
+            )
+            self.components_built_indicator.setToolTip(
+                "SAXS components have been built for this distribution."
+            )
+        else:
+            self.components_built_indicator.setStyleSheet(
+                "background-color: #6b7280; border-radius: 7px;"
+            )
+            self.components_built_indicator.setToolTip(
+                "SAXS components have not been built yet for this distribution."
+            )
+
+    def set_debye_waller_ready(self, ready: bool) -> None:
+        self._debye_waller_ready = bool(ready)
+        if ready:
+            self._debye_waller_status_note = None
+        self._refresh_debye_waller_indicator()
+
+    def refresh_debye_waller_project_status(
+        self,
+        project_dir: str | Path | None = None,
+    ) -> bool:
+        resolved_project_dir: Path | None
+        if project_dir is None:
+            resolved_project_dir = self.open_project_dir()
+        else:
+            resolved_project_dir = Path(project_dir).expanduser().resolve()
+        active_clusters_dir = self.clusters_dir()
+        ready = False
+        note: str | None = None
+        if resolved_project_dir is not None:
+            summary_path = find_saved_project_debye_waller_analysis(
+                resolved_project_dir
+            )
+            if summary_path is not None:
+                try:
+                    saved_result = load_debye_waller_analysis_result(
+                        summary_path
+                    )
+                except Exception:
+                    note = (
+                        "Saved Debye-Waller factors were found for this "
+                        "project, but the saved analysis could not be loaded."
+                    )
+                else:
+                    if (
+                        active_clusters_dir is None
+                        or not active_clusters_dir.exists()
+                    ):
+                        note = (
+                            "Debye-Waller factors are saved in this project, "
+                            "but the active PDB clusters folder is missing or "
+                            "not currently selected."
+                        )
+                    elif (
+                        saved_result.clusters_dir
+                        == active_clusters_dir.expanduser().resolve()
+                    ):
+                        ready = True
+                    else:
+                        note = (
+                            "Debye-Waller factors were saved for a different "
+                            "clusters folder. Recompute them if you want to "
+                            "use factors with the current PDB clusters."
+                        )
+        self._debye_waller_status_note = note
+        self.set_debye_waller_ready(ready)
+        return ready
+
+    def refresh_debye_waller_controls(self) -> None:
+        self._refresh_debye_waller_controls()
+
+    def _refresh_debye_waller_indicator(self) -> None:
+        if self._debye_waller_ready:
+            self.debye_waller_ready_indicator.setStyleSheet(
+                "background-color: #16a34a; border-radius: 7px;"
+            )
+            self.debye_waller_ready_indicator.setToolTip(
+                "Debye-Waller factors have been computed and saved for the "
+                "active PDB clusters folder."
+            )
+            return
+        self.debye_waller_ready_indicator.setStyleSheet(
+            "background-color: #6b7280; border-radius: 7px;"
+        )
+        self.debye_waller_ready_indicator.setToolTip(
+            self._debye_waller_status_note
+            or (
+                "Debye-Waller factors have not been computed for the active "
+                "PDB clusters folder yet."
+            )
+        )
+
+    def _debye_waller_action_state(self) -> tuple[bool, str]:
+        if not self._project_selected:
+            return (
+                False,
+                "Open or create a project first to compute Debye-Waller "
+                "factors.",
+            )
+        clusters_dir = self.clusters_dir()
+        if clusters_dir is None or not clusters_dir.exists():
+            return (
+                False,
+                "Select an active PDB clusters folder to enable Debye-Waller "
+                "factor computation.",
+            )
+        try:
+            inspection = inspect_debye_waller_input(clusters_dir)
+        except Exception:
+            return (
+                False,
+                "Debye-Waller factor computation requires a readable PDB "
+                "clusters folder.",
+            )
+        if inspection.total_structure_files <= 0:
+            return (
+                False,
+                "No cluster structure files were found in the active PDB "
+                "clusters folder.",
+            )
+        if not inspection.is_pdb_only:
+            return (
+                False,
+                "Debye-Waller factor computation requires PDB cluster files "
+                "only. Convert XYZ clusters to PDB or choose a PDB clusters "
+                "folder.",
+            )
+        return (
+            True,
+            "Launch the linked Debye-Waller tool using the active project "
+            "folder and PDB clusters folder.",
+        )
+
+    def _refresh_debye_waller_controls(self) -> None:
+        enabled, tooltip = self._debye_waller_action_state()
+        self.debye_waller_button.setEnabled(enabled)
+        self.debye_waller_button.setToolTip(tooltip)
+
     def draw_component_plot(self, component_paths: list[Path] | None) -> None:
         self._component_paths = component_paths
+        self._refresh_components_built_indicator()
         if self._preview_updates_suspended():
             self._pending_saxs_preview_redraw = True
             self._pending_prior_preview_redraw = True
@@ -1967,6 +2603,7 @@ class ProjectSetupTab(QWidget):
                     secondary_element=self.prior_secondary_element(),
                     cmap=self.prior_cmap(),
                     structure_motif_colors=self.prior_structure_motif_colors(),
+                    custom_label_order=self._active_prior_x_axis_order(),
                     ax=axis,
                 )
             except Exception as exc:
@@ -2251,7 +2888,7 @@ class ProjectSetupTab(QWidget):
         selected = QFileDialog.getExistingDirectory(
             self,
             "Select an existing SAXS project folder",
-            self.open_project_dir_edit.text().strip() or str(Path.home()),
+            self._existing_project_browser_start_dir(),
         )
         if not selected:
             return
@@ -2265,6 +2902,46 @@ class ProjectSetupTab(QWidget):
             )
             return
         self.open_project_dir_edit.setText(str(project_dir))
+
+    @staticmethod
+    def _recent_projects_settings() -> QSettings:
+        return QSettings("SAXShell", "SAXS")
+
+    def _recent_project_parent_dir(self) -> str | None:
+        raw_value = self._recent_projects_settings().value(
+            RECENT_PROJECTS_KEY,
+            [],
+        )
+        if isinstance(raw_value, str):
+            candidates = [raw_value]
+        elif isinstance(raw_value, (list, tuple)):
+            candidates = [str(item) for item in raw_value]
+        else:
+            candidates = []
+        for candidate in candidates:
+            normalized = candidate.strip()
+            if not normalized:
+                continue
+            project_dir = Path(normalized).expanduser()
+            if not project_dir.exists():
+                continue
+            resolved_dir = project_dir.resolve()
+            parent_dir = (
+                resolved_dir.parent
+                if resolved_dir.parent.exists()
+                else resolved_dir
+            )
+            return str(parent_dir)
+        return None
+
+    def _existing_project_browser_start_dir(self) -> str:
+        current_text = self.open_project_dir_edit.text().strip()
+        if current_text:
+            return current_text
+        recent_parent_dir = self._recent_project_parent_dir()
+        if recent_parent_dir:
+            return recent_parent_dir
+        return str(Path.home())
 
     def _choose_clusters_directory(self) -> None:
         selected = QFileDialog.getExistingDirectory(
@@ -2675,6 +3352,8 @@ class ProjectSetupTab(QWidget):
 
     def _on_clusters_dir_edited(self) -> None:
         self.request_cluster_scan()
+        self._refresh_debye_waller_controls()
+        self.refresh_debye_waller_project_status()
         if self.clusters_dir() is not None:
             self.autosave_project_requested.emit(
                 "updated the clusters folder reference"
@@ -2716,6 +3395,7 @@ class ProjectSetupTab(QWidget):
         )
 
     def _on_predicted_structure_weights_toggled(self, enabled: bool) -> None:
+        self._refresh_predicted_structure_controls()
         self._update_component_trace_control_state()
         self.predicted_structure_weights_changed.emit(bool(enabled))
         self.autosave_project_requested.emit(

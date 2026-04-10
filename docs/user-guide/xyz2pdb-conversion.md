@@ -3,7 +3,8 @@
 The `xyz2pdb` tool converts one `XYZ` file or a folder of `XYZ` frames into
 molecule-aware `PDB` files using a reference library and interactive mapping
 definitions. It is available as the standalone `xyz2pdb` application and from
-the main SAXSShell window through `Tools > Open XYZ -> PDB Conversion`.
+the main SAXSShell window through
+`Tools > MD Extraction > Open XYZ -> PDB Conversion`.
 
 ## Purpose
 
@@ -41,7 +42,7 @@ The current interface can:
 
 Open the tool from:
 
-- `Tools > Open XYZ -> PDB Conversion`
+- `Tools > MD Extraction > Open XYZ -> PDB Conversion`
 - the `Open XYZ -> PDB Conversion` button in the project setup workflow
 
 When opened from an active SAXS project, the window is linked to that project.

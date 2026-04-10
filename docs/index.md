@@ -40,10 +40,17 @@ The current repo supports an end-to-end path that usually looks like this:
 5. Optionally predict larger clusters and representative predicted structures
    with `clusterdynamicsml`.
 6. Measure bond and angle distributions with `bondanalysis`.
-7. Optionally compute trajectory-averaged PDFs and partial PDFs with `pdfsetup`.
-8. Build a SAXS project with `saxshell saxs`.
-9. Refine the project in **SAXS Prefit** and, if needed, run **pyDREAM**.
-10. Use the resulting distributions and selected structures in downstream tools
+7. Optionally compute project-backed Debye-Waller factors from sorted PDB
+   cluster folders with **Debye-Waller Analysis**.
+8. Optionally compute trajectory-averaged PDFs and partial PDFs with `pdfsetup`.
+9. Build a SAXS project with `saxshell saxs`, create or load a computed
+   distribution in **Project Setup**, and choose how SAXS components will be
+   prepared.
+10. Build components with one of the supported modes:
+    `No Contrast (Debye)`, `Contrast (Debye)`, or
+    `Born Approximation (Average)`.
+11. Refine the project in **SAXS Prefit** and, if needed, run **pyDREAM**.
+12. Use the resulting distributions and selected structures in downstream tools
     such as `saxshell fullrmc`.
 
 ## Documentation map
@@ -56,15 +63,18 @@ to create your first project quickly.
 ### User guide
 
 Use this section when you already know the rough workflow and need details
-about GUI tabs, file layout, template behavior, export paths, or the
-supporting applications that feed data into the main SAXS UI.
+about GUI tabs, computed distributions, component-build modes, file layout,
+template behavior, export paths, or the supporting applications that feed data
+into the main SAXS UI.
 
 The user guide is split into:
 
 - **Main UI workflow elements** for the `saxshell saxs` application and its
-  project, Prefit, DREAM, template, and export behavior
-- **Supporting applications** for trajectory preparation, cluster analysis,
-  predictive cluster expansion, and PDF calculations that support the main UI
+  project, computed distributions, Prefit, DREAM, template, and export
+  behavior
+- **Supporting applications** grouped the same way as the main `Tools` menu:
+  `MD Extraction`, `Structure Analysis`, `Cluster Dynamics`, `PDF`,
+  `Visualization`, `SAXS Calculation Preview`, and `X-ray Toolkit`
 
 ### Tutorials
 

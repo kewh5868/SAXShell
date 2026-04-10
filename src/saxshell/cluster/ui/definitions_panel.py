@@ -227,6 +227,18 @@ class ClusterDefinitionsPanel(QGroupBox):
         )
         options_layout.addRow("Search mode", self.search_mode_combo)
 
+        self.periodic_save_state_checkbox = QCheckBox("Periodic save-state")
+        self.periodic_save_state_checkbox.setChecked(True)
+        self.periodic_save_state_checkbox.setToolTip(
+            "When enabled, metadata checkpoints are written periodically "
+            "during the run. Disable to only save at the end of the run, "
+            "which can significantly speed up extraction on large datasets."
+        )
+        self.periodic_save_state_checkbox.toggled.connect(
+            self._on_periodic_save_state_toggled
+        )
+        options_layout.addRow("", self.periodic_save_state_checkbox)
+
         self.save_state_frequency_spin = QSpinBox()
         self.save_state_frequency_spin.setRange(1, 10**9)
         self.save_state_frequency_spin.setValue(DEFAULT_SAVE_STATE_FREQUENCY)
@@ -300,6 +312,20 @@ class ClusterDefinitionsPanel(QGroupBox):
             lambda _checked: self.settings_changed.emit()
         )
         options_layout.addRow("", self.shared_shells_box)
+
+        self.smart_solvation_shells_box = QCheckBox(
+            "Use Smart Solvation Shell mode (PDB only)"
+        )
+        self.smart_solvation_shells_box.setChecked(True)
+        self.smart_solvation_shells_box.setToolTip(
+            "Keep the same solvent molecules in contiguous cluster PDBs "
+            "while preserving the legacy per-frame algorithm when turned "
+            "off. This option is only available for PDB frame folders."
+        )
+        self.smart_solvation_shells_box.toggled.connect(
+            lambda _checked: self.settings_changed.emit()
+        )
+        options_layout.addRow("", self.smart_solvation_shells_box)
 
         self.include_shell_stoichiometry_box = QCheckBox(
             "Include shell atoms in stoichiometry bins"
@@ -917,7 +943,16 @@ class ClusterDefinitionsPanel(QGroupBox):
         if emit_signal:
             self.settings_changed.emit()
 
+    def _on_periodic_save_state_toggled(self, checked: bool) -> None:
+        self.save_state_frequency_spin.setEnabled(checked)
+        self.settings_changed.emit()
+
+    def periodic_save_state_enabled(self) -> bool:
+        return bool(self.periodic_save_state_checkbox.isChecked())
+
     def save_state_frequency(self) -> int:
+        if not self.periodic_save_state_enabled():
+            return 10**9
         return int(self.save_state_frequency_spin.value())
 
     def set_save_state_frequency(
@@ -973,6 +1008,21 @@ class ClusterDefinitionsPanel(QGroupBox):
         self.shared_shells_box.blockSignals(True)
         self.shared_shells_box.setChecked(bool(value))
         self.shared_shells_box.blockSignals(False)
+        if emit_signal:
+            self.settings_changed.emit()
+
+    def smart_solvation_shells(self) -> bool:
+        return self.smart_solvation_shells_box.isChecked()
+
+    def set_smart_solvation_shells(
+        self,
+        value: bool,
+        *,
+        emit_signal: bool = True,
+    ) -> None:
+        self.smart_solvation_shells_box.blockSignals(True)
+        self.smart_solvation_shells_box.setChecked(bool(value))
+        self.smart_solvation_shells_box.blockSignals(False)
         if emit_signal:
             self.settings_changed.emit()
 
@@ -1066,6 +1116,7 @@ class ClusterDefinitionsPanel(QGroupBox):
             default_cutoff=self.default_cutoff(),
             shell_growth_levels=self.shell_growth_levels(),
             shared_shells=self.shared_shells(),
+            smart_solvation_shells=self.smart_solvation_shells(),
             include_shell_atoms_in_stoichiometry=(
                 self.include_shell_atoms_in_stoichiometry()
             ),
@@ -1152,6 +1203,10 @@ class ClusterDefinitionsPanel(QGroupBox):
             emit_signal=False,
         )
         self.set_shared_shells(preset.shared_shells, emit_signal=False)
+        self.set_smart_solvation_shells(
+            preset.smart_solvation_shells,
+            emit_signal=False,
+        )
         self.set_include_shell_atoms_in_stoichiometry(
             preset.include_shell_atoms_in_stoichiometry,
             emit_signal=False,
@@ -1170,6 +1225,7 @@ class ClusterDefinitionsPanel(QGroupBox):
         if frame_format == "xyz":
             self.setTitle("Cluster Definitions (XYZ mode)")
             self.atom_table.setColumnHidden(2, True)
+            self.smart_solvation_shells_box.setEnabled(False)
             self.mode_hint_label.setText(
                 "XYZ mode uses element-only atom matching. Residue names are "
                 "not available, and shell extraction cannot rebuild full "
@@ -1181,6 +1237,7 @@ class ClusterDefinitionsPanel(QGroupBox):
         self.atom_table.setColumnHidden(2, False)
         if frame_format == "pdb":
             self.setTitle("Cluster Definitions (PDB mode)")
+            self.smart_solvation_shells_box.setEnabled(True)
             self.mode_hint_label.setText(
                 "PDB mode can match atom types by element and residue, and "
                 "shell export can keep complete residue molecules together."
@@ -1189,6 +1246,7 @@ class ClusterDefinitionsPanel(QGroupBox):
             return
 
         self.setTitle("Cluster Definitions")
+        self.smart_solvation_shells_box.setEnabled(False)
         self.mode_hint_label.setText(
             "Select an extracted PDB or XYZ frames folder. The UI will adapt "
             "these rules automatically once the frame-set mode is detected."

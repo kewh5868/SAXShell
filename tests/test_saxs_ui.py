@@ -63,6 +63,7 @@ from saxshell.saxs.contrast.representatives import (
     analyze_contrast_representatives,
 )
 from saxshell.saxs.contrast.settings import (
+    COMPONENT_BUILD_MODE_BORN_APPROXIMATION,
     COMPONENT_BUILD_MODE_CONTRAST,
     COMPONENT_BUILD_MODE_NO_CONTRAST,
     ContrastRepresentativeSamplerSettings,
@@ -110,6 +111,7 @@ from saxshell.saxs.ui.experimental_data_loader import (
     ExperimentalDataHeaderDialog,
 )
 from saxshell.saxs.ui.main_window import (
+    AUTO_SNAP_PANES_KEY,
     PROJECT_LOAD_TOTAL_STEPS,
     InstallModelDialog,
     RuntimeBundleOpener,
@@ -141,6 +143,49 @@ def _table_column_index(table, label: str) -> int:
 
 def _plot_lines_by_gid(axis, gid: str):
     return [line for line in axis.get_lines() if line.get_gid() == gid]
+
+
+def _pane_snap_resize_result(
+    splitter: QSplitter,
+    pane_snap_filter,
+    *,
+    target_index: int,
+    desired_width: int | None = None,
+    other_width: int = 220,
+) -> tuple[list[int], list[int]]:
+    pane_widget = splitter.widget(target_index)
+    assert pane_widget is not None
+    click_widget = pane_widget
+    if isinstance(pane_widget, QScrollArea):
+        click_widget = pane_widget.viewport()
+    current_sizes = splitter.sizes()
+    current_total = sum(size for size in current_sizes if size > 0)
+    assert current_total > 0
+    resolved_width = (
+        max(720, int(current_total * 0.7))
+        if desired_width is None
+        else int(desired_width)
+    )
+    if target_index == 0:
+        splitter.setSizes([250, max(current_total - 250, 1)])
+    else:
+        splitter.setSizes([max(current_total - 250, 1), 250])
+    QApplication.processEvents()
+    before_sizes = splitter.sizes()
+
+    pane_snap_filter._preferred_width = lambda widget: (
+        resolved_width
+        if widget is splitter.widget(target_index)
+        else int(other_width)
+    )
+    QTest.mouseClick(
+        click_widget,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        click_widget.rect().center(),
+    )
+    QApplication.processEvents()
+    return before_sizes, splitter.sizes()
 
 
 def _write_component_file(path, q_values, intensities):
@@ -2703,14 +2748,38 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     )
 
     assert window.tools_menu.title() == "Tools"
+    assert window.md_extraction_menu.title() == "MD Extraction"
+    assert window.structure_analysis_menu.title() == "Structure Analysis"
+    assert window.visualization_menu.title() == "Visualization"
     assert window.mdtrajectory_action.text() == "Open MD Trajectory Extraction"
     assert window.xyz2pdb_action.text() == "Open XYZ -> PDB Conversion"
     assert window.cluster_action.text() == "Open Cluster Extraction"
     assert window.bondanalysis_action.text() == "Open Bond Analysis"
-    assert [action.text() for action in window.tools_menu.actions()[:3]] == [
+    assert (
+        window.debye_waller_analysis_action.text()
+        == "Open Debye-Waller Analysis"
+    )
+    assert [action.text() for action in window.tools_menu.actions()] == [
+        "MD Extraction",
+        "Structure Analysis",
+        "Cluster Dynamics",
+        "PDF",
+        "Visualization",
+        "SAXS Calculation Preview",
+        "X-ray Toolkit",
+    ]
+    assert [
+        action.text() for action in window.md_extraction_menu.actions()
+    ] == [
         "Open MD Trajectory Extraction",
         "Open XYZ -> PDB Conversion",
         "Open Cluster Extraction",
+    ]
+    assert [
+        action.text() for action in window.structure_analysis_menu.actions()
+    ] == [
+        "Open Bond Analysis",
+        "Open Debye-Waller Analysis",
     ]
     assert (
         window.clusterdynamics_action.text() == "Open Cluster Dynamics (only)"
@@ -2719,11 +2788,17 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
         window.clusterdynamicsml_action.text() == "Open Cluster Dynamics (ML)"
     )
     assert window.fullrmc_action.text() == "Open fullrmc Setup"
+    assert window.structure_viewer_action.text() == "Structure Viewer"
+    assert window.blenderxyz_action.text() == "Open Blender XYZ Renderer"
+    assert window.component_calculation_preview_menu.title() == (
+        "SAXS Calculation Preview"
+    )
     assert window.contrast_mode_action.text() == "Open SAXS Contrast Mode"
     assert (
         window.electron_density_mapping_action.text()
         == "Open Electron Density Mapping"
     )
+    assert window.xray_toolkit_menu.title() == "X-ray Toolkit"
     assert (
         window.volume_fraction_action.text() == "Open Volume Fraction Estimate"
     )
@@ -3154,6 +3229,540 @@ def test_mdtrajectory_tool_uses_active_project_references(
     window.close()
 
 
+def test_debye_waller_tool_uses_active_project_clusters_dir(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    clusters_dir = tmp_path / "clusters"
+    clusters_dir.mkdir()
+    window.current_settings.clusters_dir = str(clusters_dir.resolve())
+    window.project_manager.save_project(window.current_settings)
+    launched: dict[str, object] = {}
+
+    class FakeDebyeWallerWindow(QWidget):
+        def __init__(self):
+            super().__init__()
+            launched["instance"] = self
+
+    def fake_launch_debye_waller_analysis_ui(**kwargs):
+        launched.update(kwargs)
+        return FakeDebyeWallerWindow()
+
+    monkeypatch.setattr(
+        "saxshell.saxs.debye_waller.ui.main_window.launch_debye_waller_analysis_ui",
+        fake_launch_debye_waller_analysis_ui,
+    )
+
+    window._open_debye_waller_analysis_tool()
+
+    assert launched["initial_project_dir"] == Path(project_dir).resolve()
+    assert launched["initial_clusters_dir"] == clusters_dir.resolve()
+    assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
+def _configure_debye_waller_project_clusters(
+    project_dir: Path,
+    tmp_path: Path,
+    *,
+    dirname: str = "project_dw_clusters",
+) -> Path:
+    def pdb_atom_line(
+        atom_id: int,
+        atom_name: str,
+        residue_name: str,
+        residue_number: int,
+        x_coord: float,
+        y_coord: float,
+        z_coord: float,
+        element: str,
+    ) -> str:
+        return (
+            f"ATOM  {atom_id:5d} {atom_name:<4} {residue_name:>3}  "
+            f"{residue_number:4d}    "
+            f"{x_coord:8.3f}{y_coord:8.3f}{z_coord:8.3f}"
+            f"  1.00  0.00          {element:>2}\n"
+        )
+
+    def write_water_frame(
+        path: Path,
+        *,
+        mol1_oxygen_x: float,
+        mol1_hydrogen_x: float,
+        mol2_oxygen_x: float,
+        mol2_hydrogen_x: float,
+    ) -> None:
+        lines = [
+            pdb_atom_line(1, "O", "HOH", 1, mol1_oxygen_x, 0.0, 0.0, "O"),
+            pdb_atom_line(2, "H1", "HOH", 1, mol1_hydrogen_x, 0.0, 0.0, "H"),
+            pdb_atom_line(3, "O", "HOH", 2, mol2_oxygen_x, 0.0, 0.0, "O"),
+            pdb_atom_line(4, "H1", "HOH", 2, mol2_hydrogen_x, 0.0, 0.0, "H"),
+            "END\n",
+        ]
+        path.write_text("".join(lines), encoding="utf-8")
+
+    clusters_dir = tmp_path / dirname
+    structure_dir = clusters_dir / "H2O2"
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    write_water_frame(
+        structure_dir / "water_frame_0001.pdb",
+        mol1_oxygen_x=0.0,
+        mol1_hydrogen_x=1.00,
+        mol2_oxygen_x=5.0,
+        mol2_hydrogen_x=6.00,
+    )
+    write_water_frame(
+        structure_dir / "water_frame_0002.pdb",
+        mol1_oxygen_x=0.0,
+        mol1_hydrogen_x=1.10,
+        mol2_oxygen_x=5.2,
+        mol2_hydrogen_x=6.35,
+    )
+
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.clusters_dir = str(clusters_dir.resolve())
+    manager.save_project(settings)
+    return clusters_dir
+
+
+def _write_debye_waller_project_result(project_dir: Path, tmp_path: Path):
+    from saxshell.saxs.debye_waller.workflow import (
+        DebyeWallerWorkflow,
+        save_debye_waller_analysis_to_project,
+    )
+
+    clusters_dir = _configure_debye_waller_project_clusters(
+        project_dir,
+        tmp_path,
+    )
+
+    result = DebyeWallerWorkflow(
+        clusters_dir,
+        project_dir=project_dir,
+        output_dir=tmp_path / "dw_external_out",
+        output_basename="dw_ui",
+    ).run()
+    return save_debye_waller_analysis_to_project(result, project_dir)
+
+
+def test_project_setup_debye_waller_button_requires_active_pdb_clusters_and_tracks_saved_result(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert not window.project_setup_tab.debye_waller_button.isEnabled()
+    assert "active PDB clusters folder" in (
+        window.project_setup_tab.debye_waller_button.toolTip()
+    )
+    assert "#6b7280" in (
+        window.project_setup_tab.debye_waller_ready_indicator.styleSheet()
+    )
+
+    _write_debye_waller_project_result(project_dir, tmp_path)
+    window.load_project(project_dir)
+
+    assert window.project_setup_tab.debye_waller_button.isEnabled()
+    assert "#16a34a" in (
+        window.project_setup_tab.debye_waller_ready_indicator.styleSheet()
+    )
+    assert (
+        "computed and saved"
+        in (
+            window.project_setup_tab.debye_waller_ready_indicator.toolTip()
+        ).lower()
+    )
+    help_tooltip = (
+        window.project_setup_tab.debye_waller_help_button.toolTip().lower()
+    )
+    assert "optional" in help_tooltip
+    assert "before building saxs components" in help_tooltip
+    assert "pdb cluster" in help_tooltip
+
+    _configure_debye_waller_project_clusters(
+        project_dir,
+        tmp_path,
+        dirname="project_dw_clusters_alt",
+    )
+    window.load_project(project_dir)
+
+    assert window.project_setup_tab.debye_waller_button.isEnabled()
+    assert "#6b7280" in (
+        window.project_setup_tab.debye_waller_ready_indicator.styleSheet()
+    )
+    assert (
+        "different clusters folder"
+        in (
+            window.project_setup_tab.debye_waller_ready_indicator.toolTip()
+        ).lower()
+    )
+    window.close()
+
+
+def test_project_setup_debye_waller_button_launches_linked_tool_and_refreshes_status(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    from saxshell.saxs.debye_waller.workflow import (
+        DebyeWallerWorkflow,
+        save_debye_waller_analysis_to_project,
+    )
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    clusters_dir = _configure_debye_waller_project_clusters(
+        project_dir,
+        tmp_path,
+        dirname="project_dw_clusters_launch",
+    )
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    launched: dict[str, object] = {}
+
+    class FakeDebyeWallerWindow(QWidget):
+        project_paths_registered = Signal(object)
+        project_analysis_saved = Signal(object)
+
+        def __init__(self):
+            super().__init__()
+            launched["instance"] = self
+
+    def fake_launch_debye_waller_analysis_ui(**kwargs):
+        launched.update(kwargs)
+        return FakeDebyeWallerWindow()
+
+    monkeypatch.setattr(
+        "saxshell.saxs.debye_waller.ui.main_window.launch_debye_waller_analysis_ui",
+        fake_launch_debye_waller_analysis_ui,
+    )
+
+    assert window.project_setup_tab.debye_waller_button.isEnabled()
+    assert "#6b7280" in (
+        window.project_setup_tab.debye_waller_ready_indicator.styleSheet()
+    )
+
+    window.project_setup_tab.debye_waller_button.click()
+
+    assert launched["initial_project_dir"] == Path(project_dir).resolve()
+    assert launched["initial_clusters_dir"] == clusters_dir.resolve()
+    assert launched["instance"] in window._child_tool_windows
+
+    result = DebyeWallerWorkflow(
+        clusters_dir,
+        project_dir=project_dir,
+        output_dir=tmp_path / "dw_linked_out",
+        output_basename="linked_refresh",
+    ).run()
+    save_debye_waller_analysis_to_project(result, project_dir)
+    launched["instance"].project_analysis_saved.emit(
+        {"project_dir": str(Path(project_dir).resolve())}
+    )
+    QApplication.processEvents()
+
+    assert "#16a34a" in (
+        window.project_setup_tab.debye_waller_ready_indicator.styleSheet()
+    )
+    window.close()
+
+
+def test_project_setup_debye_waller_button_reports_startup_progress_in_popup(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    from saxshell.saxs.debye_waller.ui.main_window import (
+        DEBYE_WALLER_WINDOW_LOAD_TOTAL_STEPS,
+    )
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    clusters_dir = _configure_debye_waller_project_clusters(
+        project_dir,
+        tmp_path,
+        dirname="project_dw_clusters_popup",
+    )
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    launched: dict[str, object] = {}
+
+    class FakeDebyeWallerWindow(QWidget):
+        project_paths_registered = Signal(object)
+        project_analysis_saved = Signal(object)
+
+    def fake_launch_debye_waller_analysis_ui(**kwargs):
+        launched.update(kwargs)
+        progress_callback = kwargs.get("startup_progress_callback")
+        log_callback = kwargs.get("startup_log_callback")
+        assert progress_callback is not None
+        assert log_callback is not None
+        progress_callback(
+            1,
+            DEBYE_WALLER_WINDOW_LOAD_TOTAL_STEPS,
+            "Preparing Debye-Waller analysis window...",
+        )
+        log_callback("Preparing Debye-Waller analysis window.")
+        progress_callback(
+            DEBYE_WALLER_WINDOW_LOAD_TOTAL_STEPS,
+            DEBYE_WALLER_WINDOW_LOAD_TOTAL_STEPS,
+            "Finalizing Debye-Waller window...",
+        )
+        log_callback("Debye-Waller analysis window is ready.")
+        return FakeDebyeWallerWindow()
+
+    monkeypatch.setattr(
+        "saxshell.saxs.debye_waller.ui.main_window.launch_debye_waller_analysis_ui",
+        fake_launch_debye_waller_analysis_ui,
+    )
+
+    window.project_setup_tab.debye_waller_button.click()
+
+    assert launched["initial_project_dir"] == Path(project_dir).resolve()
+    assert launched["initial_clusters_dir"] == clusters_dir.resolve()
+    assert window._progress_dialog is not None
+    assert not window._progress_dialog.isVisible()
+    dialog_output = window._progress_dialog.output_box.toPlainText()
+    assert "Loading Debye-Waller analysis from" in dialog_output
+    assert "Preparing Debye-Waller analysis window." in dialog_output
+    assert "Debye-Waller analysis window is ready." in dialog_output
+    window.close()
+
+
+def test_debye_waller_window_inherits_clusters_dir_from_project_reference(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    from saxshell.saxs.debye_waller.ui.main_window import (
+        DebyeWallerAnalysisMainWindow,
+    )
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    clusters_dir = tmp_path / "project_clusters"
+    clusters_dir.mkdir()
+
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.clusters_dir = str(clusters_dir.resolve())
+    manager.save_project(settings)
+
+    window = DebyeWallerAnalysisMainWindow(initial_project_dir=project_dir)
+
+    assert window.clusters_dir_edit.text() == str(clusters_dir.resolve())
+    assert (
+        "inherited from the active project"
+        in window.summary_box.toPlainText().lower()
+    )
+    window.close()
+
+
+def test_debye_waller_window_browsing_clusters_reference_skips_registered_path_refresh(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    from saxshell.saxs.debye_waller.ui.main_window import (
+        DebyeWallerAnalysisMainWindow,
+    )
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    initial_clusters_dir = tmp_path / "initial_clusters"
+    initial_clusters_dir.mkdir()
+    updated_clusters_dir = tmp_path / "updated_clusters"
+    updated_clusters_dir.mkdir()
+
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.clusters_dir = str(initial_clusters_dir.resolve())
+    manager.save_project(settings)
+    assert manager.load_project(project_dir).clusters_dir_snapshot is not None
+
+    window = DebyeWallerAnalysisMainWindow(initial_project_dir=project_dir)
+
+    save_calls: list[bool] = []
+    original_save_project = window._project_manager.save_project
+
+    def record_save_project(settings, *, refresh_registered_paths=True):
+        save_calls.append(bool(refresh_registered_paths))
+        return original_save_project(
+            settings,
+            refresh_registered_paths=refresh_registered_paths,
+        )
+
+    monkeypatch.setattr(
+        window._project_manager,
+        "save_project",
+        record_save_project,
+    )
+    monkeypatch.setattr(
+        "saxshell.saxs.debye_waller.ui.main_window.QFileDialog.getExistingDirectory",
+        lambda *args, **kwargs: str(updated_clusters_dir.resolve()),
+    )
+
+    window._browse_clusters_dir()
+
+    assert save_calls == [False]
+    saved_settings = SAXSProjectManager().load_project(project_dir)
+    assert saved_settings.clusters_dir == str(updated_clusters_dir.resolve())
+    assert saved_settings.clusters_dir_snapshot is None
+    window.close()
+
+
+def test_debye_waller_window_exposes_stoichiometry_info_tab(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    from saxshell.saxs.debye_waller.ui.main_window import (
+        DebyeWallerAnalysisMainWindow,
+    )
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = DebyeWallerAnalysisMainWindow(initial_project_dir=project_dir)
+
+    tab_labels = [
+        window.results_tabs.tabText(index)
+        for index in range(window.results_tabs.count())
+    ]
+
+    assert "Aggregated Pairs" in tab_labels
+    assert "Stoichiometries" in tab_labels
+    assert window.stoichiometry_info_table.columnCount() >= 1
+    assert window.aggregated_pair_table.columnCount() >= 1
+    window.close()
+
+
+def test_debye_waller_window_loads_saved_project_analysis(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    from saxshell.saxs.debye_waller.ui.main_window import (
+        DebyeWallerAnalysisMainWindow,
+    )
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    saved_result = _write_debye_waller_project_result(project_dir, tmp_path)
+
+    window = DebyeWallerAnalysisMainWindow(initial_project_dir=project_dir)
+
+    assert window._last_result is not None
+    assert window.aggregated_pair_table.rowCount() > 0
+    assert window.pair_summary_table.rowCount() > 0
+    assert window.stoichiometry_info_table.rowCount() > 0
+    assert "loaded saved debye-waller analysis" in (
+        window.log_box.toPlainText().lower()
+    )
+    assert window.output_dir_edit.text() == str(saved_result.output_dir)
+    window.close()
+
+
+def test_debye_waller_window_does_not_resave_project_during_startup(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    from saxshell.saxs.debye_waller.ui.main_window import (
+        DebyeWallerAnalysisMainWindow,
+    )
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    clusters_dir = _configure_debye_waller_project_clusters(
+        project_dir,
+        tmp_path,
+        dirname="project_dw_clusters_no_resave",
+    )
+    save_calls: list[str | None] = []
+    original_save_project = SAXSProjectManager.save_project
+
+    def wrapped_save_project(self, settings, *args, **kwargs):
+        save_calls.append(settings.clusters_dir)
+        return original_save_project(self, settings, *args, **kwargs)
+
+    monkeypatch.setattr(
+        SAXSProjectManager,
+        "save_project",
+        wrapped_save_project,
+    )
+
+    window = DebyeWallerAnalysisMainWindow(
+        initial_project_dir=project_dir,
+        initial_clusters_dir=clusters_dir,
+    )
+
+    assert save_calls == []
+    window.close()
+
+
+def test_debye_waller_window_autosaves_first_project_analysis(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    from saxshell.saxs.debye_waller.ui.main_window import (
+        DebyeWallerAnalysisMainWindow,
+    )
+    from saxshell.saxs.debye_waller.workflow import (
+        DebyeWallerWorkflow,
+        find_saved_project_debye_waller_analysis,
+    )
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    saved_result = _write_debye_waller_project_result(project_dir, tmp_path)
+    saved_summary_path = (
+        saved_result.artifacts.summary_json_path
+        if saved_result.artifacts is not None
+        else None
+    )
+    assert saved_summary_path is not None
+    saved_summary_path.unlink()
+
+    pair_csv = saved_result.artifacts.pair_summary_csv_path
+    scope_csv = saved_result.artifacts.scope_summary_csv_path
+    segment_csv = saved_result.artifacts.segment_csv_path
+    aggregated_pair_csv = (
+        saved_result.artifacts.aggregated_pair_summary_csv_path
+    )
+    for artifact_path in (
+        aggregated_pair_csv,
+        pair_csv,
+        scope_csv,
+        segment_csv,
+    ):
+        artifact_path.unlink()
+    saved_result.output_dir.rmdir()
+
+    clusters_dir = Path(
+        SAXSProjectManager().load_project(project_dir).clusters_dir
+    ).resolve()
+    result = DebyeWallerWorkflow(
+        clusters_dir,
+        project_dir=project_dir,
+        output_dir=tmp_path / "dw_new_run",
+        output_basename="new_run",
+    ).run()
+
+    window = DebyeWallerAnalysisMainWindow(initial_project_dir=project_dir)
+    window._project_had_saved_analysis_before_run = False
+    window._finish_run(result)
+
+    restored_path = find_saved_project_debye_waller_analysis(project_dir)
+    assert restored_path is not None
+    assert restored_path.exists()
+    assert "auto-saved the first debye-waller analysis" in (
+        window.log_box.toPlainText().lower()
+    )
+    assert window.save_project_button.isEnabled()
+    window.close()
+
+
 def test_cluster_tool_uses_active_project_frames_dir_and_project_dir(
     qapp, tmp_path, monkeypatch
 ):
@@ -3569,6 +4178,51 @@ def test_cluster_dynamics_ml_tool_uses_active_project_dir(
     window.close()
 
 
+def test_project_setup_predict_structures_button_opens_cluster_dynamics_ml_tool(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    launched: dict[str, object] = {}
+
+    class FakeClusterDynamicsMLWindow:
+        def __init__(
+            self,
+            initial_frames_dir=None,
+            initial_energy_file=None,
+            initial_project_dir=None,
+            initial_clusters_dir=None,
+            initial_experimental_data_file=None,
+        ):
+            launched["project_dir"] = initial_project_dir
+            launched["instance"] = self
+
+        def show(self):
+            launched["shown"] = True
+
+        def raise_(self):
+            launched["raised"] = True
+
+    monkeypatch.setattr(
+        "saxshell.clusterdynamicsml.ui.main_window.ClusterDynamicsMLMainWindow",
+        FakeClusterDynamicsMLWindow,
+    )
+
+    window.project_setup_tab.predict_structures_button.click()
+
+    assert (
+        launched["project_dir"]
+        == Path(window.current_settings.project_dir).resolve()
+    )
+    assert launched["shown"] is True
+    assert launched["raised"] is True
+    assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
 def test_contrast_mode_scaffold_window_populates_launch_context(
     qapp, tmp_path
 ):
@@ -3599,8 +4253,10 @@ def test_contrast_mode_scaffold_window_populates_launch_context(
     )
     _flush_contrast_window_launch_preview(window)
 
-    assert window.windowTitle() == "SAXSShell (Contrast Debye Workflow)"
-    assert window.mode_edit.text() == "Contrast Mode"
+    assert (
+        window.windowTitle() == "SAXSShell (Contrast Debye Workflow) (Preview)"
+    )
+    assert window.mode_edit.text() == "Contrast (Debye)"
     assert window.project_dir_edit.text() == str(project_dir.resolve())
     assert window.clusters_dir_edit.text() == str(clusters_dir.resolve())
     assert window.experimental_data_edit.text() == str(
@@ -3798,6 +4454,7 @@ def test_contrast_mode_tool_uses_active_project_context(
     assert launched["initial_q_min"] == pytest.approx(0.06)
     assert launched["initial_q_max"] == pytest.approx(0.75)
     assert launched["initial_template_name"] == POLY_LMA_HS_TEMPLATE
+    assert launched["preview_mode"] is True
     assert launched["instance"] in window._child_tool_windows
     assert window._contrast_mode_tool_window is launched["instance"]
     window.close()
@@ -4011,6 +4668,7 @@ def test_contrast_mode_tool_open_starts_clean_even_with_saved_distribution(
     assert launched["initial_distribution_id"] is None
     assert launched["initial_distribution_root_dir"] is None
     assert launched["initial_contrast_artifact_dir"] is None
+    assert launched["preview_mode"] is True
     window.close()
 
 
@@ -4049,6 +4707,7 @@ def test_electron_density_mapping_tool_uses_active_structure_folder(
 
     assert launched["initial_project_dir"] == Path(project_dir).resolve()
     assert launched["initial_input_path"] == pdb_frames_dir.resolve()
+    assert launched["preview_mode"] is True
     assert launched["instance"] in window._child_tool_windows
     window.close()
 
@@ -5276,6 +5935,95 @@ def test_dream_progress_label_wrap_does_not_resize_left_pane(qapp):
     assert "No DREAM dataset is loaded yet" in (
         window.dream_tab.filter_status_box.toPlainText()
     )
+
+
+@pytest.mark.parametrize(
+    ("tab_attr", "splitter_attr", "target_index"),
+    [
+        ("project_setup_tab", "_pane_splitter", 0),
+        ("project_setup_tab", "_pane_splitter", 1),
+        ("prefit_tab", "_pane_splitter", 0),
+        ("prefit_tab", "_pane_splitter", 1),
+        ("dream_tab", "_top_splitter", 0),
+        ("dream_tab", "_top_splitter", 1),
+    ],
+)
+def test_auto_snap_panes_resizes_clicked_supported_pane(
+    qapp,
+    tab_attr,
+    splitter_attr,
+    target_index,
+):
+    del qapp
+    window = SAXSMainWindow()
+    window.resize(1800, 980)
+    window.show()
+    tab = getattr(window, tab_attr)
+    window.tabs.setCurrentWidget(tab)
+    QApplication.processEvents()
+
+    splitter = getattr(tab, splitter_attr)
+    pane_snap_filter = tab._auto_snap_filter
+    before_sizes, after_sizes = _pane_snap_resize_result(
+        splitter,
+        pane_snap_filter,
+        target_index=target_index,
+    )
+
+    assert after_sizes[target_index] > before_sizes[target_index] + 20
+    window.close()
+
+
+def test_auto_snap_panes_disabled_preserves_manual_splitter_sizes(qapp):
+    del qapp
+    window = SAXSMainWindow()
+    window.resize(1800, 980)
+    window.show()
+    window._set_auto_snap_panes_enabled(False, persist=False)
+    window.tabs.setCurrentWidget(window.prefit_tab)
+    QApplication.processEvents()
+
+    splitter = window.prefit_tab._pane_splitter
+    splitter.setSizes([900, 300])
+    QApplication.processEvents()
+    before_sizes = splitter.sizes()
+    QTest.mouseClick(
+        window.prefit_tab._plot_group,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        window.prefit_tab._plot_group.rect().center(),
+    )
+    QApplication.processEvents()
+    after_sizes = splitter.sizes()
+
+    assert abs(after_sizes[0] - before_sizes[0]) <= 2
+    assert abs(after_sizes[1] - before_sizes[1]) <= 2
+    window.close()
+
+
+@pytest.mark.parametrize("target_index", [0, 1])
+def test_auto_snap_panes_focus_clicked_pane_when_its_preferred_width_is_small(
+    qapp,
+    target_index,
+):
+    del qapp
+    window = SAXSMainWindow()
+    window.resize(1800, 980)
+    window.show()
+    window.tabs.setCurrentWidget(window.project_setup_tab)
+    QApplication.processEvents()
+
+    before_sizes, after_sizes = _pane_snap_resize_result(
+        window.project_setup_tab._pane_splitter,
+        window.project_setup_tab._auto_snap_filter,
+        target_index=target_index,
+        desired_width=220,
+        other_width=720,
+    )
+
+    assert after_sizes[target_index] > before_sizes[target_index] + 20
+    assert after_sizes[1 - target_index] < before_sizes[1 - target_index] - 20
+    window.close()
 
 
 def test_dream_zeta_spin_uses_scientific_notation(qapp):
@@ -6892,15 +7640,26 @@ def test_project_setup_component_build_mode_defaults_and_round_trips(qapp):
     )
 
     assert tab.component_build_mode() == COMPONENT_BUILD_MODE_NO_CONTRAST
-    assert tab.component_build_mode_combo.currentText() == "No Contrast Mode"
+    assert (
+        tab.component_build_mode_combo.currentText() == "No Contrast (Debye)"
+    )
 
     tab.set_component_build_mode(COMPONENT_BUILD_MODE_CONTRAST)
     assert tab.component_build_mode() == COMPONENT_BUILD_MODE_CONTRAST
-    assert tab.component_build_mode_combo.currentText() == "Contrast Mode"
+    assert tab.component_build_mode_combo.currentText() == "Contrast (Debye)"
+
+    tab.set_component_build_mode(COMPONENT_BUILD_MODE_BORN_APPROXIMATION)
+    assert (
+        tab.component_build_mode() == COMPONENT_BUILD_MODE_BORN_APPROXIMATION
+    )
+    assert (
+        tab.component_build_mode_combo.currentText()
+        == "Born Approximation (Average)"
+    )
 
     tab.set_project_settings(settings, [])
     assert tab.component_build_mode() == COMPONENT_BUILD_MODE_CONTRAST
-    assert "Contrast Mode" in tab.component_build_mode_label.text()
+    assert "Contrast (Debye)" in tab.component_build_mode_label.text()
 
 
 def test_distribution_identity_and_label_include_component_build_mode(
@@ -6917,10 +7676,10 @@ def test_distribution_identity_and_label_include_component_build_mode(
     assert project_module.distribution_id_for_settings(
         no_contrast_settings
     ) != project_module.distribution_id_for_settings(contrast_settings)
-    assert "Build: No Contrast Mode" in (
+    assert "Build: No Contrast (Debye)" in (
         project_module.distribution_label_for_settings(no_contrast_settings)
     )
-    assert "Build: Contrast Mode" in (
+    assert "Build: Contrast (Debye)" in (
         project_module.distribution_label_for_settings(contrast_settings)
     )
 
@@ -9634,6 +10393,145 @@ def test_open_project_uses_existing_project_field(qapp, tmp_path):
     assert window.project_setup_tab.project_name_edit.text() == "saxs_project"
 
 
+def test_existing_project_browser_starts_in_recent_project_parent(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+
+    class _FakeSettings:
+        def __init__(self, values: dict[str, object]):
+            self.values = dict(values)
+
+        def value(self, key, default=None):
+            return self.values.get(key, default)
+
+        def setValue(self, key, value):
+            self.values[key] = value
+
+    recent_root = tmp_path / "recent_projects"
+    recent_root.mkdir()
+    project_dir, _paths = _build_minimal_saxs_project(recent_root)
+    settings_store = _FakeSettings(
+        {"recent_project_dirs": [str(project_dir.resolve())]}
+    )
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.project_setup_tab.QSettings",
+        lambda *args, **kwargs: settings_store,
+    )
+
+    def _capture_existing_directory(*args, **kwargs):
+        captured["start_dir"] = args[2]
+        return ""
+
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.project_setup_tab.QFileDialog.getExistingDirectory",
+        _capture_existing_directory,
+    )
+
+    tab = ProjectSetupTab()
+    tab._browse_existing_project_directory()
+
+    assert captured["start_dir"] == str(project_dir.resolve().parent)
+
+
+def test_open_project_dialog_uses_recent_project_parent_when_field_is_empty(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+
+    class _FakeSettings:
+        def __init__(self, values: dict[str, object]):
+            self.values = dict(values)
+
+        def value(self, key, default=None):
+            return self.values.get(key, default)
+
+        def setValue(self, key, value):
+            self.values[key] = value
+
+    recent_root = tmp_path / "recent_projects"
+    recent_root.mkdir()
+    project_dir, _paths = _build_minimal_saxs_project(recent_root)
+    settings_store = _FakeSettings(
+        {"recent_project_dirs": [str(project_dir.resolve())]}
+    )
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(
+        SAXSMainWindow,
+        "_recent_projects_settings",
+        lambda self: settings_store,
+    )
+
+    def _capture_existing_directory(*args, **kwargs):
+        captured["start_dir"] = args[2]
+        return ""
+
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.main_window.QFileDialog.getExistingDirectory",
+        _capture_existing_directory,
+    )
+
+    window = SAXSMainWindow()
+    window.project_setup_tab.open_project_dir_edit.clear()
+
+    window.open_project_from_dialog()
+
+    assert captured["start_dir"] == str(project_dir.resolve().parent)
+
+
+def test_auto_snap_panes_setting_defaults_enabled_and_persists(
+    qapp,
+    monkeypatch,
+):
+    del qapp
+
+    class _FakeSettings:
+        def __init__(self, values: dict[str, object] | None = None):
+            self.values = {} if values is None else dict(values)
+
+        def value(self, key, default=None):
+            return self.values.get(key, default)
+
+        def setValue(self, key, value):
+            self.values[key] = value
+
+    settings_store = _FakeSettings()
+
+    monkeypatch.setattr(
+        SAXSMainWindow,
+        "_recent_projects_settings",
+        lambda self: settings_store,
+    )
+
+    first_window = SAXSMainWindow()
+
+    assert first_window.auto_snap_panes_action.isChecked()
+    assert first_window.project_setup_tab._auto_snap_filter.is_enabled()
+    assert first_window.prefit_tab._auto_snap_filter.is_enabled()
+    assert first_window.dream_tab._auto_snap_filter.is_enabled()
+
+    first_window.auto_snap_panes_action.trigger()
+
+    assert settings_store.values[AUTO_SNAP_PANES_KEY] is False
+    assert not first_window.auto_snap_panes_action.isChecked()
+    assert not first_window.project_setup_tab._auto_snap_filter.is_enabled()
+    assert not first_window.prefit_tab._auto_snap_filter.is_enabled()
+    assert not first_window.dream_tab._auto_snap_filter.is_enabled()
+
+    second_window = SAXSMainWindow()
+
+    assert not second_window.auto_snap_panes_action.isChecked()
+    assert not second_window.project_setup_tab._auto_snap_filter.is_enabled()
+    assert not second_window.prefit_tab._auto_snap_filter.is_enabled()
+    assert not second_window.dream_tab._auto_snap_filter.is_enabled()
+
+    first_window.close()
+    second_window.close()
+
+
 def test_open_project_reports_loader_progress_and_output(qapp, tmp_path):
     del qapp
     project_dir, _paths = _build_minimal_saxs_project(tmp_path)
@@ -11645,7 +12543,7 @@ def test_build_components_in_contrast_mode_launches_scaffold_instead_of_builder_
     monkeypatch.setattr(
         window,
         "_open_contrast_mode_tool",
-        lambda: launched.append("contrast"),
+        lambda **kwargs: launched.append(kwargs),
     )
 
     window.project_setup_tab.set_component_build_mode(
@@ -11655,7 +12553,7 @@ def test_build_components_in_contrast_mode_launches_scaffold_instead_of_builder_
 
     saved_settings = SAXSProjectManager().load_project(project_dir)
     assert not start_calls
-    assert launched == ["contrast"]
+    assert launched == [{"preview_mode": False}]
     assert saved_settings.component_build_mode == COMPONENT_BUILD_MODE_CONTRAST
     assert window.current_settings is not None
     assert (
@@ -11663,7 +12561,71 @@ def test_build_components_in_contrast_mode_launches_scaffold_instead_of_builder_
         == COMPONENT_BUILD_MODE_CONTRAST
     )
     assert (
-        "Contrast Mode" in window.project_setup_tab.summary_box.toPlainText()
+        "Contrast (Debye)"
+        in window.project_setup_tab.summary_box.toPlainText()
+    )
+    window.close()
+
+
+def test_build_components_in_born_approximation_launches_electron_density_workflow(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    launched: list[dict[str, object]] = []
+    start_calls: list[str] = []
+    clusters_dir = tmp_path / "clusters"
+    (clusters_dir / "PbI2").mkdir(parents=True)
+    (clusters_dir / "PbI2" / "frame_0001.xyz").write_text(
+        "\n".join(
+            [
+                "3",
+                "frame_0001",
+                "Pb 0.0 0.0 0.0",
+                "I 2.8 0.0 0.0",
+                "I 0.0 2.8 0.0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    window.project_setup_tab.clusters_dir_edit.setText(
+        str(clusters_dir.resolve())
+    )
+    window.project_setup_tab.set_component_build_mode(
+        COMPONENT_BUILD_MODE_BORN_APPROXIMATION
+    )
+    monkeypatch.setattr(
+        window,
+        "_confirm_default_q_range_for_component_build",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        window,
+        "_start_project_task",
+        lambda task_name, *args, **kwargs: start_calls.append(task_name),
+    )
+    monkeypatch.setattr(
+        window,
+        "_open_electron_density_mapping_tool",
+        lambda **kwargs: launched.append(kwargs),
+    )
+
+    window.build_project_components()
+
+    assert not start_calls
+    assert launched == [{"preview_mode": False}]
+    assert window.current_settings is not None
+    assert (
+        window.current_settings.component_build_mode
+        == COMPONENT_BUILD_MODE_BORN_APPROXIMATION
+    )
+    assert (
+        "Born Approximation (Average)"
+        in window.project_setup_tab.summary_box.toPlainText()
     )
     window.close()
 
@@ -11712,10 +12674,10 @@ def test_saved_distributions_can_coexist_and_load_by_component_build_mode(
         records[contrast_artifacts.distribution_id].component_build_mode
         == COMPONENT_BUILD_MODE_CONTRAST
     )
-    assert "Build: No Contrast Mode" in (
+    assert "Build: No Contrast (Debye)" in (
         records[no_contrast_artifacts.distribution_id].label
     )
-    assert "Build: Contrast Mode" in (
+    assert "Build: Contrast (Debye)" in (
         records[contrast_artifacts.distribution_id].label
     )
     assert (
@@ -12862,11 +13824,48 @@ def test_predicted_structure_mode_status_guides_user_when_bundle_is_missing(
     window = SAXSMainWindow(initial_project_dir=project_dir)
 
     assert window.project_setup_tab.use_predicted_structure_weights()
+    assert (
+        window.project_setup_tab.use_predicted_structure_weights_checkbox.isEnabled()
+    )
+    assert "#6b7280" in (
+        window.project_setup_tab.predicted_structure_ready_indicator.styleSheet()
+    )
     assert "Predicted Structures mode is on" in (
         window.project_setup_tab.predicted_structure_status_label.text()
     )
-    assert "Open Tools > Open Cluster Dynamics ML" in (
+    assert "Open Cluster Dynamics (ML)" in (
         window.project_setup_tab.predicted_structure_status_label.text()
+    )
+    window.close()
+
+
+def test_predicted_structure_toggle_stays_disabled_until_predictions_exist(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert not window.project_setup_tab.use_predicted_structure_weights()
+    assert (
+        not window.project_setup_tab.use_predicted_structure_weights_checkbox.isEnabled()
+    )
+    assert "#6b7280" in (
+        window.project_setup_tab.predicted_structure_ready_indicator.styleSheet()
+    )
+
+    _write_predicted_structure_artifacts(paths)
+    window._refresh_predicted_structure_status()
+
+    assert (
+        window.project_setup_tab.use_predicted_structure_weights_checkbox.isEnabled()
+    )
+    assert "#16a34a" in (
+        window.project_setup_tab.predicted_structure_ready_indicator.styleSheet()
+    )
+    assert "1 predicted structure is available" in (
+        window.project_setup_tab.predicted_structure_ready_indicator.toolTip()
     )
     window.close()
 

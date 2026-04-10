@@ -5,9 +5,11 @@ from pathlib import Path
 
 COMPONENT_BUILD_MODE_NO_CONTRAST = "no_contrast"
 COMPONENT_BUILD_MODE_CONTRAST = "contrast"
+COMPONENT_BUILD_MODE_BORN_APPROXIMATION = "born_approximation"
 _COMPONENT_BUILD_MODE_LABELS = {
-    COMPONENT_BUILD_MODE_NO_CONTRAST: "No Contrast Mode",
-    COMPONENT_BUILD_MODE_CONTRAST: "Contrast Mode",
+    COMPONENT_BUILD_MODE_NO_CONTRAST: "No Contrast (Debye)",
+    COMPONENT_BUILD_MODE_CONTRAST: "Contrast (Debye)",
+    COMPONENT_BUILD_MODE_BORN_APPROXIMATION: "Born Approximation (Average)",
 }
 
 
@@ -18,6 +20,14 @@ def normalize_component_build_mode(value: object) -> str:
         "contrast_mode",
     }:
         return COMPONENT_BUILD_MODE_CONTRAST
+    if normalized in {
+        COMPONENT_BUILD_MODE_BORN_APPROXIMATION,
+        "born_approx",
+        "born_approximation_mode",
+        "born_approximation_average",
+        "average",
+    }:
+        return COMPONENT_BUILD_MODE_BORN_APPROXIMATION
     return COMPONENT_BUILD_MODE_NO_CONTRAST
 
 
