@@ -43,10 +43,9 @@ molecular dynamics-derived liquid structures.
 scriptable workflows that connect atomistic simulation output to
 scattering observables and structural interpretation.
 
-The project is being developed as a Python library with command-line
-entry points and documentation for simulation-driven scattering
-analysis, especially for liquid-state structure and solvation-focused
-studies.
+The project is being developed as a Python library with Qt applications,
+supporting tools, and documentation for simulation-driven scattering analysis,
+especially for liquid-state structure and solvation-focused studies.
 
 For more information about the saxshell library, please consult our `online documentation <https://kewh5868.github.io/saxshell>`_.
 
@@ -60,51 +59,35 @@ If you use saxshell in a scientific publication, we would like you to cite this 
 Installation
 ------------
 
-The preferred method is to use `Miniconda Python
-<https://docs.conda.io/projects/miniconda/en/latest/miniconda-install.html>`_
-and install from the "conda-forge" channel of Conda packages.
+SAXSShell is not pip-installable yet. The current user-facing path is to clone
+the repository and create the conda environment from the checked-in
+``requirements/saxshell-py312.yml`` file.
 
-To add "conda-forge" to the conda channels, run the following in a terminal. ::
+From a terminal, run ::
 
-        conda config --add channels conda-forge
+        git clone https://github.com/kewh5868/SAXSShell.git
+        cd SAXSShell
+        conda env create -f requirements/saxshell-py312.yml
 
-We want to install our packages in a suitable conda environment.
-The following creates and activates a new environment named ``saxshell_env`` ::
+If the environment already exists, update it with ::
 
-        conda create -n saxshell_env saxshell
-        conda activate saxshell_env
+        conda env update -n saxshell-py312 -f requirements/saxshell-py312.yml --prune
 
-The output should print the latest version displayed on the badges above.
+Launch the main SAXSShell application from the repository root with ::
 
-If the above does not work, you can use ``pip`` to download and install the latest release from
-`Python Package Index <https://pypi.python.org>`_.
-To install using ``pip`` into your ``saxshell_env`` environment, type ::
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs
 
-        pip install saxshell
+You can also verify that the source checkout imports inside the conda
+environment with ::
 
-If you prefer to install from sources, after installing the dependencies, obtain the source archive from
-`GitHub <https://github.com/kewh5868/saxshell/>`_. Once installed, ``cd`` into your ``saxshell`` directory
-and run the following ::
-
-        pip install .
-
-This package also provides command-line utilities. To check the software has been installed correctly, type ::
-
-        saxshell --version
-
-You can also type the following command to verify the installation. ::
-
-        python -c "import saxshell; print(saxshell.__version__)"
-
-
-To view the basic usage and available commands, type ::
-
-        saxshell -h
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -c "import saxshell; print(saxshell.__version__)"
 
 Getting Started
 ---------------
 
 You may consult our `online documentation <https://kewh5868.github.io/saxshell>`_ for tutorials and API references.
+Start by learning how to process your MD trajectory into frames and clusters,
+then create a dedicated project folder for the SAXSShell session.
 
 Workflow Process Tree
 ---------------------
@@ -186,15 +169,12 @@ based steady-state cutoff suggestions.
 The same ``mdtrajectory`` workflow can be used in three ways:
 
 1. As a Qt desktop application for interactive use.
-2. As a terminal command for scripted or batch workflows.
+2. Through the source-checkout module launch for scripted or batch workflows.
 3. As a Python class in notebooks and other Python scripts.
 
-To launch the Qt application, use one of the following commands ::
+To launch the Qt application from the repository root ::
 
-        mdtrajectory
-        mdtrajectory ui
-        saxshell mdtrajectory
-        python -m saxshell.mdtrajectory
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory
 
 Terminal Use Cases
 ------------------
@@ -205,11 +185,11 @@ preprocessing inside a larger shell workflow.
 
 Inspect a trajectory and optional energy file ::
 
-        mdtrajectory inspect traj.xyz --energy-file traj.ener
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory inspect traj.xyz --energy-file traj.ener
 
 Suggest a steady-state cutoff from a CP2K energy profile ::
 
-        mdtrajectory suggest-cutoff traj.xyz \
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory suggest-cutoff traj.xyz \
             --energy-file traj.ener \
             --temp-target-k 300 \
             --temp-tol-k 1.0 \
@@ -217,7 +197,7 @@ Suggest a steady-state cutoff from a CP2K energy profile ::
 
 Preview the selected export range without writing files ::
 
-        mdtrajectory preview traj.xyz \
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory preview traj.xyz \
             --use-cutoff \
             --cutoff-fs 50 \
             --start 0 \
@@ -225,15 +205,11 @@ Preview the selected export range without writing files ::
 
 Export frames directly from the terminal ::
 
-        mdtrajectory export traj.xyz \
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory export traj.xyz \
             --energy-file traj.ener \
             --use-suggested-cutoff \
             --temp-target-k 300 \
             --window 3
-
-The ``saxshell`` command also forwards to the same workflow ::
-
-        saxshell mdtrajectory inspect traj.xyz
 
 Python and Notebook Use
 -----------------------
@@ -274,15 +250,12 @@ files into residue-labeled PDB files. It uses:
 The same ``xyz2pdb`` workflow can be used in three ways:
 
 1. As a Qt desktop application for interactive use.
-2. As a terminal command for scripted or batch workflows.
+2. Through the source-checkout module launch for scripted or batch workflows.
 3. As a Python class in notebooks and other Python scripts.
 
-To launch the Qt application, use one of the following commands ::
+To launch the Qt application from the repository root ::
 
-        xyz2pdb
-        xyz2pdb ui
-        saxshell xyz2pdb
-        python -m saxshell.xyz2pdb
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.xyz2pdb
 
 Reference Library
 -----------------
@@ -296,11 +269,11 @@ add it to the current library folder.
 
 List the available reference molecules ::
 
-        xyz2pdb references list
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.xyz2pdb references list
 
 Create a new reference molecule from the terminal ::
 
-        xyz2pdb references add ref.xyz --name dmf --residue-name DMF
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.xyz2pdb references add ref.xyz --name dmf --residue-name DMF
 
 Residue Assignment JSON
 -----------------------
@@ -342,11 +315,11 @@ Suppose you have:
 
 Launch the UI ::
 
-        xyz2pdb
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.xyz2pdb
 
 Or prefill the main inputs from the terminal ::
 
-        xyz2pdb ui splitxyz \
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.xyz2pdb ui splitxyz \
             --config dmf_assignments.json \
             --library-dir src/saxshell/xyz2pdb/reference_library
 
@@ -372,24 +345,24 @@ terminal.
 List the available references first if you want to confirm that the
 expected PDB is in the library ::
 
-        xyz2pdb references list \
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.xyz2pdb references list \
             --library-dir src/saxshell/xyz2pdb/reference_library
 
 Inspect the selected XYZ input and JSON config ::
 
-        xyz2pdb inspect splitxyz \
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.xyz2pdb inspect splitxyz \
             --config dmf_assignments.json \
             --library-dir src/saxshell/xyz2pdb/reference_library
 
 Preview the first frame before writing files ::
 
-        xyz2pdb preview splitxyz \
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.xyz2pdb preview splitxyz \
             --config dmf_assignments.json \
             --library-dir src/saxshell/xyz2pdb/reference_library
 
 Export the converted PDB files ::
 
-        xyz2pdb export splitxyz \
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.xyz2pdb export splitxyz \
             --config dmf_assignments.json \
             --library-dir src/saxshell/xyz2pdb/reference_library \
             --output-dir xyz2pdb_splitxyz
@@ -399,25 +372,21 @@ Terminal Use Cases
 
 Inspect the selected XYZ input, reference library, and config ::
 
-        xyz2pdb inspect splitxyz \
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.xyz2pdb inspect splitxyz \
             --config assignments.json \
             --library-dir references
 
 Preview the first-frame residue assignments and suggested output folder ::
 
-        xyz2pdb preview splitxyz \
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.xyz2pdb preview splitxyz \
             --config assignments.json \
             --library-dir references
 
 Export PDB files from one XYZ or a folder of XYZ files ::
 
-        xyz2pdb export splitxyz \
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.xyz2pdb export splitxyz \
             --config assignments.json \
             --library-dir references
-
-The ``saxshell`` command also forwards to the same workflow ::
-
-        saxshell xyz2pdb inspect splitxyz --config assignments.json
 
 Python and Class-Based Use Case
 -------------------------------
@@ -495,15 +464,12 @@ same folder.
 The same ``clusters`` workflow can be used in three ways:
 
 1. As a Qt desktop application for interactive use.
-2. As a terminal command for scripted or batch workflows.
+2. Through the source-checkout module launch for scripted or batch workflows.
 3. As a Python class in notebooks and other Python scripts.
 
-To launch the Qt application, use one of the following commands ::
+To launch the Qt application from the repository root ::
 
-        clusters
-        clusters ui
-        saxshell cluster
-        python -m saxshell.clusters
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.cluster
 
 Cluster UI Use
 --------------
@@ -514,11 +480,11 @@ enable periodic boundary conditions before exporting clusters.
 
 Launch the UI ::
 
-        clusters
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.cluster
 
 Or open the UI with a frames folder preloaded ::
 
-        clusters ui splitxyz0001
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.cluster ui splitxyz0001
 
 Inside the window:
 
@@ -540,11 +506,11 @@ operations directly from the terminal.
 
 Inspect an extracted frames folder ::
 
-        clusters inspect splitxyz0001
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.cluster inspect splitxyz0001
 
 Preview a run using explicit cluster rules and periodic wrapping ::
 
-        clusters preview splitxyz0001 \
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.cluster preview splitxyz0001 \
             --use-pbc \
             --search-mode kdtree \
             --node Pb \
@@ -555,7 +521,7 @@ Preview a run using explicit cluster rules and periodic wrapping ::
 
 Export clusters without opening the UI ::
 
-        clusters export splitxyz0001 \
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.cluster export splitxyz0001 \
             --use-pbc \
             --search-mode kdtree \
             --node Pb \
@@ -621,15 +587,12 @@ folders produced by ``clusters``. A typical workflow is:
 The same ``bondanalysis`` workflow can be used in three ways:
 
 1. As a Qt desktop application for interactive use.
-2. As a terminal command for scripted or batch workflows.
+2. Through the source-checkout module launch for scripted or batch workflows.
 3. As a Python workflow in notebooks and other Python scripts.
 
-To launch the Qt application, use one of the following commands ::
+To launch the Qt application from the repository root ::
 
-        bondanalysis
-        bondanalysis ui
-        saxshell bondanalysis
-        python -m saxshell.bondanalysis
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.bondanalysis
 
 Bondanalysis UI Use
 -------------------
@@ -641,11 +604,11 @@ updated.
 
 Launch the UI ::
 
-        bondanalysis
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.bondanalysis
 
 Or open the UI with a clusters folder preloaded ::
 
-        bondanalysis ui clusters_splitxyz0001
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.bondanalysis ui clusters_splitxyz0001
 
 Inside the window:
 
@@ -681,11 +644,11 @@ Bondanalysis Terminal Use
 
 Inspect a clusters directory before running analysis ::
 
-        bondanalysis inspect clusters_splitxyz0001
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.bondanalysis inspect clusters_splitxyz0001
 
 Run bond-pair and angle analysis headlessly on every cluster type ::
 
-        bondanalysis run clusters_splitxyz0001 \
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.bondanalysis run clusters_splitxyz0001 \
             --bond-pair Pb:I:3.50 \
             --bond-pair Pb:O:3.20 \
             --angle-triplet Pb:I:I:3.50:3.50
@@ -693,16 +656,12 @@ Run bond-pair and angle analysis headlessly on every cluster type ::
 Restrict the run to selected stoichiometry folders and choose an
 explicit output directory ::
 
-        bondanalysis run clusters_splitxyz0001 \
+        PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.bondanalysis run clusters_splitxyz0001 \
             --output-dir bondanalysis_clusters_splitxyz0001 \
             --cluster-type PbI2 \
             --cluster-type Pb2I3 \
             --bond-pair Pb:I:3.50 \
             --angle-triplet Pb:I:I:3.50:3.50
-
-The top-level ``saxshell`` command forwards to the same workflow ::
-
-        saxshell bondanalysis inspect clusters_splitxyz0001
 
 Bondanalysis Python and Notebook Use
 ------------------------------------
@@ -740,12 +699,10 @@ Support and Contribute
 
 If you see a bug or want to request a feature, please `report it as an issue <https://github.com/kewh5868/saxshell/issues>`_ and/or `submit a fix as a PR <https://github.com/kewh5868/saxshell/pulls>`_.
 
-Feel free to fork the project and contribute. To install saxshell
-in a development mode, with its sources being directly used by Python
-rather than copied to a package directory, use the following in the root
-directory ::
-
-        pip install -e .
+Feel free to fork the project and contribute. For the current source-checkout
+workflow, create or update the ``saxshell-py312`` conda environment from
+``requirements/saxshell-py312.yml`` and run tools with ``PYTHONPATH=src`` from
+the repository root.
 
 To ensure code quality and to prevent accidental commits into the default branch, please set up the use of our pre-commit
 hooks.

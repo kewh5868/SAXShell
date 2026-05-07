@@ -1,8 +1,7 @@
 # Cluster Dynamics ML
 
 `clusterdynamicsml` is the predictive companion to `clusterdynamics`. It can be
-launched directly from the `clusterdynamicsml` application entry point or from
-the main SAXSShell UI. It
+launched directly from the source checkout or from the main SAXSShell UI. It
 combines:
 
 - time-binned cluster dynamics from extracted XYZ or PDB frame folders

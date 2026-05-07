@@ -5,10 +5,20 @@ estimating pair-resolved thermal-displacement coefficients from sorted PDB
 cluster folders. It is designed to stay project-aware so the results can be
 saved, reopened, and reused by later SAXSShell workflows.
 
+!!! warning "Current testing status"
+The linked **Compute Debye-Waller Factors (beta)** workflow is currently
+in testing and has a known bug. Treat the tool and its saved outputs as
+provisional until they have been manually checked for your project.
+
+!!! info "Image placeholder"
+Add a screenshot of the Debye-Waller Analysis window showing the cluster
+selector, results tables, and run log that users should verify during a
+test run.
+
 ## Launching the application
 
 Open the tool from the main SAXS UI through
-`Tools > Structure Analysis > Open Debye-Waller Analysis`.
+`Tools > (beta) > Open Debye-Waller Analysis`.
 
 If the tool is launched from an active project, it uses that project to:
 

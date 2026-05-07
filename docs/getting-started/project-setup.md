@@ -5,6 +5,15 @@ distribution. This is the point where you define the Project Setup snapshot,
 optionally compute Debye-Waller factors, and decide how SAXS components should
 be built for the active modeling branch.
 
+In plain language, this is where you tell SAXSShell what experimental SAXS data
+you want to match, which simulation-derived cluster set should be compared
+against that data, and which modeling branch should be saved for later fitting.
+
+!!! info "Image placeholder"
+Add a screenshot of the full **Project Setup** tab with a loaded project,
+showing the project path, input selectors, computed-distribution controls,
+and preview panels.
+
 ## What lives here
 
 The current UI code shows Project Setup as the first tab in the SAXS
@@ -16,25 +25,41 @@ application. This is where you typically:
 - choose a model template
 - set the q-range, grid behavior, recognized elements, and excluded elements
 - create or load computed distributions
-- optionally compute project-backed Debye-Waller factors
+- optionally compute project-backed representative structures or
+  Debye-Waller factors
 - build SAXS components with the selected component-build mode
 - preview component traces and prior histograms before moving to Prefit
 
 ## Typical setup order
 
-1. Open the SAXS application with `saxshell saxs ui` or
-   `PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs ui`.
-2. Create a new project or load an existing project directory.
-3. Select the experimental dataset and the cluster folder you want to model.
-4. Choose the template, q-range, grid mode, and excluded elements.
-5. Pick the **Component build mode** for the current modeling branch.
-6. Click **Create Computed Distribution**.
-7. Optionally click **Compute Debye-Waller Factors** if the active clusters are
-   PDB files and you want saved disorder terms for later workflows.
-8. Click **Build SAXS Components**.
-9. Review the component preview, cluster table, and prior histogram preview.
-10. Move to **SAXS Prefit** once the active distribution has the component
+1. Process the MD trajectory first: inspect it, export frames, optionally
+   convert XYZ frames to PDB, and extract the cluster folder you want to model.
+2. Create a dedicated project folder for this SAXSShell session.
+3. Open the SAXS application from the repository root:
+   `PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs`.
+4. Create a new project or load the project directory you prepared.
+5. Select the experimental dataset and the cluster folder you want to model.
+6. Choose the template, q-range, grid mode, and excluded elements.
+7. Pick the **Component build mode** for the current modeling branch.
+8. Click **Create Computed Distribution**.
+9. Optionally compute representative structures from the full UI or the beta
+   CLI setup if later workflows should use representative files instead of
+   average cluster folders.
+10. Optionally click **Compute Debye-Waller Factors (beta)** if the active
+    clusters are PDB files and you want saved disorder terms for later
+    workflows.
+11. Click **Build SAXS Components**.
+12. Review the component preview, cluster table, and prior histogram preview.
+13. Move to **SAXS Prefit** once the active distribution has the component
     traces you want to fit.
+
+!!! info "Image placeholder"
+Add a screenshot focused on the project and input-selection controls used
+in steps 2 through 4.
+
+!!! info "Image placeholder"
+Add a screenshot focused on the computed-distribution and component-build
+controls used in steps 5 through 8.
 
 ## Computed distributions
 
@@ -62,23 +87,44 @@ into the saved distribution identity.
 
 Because the component build mode is part of that identity, the same project can
 hold multiple otherwise-similar distributions at once, for example one built
-with `No Contrast (Debye)` and one built with
-`Born Approximation (Average)`.
+with `No Contrast (Debye)`, one built with
+`1D Born Approximation (Average)`, and one built with
+`3D FFT Born Approximation`.
 
 ## Component build modes
 
 The **Component build mode** dropdown controls what happens when you click
 **Build SAXS Components**.
 
-| Mode                             | What happens                                                                                                                                                                                                                                                                                                   |
-| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **No Contrast (Debye)**          | The main SAXS UI runs the direct Debye component builder and saves the component traces into the active computed distribution.                                                                                                                                                                                 |
-| **Contrast (Debye)**             | SAXSShell opens the linked **SAXS Contrast Mode** workflow so you can analyze representative structures, compute electron-density terms, and build contrast-aware Debye traces for that computed distribution.                                                                                                 |
-| **Born Approximation (Average)** | SAXSShell opens the linked **Electron Density Mapping** workflow in computed-distribution mode so you can compute per-stoichiometry electron-density profiles, apply optional solvent subtraction, evaluate Fourier transforms, and then push the resulting Born-approximation components back into the model. |
+| Mode                                | What happens                                                                                                                                                                                                                                                                                                              |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **No Contrast (Debye)**             | The main SAXS UI runs the direct Debye component builder and saves the component traces into the active computed distribution.                                                                                                                                                                                            |
+| **Contrast (Debye)**                | SAXSShell opens the linked **SAXS Contrast Mode** workflow so you can analyze representative structures, compute electron-density terms, and build contrast-aware Debye traces for that computed distribution.                                                                                                            |
+| **1D Born Approximation (Average)** | SAXSShell opens the linked legacy radial-density workflow in computed-distribution mode so you can compute per-stoichiometry electron-density profiles, apply optional solvent subtraction, evaluate spherical Fourier transforms, and then push the resulting Born-approximation components back into the model.         |
+| **3D FFT Born Approximation**       | SAXSShell opens the separate Cartesian FFT workflow so you can build a 3D electron-density map, optionally apply a constant solvent-density contrast subtraction in real space, compare the q-shell-averaged FFT result against 1D Born and Debye references, and push computed traces back into the linked distribution. |
+
+## Representative structures
+
+Representative structures are optional project-backed files that compatible
+Debye, Born, FFT, and RMCSetup workflows can use instead of average cluster
+folders. Use **Tools > Structure Analysis > Open Representative Structures** for
+the full interactive analysis UI, or use **Tools > (beta) > Open Representative
+CLI Setup (Beta)** to save `representative_structure_cli_run.json` and run the
+same backend from the source checkout:
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.representativefinder run /path/to/project
+```
 
 ## Debye-Waller factors
 
-**Compute Debye-Waller Factors** is an optional linked step in Project Setup.
+**Compute Debye-Waller Factors (beta)** is an optional linked step in Project
+Setup.
+
+!!! warning "Current testing status"
+The linked **Compute Debye-Waller Factors (beta)** workflow is currently in
+testing and has a known bug. Use it cautiously and verify any saved
+Debye-Waller outputs before treating them as reliable downstream inputs.
 
 Important current behavior:
 
@@ -94,6 +140,10 @@ Important current behavior:
 You do not need Debye-Waller factors to create a computed distribution, but the
 tool is intended to be run before component building when you plan to reuse
 those saved disorder terms in later SAXSShell workflows.
+
+!!! info "Image placeholder"
+Add a screenshot of the Debye-Waller readiness indicator and button state
+inside **Project Setup**, including an example tooltip if available.
 
 ## Model and Build section
 
@@ -126,6 +176,8 @@ Examples from the current codebase include:
 
 - Treat **Create Computed Distribution** as the point where you intentionally
   branch the project into a specific build configuration.
+- Finish the basic project definition in **Project Setup** before you spend
+  time interpreting Prefit or DREAM behavior.
 - Finish the Project Setup steps before judging Prefit behavior. Prefit and
   DREAM both depend on the active computed distribution and its saved
   component artifacts.

@@ -1,7 +1,7 @@
 # Blender Structure Renderer
 
 The Blender tool is SAXSShell's publication-rendering application for atomistic
-structures. It is exposed as the standalone `blenderxyz` program and from the
+structures. It is available as the standalone `blenderxyz` tool and from the
 main SAXSShell window through
 `Tools > Visualization > Open Blender XYZ Renderer`.
 
@@ -52,23 +52,6 @@ Blender application manually.
 You do not need to open the main SAXSShell UI first. The Blender renderer can
 be launched directly as its own Qt application.
 
-### Installed package
-
-If SAXSShell is installed into your environment, start the Blender tool with:
-
-```bash
-blenderxyz
-```
-
-You can also prefill a structure file or Blender location:
-
-```bash
-blenderxyz path/to/structure.xyz
-blenderxyz path/to/structure.pdb --blender-executable /Applications/Blender.app
-```
-
-### Source checkout
-
 From the repository root, launch the same standalone application with:
 
 ```bash
@@ -86,7 +69,8 @@ PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 \
 
 ## Typical workflow
 
-1. Launch `blenderxyz`.
+1. Launch the Blender renderer from the source checkout or from the main
+   SAXSShell UI.
 2. Choose an `XYZ` or `PDB` file.
 3. Confirm or browse to the Blender executable if needed.
 4. Review the generated orientation rows and duplicate or add custom rows.

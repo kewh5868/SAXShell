@@ -11,26 +11,30 @@ Assume you have:
 - optionally a CP2K energy file such as `traj.ener`
 - optionally a residue-mapping JSON file for `xyz2pdb`
 
+Also assume you have cloned the repository, created the `saxshell-py312`
+conda environment from `requirements/saxshell-py312.yml`, and are running these
+commands from the repository root.
+
 ## Export frames
 
 ```bash
-mdtrajectory inspect traj.xyz --energy-file traj.ener
-mdtrajectory suggest-cutoff traj.xyz --energy-file traj.ener --temp-target-k 300 --window 3
-mdtrajectory export traj.xyz --energy-file traj.ener --use-suggested-cutoff --temp-target-k 300 --window 3
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory inspect traj.xyz --energy-file traj.ener
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory suggest-cutoff traj.xyz --energy-file traj.ener --temp-target-k 300 --window 3
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory export traj.xyz --energy-file traj.ener --use-suggested-cutoff --temp-target-k 300 --window 3
 ```
 
 ## Convert to residue-aware PDB, if needed
 
 ```bash
-xyz2pdb preview splitxyz --config residue_map.json
-xyz2pdb export splitxyz --config residue_map.json
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.xyz2pdb preview splitxyz --config residue_map.json
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.xyz2pdb export splitxyz --config residue_map.json
 ```
 
 ## Extract clusters
 
 ```bash
-clusters inspect splitxyz
-clusters export splitxyz --use-pbc
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.cluster inspect splitxyz
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.cluster export splitxyz --use-pbc
 ```
 
 The exact node, linker, shell, and cutoff settings depend on the chemistry of
@@ -40,21 +44,20 @@ hard-coding them into ad hoc notebooks.
 ## Analyze distributions
 
 ```bash
-bondanalysis inspect clusters_splitxyz0001
-bondanalysis run clusters_splitxyz0001
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.bondanalysis inspect clusters_splitxyz0001
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.bondanalysis run clusters_splitxyz0001
 ```
 
 ## Build the SAXS project
 
 ```bash
-saxshell saxs ui
+mkdir -p my_saxshell_project
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs
 ```
 
-There is currently no one-shot CLI that replaces the full Project Setup tab, so
-the usual next step is interactive project configuration in the SAXS UI.
-
-From a source checkout, use
-`PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs ui`.
+The usual next step is interactive project configuration in the SAXS UI. Choose
+the project folder you created, then select the experimental SAXS dataset and
+the cluster folder produced above.
 
 ## Prefit and DREAM
 

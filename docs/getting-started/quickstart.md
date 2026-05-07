@@ -1,106 +1,147 @@
 # Quickstart
 
-This quickstart is intentionally practical. It is not the full workflow, but it
-gets you from a trajectory or cluster folder to the relevant applications.
+This quickstart starts where a new SAXSShell project usually starts: with a
+molecular dynamics trajectory that needs to become a reusable SAXS project
+folder.
 
-The command examples below assume the package is installed in your active
-environment. If you are launching directly from a source checkout, use the
-`PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m ...`
-pattern from [Installation](installation.md). For example, `saxshell saxs ui`
-maps to `python -m saxshell.saxs ui`.
+In plain language, the goal is to turn a trajectory into exported frames,
+clusters, and a dedicated SAXSShell project directory, then compare those
+simulation-derived structures against experimental SAXS data.
 
-## 1. Inspect and export frames
+Run commands from the repository root after creating the conda environment in
+[Installation](installation.md).
 
-If you are starting from a trajectory:
+## Prepare the MD trajectory first
 
-```bash
-mdtrajectory inspect traj.xyz --energy-file traj.ener
-mdtrajectory export traj.xyz --energy-file traj.ener --use-suggested-cutoff --temp-target-k 300 --window 3
-```
-
-This gives you a folder of exported frames that can feed the next stage.
-
-## 2. Optional XYZ to PDB conversion
-
-If you need residue-aware PDB frames before clustering:
+Begin by confirming that the trajectory is readable and exporting the frame set
+that downstream tools should use:
 
 ```bash
-xyz2pdb preview splitxyz --config residue_map.json
-xyz2pdb export splitxyz --config residue_map.json
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory inspect traj.xyz --energy-file traj.ener
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory suggest-cutoff traj.xyz --energy-file traj.ener --temp-target-k 300 --window 3
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory export traj.xyz --energy-file traj.ener --use-suggested-cutoff --temp-target-k 300 --window 3
 ```
 
-Skip this stage if plain XYZ cluster extraction is enough for your system.
-
-## 3. Extract clusters
-
-Launch the cluster UI:
+If residue identity matters for your downstream analysis, convert the exported
+XYZ frames before clustering:
 
 ```bash
-clusters
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.xyz2pdb export splitxyz --config residue_map.json
 ```
 
-Or inspect a frame folder from the terminal:
+Extract the cluster folder that the SAXS project will consume:
 
 ```bash
-clusters inspect splitxyz
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.cluster inspect splitxyz
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.cluster export splitxyz
 ```
 
-## 4. Analyze bond and angle distributions
+Create a dedicated project folder for the SAXSShell session. Keep the project
+folder separate from raw trajectory output so saved SAXS state, computed
+distributions, fit results, and optional project-backed calculations stay
+together.
 
 ```bash
-bondanalysis inspect clusters_splitxyz0001
-bondanalysis run clusters_splitxyz0001
+mkdir -p my_saxshell_project
 ```
 
-## 5. Launch the SAXS workflow
+The fastest way to understand the SAXS UI is to treat the first three tabs as a
+sequence:
 
-Open the SAXS UI:
+- **Project Setup** defines the project inputs and creates a saved computed
+  distribution for one modeling branch.
+- **SAXS Prefit** lets you inspect whether the chosen template and built
+  components produce a sensible model preview.
+- **SAXS DREAM Fit** takes the Prefit state and runs Bayesian sampling when you
+  want a posterior distribution instead of just a single editable preview.
+
+## Start in Project Setup
+
+Launch the SAXS UI:
 
 ```bash
-saxshell saxs ui
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs
 ```
 
-Inside the UI, the normal path is:
+### What to do first
 
-1. Create or open a SAXS project.
-2. Point the project at your experimental data and cluster folder.
-3. In **Project Setup**, choose the template, q-range, grid behavior, excluded
-   elements, and SAXS component build mode.
-4. Click **Create Computed Distribution** to save that Project Setup snapshot
-   and generate the matching prior-weight inputs.
-5. Optionally click **Compute Debye-Waller Factors** when the active clusters
-   folder contains PDB files and you want saved disorder terms for later
-   workflows.
-6. Click **Build SAXS Components**.
-7. If the build mode is `No Contrast (Debye)`, the main UI runs the direct
-   component builder.
-8. If the build mode is `Contrast (Debye)`, the linked SAXS Contrast Mode
-   window opens.
-9. If the build mode is `Born Approximation (Average)`, the linked Electron
-   Density Mapping window opens in computed-distribution mode.
-10. Review the model in **SAXS Prefit**.
-11. Run **SAXS DREAM Fit** if you need Bayesian refinement.
+1. Create a new project directory or open an existing SAXS project.
+2. Select the experimental SAXS dataset.
+3. Select the cluster folder you want to model.
+4. Optionally select the solvent SAXS dataset if the workflow needs it.
+5. Choose the template, q-range, grid behavior, and excluded elements.
+6. Choose the **Component build mode** for the modeling branch you want to
+   save.
+7. Click **Create Computed Distribution**.
+8. Click **Build SAXS Components**.
 
-A computed distribution is the saved Project Setup configuration for one SAXS
-modeling branch. In practice it tracks the active template, component-build
-mode, cluster source, q-range and grid choices, excluded elements, and whether
-the run uses observed structures only or observed plus predicted structures.
+!!! info "Image placeholder"
+Add a screenshot of the **Project Setup** tab after a project is loaded,
+with the project path, data selectors, computed-distribution controls, and
+component-build controls visible.
 
-## 6. If you are starting from an existing project
+### About computed distributions
 
-You can open a project directly:
+A computed distribution is SAXSShell's saved record of one Project Setup branch.
+In practice it captures the active template, cluster source, q-range choices,
+component-build mode, and related settings that define how SAXS components
+should be generated for that branch.
+
+### Debye-Waller note
+
+!!! warning "Debye-Waller status"
+**Compute Debye-Waller Factors (beta)** is currently in testing and has a
+known bug. Treat that path as provisional, and verify any saved outputs
+before you rely on them in later workflows.
+
+## Move to SAXS Prefit
+
+After components exist for the active computed distribution, move to
+**SAXS Prefit**.
+
+This is the tab where you answer practical questions such as:
+
+- does the current template behave sensibly against the experimental trace
+- do the built components look reasonable
+- do any geometry-aware templates need cluster geometry metadata before the
+  model can update
+- which parameters should stay fixed, vary, or be expressed through simple
+  relationships
+
+!!! info "Image placeholder"
+Add a screenshot of the **SAXS Prefit** tab showing the main plot, the
+parameter table, and any geometry or solution-estimator controls that
+should be called out to a first-time user.
+
+## Use SAXS DREAM Fit when Prefit is stable
+
+Only move to **SAXS DREAM Fit** after Prefit looks reasonable.
+
+The DREAM tab uses the current Prefit state to prepare a pyDREAM runtime bundle
+and then sample plausible parameter combinations. Use it when you want
+uncertainty estimates, posterior summaries, or a more formal Bayesian fit.
+
+!!! info "Image placeholder"
+Add a screenshot of the **SAXS DREAM Fit** tab showing the parameter map,
+runtime settings, and result-preview area that a new user should inspect
+first.
+
+## Optional upstream analysis
+
+The SAXS tabs assume you already have a usable project input set. Depending on
+your question, you may also want to analyze the prepared clusters before
+building SAXS components:
 
 ```bash
-saxshell saxs ui /path/to/project
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.bondanalysis run clusters_splitxyz0001
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.clusterdynamics splitxyz --project-dir my_saxshell_project
 ```
 
-The same pattern also exists for the `fullrmc` UI:
+## Next steps
 
-```bash
-saxshell fullrmc ui /path/to/project
-```
-
-## Next step
-
-Go to [Project Setup](project-setup.md) for the first SAXS-specific workflow in
-the GUI.
+- Go to [Project Setup](project-setup.md) for a more detailed setup sequence.
+- Use [GUI Overview](../user-guide/gui-overview.md) if you want the main window
+  mapped out before exploring the deeper user-guide pages.
+- Use [SAXS Prefit](../user-guide/saxs-prefit.md) and
+  [pyDREAM Workflow](../user-guide/pydream-workflow.md) once your computed
+  distribution is in place.

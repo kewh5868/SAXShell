@@ -3,13 +3,16 @@
 This walkthrough shows a realistic high-level sequence without assuming a
 specific chemistry beyond "simulation frames eventually become a SAXS project."
 
+Run the commands from the repository root after creating the `saxshell-py312`
+conda environment from `requirements/saxshell-py312.yml`.
+
 ## Step 1: inspect the trajectory
 
 Start with the trajectory tool to confirm that the input is readable and, if
 available, that the accompanying energy file is usable for cutoff analysis.
 
 ```bash
-mdtrajectory inspect traj.xyz --energy-file traj.ener
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory inspect traj.xyz --energy-file traj.ener
 ```
 
 ## Step 2: export usable frames
@@ -17,7 +20,7 @@ mdtrajectory inspect traj.xyz --energy-file traj.ener
 Use either a manual cutoff or the suggested one:
 
 ```bash
-mdtrajectory export traj.xyz --energy-file traj.ener --use-suggested-cutoff --temp-target-k 300 --window 3
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory export traj.xyz --energy-file traj.ener --use-suggested-cutoff --temp-target-k 300 --window 3
 ```
 
 ## Step 3: convert to PDB only if needed
@@ -25,7 +28,7 @@ mdtrajectory export traj.xyz --energy-file traj.ener --use-suggested-cutoff --te
 If downstream logic needs molecule identity, convert the exported XYZ frames:
 
 ```bash
-xyz2pdb export splitxyz --config residue_map.json
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.xyz2pdb export splitxyz --config residue_map.json
 ```
 
 ## Step 4: extract clusters
@@ -33,8 +36,8 @@ xyz2pdb export splitxyz --config residue_map.json
 Use the cluster workflow on the exported frame folder:
 
 ```bash
-clusters preview splitxyz
-clusters export splitxyz
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.cluster preview splitxyz
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.cluster export splitxyz
 ```
 
 ## Step 5: inspect distributions
@@ -43,26 +46,25 @@ Run bond analysis on the resulting cluster folder if you need bond-pair or
 angle summaries:
 
 ```bash
-bondanalysis run clusters_splitxyz0001
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.bondanalysis run clusters_splitxyz0001
 ```
 
 ## Step 6: build a SAXS project
 
-Open the SAXS UI and configure the project:
+Create a dedicated project folder, open the SAXS UI, and configure the project:
 
 ```bash
-saxshell saxs ui
+mkdir -p my_saxshell_project
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs
 ```
 
 In the UI:
 
-1. select the experimental data
-2. select the cluster folder
-3. choose the template
-4. build the project inputs
-
-From a source checkout, use
-`PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs ui`.
+1. choose or create the project folder
+2. select the experimental data
+3. select the cluster folder
+4. choose the template
+5. create the computed distribution and build the project inputs
 
 ## Step 7: refine the Prefit model
 
