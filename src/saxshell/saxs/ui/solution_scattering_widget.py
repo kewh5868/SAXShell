@@ -641,16 +641,24 @@ class SolutionScatteringEstimatorWidget(QWidget):
         self,
         parameter_name: str | None,
         fraction_kind: str | None,
+        fraction_source: str = "saxs_effective",
         solvent_weight_parameter: str | None = None,
     ) -> None:
         messages: list[str] = []
         if parameter_name and fraction_kind:
             label = "solute" if fraction_kind == "solute" else "solvent"
-            messages.append(
-                f"{parameter_name} ({label} SAXS-effective interaction fraction)"
+            source_label = (
+                "physical volume fraction"
+                if str(fraction_source).strip() == "physical"
+                else "SAXS-effective interaction fraction"
             )
+            messages.append(f"{parameter_name} ({label} {source_label})")
         if solvent_weight_parameter:
-            if parameter_name and fraction_kind:
+            if (
+                parameter_name
+                and fraction_kind
+                and str(fraction_source).strip() == "saxs_effective"
+            ):
                 messages.append(
                     f"{solvent_weight_parameter} (attenuation solvent scale)"
                 )

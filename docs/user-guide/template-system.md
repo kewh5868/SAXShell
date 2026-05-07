@@ -361,18 +361,7 @@ anisotropic hard-ellipsoid closure.
 - [Henriques J, Arleth L, Lindorff-Larsen K, Skepö M. _On the Calculation of SAXS Profiles of Folded and Intrinsically Disordered Proteins from Computer Simulations_. Journal of Molecular Biology (2018).](https://pubmed.ncbi.nlm.nih.gov/29548755/)
 - [Edwards-Gayle CJC, Khunti N, Hamley IW, Inoue K, Cowieson N, Rambo RP. _Design of a multipurpose sample cell holder for the Diamond Light Source high-throughput SAXS beamline B21_. Journal of Synchrotron Radiation (2021).](https://pmc.ncbi.nlm.nih.gov/articles/PMC7842227/)
 
-## CLI support
-
-The SAXS CLI includes template management commands through the installed
-umbrella command:
-
-```bash
-saxshell saxs templates
-saxshell saxs templates validate path/to/template.py
-saxshell saxs templates install path/to/template.py
-```
-
-From a source checkout, use the module directly:
+## Template management from source
 
 ```bash
 PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs templates

@@ -6,10 +6,17 @@ from pathlib import Path
 COMPONENT_BUILD_MODE_NO_CONTRAST = "no_contrast"
 COMPONENT_BUILD_MODE_CONTRAST = "contrast"
 COMPONENT_BUILD_MODE_BORN_APPROXIMATION = "born_approximation"
+COMPONENT_BUILD_MODE_BORN_APPROXIMATION_1D = (
+    COMPONENT_BUILD_MODE_BORN_APPROXIMATION
+)
+COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT = "born_approximation_3d_fft"
 _COMPONENT_BUILD_MODE_LABELS = {
     COMPONENT_BUILD_MODE_NO_CONTRAST: "No Contrast (Debye)",
     COMPONENT_BUILD_MODE_CONTRAST: "Contrast (Debye)",
-    COMPONENT_BUILD_MODE_BORN_APPROXIMATION: "Born Approximation (Average)",
+    COMPONENT_BUILD_MODE_BORN_APPROXIMATION: "1D Born Approximation (Average)",
+    COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT: (
+        "3D FFT Born Approximation"
+    ),
 }
 
 
@@ -25,9 +32,21 @@ def normalize_component_build_mode(value: object) -> str:
         "born_approx",
         "born_approximation_mode",
         "born_approximation_average",
+        "born_approximation_1d",
+        "born_approximation_average_1d",
+        "1d_born_approximation",
         "average",
     }:
         return COMPONENT_BUILD_MODE_BORN_APPROXIMATION
+    if normalized in {
+        COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT,
+        "born_approximation_fft",
+        "born_approximation_3d",
+        "born_fft",
+        "3d_fft_born",
+        "3d_fft_born_approximation",
+    }:
+        return COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
     return COMPONENT_BUILD_MODE_NO_CONTRAST
 
 

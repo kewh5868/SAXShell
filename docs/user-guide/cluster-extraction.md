@@ -16,6 +16,9 @@ In this repository, that bridge spans more than one tool.
    pairwise disorder coefficients from sorted PDB cluster folders.
 7. Feed the resulting cluster folder into the SAXS project.
 
+Run the examples from the repository root after creating the
+`saxshell-py312` conda environment.
+
 ## `mdtrajectory`
 
 This tool is responsible for:
@@ -30,9 +33,9 @@ This tool is responsible for:
 Example:
 
 ```bash
-mdtrajectory inspect traj.xyz --energy-file traj.ener
-mdtrajectory suggest-cutoff traj.xyz --energy-file traj.ener --temp-target-k 300 --window 3
-mdtrajectory export traj.xyz --energy-file traj.ener --use-suggested-cutoff --temp-target-k 300 --window 3
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory inspect traj.xyz --energy-file traj.ener
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory suggest-cutoff traj.xyz --energy-file traj.ener --temp-target-k 300 --window 3
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory export traj.xyz --energy-file traj.ener --use-suggested-cutoff --temp-target-k 300 --window 3
 ```
 
 When a cutoff is applied, the default folder name now uses the form

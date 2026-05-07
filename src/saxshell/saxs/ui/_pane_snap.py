@@ -28,7 +28,7 @@ class PaneSnapFilter(QObject):
 
     def set_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
-        if enabled == self._enabled:
+        if enabled == getattr(self, "_enabled", False):
             return
         self._enabled = enabled
         app = QApplication.instance()
@@ -40,23 +40,29 @@ class PaneSnapFilter(QObject):
             app.removeEventFilter(self)
 
     def is_enabled(self) -> bool:
-        return self._enabled
+        return getattr(self, "_enabled", False)
 
     # ------------------------------------------------------------------
     # QObject interface
     # ------------------------------------------------------------------
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        splitter = getattr(self, "_splitter", None)
         if (
-            not self._enabled
-            or self._splitter.orientation() != Qt.Orientation.Horizontal
-            or not self._splitter.isVisible()
+            not getattr(self, "_enabled", False)
+            or splitter is None
+            or splitter.orientation() != Qt.Orientation.Horizontal
+            or not splitter.isVisible()
         ):
             return False
+        left_widget = getattr(self, "_left_widget", None)
+        right_widget = getattr(self, "_right_widget", None)
+        if left_widget is None or right_widget is None:
+            return False
         if event.type() == QEvent.Type.MouseButtonPress:
-            if self._is_descendant(watched, self._left_widget):
+            if self._is_descendant(watched, left_widget):
                 self._snap_to(0)
-            elif self._is_descendant(watched, self._right_widget):
+            elif self._is_descendant(watched, right_widget):
                 self._snap_to(1)
         return False  # never consume events
 

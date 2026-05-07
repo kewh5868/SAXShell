@@ -1,7 +1,8 @@
 site_name: SAXSShell
 site_description: >-
-  Workflow-oriented documentation for SAXSShell, from trajectory processing and
-  cluster extraction to SAXS project setup, prefit modeling, and pyDREAM runs.
+  Workflow-oriented documentation for SAXSShell, focused on comparing
+  molecular-dynamics-derived solvation structures against small-angle X-ray
+  scattering data.
 site_url: https://kewh5868.github.io/SAXSShell/
 repo_url: https://github.com/kewh5868/SAXSShell
 repo_name: kewh5868/SAXSShell
@@ -36,6 +37,9 @@ theme:
 
 plugins:
   - search
+
+hooks:
+  - docs/hooks.py
 
 markdown_extensions:
   - admonition
@@ -82,19 +86,23 @@ nav:
               - XYZ to PDB Conversion: user-guide/xyz2pdb-conversion.md
           - Structure Analysis:
               - Bond Analysis: user-guide/bond-analysis.md
-              - Debye-Waller Analysis: user-guide/debye-waller-analysis.md
           - Cluster Dynamics:
               - Cluster Dynamics: user-guide/cluster-dynamics.md
               - Cluster Dynamics ML: user-guide/cluster-dynamics-ml.md
           - PDF:
               - PDF Calculation: user-guide/pdf-calculation.md
+              - fullrmc Packmol Docker Link: user-guide/fullrmc-packmol-docker.md
           - Visualization:
               - Blender Structure Renderer: user-guide/blender-structure-renderer.md
           - SAXS Calculation Preview:
               - SAXS Contrast Mode: user-guide/saxs-contrast-mode.md
-              - Electron Density Mapping: user-guide/electron-density-mapping.md
+              - 1D Born Approximation (Average): user-guide/electron-density-mapping.md
+              - 3D FFT Born Approximation: user-guide/fft-born-approximation.md
           - X-ray Toolkit:
               - X-ray Toolkit: user-guide/xray-toolkit.md
+          - (beta):
+              - Representative Structure CLI: user-guide/representative-structure-cli.md
+              - Debye-Waller Analysis: user-guide/debye-waller-analysis.md
   - Tutorials:
       - Example Workflow: tutorials/example-workflow.md
       - MD to SAXS Pipeline: tutorials/md-to-saxs-pipeline.md

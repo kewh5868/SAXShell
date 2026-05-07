@@ -2,17 +2,23 @@
 
 ## Local setup
 
-Create a Python 3.12 environment and install the package in editable mode:
+Create or update the Python 3.12 conda environment from the repository root:
 
 ```bash
-python -m pip install -e .
+conda env create -f requirements/saxshell-py312.yml
+```
+
+If the environment already exists:
+
+```bash
+conda env update -n saxshell-py312 -f requirements/saxshell-py312.yml --prune
 ```
 
 Install pre-commit and enable the hooks:
 
 ```bash
-python -m pip install pre-commit
-pre-commit install
+conda run --no-capture-output -n saxshell-py312 python -m pip install pre-commit
+conda run --no-capture-output -n saxshell-py312 pre-commit install
 ```
 
 ## Running tests
@@ -20,7 +26,7 @@ pre-commit install
 Run the full suite:
 
 ```bash
-pytest -q
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 pytest -q
 ```
 
 For focused work, prefer the smallest test slice that exercises your change.
@@ -30,14 +36,14 @@ For focused work, prefer the smallest test slice that exercises your change.
 Install the pinned docs dependencies and start the local server:
 
 ```bash
-python -m pip install -r requirements/docs.txt
-mkdocs serve
+conda run --no-capture-output -n saxshell-py312 python -m pip install -r requirements/docs.txt
+conda run --no-capture-output -n saxshell-py312 mkdocs serve
 ```
 
 Build the site locally the same way CI does:
 
 ```bash
-mkdocs build --strict
+conda run --no-capture-output -n saxshell-py312 mkdocs build --strict
 ```
 
 ## Formatting and linting
@@ -54,7 +60,7 @@ The repository uses pre-commit hooks for:
 Run them manually if needed:
 
 ```bash
-pre-commit run --all-files
+conda run --no-capture-output -n saxshell-py312 pre-commit run --all-files
 ```
 
 ## Branch and PR expectations

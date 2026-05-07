@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from saxshell.plotting import Q_A_INVERSE_LABEL
 from saxshell.saxs.electron_density_mapping.workflow import (
     ElectronDensityFourierTransformPreview,
     ElectronDensityMeshGeometry,
@@ -827,7 +828,7 @@ class ElectronDensityScatteringPlot(QWidget):
             axis.set_xscale("log")
         if log_intensity_axis:
             axis.set_yscale("log")
-        axis.set_xlabel("q (Å⁻¹)", labelpad=10.0)
+        axis.set_xlabel(Q_A_INVERSE_LABEL, labelpad=10.0)
         axis.set_ylabel("Intensity (arb. units)")
         axis.set_title("q-Space Scattering Profile")
         axis.grid(True, which="both", alpha=0.28)

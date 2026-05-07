@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,8 +14,22 @@ from saxshell.clusterdynamicsml.workflow import (
     ClusterDynamicsMLTrainingObservation,
     PredictedClusterCandidate,
 )
+from saxshell.fullrmc.project_model import build_rmcsetup_paths
+from saxshell.fullrmc.representatives import (
+    DistributionSelectionMetadata,
+    RepresentativeSelectionEntry,
+    RepresentativeSelectionMetadata,
+    RepresentativeSelectionSettings,
+    save_representative_selection_metadata,
+)
 from saxshell.fullrmc.solution_properties import SolutionPropertiesSettings
-from saxshell.saxs._model_templates import load_template_module
+from saxshell.saxs._model_templates import (
+    load_template_module,
+    load_template_spec,
+)
+from saxshell.saxs.contrast.settings import (
+    COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT,
+)
 from saxshell.saxs.debye.profiles import AveragedComponent, ClusterBin
 from saxshell.saxs.prefit import (
     SAXSPrefitWorkflow,
@@ -24,6 +39,7 @@ from saxshell.saxs.prefit import (
 )
 from saxshell.saxs.prefit.workflow import constrained_prefit_residuals
 from saxshell.saxs.project_manager import (
+    DreamBestFitSelection,
     SAXSProjectManager,
     build_project_paths,
     project_artifact_paths,
@@ -40,6 +56,9 @@ from saxshell.saxs.solution_scattering_estimator import (
 
 POLY_LMA_HS_TEMPLATE = "template_pydream_poly_lma_hs"
 POLY_LMA_HS_MIX_TEMPLATE = "template_pydream_poly_lma_hs_mix_approx"
+SCALED_SOLVENT_MONOSQ_TEMPLATE = (
+    "template_pydream_monosq_normalized_scaled_solvent"
+)
 
 
 def _write_component_file(path, q_values, intensities):
@@ -1015,6 +1034,219 @@ def test_project_manager_saves_distribution_artifacts_and_metadata(
     assert records[0].prior_artifacts_ready
 
 
+def test_prefit_loads_pushed_3d_fft_components_after_source_toggle_change(
+    tmp_path,
+):
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.component_build_mode = (
+        COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
+    )
+    settings.use_representative_structures = True
+    manager.save_project(settings)
+
+    artifact_paths = project_artifact_paths(
+        settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+    manager.ensure_artifact_dirs(artifact_paths)
+    artifact_paths.component_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_paths.component_dir / "A_no_motif.txt").write_text(
+        (paths.scattering_components_dir / "A_no_motif.txt").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    artifact_paths.component_map_file.write_text(
+        (paths.project_dir / "md_saxs_map.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    artifact_paths.prior_weights_file.write_text(
+        (paths.project_dir / "md_prior_weights.json").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    manager._write_distribution_metadata(
+        settings,
+        artifact_paths=artifact_paths,
+        built_component_source_mode="average",
+    )
+
+    workflow = SAXSPrefitWorkflow(project_dir)
+
+    assert manager.component_artifacts_match_settings(
+        settings,
+        artifact_paths=artifact_paths,
+    )
+    assert [
+        (component.structure, component.motif)
+        for component in workflow.components
+    ] == [("A", "no_motif")]
+    assert np.allclose(
+        workflow.evaluate().q_values,
+        np.linspace(0.05, 0.3, 8),
+    )
+
+
+def test_prefit_snaps_legacy_3d_fft_endpoint_to_component_q_grid(tmp_path):
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    q_values = 0.0101 + 0.01 * np.arange(119, dtype=float)
+    component = np.linspace(10.0, 17.0, q_values.size)
+    _write_component_file(
+        paths.scattering_components_dir / "A_no_motif.txt",
+        q_values,
+        component,
+    )
+
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.component_build_mode = (
+        COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
+    )
+    settings.model_only_mode = True
+    settings.q_min = 0.0101
+    settings.q_max = 1.1976
+    manager.save_project(settings)
+
+    workflow = SAXSPrefitWorkflow(project_dir)
+    evaluation = workflow.evaluate()
+
+    assert np.allclose(evaluation.q_values, q_values)
+
+
+def test_prefit_cluster_geometry_uses_representative_source_for_3d_fft_components(
+    tmp_path,
+):
+    project_dir, paths, _effective_radius = _build_poly_lma_geometry_project(
+        tmp_path
+    )
+    rmcsetup_paths = build_rmcsetup_paths(project_dir)
+    representative_dir = rmcsetup_paths.representative_partial_solvent_dir
+    representative_dir.mkdir(parents=True, exist_ok=True)
+    representative_path = representative_dir / "selected_rep.xyz"
+    representative_path.write_text(
+        "\n".join(
+            [
+                "4",
+                "selected representative",
+                "Pb 0.0 0.0 0.0",
+                "I 2.8 0.0 0.0",
+                "I 0.0 2.8 0.0",
+                "I 0.0 0.0 2.8",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    selection = DreamBestFitSelection(
+        run_name="Representative Structure Finder",
+        run_relative_path="rmcsetup/representative_structures",
+        label="Representative Structure Finder",
+        selection_source="representativefinder",
+        selected_at="2026-05-06T12:00:00",
+    )
+    save_representative_selection_metadata(
+        rmcsetup_paths.representative_selection_path,
+        RepresentativeSelectionMetadata(
+            selection_mode="representative_finder",
+            selection=selection,
+            distribution_selection=DistributionSelectionMetadata(
+                selection_mode="representative_finder",
+                selection=selection,
+                run_dir="rmcsetup/representative_structures",
+                updated_at="2026-05-06T12:00:00",
+                entries=[],
+            ),
+            settings=RepresentativeSelectionSettings(),
+            updated_at="2026-05-06T12:00:00",
+            representative_entries=[
+                RepresentativeSelectionEntry(
+                    structure="A",
+                    motif="no_motif",
+                    param="w0",
+                    selected_weight=1.0,
+                    cluster_count=2,
+                    source_dir=str(representative_dir),
+                    source_file=str(representative_path),
+                    source_file_name=representative_path.name,
+                    atom_count=4,
+                    element_counts={"Pb": 1, "I": 3},
+                    source_solvent_mode="partialsolv",
+                )
+            ],
+            missing_bins=[],
+            invalid_bins=[],
+        ),
+    )
+
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.component_build_mode = (
+        COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
+    )
+    settings.use_representative_structures = True
+    settings.clusters_dir = None
+    manager.save_project(settings)
+
+    artifact_paths = project_artifact_paths(
+        settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+    manager.ensure_artifact_dirs(artifact_paths)
+    artifact_paths.component_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_paths.component_dir / "A_no_motif.txt").write_text(
+        (paths.scattering_components_dir / "A_no_motif.txt").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    artifact_paths.component_map_file.write_text(
+        json.dumps({"saxs_map": {"A": {"no_motif": "A_no_motif.txt"}}}) + "\n",
+        encoding="utf-8",
+    )
+    artifact_paths.prior_weights_file.write_text(
+        json.dumps(
+            {
+                "origin": "representative_structures",
+                "total_files": 2,
+                "structures": {
+                    "A": {
+                        "no_motif": {
+                            "count": 2,
+                            "weight": 1.0,
+                            "representative": representative_path.name,
+                            "profile_file": "A_no_motif.txt",
+                            "source_kind": "representative_structure",
+                            "source_dir": str(representative_dir),
+                            "source_file": str(representative_path),
+                            "source_file_name": representative_path.name,
+                        }
+                    }
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manager._write_distribution_metadata(
+        settings,
+        artifact_paths=artifact_paths,
+        built_component_source_mode="representative",
+    )
+
+    workflow = SAXSPrefitWorkflow(project_dir)
+    table = workflow.compute_cluster_geometry_table()
+
+    assert [row.cluster_id for row in table.rows] == ["A"]
+    assert Path(table.rows[0].cluster_path) == representative_dir.resolve()
+    assert table.rows[0].mapped_parameter == "w0"
+
+
 def test_prefit_cluster_geometry_includes_predicted_structures_when_enabled(
     tmp_path,
     monkeypatch,
@@ -1399,6 +1631,170 @@ def test_saxs_prefit_workflow_recommends_scale_with_weighted_solvent_trace(
     assert recommendation.points_used == 8
 
 
+def test_scaled_solvent_monosq_template_scales_solvent_with_global_scale():
+    template_module = load_template_module(SCALED_SOLVENT_MONOSQ_TEMPLATE)
+    q_values = np.linspace(0.05, 0.3, 8)
+    component = np.linspace(10.0, 17.0, 8)
+    solvent = np.linspace(1.5, 2.2, 8)
+
+    result = template_module.lmfit_model_profile(
+        q_values,
+        solvent,
+        [component],
+        w0=0.6,
+        solv_w=0.5,
+        offset=0.05,
+        eff_r=9.0,
+        vol_frac=0.0,
+        scale=2e-3,
+    )
+
+    assert np.allclose(
+        result,
+        2e-3 * ((0.6 * component) + (0.5 * solvent)) + 0.05,
+    )
+
+
+def test_scaled_solvent_monosq_prefit_evaluates_scaled_solvent_contribution(
+    tmp_path,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    solvent_q = np.linspace(0.05, 0.3, 8)
+    solvent_intensity = np.linspace(1.5, 2.2, 8)
+    solvent_path = tmp_path / "scaled_weighted_solvent_trace.dat"
+    np.savetxt(solvent_path, np.column_stack([solvent_q, solvent_intensity]))
+
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.selected_model_template = SCALED_SOLVENT_MONOSQ_TEMPLATE
+    settings.solvent_data_path = str(solvent_path)
+    settings.copied_solvent_data_file = None
+    manager.save_project(settings)
+
+    workflow = SAXSPrefitWorkflow(project_dir)
+    entries = workflow.load_parameter_entries()
+    for entry in entries:
+        if entry.name == "solv_w":
+            entry.value = 0.5
+        if entry.name == "scale":
+            entry.value = 2e-3
+
+    evaluation = workflow.evaluate(entries)
+
+    assert evaluation.solvent_intensities is not None
+    assert evaluation.solvent_contribution is not None
+    assert np.allclose(evaluation.solvent_intensities, solvent_intensity)
+    assert np.allclose(
+        evaluation.solvent_contribution,
+        solvent_intensity * 0.5 * 2e-3,
+    )
+
+
+def test_scaled_solvent_monosq_recommends_scale_with_scaled_solvent_branch(
+    tmp_path,
+):
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    solvent_q = np.linspace(0.05, 0.3, 8)
+    solvent_intensity = np.linspace(1.5, 2.2, 8)
+    solvent_path = tmp_path / "scaled_autoscale_solvent_trace.dat"
+    np.savetxt(solvent_path, np.column_stack([solvent_q, solvent_intensity]))
+
+    template_module = load_template_module(SCALED_SOLVENT_MONOSQ_TEMPLATE)
+    q_values = np.linspace(0.05, 0.3, 8)
+    component = np.linspace(10.0, 17.0, 8)
+    experimental = template_module.lmfit_model_profile(
+        q_values,
+        solvent_intensity,
+        [component],
+        w0=0.6,
+        solv_w=0.5,
+        offset=0.05,
+        eff_r=9.0,
+        vol_frac=0.0,
+        scale=5e-4,
+    )
+    experimental_path = paths.experimental_data_dir / "scaled_exp_demo.txt"
+    np.savetxt(experimental_path, np.column_stack([q_values, experimental]))
+
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.selected_model_template = SCALED_SOLVENT_MONOSQ_TEMPLATE
+    settings.experimental_data_path = str(experimental_path)
+    settings.copied_experimental_data_file = str(experimental_path)
+    settings.solvent_data_path = str(solvent_path)
+    settings.copied_solvent_data_file = None
+    manager.save_project(settings)
+
+    workflow = SAXSPrefitWorkflow(project_dir)
+    entries = workflow.load_parameter_entries()
+    for entry in entries:
+        if entry.name == "solv_w":
+            entry.value = 0.5
+        if entry.name == "scale":
+            entry.value = 1e-6
+            entry.minimum = 1e-7
+            entry.maximum = 1e-5
+
+    recommendation = workflow.recommend_scale_settings(entries)
+
+    assert recommendation.current_scale == pytest.approx(1e-6)
+    assert recommendation.recommended_scale == pytest.approx(5e-4)
+    assert recommendation.recommended_minimum == pytest.approx(5e-5)
+    assert recommendation.recommended_maximum == pytest.approx(5e-3)
+    assert recommendation.current_offset == pytest.approx(0.0)
+    assert recommendation.recommended_offset == pytest.approx(0.05)
+    assert recommendation.points_used == 8
+
+
+def test_scaled_solvent_monosq_recommendation_uses_adaptive_bounds(tmp_path):
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    q_values = np.linspace(0.05, 0.3, 8)
+    component = np.linspace(10.0, 17.0, 8)
+    experimental_scale = 2e-7
+    experimental_offset = 0.01
+    template_module = load_template_module(SCALED_SOLVENT_MONOSQ_TEMPLATE)
+    experimental = template_module.lmfit_model_profile(
+        q_values,
+        np.zeros_like(q_values),
+        [component],
+        w0=0.6,
+        solv_w=0.0,
+        offset=experimental_offset,
+        eff_r=3.0,
+        vol_frac=0.0,
+        scale=experimental_scale,
+    )
+    experimental_path = paths.experimental_data_dir / "adaptive_exp_demo.txt"
+    np.savetxt(experimental_path, np.column_stack([q_values, experimental]))
+
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.selected_model_template = SCALED_SOLVENT_MONOSQ_TEMPLATE
+    settings.experimental_data_path = str(experimental_path)
+    settings.copied_experimental_data_file = str(experimental_path)
+    manager.save_project(settings)
+
+    workflow = SAXSPrefitWorkflow(project_dir)
+    recommendation = workflow.recommend_scale_settings(
+        workflow.load_parameter_entries()
+    )
+
+    assert recommendation.recommended_scale == pytest.approx(
+        experimental_scale
+    )
+    assert recommendation.recommended_minimum == pytest.approx(
+        experimental_scale / 10.0
+    )
+    assert recommendation.recommended_maximum == pytest.approx(
+        experimental_scale * 10.0
+    )
+    assert recommendation.recommended_offset == pytest.approx(
+        experimental_offset
+    )
+    assert recommendation.recommended_offset_minimum == pytest.approx(0.009)
+    assert recommendation.recommended_offset_maximum == pytest.approx(0.011)
+
+
 def test_solute_volume_fraction_estimate_uses_component_densities():
     estimate = calculate_solute_volume_fraction_estimate(
         SoluteVolumeFractionSettings(
@@ -1498,6 +1894,50 @@ def test_monosq_prefit_workflow_exposes_solvent_weight_target(tmp_path):
     workflow = SAXSPrefitWorkflow(project_dir)
 
     assert workflow.solvent_weight_estimator_target() == "solv_w"
+
+
+def test_scaled_solvent_monosq_prefit_exposes_physical_vol_frac_target(
+    tmp_path,
+):
+    spec = load_template_spec(SCALED_SOLVENT_MONOSQ_TEMPLATE)
+    assert (
+        spec.solution_scattering_support.volume_fraction_parameter
+        == "vol_frac"
+    )
+    assert spec.solution_scattering_support.volume_fraction_kind == "solute"
+    assert (
+        spec.solution_scattering_support.volume_fraction_source == "physical"
+    )
+    assert (
+        spec.solution_scattering_support.solvent_contribution_scale_mode
+        == "global_scale"
+    )
+    assert spec.prefit_support.auto_apply_autoscale_on_load
+    assert spec.prefit_support.autoscale_bounds_mode == "adaptive"
+    eff_r_entry = next(
+        parameter for parameter in spec.parameters if parameter.name == "eff_r"
+    )
+    assert eff_r_entry.initial_value == pytest.approx(3.0)
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.selected_model_template = SCALED_SOLVENT_MONOSQ_TEMPLATE
+    manager.save_project(settings)
+    workflow = SAXSPrefitWorkflow(project_dir)
+
+    assert workflow.supports_volume_fraction_estimator()
+    assert workflow.volume_fraction_estimator_target() == (
+        "vol_frac",
+        "solute",
+    )
+    assert workflow.solution_scattering_volume_fraction_target() == (
+        "vol_frac",
+        "solute",
+        "physical",
+    )
+    assert workflow.solvent_weight_estimator_target() == "solv_w"
+    assert workflow.solvent_contribution_is_scaled_by_global_scale()
 
 
 def test_poly_lma_prefit_workflow_exposes_solvent_weight_target(tmp_path):

@@ -7,23 +7,40 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QApplication,
+    QDoubleSpinBox,
+    QMessageBox,
+    QWidget,
+)
 
 import saxshell.fullrmc.cli as fullrmc_cli
+import saxshell.fullrmc.solvent_shell_builder as solvent_shell_builder_module
+import saxshell.fullrmc.ui.main_window as fullrmc_ui_module
 from saxshell.fullrmc import (
+    DEFAULT_REFERENCE_MATCH_TOLERANCE_A,
     ConstraintGenerationSettings,
+    PackmolDockerContainerRecord,
+    PackmolDockerDirectoryEntry,
+    PackmolDockerLink,
+    PackmolDockerSyncResult,
+    PackmolDockerValidationResult,
     PackmolPlanningSettings,
     PackmolSetupSettings,
     RepresentativeSelectionSettings,
     SolutionPropertiesSettings,
     SolventHandlingSettings,
+    analyze_solvent_shell,
     build_constraint_generation,
     build_distribution_selection,
     build_packmol_plan,
     build_packmol_setup,
     build_representative_preview_clusters,
     build_representative_solvent_outputs,
+    build_solvent_shell_output,
     calculate_solution_properties,
+    container_project_root_is_valid,
     load_constraint_generation_metadata,
     load_packmol_planning_metadata,
     load_packmol_setup_metadata,
@@ -32,21 +49,62 @@ from saxshell.fullrmc import (
     load_solvent_handling_metadata,
     parse_angle_triplet_text,
     parse_bond_pair_text,
+    save_packmol_docker_link_metadata,
+    save_representative_selection_metadata,
     save_solution_properties_metadata,
     select_distribution_representatives,
     select_first_file_representatives,
 )
 from saxshell.fullrmc.cli import main as fullrmc_main
 from saxshell.fullrmc.ui.main_window import RMCSetupMainWindow
+from saxshell.fullrmc.ui.solvent_shell_builder_window import (
+    SolventShellBuilderMainWindow,
+)
 from saxshell.saxs.dream import DreamRunSettings
 from saxshell.saxs.project_manager import (
     DreamBestFitSelection,
     SAXSProjectManager,
     build_project_paths,
+    project_artifact_paths,
 )
 from saxshell.saxs.stoichiometry import format_stoich_for_axis
 from saxshell.saxshell import main as saxshell_main
-from saxshell.structure import PDBStructure
+from saxshell.structure import PDBAtom, PDBStructure
+from saxshell.xyz2pdb import create_reference_molecule
+
+
+def _integrated_solvent_handling_settings(
+    *,
+    reference_source: str = "preset",
+    preset_name: str = "dmf",
+    custom_reference_path: str | None = None,
+    director_atom_name: str | None = None,
+    pb_target_coordination: float = 1.0,
+    pb_cutoff_a: float = 2.6,
+    i_cutoff_a: float = 3.0,
+) -> SolventHandlingSettings:
+    return SolventHandlingSettings.from_dict(
+        {
+            "coordinated_solvent_mode": "automatic_detection",
+            "reference_source": reference_source,
+            "preset_name": preset_name,
+            "custom_reference_path": custom_reference_path,
+            "director_atom_name": director_atom_name,
+            "minimum_solvent_atom_separation_a": 1.2,
+            "solute_atom_settings": {
+                "Pb": {
+                    "coordination_center": True,
+                    "target_coordination_number": pb_target_coordination,
+                    "director_distance_cutoff_a": pb_cutoff_a,
+                },
+                "I": {
+                    "coordination_center": False,
+                    "target_coordination_number": 0.0,
+                    "director_distance_cutoff_a": i_cutoff_a,
+                },
+            },
+        }
+    )
 
 
 def _build_sample_saxs_project(tmp_path):
@@ -130,6 +188,294 @@ def _build_sample_saxs_project(tmp_path):
     ]
     manager.save_project(settings)
     return project_dir, paths
+
+
+def _build_sample_distribution_scoped_saxs_project(tmp_path):
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "rmcsetup_distribution_source"
+    settings = manager.create_project(project_dir)
+    paths = build_project_paths(project_dir)
+    clusters_dir = _build_sample_clusters_dir(tmp_path)
+    settings.clusters_dir = str(clusters_dir)
+    settings.cluster_inventory_rows = [
+        {
+            "structure": "PbI2",
+            "motif": "no_motif",
+            "count": 2,
+            "source_dir": str(clusters_dir / "PbI2"),
+        },
+        {
+            "structure": "PbI2O",
+            "motif": "motif_1",
+            "count": 1,
+            "source_dir": str(clusters_dir / "PbI2O" / "motif_1"),
+        },
+    ]
+    artifact_paths = project_artifact_paths(
+        settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+    manager.ensure_project_dirs(paths)
+    manager.ensure_artifact_dirs(artifact_paths)
+
+    run_a = _write_sample_dream_run(
+        artifact_paths.dream_runtime_dir / "dream_run_001",
+        settings=DreamRunSettings(
+            bestfit_method="map",
+            posterior_filter_mode="all_post_burnin",
+            credible_interval_low=10.0,
+            credible_interval_high=90.0,
+            model_name="template_pd_likelihood_monosq_decoupled",
+        ),
+        template_name="template_pd_likelihood_monosq_decoupled",
+    )
+    run_b = _write_sample_dream_run(
+        artifact_paths.dream_runtime_dir / "dream_run_002",
+        settings=DreamRunSettings(
+            bestfit_method="median",
+            posterior_filter_mode="top_percent_logp",
+            posterior_top_percent=7.5,
+            posterior_top_n=200,
+            credible_interval_low=20.0,
+            credible_interval_high=80.0,
+            model_name="template_pd_likelihood_monosq_decoupled",
+        ),
+        template_name="template_pd_likelihood_monosq_decoupled",
+    )
+
+    favorite = DreamBestFitSelection(
+        run_name=run_a.name,
+        run_relative_path=str(run_a.relative_to(project_dir)),
+        bestfit_method="chain_mean",
+        posterior_filter_mode="top_n_logp",
+        posterior_top_percent=10.0,
+        posterior_top_n=42,
+        credible_interval_low=25.0,
+        credible_interval_high=75.0,
+        label="2026-03-23T10:00:00 • dream_run_001 • chain_mean",
+        template_name="template_pd_likelihood_monosq_decoupled",
+        model_name="template_pd_likelihood_monosq_decoupled",
+        selection_source="rmcsetup",
+        selected_at="2026-03-23T10:00:00",
+    )
+    history_entry = DreamBestFitSelection(
+        run_name=run_b.name,
+        run_relative_path=str(run_b.relative_to(project_dir)),
+        bestfit_method="median",
+        posterior_filter_mode="top_percent_logp",
+        posterior_top_percent=7.5,
+        posterior_top_n=200,
+        credible_interval_low=20.0,
+        credible_interval_high=80.0,
+        label="2026-03-22T09:00:00 • dream_run_002 • median",
+        template_name="template_pd_likelihood_monosq_decoupled",
+        model_name="template_pd_likelihood_monosq_decoupled",
+        selection_source="rmcsetup",
+        selected_at="2026-03-22T09:00:00",
+    )
+    settings.dream_favorite_selection = favorite
+    settings.dream_favorite_history = [history_entry]
+    manager.save_project(settings)
+    manager._write_distribution_metadata(
+        settings,
+        artifact_paths=artifact_paths,
+    )
+    return project_dir, paths, artifact_paths
+
+
+def _build_sample_predicted_distribution_scoped_saxs_project(tmp_path):
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "rmcsetup_predicted_distribution_source"
+    settings = manager.create_project(project_dir)
+    paths = build_project_paths(project_dir)
+    clusters_dir = _build_sample_clusters_dir(tmp_path)
+    predicted_dir = tmp_path / "predicted_structures"
+    predicted_dir.mkdir(parents=True, exist_ok=True)
+    predicted_source = predicted_dir / "zn1_rank01.xyz"
+    predicted_source.write_text(
+        "\n".join(
+            [
+                "1",
+                "predicted Zn1 structure",
+                "Zn 0.0 0.0 0.0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    settings.use_predicted_structure_weights = True
+    settings.clusters_dir = str(clusters_dir)
+    # Keep the saved settings stale on purpose so the loader has to prefer
+    # the active predicted-structure artifact inventory on window open.
+    settings.cluster_inventory_rows = [
+        {
+            "structure": "PbI2",
+            "motif": "no_motif",
+            "count": 2,
+            "source_dir": str(clusters_dir / "PbI2"),
+        },
+        {
+            "structure": "PbI2O",
+            "motif": "motif_1",
+            "count": 1,
+            "source_dir": str(clusters_dir / "PbI2O" / "motif_1"),
+        },
+    ]
+    artifact_paths = project_artifact_paths(
+        settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+    manager.ensure_project_dirs(paths)
+    manager.ensure_artifact_dirs(artifact_paths)
+
+    run = _write_sample_dream_run(
+        artifact_paths.dream_runtime_dir / "dream_run_predicted",
+        settings=DreamRunSettings(
+            bestfit_method="map",
+            posterior_filter_mode="all_post_burnin",
+            credible_interval_low=10.0,
+            credible_interval_high=90.0,
+            model_name="template_pd_likelihood_monosq_decoupled",
+        ),
+        template_name="template_pd_likelihood_monosq_decoupled",
+        weight_entries=[
+            {
+                "structure": "PbI2",
+                "motif": "no_motif",
+                "param_type": "Both",
+                "param": "w0",
+                "value": 0.45,
+                "vary": True,
+                "distribution": "lognorm",
+                "dist_params": {
+                    "loc": 0.0,
+                    "scale": 0.45,
+                    "s": 0.3,
+                },
+            },
+            {
+                "structure": "PbI2O",
+                "motif": "motif_1",
+                "param_type": "Both",
+                "param": "w1",
+                "value": 0.25,
+                "vary": True,
+                "distribution": "lognorm",
+                "dist_params": {
+                    "loc": 0.0,
+                    "scale": 0.25,
+                    "s": 0.3,
+                },
+            },
+            {
+                "structure": "Zn1",
+                "motif": "predicted_rank01",
+                "param_type": "Both",
+                "param": "w2",
+                "value": 0.30,
+                "vary": True,
+                "distribution": "lognorm",
+                "dist_params": {
+                    "loc": 0.0,
+                    "scale": 0.30,
+                    "s": 0.3,
+                },
+            },
+        ],
+        sampled_params=np.asarray(
+            [[[0.45, 0.25, 0.30], [0.40, 0.30, 0.30]]],
+            dtype=float,
+        ),
+    )
+
+    settings.dream_favorite_selection = DreamBestFitSelection(
+        run_name=run.name,
+        run_relative_path=str(run.relative_to(project_dir)),
+        bestfit_method="chain_mean",
+        posterior_filter_mode="top_n_logp",
+        posterior_top_percent=10.0,
+        posterior_top_n=42,
+        credible_interval_low=25.0,
+        credible_interval_high=75.0,
+        label="2026-03-23T11:00:00 • dream_run_predicted • chain_mean",
+        template_name="template_pd_likelihood_monosq_decoupled",
+        model_name="template_pd_likelihood_monosq_decoupled",
+        selection_source="rmcsetup",
+        selected_at="2026-03-23T11:00:00",
+    )
+    manager.save_project(settings)
+
+    artifact_paths.prior_weights_file.write_text(
+        json.dumps(
+            {
+                "origin": "clusters_predicted_structures",
+                "total_files": 4,
+                "includes_predicted_structures": True,
+                "structures": {
+                    "PbI2": {
+                        "no_motif": {
+                            "count": 2,
+                            "weight": 0.45,
+                            "representative": "frame_0002.xyz",
+                            "profile_file": "PbI2_no_motif.txt",
+                            "source_kind": "cluster_dir",
+                            "source_dir": str(clusters_dir / "PbI2"),
+                            "source_file": str(
+                                (
+                                    clusters_dir / "PbI2" / "frame_0002.xyz"
+                                ).resolve()
+                            ),
+                            "source_file_name": "frame_0002.xyz",
+                        }
+                    },
+                    "PbI2O": {
+                        "motif_1": {
+                            "count": 1,
+                            "weight": 0.25,
+                            "representative": "frame_0003.xyz",
+                            "profile_file": "PbI2O_motif_1.txt",
+                            "source_kind": "cluster_dir",
+                            "source_dir": str(
+                                clusters_dir / "PbI2O" / "motif_1"
+                            ),
+                            "source_file": str(
+                                (
+                                    clusters_dir
+                                    / "PbI2O"
+                                    / "motif_1"
+                                    / "frame_0003.xyz"
+                                ).resolve()
+                            ),
+                            "source_file_name": "frame_0003.xyz",
+                        }
+                    },
+                    "Zn1": {
+                        "predicted_rank01": {
+                            "count": 1,
+                            "weight": 0.30,
+                            "representative": predicted_source.name,
+                            "profile_file": "Zn1_predicted_rank01.txt",
+                            "source_kind": "predicted_structure",
+                            "source_dir": str(predicted_source.parent),
+                            "source_file": str(predicted_source.resolve()),
+                            "source_file_name": predicted_source.name,
+                        }
+                    },
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manager._write_distribution_metadata(
+        settings,
+        artifact_paths=artifact_paths,
+    )
+    return project_dir, predicted_source.resolve()
 
 
 def _write_sample_dream_run(
@@ -538,12 +884,342 @@ def _write_custom_solvent_pdb(tmp_path: Path) -> Path:
     return solvent_path
 
 
+def _build_test_solvent_reference_library(
+    tmp_path: Path,
+) -> tuple[Path, Path]:
+    reference_source = _write_custom_solvent_pdb(tmp_path)
+    reference_library_dir = tmp_path / "reference_library"
+    reference_library_dir.mkdir(parents=True, exist_ok=True)
+    result = create_reference_molecule(
+        reference_source,
+        reference_name="water_test",
+        residue_name="HOH",
+        library_dir=reference_library_dir,
+    )
+    return reference_library_dir, result.path
+
+
+def _write_test_solvent_shell_pdb(
+    tmp_path: Path,
+    *,
+    reference_path: Path,
+) -> Path:
+    reference_structure = PDBStructure.from_file(reference_path)
+    atoms = [
+        PDBAtom(
+            atom_id=1,
+            atom_name="PB1",
+            residue_name="PBI",
+            residue_number=1,
+            coordinates=np.array([0.0, 0.0, 0.0], dtype=float),
+            element="Pb",
+        )
+    ]
+    atom_id = 2
+    for residue_name, residue_number, shift in (
+        ("HOH", 2, np.array([3.0, 0.0, 0.0], dtype=float)),
+        ("ALT", 3, np.array([6.0, 0.0, 0.0], dtype=float)),
+    ):
+        for reference_atom in reference_structure.atoms:
+            atoms.append(
+                PDBAtom(
+                    atom_id=atom_id,
+                    atom_name=reference_atom.atom_name,
+                    residue_name=residue_name,
+                    residue_number=residue_number,
+                    coordinates=reference_atom.coordinates.copy() + shift,
+                    element=reference_atom.element,
+                )
+            )
+            atom_id += 1
+    structure = PDBStructure(atoms=atoms, source_name="solvent_shell")
+    output_path = tmp_path / "solvent_shell_input.pdb"
+    structure.write_pdb_file(output_path)
+    return output_path
+
+
+def _write_test_incomplete_solvent_shell_pdb(
+    tmp_path: Path,
+    *,
+    reference_path: Path,
+) -> Path:
+    reference_structure = PDBStructure.from_file(reference_path)
+    atoms = [
+        PDBAtom(
+            atom_id=1,
+            atom_name="PB1",
+            residue_name="PBI",
+            residue_number=1,
+            coordinates=np.array([0.0, 0.0, 0.0], dtype=float),
+            element="Pb",
+        )
+    ]
+    atom_id = 2
+    complete_shift = np.array([3.0, 0.0, 0.0], dtype=float)
+    for reference_atom in reference_structure.atoms:
+        atoms.append(
+            PDBAtom(
+                atom_id=atom_id,
+                atom_name=reference_atom.atom_name,
+                residue_name="HOH",
+                residue_number=2,
+                coordinates=reference_atom.coordinates.copy() + complete_shift,
+                element=reference_atom.element,
+            )
+        )
+        atom_id += 1
+    partial_shift = np.array([6.0, 0.0, 0.0], dtype=float)
+    for reference_atom in reference_structure.atoms[:2]:
+        atoms.append(
+            PDBAtom(
+                atom_id=atom_id,
+                atom_name=reference_atom.atom_name,
+                residue_name="HOH",
+                residue_number=3,
+                coordinates=reference_atom.coordinates.copy() + partial_shift,
+                element=reference_atom.element,
+            )
+        )
+        atom_id += 1
+    structure = PDBStructure(
+        atoms=atoms,
+        source_name="solvent_shell_incomplete",
+    )
+    output_path = tmp_path / "solvent_shell_incomplete_input.pdb"
+    structure.write_pdb_file(output_path)
+    return output_path
+
+
+def _write_test_no_solvent_shell_pdb(tmp_path: Path) -> Path:
+    structure = PDBStructure(
+        atoms=[
+            PDBAtom(
+                atom_id=1,
+                atom_name="PB1",
+                residue_name="PBI",
+                residue_number=1,
+                coordinates=np.array([0.0, 0.0, 0.0], dtype=float),
+                element="Pb",
+            )
+        ],
+        source_name="solvent_shell_none",
+    )
+    output_path = tmp_path / "solvent_shell_none_input.pdb"
+    structure.write_pdb_file(output_path)
+    return output_path
+
+
+def _write_test_no_solvent_mixed_shell_pdb(tmp_path: Path) -> Path:
+    structure = PDBStructure(
+        atoms=[
+            PDBAtom(
+                atom_id=1,
+                atom_name="PB1",
+                residue_name="PBI",
+                residue_number=1,
+                coordinates=np.array([-1.2, 0.0, 0.0], dtype=float),
+                element="Pb",
+            ),
+            PDBAtom(
+                atom_id=2,
+                atom_name="PB2",
+                residue_name="PBI",
+                residue_number=1,
+                coordinates=np.array([1.2, 0.0, 0.0], dtype=float),
+                element="Pb",
+            ),
+            PDBAtom(
+                atom_id=3,
+                atom_name="I1",
+                residue_name="PBI",
+                residue_number=1,
+                coordinates=np.array([-1.2, 2.6, 0.0], dtype=float),
+                element="I",
+            ),
+            PDBAtom(
+                atom_id=4,
+                atom_name="I2",
+                residue_name="PBI",
+                residue_number=1,
+                coordinates=np.array([1.2, -2.6, 0.0], dtype=float),
+                element="I",
+            ),
+        ],
+        source_name="solvent_shell_mixed_none",
+    )
+    output_path = tmp_path / "solvent_shell_mixed_none_input.pdb"
+    structure.write_pdb_file(output_path)
+    return output_path
+
+
+def _write_test_solvent_shell_xyz(
+    tmp_path: Path,
+    *,
+    reference_path: Path,
+) -> Path:
+    reference_structure = PDBStructure.from_file(reference_path)
+    xyz_lines = ["7", "solvent shell xyz"]
+    for shift in (
+        np.array([0.0, 0.0, 0.0], dtype=float),
+        np.array([4.0, 0.0, 0.0], dtype=float),
+    ):
+        for atom in reference_structure.atoms:
+            coordinates = atom.coordinates + shift
+            xyz_lines.append(
+                f"{atom.element} "
+                f"{coordinates[0]:.6f} "
+                f"{coordinates[1]:.6f} "
+                f"{coordinates[2]:.6f}"
+            )
+    xyz_lines.append("Pb 9.000000 0.000000 0.000000")
+    output_path = tmp_path / "solvent_shell_input.xyz"
+    output_path.write_text("\n".join(xyz_lines) + "\n", encoding="utf-8")
+    return output_path
+
+
+def _write_test_partial_solvent_shell_xyz(tmp_path: Path) -> Path:
+    xyz_lines = [
+        "3",
+        "partial solvent xyz",
+        "Pb 0.000000 0.000000 0.000000",
+        "I 2.000000 0.000000 0.000000",
+        "O 0.000000 2.000000 0.000000",
+    ]
+    output_path = tmp_path / "partial_solvent_shell_input.xyz"
+    output_path.write_text("\n".join(xyz_lines) + "\n", encoding="utf-8")
+    return output_path
+
+
 def qapp():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     app = QApplication.instance()
     if app is None:
         app = QApplication([])
     return app
+
+
+class _FakeSettings:
+    def __init__(self):
+        self.values: dict[str, object] = {}
+
+    def value(self, key, default=None):
+        return self.values.get(key, default)
+
+    def setValue(self, key, value):
+        self.values[key] = value
+
+
+class _FakePackmolDockerClient:
+    def __init__(self):
+        self.listed_containers: int = 0
+        self.verified_links: list[PackmolDockerLink] = []
+        self.listed_directories: list[tuple[str, str]] = []
+        self.synced_calls: list[tuple[str, Path, str | None]] = []
+
+    def list_containers(self) -> list[PackmolDockerContainerRecord]:
+        self.listed_containers += 1
+        return [
+            PackmolDockerContainerRecord(
+                name="analysis-helper",
+                image_name="ubuntu:22.04",
+                status="Exited (0) 2 hours ago",
+            ),
+            PackmolDockerContainerRecord(
+                name="packmol-dev",
+                image_name="packmol:test-image",
+                status="Up 8 minutes",
+            ),
+        ]
+
+    def verify_link(
+        self,
+        link: PackmolDockerLink,
+    ) -> PackmolDockerValidationResult:
+        self.verified_links.append(
+            PackmolDockerLink.from_dict(link.to_dict()) or link
+        )
+        return PackmolDockerValidationResult(
+            verified_at="2026-04-17T12:30:00",
+            container_id="sha256:fakepackmol",
+            image_name="packmol:test-image",
+            packmol_command_path="/usr/local/bin/packmol",
+            packmol_version="Packmol version 20.14.4",
+            container_project_root=link.container_project_root,
+        )
+
+    def list_directories(
+        self,
+        link: PackmolDockerLink,
+        directory: str,
+    ) -> list[PackmolDockerDirectoryEntry]:
+        self.listed_directories.append((link.container_name, directory))
+        mapping = {
+            "/packmol_input_files": [
+                PackmolDockerDirectoryEntry(
+                    name="project_alpha",
+                    path="/packmol_input_files/project_alpha",
+                ),
+                PackmolDockerDirectoryEntry(
+                    name="project_beta",
+                    path="/packmol_input_files/project_beta",
+                ),
+            ],
+            "/packmol_input_files/project_alpha": [
+                PackmolDockerDirectoryEntry(
+                    name="subrun",
+                    path="/packmol_input_files/project_alpha/subrun",
+                )
+            ],
+        }
+        return mapping.get(directory, [])
+
+    def sync_packmol_inputs(
+        self,
+        link: PackmolDockerLink,
+        local_packmol_inputs_dir: str | Path,
+        *,
+        packmol_setup_metadata=None,
+    ) -> PackmolDockerSyncResult:
+        local_dir = Path(local_packmol_inputs_dir).resolve()
+        self.synced_calls.append(
+            (
+                link.container_name,
+                local_dir,
+                (
+                    None
+                    if packmol_setup_metadata is None
+                    else packmol_setup_metadata.packmol_input_path
+                ),
+            )
+        )
+        input_name = (
+            "packmol_combined.inp"
+            if packmol_setup_metadata is None
+            else Path(packmol_setup_metadata.packmol_input_path).name
+        )
+        output_name = (
+            "packed_combined.pdb"
+            if packmol_setup_metadata is None
+            else packmol_setup_metadata.packed_output_filename
+        )
+        return PackmolDockerSyncResult(
+            synced_at="2026-04-17T12:45:00",
+            remote_packmol_inputs_dir=str(link.remote_packmol_inputs_dir()),
+            remote_packmol_input_path=str(
+                link.remote_packmol_inputs_dir() / input_name
+            ),
+            remote_packed_output_path=str(
+                link.remote_packmol_inputs_dir() / output_name
+            ),
+            synced_file_count=4,
+        )
+
+
+class _FakeRepresentativeStructuresWindow(QWidget):
+    project_results_changed = Signal(str)
+
+    def __init__(self):
+        super().__init__()
 
 
 def _wait_for_representative_worker(
@@ -561,6 +1237,39 @@ def _wait_for_representative_worker(
         time.sleep(0.01)
     app.processEvents()
     assert window._representative_thread is None
+
+
+def _configure_integrated_rmcsetup_solvent_panel(
+    window: RMCSetupMainWindow,
+    *,
+    minimum_separation_a: float = 1.4,
+    pb_target_coordination: float = 1.0,
+    pb_cutoff_a: float = 2.6,
+) -> None:
+    window.solvent_reference_source_combo.setCurrentIndex(0)
+    preset_index = window.solvent_preset_combo.findData("dmf")
+    assert preset_index >= 0
+    window.solvent_preset_combo.setCurrentIndex(preset_index)
+    window.solvent_minimum_separation_spin.setValue(minimum_separation_a)
+    window._analyze_representative_solvent_states()
+
+    pb_row = None
+    for row in range(window.solvent_cutoff_table.rowCount()):
+        if window.solvent_cutoff_table.item(row, 0).text() == "Pb":
+            pb_row = row
+            break
+    assert pb_row is not None
+
+    center_item = window.solvent_cutoff_table.item(pb_row, 2)
+    assert center_item is not None
+    center_item.setCheckState(Qt.CheckState.Checked)
+
+    coordination_spin = window.solvent_cutoff_table.cellWidget(pb_row, 3)
+    cutoff_spin = window.solvent_cutoff_table.cellWidget(pb_row, 4)
+    assert isinstance(coordination_spin, QDoubleSpinBox)
+    assert isinstance(cutoff_spin, QDoubleSpinBox)
+    coordination_spin.setValue(pb_target_coordination)
+    cutoff_spin.setValue(pb_cutoff_a)
 
 
 def test_project_settings_roundtrip_preserves_dream_favorite_data(tmp_path):
@@ -603,6 +1312,160 @@ def test_fullrmc_project_loader_discovers_valid_runs_and_favorites(tmp_path):
     assert state.rmcsetup_paths.solution_properties_path.is_file()
     assert state.rmcsetup_paths.solvent_handling_path.is_file()
     assert state.rmcsetup_paths.representative_selection_path.is_file()
+    assert state.rmcsetup_paths.packmol_docker_link_path.is_file()
+
+
+def test_fullrmc_project_loader_restores_packmol_docker_link(tmp_path):
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    link = PackmolDockerLink(
+        display_name="Mounted Packmol Container",
+        container_name="packmol-test",
+        container_project_root="/packmol_input_files/project_alpha",
+        packmol_command="packmol",
+        shell_command="bash",
+        packmol_version="Packmol version 20.14.4",
+        linked_at="2026-04-17T09:00:00",
+        last_verified_at="2026-04-17T09:05:00",
+        container_id="sha256:restoreme",
+        image_name="packmol:latest",
+        packmol_command_path="/usr/local/bin/packmol",
+    )
+    save_packmol_docker_link_metadata(
+        project_dir / "rmcsetup" / "packmol_docker_link.json",
+        link,
+    )
+
+    state = load_rmc_project_source(project_dir)
+
+    assert state.packmol_docker_link is not None
+    assert state.packmol_docker_link.container_name == "packmol-test"
+    assert state.packmol_docker_link.container_project_root == (
+        "/packmol_input_files/project_alpha"
+    )
+    assert state.packmol_docker_link.packmol_command_path == (
+        "/usr/local/bin/packmol"
+    )
+
+
+def test_packmol_docker_project_root_validation_targets_input_mount():
+    assert container_project_root_is_valid("/packmol_input_files")
+    assert container_project_root_is_valid(
+        "/packmol_input_files/project_alpha"
+    )
+    assert container_project_root_is_valid(
+        "/packmol_input_files/project_alpha/.."
+    )
+    assert container_project_root_is_valid(
+        "/packmol_input_files/project_alpha/subrun"
+    )
+    assert container_project_root_is_valid(
+        "/packmol_input_files/project_alpha/../subrun"
+    )
+    assert (
+        container_project_root_is_valid("/packmol_input_files_extra") is False
+    )
+    assert (
+        container_project_root_is_valid("/packmol_input_files/../etc") is False
+    )
+    assert (
+        container_project_root_is_valid(
+            "/packmol_input_files/project_alpha/../../etc"
+        )
+        is False
+    )
+    assert container_project_root_is_valid("/tmp/project_alpha") is False
+
+
+def test_fullrmc_project_loader_discovers_distribution_scoped_runs(
+    tmp_path,
+):
+    project_dir, _paths, artifact_paths = (
+        _build_sample_distribution_scoped_saxs_project(tmp_path)
+    )
+
+    state = load_rmc_project_source(project_dir)
+
+    assert [run.run_name for run in state.valid_runs] == [
+        "dream_run_002",
+        "dream_run_001",
+    ]
+    assert all(
+        run.relative_path.startswith("saved_distributions/")
+        for run in state.valid_runs
+    )
+    assert state.favorite_selection is not None
+    assert state.find_run_for_selection(state.favorite_selection) is not None
+    assert (
+        state.valid_runs[0].run_dir.parent == artifact_paths.dream_runtime_dir
+    )
+
+
+def test_fullrmc_project_loader_uses_active_predicted_distribution_rows(
+    tmp_path,
+):
+    project_dir, predicted_source = (
+        _build_sample_predicted_distribution_scoped_saxs_project(tmp_path)
+    )
+
+    state = load_rmc_project_source(project_dir)
+
+    assert state.cluster_validation.is_valid is True
+    assert any(
+        row.get("source_kind") == "predicted_structure"
+        for row in state.cluster_validation.expected_rows
+    )
+    assert all(
+        row.get("structure") != "Zn1"
+        for row in state.cluster_validation.current_rows
+    )
+
+    selection = state.favorite_selection
+    assert selection is not None
+    distribution = build_distribution_selection(state, selection)
+    predicted_entry = next(
+        entry
+        for entry in distribution.entries
+        if entry.source_kind == "predicted_structure"
+    )
+
+    assert predicted_entry.structure == "Zn1"
+    assert predicted_entry.motif == "predicted_rank01"
+    assert predicted_entry.source_file == str(predicted_source)
+    assert predicted_entry.source_file_name == predicted_source.name
+    assert predicted_entry.cluster_count == 1
+
+
+def test_fullrmc_project_loader_falls_back_to_project_root_runs(
+    tmp_path,
+):
+    project_dir, paths = _build_sample_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    artifact_paths = project_artifact_paths(
+        settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+    manager.ensure_artifact_dirs(artifact_paths)
+    manager._write_distribution_metadata(
+        settings,
+        artifact_paths=artifact_paths,
+    )
+
+    state = load_rmc_project_source(project_dir)
+
+    assert [run.run_name for run in state.valid_runs] == [
+        "dream_run_002",
+        "dream_run_001",
+    ]
+    assert all(
+        run.run_dir.parent == paths.dream_runtime_dir
+        for run in state.valid_runs
+    )
+    assert all(
+        not run.relative_path.startswith("saved_distributions/")
+        for run in state.valid_runs
+    )
 
 
 def test_fullrmc_project_loader_detects_cluster_count_drift(tmp_path):
@@ -886,23 +1749,30 @@ def test_build_representative_solvent_outputs_with_preset_reference(
 
     metadata = build_representative_solvent_outputs(
         state,
-        SolventHandlingSettings(
-            coordinated_solvent_mode="partial_coordinated_solvent",
-            reference_source="preset",
-            preset_name="dmf",
-        ),
+        _integrated_solvent_handling_settings(),
     )
     reloaded = load_solvent_handling_metadata(
         state.rmcsetup_paths.solvent_handling_path
     )
 
     assert metadata.reference_name == "dmf"
+    assert metadata.detected_distribution_status == "no_solvent"
     assert len(metadata.entries) == 2
     assert all(
         entry.atom_count_completed > entry.atom_count_no_solvent
         for entry in metadata.entries
     )
     assert all(entry.solvent_atoms_added > 0 for entry in metadata.entries)
+    assert all(
+        Path(entry.completed_pdb).parent
+        == state.rmcsetup_paths.pdb_with_solvent_dir / entry.structure
+        for entry in metadata.entries
+    )
+    assert all(
+        Path(entry.no_solvent_pdb).parent
+        == state.rmcsetup_paths.pdb_no_solvent_dir / entry.structure
+        for entry in metadata.entries
+    )
     assert reloaded is not None
     assert reloaded.settings.preset_name == "dmf"
     assert reloaded.settings.minimum_solvent_atom_separation_a == (
@@ -924,12 +1794,7 @@ def test_partial_coordinated_solvent_replaces_anchor_atoms_and_points_outward(
 
     metadata = build_representative_solvent_outputs(
         state,
-        SolventHandlingSettings(
-            coordinated_solvent_mode="partial_coordinated_solvent",
-            reference_source="preset",
-            preset_name="dmf",
-            minimum_solvent_atom_separation_a=1.2,
-        ),
+        _integrated_solvent_handling_settings(),
     )
 
     anchored_entry = next(
@@ -937,12 +1802,14 @@ def test_partial_coordinated_solvent_replaces_anchor_atoms_and_points_outward(
         for entry in metadata.entries
         if entry.structure == "PbI2O" and entry.motif == "motif_1"
     )
-    assert anchored_entry.atom_count_no_solvent == 4
+    assert metadata.detected_distribution_status == "no_solvent"
+    assert anchored_entry.atom_count_no_solvent == 3
     assert anchored_entry.atom_count_completed == 15
-    assert anchored_entry.solvent_atoms_added == 11
+    assert anchored_entry.solvent_atoms_added == 12
     assert anchored_entry.solvent_molecules_added == 1
-    assert anchored_entry.completion_strategy.startswith(
-        "anchored_solvent_completion"
+    assert (
+        anchored_entry.completion_strategy
+        == "rebuilt_from_no_solvent_distribution"
     )
 
     completed_structure = PDBStructure.from_file(anchored_entry.completed_pdb)
@@ -959,31 +1826,9 @@ def test_partial_coordinated_solvent_replaces_anchor_atoms_and_points_outward(
     assert len(solvent_atoms) == 12
     assert len(solute_atoms) == 3
 
-    anchor_atom = next(atom for atom in solvent_atoms if atom.element == "O")
-    assert anchor_atom.coordinates == pytest.approx([0.0, 0.0, 1.0], abs=1e-3)
-
-    solute_center = np.mean(
-        [atom.coordinates for atom in solute_atoms],
-        axis=0,
-    )
-    solvent_body_center = np.mean(
-        [
-            atom.coordinates
-            for atom in solvent_atoms
-            if atom.atom_id != anchor_atom.atom_id
-        ],
-        axis=0,
-    )
-    outward_alignment = np.dot(
-        solvent_body_center - anchor_atom.coordinates,
-        anchor_atom.coordinates - solute_center,
-    )
-    assert outward_alignment > 0.0
-
     minimum_distance = min(
         np.linalg.norm(solvent_atom.coordinates - solute_atom.coordinates)
         for solvent_atom in solvent_atoms
-        if solvent_atom.atom_id != anchor_atom.atom_id
         for solute_atom in solute_atoms
     )
     assert minimum_distance >= 1.2 - 1e-6
@@ -1004,15 +1849,16 @@ def test_build_representative_solvent_outputs_with_custom_reference(
 
     metadata = build_representative_solvent_outputs(
         state,
-        SolventHandlingSettings(
-            coordinated_solvent_mode="partial_coordinated_solvent",
+        _integrated_solvent_handling_settings(
             reference_source="custom",
             custom_reference_path=str(custom_solvent),
+            director_atom_name="O1",
         ),
     )
 
     assert metadata.reference_name == "water_ref"
     assert metadata.reference_residue_name == "HOH"
+    assert metadata.detected_distribution_status == "no_solvent"
     added_counts = {
         (entry.structure, entry.motif): entry.solvent_atoms_added
         for entry in metadata.entries
@@ -1022,7 +1868,7 @@ def test_build_representative_solvent_outputs_with_custom_reference(
         for entry in metadata.entries
     }
     assert added_counts[("PbI2", "no_motif")] == 3
-    assert added_counts[("PbI2O", "motif_1")] == 2
+    assert added_counts[("PbI2O", "motif_1")] == 3
     assert molecule_counts[("PbI2", "no_motif")] == 1
     assert molecule_counts[("PbI2O", "motif_1")] == 1
 
@@ -1043,11 +1889,7 @@ def test_build_representative_solvent_outputs_preserves_single_atom_sources(
 
     metadata = build_representative_solvent_outputs(
         state,
-        SolventHandlingSettings(
-            coordinated_solvent_mode="partial_coordinated_solvent",
-            reference_source="preset",
-            preset_name="dmf",
-        ),
+        _integrated_solvent_handling_settings(),
     )
 
     zn_entry = next(
@@ -1060,7 +1902,10 @@ def test_build_representative_solvent_outputs_preserves_single_atom_sources(
     assert zn_entry.atom_count_completed == 1
     assert zn_entry.solvent_atoms_added == 0
     assert zn_entry.solvent_molecules_added == 0
-    assert zn_entry.completion_strategy == "preserved_single_structure_file"
+    assert (
+        zn_entry.completion_strategy
+        == "preserved_without_matching_coordination_settings"
+    )
     assert [atom.element for atom in completed_structure.atoms] == ["Zn"]
 
 
@@ -1120,6 +1965,47 @@ def test_build_packmol_plan_writes_metadata_and_reports(tmp_path):
     )
 
 
+def test_build_packmol_plan_requires_all_positive_weight_representatives(
+    tmp_path,
+):
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    state = load_rmc_project_source(project_dir)
+    selection = state.favorite_selection
+    assert selection is not None
+    metadata = select_first_file_representatives(
+        state,
+        selection,
+    )
+    metadata.representative_entries = metadata.representative_entries[:1]
+    state.representative_selection = metadata
+    solution_settings = SolutionPropertiesSettings(
+        mode="mass",
+        solution_density=1.05,
+        solute_stoich="Pb1I2",
+        solvent_stoich="C3H7NO",
+        molar_mass_solute=461.0,
+        molar_mass_solvent=73.09,
+        mass_solute=4.61,
+        mass_solvent=95.39,
+    )
+    state.solution_properties = save_solution_properties_metadata(
+        state.rmcsetup_paths.solution_properties_path,
+        settings=solution_settings,
+        result=calculate_solution_properties(solution_settings),
+    )
+
+    with pytest.raises(
+        ValueError, match="exactly one representative structure"
+    ):
+        build_packmol_plan(
+            state,
+            PackmolPlanningSettings(
+                planning_mode="per_element",
+                box_side_length_a=80.0,
+            ),
+        )
+
+
 def test_build_packmol_plan_includes_single_atom_model_sources(tmp_path):
     project_dir, _paths, _single_atom_path = (
         _build_sample_saxs_project_with_single_atom_model(tmp_path)
@@ -1158,11 +2044,7 @@ def test_build_packmol_plan_includes_single_atom_model_sources(tmp_path):
     )
     state.solvent_handling = build_representative_solvent_outputs(
         state,
-        SolventHandlingSettings(
-            coordinated_solvent_mode="partial_coordinated_solvent",
-            reference_source="preset",
-            preset_name="dmf",
-        ),
+        _integrated_solvent_handling_settings(),
     )
 
     metadata = build_packmol_plan(
@@ -1182,6 +2064,74 @@ def test_build_packmol_plan_includes_single_atom_model_sources(tmp_path):
     assert zn_entry.element_counts == {"Zn": 1}
     assert zn_entry.composition_source == "pdb_no_solvent"
     assert zn_entry.planned_count_weight >= 0.0
+
+
+def test_build_packmol_plan_tracks_solvent_allocation(tmp_path):
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    state = load_rmc_project_source(project_dir)
+    selection = state.favorite_selection
+    assert selection is not None
+    state.representative_selection = select_first_file_representatives(
+        state,
+        selection,
+    )
+    state.solution_properties = save_solution_properties_metadata(
+        state.rmcsetup_paths.solution_properties_path,
+        settings=SolutionPropertiesSettings(
+            mode="mass",
+            solution_density=1.05,
+            solute_stoich="Pb1I2",
+            solvent_stoich="C3H7NO",
+            molar_mass_solute=461.0,
+            molar_mass_solvent=73.09,
+            mass_solute=4.61,
+            mass_solvent=95.39,
+        ),
+        result=calculate_solution_properties(
+            SolutionPropertiesSettings(
+                mode="mass",
+                solution_density=1.05,
+                solute_stoich="Pb1I2",
+                solvent_stoich="C3H7NO",
+                molar_mass_solute=461.0,
+                molar_mass_solvent=73.09,
+                mass_solute=4.61,
+                mass_solvent=95.39,
+            )
+        ),
+    )
+    state.solvent_handling = build_representative_solvent_outputs(
+        state,
+        _integrated_solvent_handling_settings(),
+    )
+
+    metadata = build_packmol_plan(
+        state,
+        PackmolPlanningSettings(
+            planning_mode="per_element",
+            box_side_length_a=80.0,
+        ),
+    )
+
+    allocation = metadata.solvent_allocation
+
+    assert allocation is not None
+    assert allocation.reference_name == "dmf"
+    assert allocation.target_solvent_molecules == int(
+        metadata.target_box_composition["solvent_molecules"]
+    )
+    assert allocation.solvent_molecules_in_clusters == sum(
+        entry.solvent_molecules_total for entry in allocation.entries
+    )
+    assert allocation.free_solvent_molecules == max(
+        0,
+        allocation.target_solvent_molecules
+        - allocation.solvent_molecules_in_clusters,
+    )
+    assert any(
+        entry.solvent_molecules_total > 0 for entry in allocation.entries
+    )
+    assert "Cluster solvent molecules:" in metadata.summary_text()
 
 
 def test_build_packmol_setup_writes_input_files_and_audit(tmp_path):
@@ -1220,11 +2170,7 @@ def test_build_packmol_setup_writes_input_files_and_audit(tmp_path):
     )
     state.solvent_handling = build_representative_solvent_outputs(
         state,
-        SolventHandlingSettings(
-            coordinated_solvent_mode="partial_coordinated_solvent",
-            reference_source="preset",
-            preset_name="dmf",
-        ),
+        _integrated_solvent_handling_settings(),
     )
     state.packmol_planning = build_packmol_plan(
         state,
@@ -1251,6 +2197,17 @@ def test_build_packmol_setup_writes_input_files_and_audit(tmp_path):
     assert Path(metadata.audit_report_path).is_file()
     assert reloaded is not None
     assert reloaded.free_solvent_molecules >= 0
+    assert metadata.free_solvent_reference_name == "dmf"
+    assert state.packmol_planning.solvent_allocation is not None
+    assert metadata.target_solvent_molecules == (
+        state.packmol_planning.solvent_allocation.target_solvent_molecules
+    )
+    assert metadata.solvent_molecules_in_clusters == (
+        state.packmol_planning.solvent_allocation.solvent_molecules_in_clusters
+    )
+    assert metadata.free_solvent_molecules == (
+        state.packmol_planning.solvent_allocation.free_solvent_molecules
+    )
     assert len({entry.residue_name for entry in metadata.entries}) == len(
         metadata.entries
     )
@@ -1262,7 +2219,57 @@ def test_build_packmol_setup_writes_input_files_and_audit(tmp_path):
     assert "structure 001_PbI2O_motif_1_CAA.pdb" in packmol_text
     audit_text = Path(metadata.audit_report_path).read_text(encoding="utf-8")
     assert "# Packmol Build Audit" in audit_text
+    assert "Cluster solvent molecules:" in audit_text
     assert "Count-normalized weights" in audit_text
+
+
+def test_build_packmol_setup_requires_all_positive_weight_representatives(
+    tmp_path,
+):
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    state = load_rmc_project_source(project_dir)
+    selection = state.favorite_selection
+    assert selection is not None
+    state.representative_selection = select_first_file_representatives(
+        state,
+        selection,
+    )
+    solution_settings = SolutionPropertiesSettings(
+        mode="mass",
+        solution_density=1.05,
+        solute_stoich="Pb1I2",
+        solvent_stoich="C3H7NO",
+        molar_mass_solute=461.0,
+        molar_mass_solvent=73.09,
+        mass_solute=4.61,
+        mass_solvent=95.39,
+    )
+    state.solution_properties = save_solution_properties_metadata(
+        state.rmcsetup_paths.solution_properties_path,
+        settings=solution_settings,
+        result=calculate_solution_properties(solution_settings),
+    )
+    state.packmol_planning = build_packmol_plan(
+        state,
+        PackmolPlanningSettings(
+            planning_mode="per_element",
+            box_side_length_a=80.0,
+        ),
+    )
+    assert state.representative_selection is not None
+    state.representative_selection.representative_entries = (
+        state.representative_selection.representative_entries[:1]
+    )
+
+    with pytest.raises(
+        ValueError, match="exactly one representative structure"
+    ):
+        build_packmol_setup(
+            state,
+            PackmolSetupSettings(
+                include_free_solvent=False,
+            ),
+        )
 
 
 def test_build_packmol_setup_includes_single_atom_model_sources(tmp_path):
@@ -1303,11 +2310,7 @@ def test_build_packmol_setup_includes_single_atom_model_sources(tmp_path):
     )
     state.solvent_handling = build_representative_solvent_outputs(
         state,
-        SolventHandlingSettings(
-            coordinated_solvent_mode="partial_coordinated_solvent",
-            reference_source="preset",
-            preset_name="dmf",
-        ),
+        _integrated_solvent_handling_settings(),
     )
     state.packmol_planning = build_packmol_plan(
         state,
@@ -1363,11 +2366,7 @@ def test_build_constraint_generation_writes_per_structure_and_merged_files(
     )
     state.solvent_handling = build_representative_solvent_outputs(
         state,
-        SolventHandlingSettings(
-            coordinated_solvent_mode="partial_coordinated_solvent",
-            reference_source="preset",
-            preset_name="dmf",
-        ),
+        _integrated_solvent_handling_settings(),
     )
     state.packmol_planning = build_packmol_plan(
         state,
@@ -1486,16 +2485,96 @@ def test_rmcsetup_main_window_prefills_project_and_applies_favorite(tmp_path):
     assert window._project_source_state.cluster_validation.is_valid is True
     assert not hasattr(window, "cluster_validation_box")
     assert not hasattr(window, "validation_warning_label")
-    assert "/rmcsetup/representative_clusters" in (
+    assert "/rmcsetup/representative_structures" in (
         window.output_summary_box.toPlainText()
     )
     assert window.solution_group.isEnabled() is True
     assert "No saved solution-properties calculation yet" in (
         window.solution_output_box.toPlainText()
     )
-    assert "No representative selection has been saved yet" in (
+    assert window.representative_group.title() == "Representative Structures"
+    assert window.compute_representatives_button.text() == (
+        "Open Representative Structures"
+    )
+    assert window.preview_representatives_button.text() == (
+        "Reload Saved Representative Structures"
+    )
+    assert "No representative structures have been saved yet" in (
         window.representative_summary_box.toPlainText()
     )
+
+
+def test_rmcsetup_main_window_lists_distribution_scoped_dream_runs(tmp_path):
+    qapp()
+    project_dir, _paths, _artifact_paths = (
+        _build_sample_distribution_scoped_saxs_project(tmp_path)
+    )
+
+    window = RMCSetupMainWindow(initial_project_dir=project_dir)
+
+    assert [window.dream_run_combo.itemText(i) for i in range(2)] == [
+        "dream_run_002",
+        "dream_run_001",
+    ]
+    assert window.dream_run_combo.currentText() == "dream_run_001"
+    assert window._project_source_state is not None
+    assert all(
+        run.relative_path.startswith("saved_distributions/")
+        for run in window._project_source_state.valid_runs
+    )
+
+
+def test_rmcsetup_representative_panel_opens_representative_structures_tool(
+    tmp_path,
+    monkeypatch,
+):
+    qapp()
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    window = RMCSetupMainWindow(initial_project_dir=project_dir)
+    fake_window = _FakeRepresentativeStructuresWindow()
+    launched: dict[str, Path | None] = {}
+
+    import saxshell.representativefinder.ui.main_window as representativefinder_ui_module
+
+    def fake_launch(
+        *,
+        initial_project_dir=None,
+        initial_input_path=None,
+    ):
+        launched["initial_project_dir"] = (
+            None
+            if initial_project_dir is None
+            else Path(initial_project_dir).expanduser().resolve()
+        )
+        launched["initial_input_path"] = (
+            None
+            if initial_input_path is None
+            else Path(initial_input_path).expanduser().resolve()
+        )
+        return fake_window
+
+    monkeypatch.setattr(
+        representativefinder_ui_module,
+        "launch_representativefinder_ui",
+        fake_launch,
+    )
+
+    window.compute_representatives_button.click()
+
+    assert launched["initial_project_dir"] == project_dir.resolve()
+    assert launched["initial_input_path"] == (
+        window._project_source_state.settings.resolved_clusters_dir
+    )
+    assert fake_window in window._child_tool_windows
+
+    fake_window.project_results_changed.emit(str(project_dir.resolve()))
+    QApplication.processEvents()
+
+    assert "Representative structures were updated in the dedicated tool" in (
+        window.run_log_box.toPlainText()
+    )
+    fake_window.close()
+    window.close()
 
 
 def test_rmcsetup_software_details_section_is_collapsible_and_link_ready(
@@ -1546,8 +2625,55 @@ def test_rmcsetup_main_window_uses_two_scrollable_panes_with_splitter(
     assert window._left_panel.isAncestorOf(window.solution_group)
     assert window._right_panel.isAncestorOf(window.dream_preview_group)
     assert window._right_panel.isAncestorOf(window.representative_group)
+    assert window._right_panel.isAncestorOf(window.solvent_group)
     assert window._right_panel.isAncestorOf(window.packmol_group)
     assert window._right_panel.isAncestorOf(window.run_log_group)
+
+
+def test_rmcsetup_readiness_sections_can_collapse_without_hiding_status(
+    tmp_path,
+):
+    qapp()
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+
+    window = RMCSetupMainWindow(initial_project_dir=project_dir)
+
+    readiness_sections = {
+        "project_source": ["project_source"],
+        "dream_selection": ["dream_selection"],
+        "solution_properties": ["solution_properties"],
+        "representative_selection": ["representative_selection"],
+        "solvent_outputs": ["solvent_outputs"],
+        "packmol": ["packmol_plan", "packmol_setup"],
+    }
+
+    for section_key, readiness_keys in readiness_sections.items():
+        toggle = window._section_toggle_buttons[section_key]
+        content = window._section_content_widgets[section_key]
+        assert content.isHidden() is False
+        for readiness_key in readiness_keys:
+            checkbox = window._readiness_checkboxes[readiness_key]
+            assert content.isAncestorOf(checkbox) is False
+            assert checkbox.isHidden() is False
+        toggle.click()
+        assert content.isHidden() is True
+        assert toggle.text() == "Expand"
+        for readiness_key in readiness_keys:
+            assert (
+                window._readiness_checkboxes[readiness_key].isHidden() is False
+            )
+        toggle.click()
+        assert content.isHidden() is False
+        assert toggle.text() == "Collapse"
+
+    representative_content = window._section_content_widgets[
+        "representative_selection"
+    ]
+    assert representative_content.isAncestorOf(window.solvent_group) is False
+    window._section_toggle_buttons["representative_selection"].click()
+    assert representative_content.isHidden() is True
+    assert window.solvent_group.isHidden() is False
+    assert window._readiness_checkboxes["solvent_outputs"].isHidden() is False
 
 
 def test_rmcsetup_main_window_renders_selected_dream_preview_and_tooltips(
@@ -1603,6 +2729,187 @@ def test_rmcsetup_main_window_renders_selected_dream_preview_and_tooltips(
     assert "Selected run: dream_run_002" in (
         window.dream_preview_status_label.text()
     )
+
+
+def test_packmol_docker_link_dialog_validates_container_and_updates_tree(
+    tmp_path,
+):
+    qapp()
+    client = _FakePackmolDockerClient()
+    dialog = fullrmc_ui_module.PackmolDockerLinkDialog(
+        recent_presets=[
+            PackmolDockerLink(
+                display_name="Mounted Packmol",
+                container_name="packmol-dev",
+                container_project_root="/packmol_input_files",
+            )
+        ],
+        docker_client=client,
+    )
+
+    assert client.listed_containers >= 1
+    assert dialog.available_container_combo.count() == 2
+    assert "packmol-dev" in dialog.available_container_combo.itemText(1)
+    assert dialog._test_connection() is True
+    assert "Docker validation succeeded." in dialog.status_box.toPlainText()
+    assert "Packmol version 20.14.4" in dialog.status_box.toPlainText()
+    assert dialog.directory_tree.topLevelItemCount() == 1
+
+    root_item = dialog.directory_tree.topLevelItem(0)
+    assert root_item.text(0) == "/packmol_input_files"
+    assert root_item.childCount() == 2
+
+    first_child = root_item.child(0)
+    dialog.directory_tree.setCurrentItem(first_child)
+    dialog._use_selected_directory()
+
+    assert dialog.container_root_edit.text() == (
+        "/packmol_input_files/project_alpha"
+    )
+    dialog.close()
+
+
+def test_packmol_docker_link_dialog_can_load_discovered_container_name():
+    qapp()
+    dialog = fullrmc_ui_module.PackmolDockerLinkDialog(
+        docker_client=_FakePackmolDockerClient(),
+    )
+
+    assert dialog.available_container_combo.count() == 2
+    dialog.available_container_combo.setCurrentIndex(1)
+    dialog._use_available_container()
+
+    assert dialog.container_name_edit.text() == "packmol-dev"
+    assert "Press Test Container to verify Packmol" in (
+        dialog.status_box.toPlainText()
+    )
+    dialog.close()
+
+
+def test_packmol_docker_link_dialog_rejects_invalid_container_project_root():
+    qapp()
+
+    class _RejectingClient(_FakePackmolDockerClient):
+        def verify_link(self, link):
+            raise RuntimeError(
+                "Container project root must be inside /packmol_input_files "
+                "so Packmol input files stay inside the expected bind-mounted folder."
+            )
+
+    dialog = fullrmc_ui_module.PackmolDockerLinkDialog(
+        docker_client=_RejectingClient(),
+    )
+    dialog.container_name_edit.setText("packmol-dev")
+    dialog.container_root_edit.setText("/tmp/not_allowed")
+
+    assert dialog._test_connection() is False
+    assert "must be inside /packmol_input_files" in (
+        dialog.status_box.toPlainText()
+    )
+    dialog.close()
+
+
+def test_packmol_docker_link_dialog_explains_docker_daemon_failure():
+    qapp()
+
+    class _DaemonDownClient(_FakePackmolDockerClient):
+        def verify_link(self, link):
+            del link
+            raise RuntimeError(
+                'WARNING: Plugin "/Users/test/.docker/cli-plugins/docker-scan" '
+                "is not valid: failed to fetch metadata: fork/exec "
+                "/Users/test/.docker/cli-plugins/docker-scan: no such file "
+                "or directory\n"
+                "ERROR: Cannot connect to the Docker daemon at "
+                "unix:///Users/test/.docker/run/docker.sock. Is the docker "
+                "daemon running?\n"
+                "errors pretty printing info"
+            )
+
+    dialog = fullrmc_ui_module.PackmolDockerLinkDialog(
+        docker_client=_DaemonDownClient(),
+    )
+    dialog.container_name_edit.setText("packmol-dev")
+
+    assert dialog._test_connection() is False
+    assert (
+        "Docker Desktop or the Docker daemon does not appear to be running."
+        in (dialog.status_box.toPlainText())
+    )
+    assert "wait for `docker info` to succeed" in (
+        dialog.status_box.toPlainText()
+    )
+    assert "Cannot connect to the Docker daemon" in (
+        dialog.status_box.toPlainText()
+    )
+    dialog.close()
+
+
+def test_rmcsetup_tools_menu_can_link_packmol_docker_container(
+    tmp_path,
+    monkeypatch,
+):
+    qapp()
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    settings_store = _FakeSettings()
+    linked = PackmolDockerLink(
+        display_name="Saved Container",
+        container_name="packmol-dev",
+        container_project_root="/packmol_input_files/project_alpha",
+        packmol_command="packmol",
+        shell_command="sh",
+        packmol_version="Packmol version 20.14.4",
+        last_verified_at="2026-04-17T12:30:00",
+        container_id="sha256:dialog",
+        image_name="packmol:test-image",
+        packmol_command_path="/usr/local/bin/packmol",
+    )
+
+    class _FakeDialog:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def exec(self):
+            return 1
+
+        def selected_link(self):
+            return PackmolDockerLink.from_dict(linked.to_dict())
+
+    monkeypatch.setattr(
+        RMCSetupMainWindow,
+        "_packmol_docker_settings",
+        lambda self: settings_store,
+    )
+    monkeypatch.setattr(
+        fullrmc_ui_module,
+        "PackmolDockerLinkDialog",
+        _FakeDialog,
+    )
+
+    window = RMCSetupMainWindow(initial_project_dir=project_dir)
+
+    assert window.tools_menu.title() == "Tools"
+    assert window.link_packmol_docker_action.text() == (
+        "Link Packmol Docker Container"
+    )
+
+    window._open_packmol_docker_link_dialog()
+
+    assert window._project_source_state is not None
+    assert window._project_source_state.packmol_docker_link is not None
+    assert window._project_source_state.packmol_docker_link.container_name == (
+        "packmol-dev"
+    )
+    assert "packmol-dev" in window.packmol_docker_summary_box.toPlainText()
+    assert "Packmol version 20.14.4" in (
+        window.packmol_docker_summary_box.toPlainText()
+    )
+    raw_presets = settings_store.value("packmol_docker_presets", "[]")
+    preset_payload = json.loads(raw_presets)
+    assert preset_payload[0]["container_name"] == "packmol-dev"
+
+    reloaded = RMCSetupMainWindow(initial_project_dir=project_dir)
+    assert "packmol-dev" in reloaded.packmol_docker_summary_box.toPlainText()
 
 
 def test_rmcsetup_solution_properties_mode_switch_changes_active_page(
@@ -1915,18 +3222,22 @@ def test_rmcsetup_solvent_handling_ui_builds_and_reloads(tmp_path):
 
     window._compute_representative_clusters()
     _wait_for_representative_worker(window)
-    window.coordinated_solvent_mode_combo.setCurrentIndex(1)
-    window.solvent_reference_source_combo.setCurrentIndex(0)
-    window.solvent_minimum_separation_spin.setValue(1.4)
+    _configure_integrated_rmcsetup_solvent_panel(window)
+    window._solvent_distribution_analysis = None
+    assert window.build_solvent_outputs_button.isEnabled() is True
     window._build_representative_solvent_outputs()
 
     assert "reference molecule: dmf" in (
         window.solvent_summary_box.toPlainText().lower()
     )
+    assert (
+        "Detected representative distribution state: No solvent molecules detected"
+        in (window.solvent_summary_box.toPlainText())
+    )
     assert "Minimum solvent atom separation: 1.4 A" in (
         window.solvent_summary_box.toPlainText()
     )
-    assert window.generated_pdb_table.rowCount() == 4
+    assert window.generated_pdb_table.rowCount() == 2
     generated_rows = {
         (
             window.generated_pdb_table.item(row, 0).text(),
@@ -1935,13 +3246,11 @@ def test_rmcsetup_solvent_handling_ui_builds_and_reloads(tmp_path):
         for row in range(window.generated_pdb_table.rowCount())
     }
     assert set(generated_rows) == {
-        ("PbI2", "No solvent"),
-        ("PbI2", "With solvent"),
-        ("PbI2O/motif_1", "No solvent"),
-        ("PbI2O/motif_1", "With solvent"),
+        ("PbI2", "No solvent molecules detected"),
+        ("PbI2O/motif_1", "Partial solvent molecules detected"),
     }
     window.generated_pdb_table.selectRow(
-        generated_rows[("PbI2", "With solvent")]
+        generated_rows[("PbI2", "No solvent molecules detected")]
     )
     details_text = window.generated_pdb_details_box.toPlainText()
     assert "Atom count: 15" in details_text
@@ -1950,9 +3259,10 @@ def test_rmcsetup_solvent_handling_ui_builds_and_reloads(tmp_path):
         details_text
     )
     assert "PBI 1: 3 atoms (I:2, Pb:1)" in details_text
-    assert "DMF 2: 12 atoms (C:3, H:7, N:1, O:1)" in details_text
+    assert "12 atoms (C:3, H:7, N:1, O:1)" in details_text
     assert "1: Pb1 (Pb) -> PBI 1" in details_text
-    assert "4: O1 (O) -> DMF 2" in details_text
+    assert "O1 (O) -> DMF" in details_text
+    assert window.generated_pdb_viewer.current_structure is not None
 
     window._open_selected_generated_pdb_preview()
 
@@ -1982,24 +3292,822 @@ def test_rmcsetup_solvent_handling_ui_builds_and_reloads(tmp_path):
         len(generated_preview_window.figure.axes[0].collections)
         > initial_collection_count
     )
-    assert "Built representative solvent-aware PDB outputs." in (
+    assert "Built solvent-decorated representative PDB outputs." in (
         window.run_log_box.toPlainText()
     )
     assert "Opened generated PDB preview:" in window.run_log_box.toPlainText()
 
     reloaded = RMCSetupMainWindow(initial_project_dir=project_dir)
-    assert reloaded.coordinated_solvent_mode_combo.currentData() == (
-        "partial_coordinated_solvent"
-    )
     assert reloaded.solvent_reference_source_combo.currentData() == "preset"
     assert reloaded.solvent_preset_combo.currentData() == "dmf"
     assert reloaded.solvent_minimum_separation_spin.value() == pytest.approx(
         1.4
     )
-    assert reloaded.generated_pdb_table.rowCount() == 4
+    assert reloaded.generated_pdb_table.rowCount() == 2
     assert "Representative entries exported: 2" in (
         reloaded.solvent_summary_box.toPlainText()
     )
+
+
+def test_rmcsetup_imported_full_solvent_representatives_mark_solvent_ready(
+    tmp_path,
+):
+    qapp()
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    state = load_rmc_project_source(project_dir)
+    selection = state.favorite_selection
+    assert selection is not None
+    metadata = select_first_file_representatives(
+        state,
+        selection,
+    )
+    state.representative_selection = metadata
+    solvent_metadata = build_representative_solvent_outputs(
+        state,
+        _integrated_solvent_handling_settings(),
+    )
+
+    solvent_lookup = {
+        (entry.structure, entry.motif, entry.param): entry
+        for entry in solvent_metadata.entries
+    }
+    for entry in metadata.representative_entries:
+        solvent_entry = solvent_lookup[
+            (entry.structure, entry.motif, entry.param)
+        ]
+        completed_path = Path(solvent_entry.completed_pdb).resolve()
+        entry.source_dir = str(completed_path.parent)
+        entry.source_file = str(completed_path)
+        entry.source_file_name = completed_path.name
+        entry.source_solvent_mode = "unknown"
+    save_representative_selection_metadata(
+        state.rmcsetup_paths.representative_selection_path,
+        metadata,
+    )
+    state.rmcsetup_paths.solvent_handling_path.write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+
+    reloaded_selection = load_representative_selection_metadata(
+        state.rmcsetup_paths.representative_selection_path
+    )
+    assert reloaded_selection is not None
+    assert {
+        entry.source_solvent_mode
+        for entry in reloaded_selection.representative_entries
+    } == {"fullsolv"}
+
+    window = RMCSetupMainWindow(initial_project_dir=project_dir)
+
+    assert window._readiness_checkboxes["solvent_outputs"].isChecked() is True
+    assert window.readiness_progress_bar.value() == 4
+    assert window.generated_pdb_mode_combo.currentData() == "full_solvent"
+    assert window.generated_pdb_table.rowCount() == 2
+    assert {
+        window.generated_pdb_table.item(row, 1).text()
+        for row in range(window.generated_pdb_table.rowCount())
+    } == {"Full solvent analyzed"}
+    assert (
+        "Imported representative structures already include the Full solvent structure set"
+        in (window.solvent_summary_box.toPlainText())
+    )
+    assert (
+        "The active representative source files already provide the Full "
+        "solvent structure set."
+    ) in window.solvent_status_stats_label.text()
+    assert "Solvent Shell Builder readiness: Ready for Packmol" in (
+        window.solvent_status_stats_label.text()
+    )
+    assert window.solvent_group.title() == "Solvent Shell Builder"
+    assert window.analyze_solvent_outputs_button.isEnabled() is False
+    assert window.build_solvent_outputs_button.isEnabled() is False
+    assert window.solvent_cutoff_group.isEnabled() is False
+    window.close()
+
+
+def test_rmcsetup_imported_full_solvent_representatives_can_build_packmol_setup(
+    tmp_path,
+):
+    qapp()
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    state = load_rmc_project_source(project_dir)
+    selection = state.favorite_selection
+    assert selection is not None
+    metadata = select_first_file_representatives(
+        state,
+        selection,
+    )
+    state.representative_selection = metadata
+    save_solution_properties_metadata(
+        state.rmcsetup_paths.solution_properties_path,
+        settings=SolutionPropertiesSettings(
+            mode="mass",
+            solution_density=1.05,
+            solute_stoich="Pb1I2",
+            solvent_stoich="C3H7NO",
+            molar_mass_solute=461.0,
+            molar_mass_solvent=73.09,
+            mass_solute=4.61,
+            mass_solvent=95.39,
+        ),
+        result=calculate_solution_properties(
+            SolutionPropertiesSettings(
+                mode="mass",
+                solution_density=1.05,
+                solute_stoich="Pb1I2",
+                solvent_stoich="C3H7NO",
+                molar_mass_solute=461.0,
+                molar_mass_solvent=73.09,
+                mass_solute=4.61,
+                mass_solvent=95.39,
+            )
+        ),
+    )
+    solvent_metadata = build_representative_solvent_outputs(
+        state,
+        _integrated_solvent_handling_settings(),
+    )
+
+    solvent_lookup = {
+        (entry.structure, entry.motif, entry.param): entry
+        for entry in solvent_metadata.entries
+    }
+    for entry in metadata.representative_entries:
+        solvent_entry = solvent_lookup[
+            (entry.structure, entry.motif, entry.param)
+        ]
+        completed_path = Path(solvent_entry.completed_pdb).resolve()
+        entry.source_dir = str(completed_path.parent)
+        entry.source_file = str(completed_path)
+        entry.source_file_name = completed_path.name
+        entry.source_solvent_mode = "unknown"
+    save_representative_selection_metadata(
+        state.rmcsetup_paths.representative_selection_path,
+        metadata,
+    )
+    state.rmcsetup_paths.solvent_handling_path.write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+
+    window = RMCSetupMainWindow(initial_project_dir=project_dir)
+
+    assert window._project_source_state is not None
+    assert window._project_source_state.solvent_handling is None
+
+    dmf_index = window.packmol_free_solvent_combo.findText("dmf")
+    assert dmf_index >= 0
+    window.packmol_free_solvent_combo.setCurrentIndex(dmf_index)
+    window.packmol_box_side_spin.setValue(80.0)
+
+    window._compute_packmol_plan()
+    window._build_packmol_setup()
+
+    assert "Total solvent molecules:" in (
+        window.packmol_plan_summary_box.toPlainText()
+    )
+    assert "Cluster solvent molecules:" in (
+        window.packmol_plan_summary_box.toPlainText()
+    )
+    assert "Free solvent structure: dmf" in (
+        window.packmol_build_summary_box.toPlainText()
+    )
+    assert "Free solvent molecules:" in (
+        window.packmol_build_summary_box.toPlainText()
+    )
+    assert window.open_packmol_setup_folder_button.isEnabled() is True
+    assert "Built Packmol setup inputs and audit report." in (
+        window.run_log_box.toPlainText()
+    )
+    window.close()
+
+
+def test_solvent_shell_builder_analysis_detects_pdb_residue_types(tmp_path):
+    reference_library_dir, reference_path = (
+        _build_test_solvent_reference_library(tmp_path)
+    )
+    input_path = _write_test_solvent_shell_pdb(
+        tmp_path,
+        reference_path=reference_path,
+    )
+
+    result = analyze_solvent_shell(
+        input_path,
+        "water_test",
+        reference_library_dir=reference_library_dir,
+    )
+
+    assert result.input_format == "pdb"
+    assert result.detected_solvent_molecules == 2
+    assert result.has_solvent_molecules is True
+    assert result.matched_atom_count == 6
+    assert result.unmatched_atom_count == 1
+    assert [
+        summary.residue_name for summary in result.matched_residue_summaries
+    ] == [
+        "ALT",
+        "HOH",
+    ]
+    assert {
+        summary.residue_name: summary.residue_numbers
+        for summary in result.matched_residue_summaries
+    } == {
+        "ALT": (3,),
+        "HOH": (2,),
+    }
+    assert "Solvent molecules detected: 2" in result.summary_text()
+    assert "ALT: 1 molecule(s)" in result.summary_text()
+
+
+def test_solvent_shell_builder_analysis_detects_xyz_solvent_count(tmp_path):
+    reference_library_dir, reference_path = (
+        _build_test_solvent_reference_library(tmp_path)
+    )
+    input_path = _write_test_solvent_shell_xyz(
+        tmp_path,
+        reference_path=reference_path,
+    )
+
+    result = analyze_solvent_shell(
+        input_path,
+        "water_test",
+        reference_library_dir=reference_library_dir,
+    )
+
+    assert result.input_format == "xyz"
+    assert result.detected_solvent_molecules == 2
+    assert result.matched_residue_summaries == ()
+    assert result.matched_atom_count == 6
+    assert result.unmatched_atom_count == 1
+    assert result.no_solvent_status_text == "no"
+    assert result.partial_solvent_status_text == "no"
+    assert result.complete_solvent_status_text == "yes"
+    assert (
+        result.cluster_solvent_status_text
+        == "Complete solvent molecules detected."
+    )
+    assert "Matched residue types: n/a for XYZ inputs" in result.summary_text()
+
+
+def test_solvent_shell_builder_analysis_infers_partial_xyz_solvent_candidates(
+    tmp_path,
+):
+    reference_library_dir, _reference_path = (
+        _build_test_solvent_reference_library(tmp_path)
+    )
+    input_path = _write_test_partial_solvent_shell_xyz(tmp_path)
+
+    result = analyze_solvent_shell(
+        input_path,
+        "water_test",
+        reference_library_dir=reference_library_dir,
+    )
+
+    assert result.input_format == "xyz"
+    assert result.complete_solvent_molecule_count == 0
+    assert result.partial_solvent_molecule_count == 1
+    assert result.no_solvent_status_text == "no"
+    assert result.partial_solvent_status_text == "yes"
+    assert result.complete_solvent_status_text == "no"
+    assert (
+        result.cluster_solvent_status_text
+        == "Partial solvent molecules detected."
+    )
+    assert len(result.residue_mismatch_summaries) == 1
+    candidate = result.residue_mismatch_summaries[0]
+    assert candidate.residue_name == "HOH"
+    assert candidate.common_atom_count == 1
+    assert candidate.reference_atom_count == 3
+    assert candidate.missing_atom_names == ("H1", "H2")
+    assert candidate.source_atom_ids == (3,)
+    summary_text = result.summary_text()
+    assert "Partial solvent candidate count: 1" in summary_text
+    assert "XYZ partial solvent candidates:" in summary_text
+    assert "source atom ids 3" in summary_text
+
+
+def test_solvent_shell_builder_analysis_identifies_no_solvent_status(tmp_path):
+    reference_library_dir, _reference_path = (
+        _build_test_solvent_reference_library(tmp_path)
+    )
+    input_path = _write_test_no_solvent_shell_pdb(tmp_path)
+
+    result = analyze_solvent_shell(
+        input_path,
+        "water_test",
+        reference_library_dir=reference_library_dir,
+    )
+
+    assert result.input_format == "pdb"
+    assert result.complete_solvent_molecule_count == 0
+    assert result.partial_solvent_molecule_count == 0
+    assert result.no_solvent_status_text == "yes"
+    assert result.partial_solvent_status_text == "no"
+    assert result.complete_solvent_status_text == "no"
+    assert (
+        result.cluster_solvent_status_text == "No solvent molecules detected."
+    )
+    assert "Cluster solvent status: No solvent molecules detected." in (
+        result.summary_text()
+    )
+
+
+def test_solvent_shell_builder_analysis_preserves_incomplete_pdb_residues(
+    tmp_path,
+):
+    reference_library_dir, reference_path = (
+        _build_test_solvent_reference_library(tmp_path)
+    )
+    input_path = _write_test_incomplete_solvent_shell_pdb(
+        tmp_path,
+        reference_path=reference_path,
+    )
+
+    result = analyze_solvent_shell(
+        input_path,
+        "water_test",
+        reference_library_dir=reference_library_dir,
+    )
+
+    assert result.input_format == "pdb"
+    assert result.detected_solvent_molecules == 1
+    assert result.matched_atom_count == 3
+    assert result.unmatched_atom_count == 3
+    assert [
+        summary.residue_name for summary in result.matched_residue_summaries
+    ] == ["HOH"]
+    assert result.matched_residue_summaries[0].residue_numbers == (2,)
+    assert len(result.residue_mismatch_summaries) == 1
+    mismatch = result.residue_mismatch_summaries[0]
+    assert mismatch.residue_name == "HOH"
+    assert mismatch.residue_number == 3
+    assert mismatch.observed_atom_count == 2
+    assert mismatch.common_atom_count == 2
+    assert mismatch.reference_atom_count == 3
+    assert mismatch.missing_atom_names == ("H2",)
+    assert mismatch.extra_atom_names == ()
+    assert result.no_solvent_status_text == "no"
+    assert result.partial_solvent_status_text == "yes"
+    assert result.complete_solvent_status_text == "yes"
+    assert (
+        result.cluster_solvent_status_text
+        == "Complete and partial solvent molecules detected."
+    )
+    summary_text = result.summary_text()
+    assert "Residue mismatches preserved: 1" in summary_text
+    assert "HOH 3: missing reference atoms" in summary_text
+    assert "missing H2" in summary_text
+
+
+def test_solvent_shell_builder_builds_no_solvent_output_pdb(tmp_path):
+    reference_library_dir, _reference_path = (
+        _build_test_solvent_reference_library(tmp_path)
+    )
+    input_path = _write_test_no_solvent_shell_pdb(tmp_path)
+
+    analysis_result = analyze_solvent_shell(
+        input_path,
+        "water_test",
+        reference_library_dir=reference_library_dir,
+    )
+    output_path = tmp_path / "solvent_shell_no_solvent_output.pdb"
+    build_result = build_solvent_shell_output(
+        input_path,
+        "water_test",
+        output_path=output_path,
+        director_atom_name="O1",
+        minimum_solvent_atom_separation_a=1.2,
+        solute_distance_cutoffs_a={"Pb": 2.6},
+        coordinating_center_elements=("Pb",),
+        target_average_coordination_numbers={"Pb": 1.0},
+        reference_library_dir=reference_library_dir,
+        analysis_result=analysis_result,
+    )
+
+    output_structure = PDBStructure.from_file(output_path)
+    solvent_atoms = [
+        atom for atom in output_structure.atoms if atom.residue_name == "HOH"
+    ]
+    oxygen_atoms = [atom for atom in solvent_atoms if atom.element == "O"]
+
+    assert build_result.build_mode == "no_solvent_shell_build"
+    assert build_result.solvent_molecules_added == 1
+    assert build_result.solvent_atoms_added == 3
+    assert build_result.partial_candidates_completed == 0
+    assert len(output_structure.atoms) == 4
+    assert len(solvent_atoms) == 3
+    assert len(oxygen_atoms) == 1
+    assert np.allclose(
+        oxygen_atoms[0].coordinates,
+        np.array([2.6, 0.0, 0.0], dtype=float),
+    )
+    assert build_result.target_average_coordination_numbers == {"Pb": 1.0}
+    assert build_result.achieved_average_coordination_numbers == {"Pb": 1.0}
+
+
+def test_solvent_shell_builder_builds_no_solvent_output_using_average_coordination(
+    tmp_path,
+):
+    reference_library_dir, _reference_path = (
+        _build_test_solvent_reference_library(tmp_path)
+    )
+    input_path = _write_test_no_solvent_mixed_shell_pdb(tmp_path)
+
+    analysis_result = analyze_solvent_shell(
+        input_path,
+        "water_test",
+        reference_library_dir=reference_library_dir,
+    )
+    output_path = tmp_path / "solvent_shell_coordination_average_output.pdb"
+    build_result = build_solvent_shell_output(
+        input_path,
+        "water_test",
+        output_path=output_path,
+        director_atom_name="O1",
+        minimum_solvent_atom_separation_a=1.2,
+        solute_distance_cutoffs_a={"I": 3.0, "Pb": 2.6},
+        coordinating_center_elements=("Pb",),
+        target_average_coordination_numbers={"Pb": 2.0},
+        reference_library_dir=reference_library_dir,
+        analysis_result=analysis_result,
+    )
+
+    assert build_result.build_mode == "no_solvent_shell_build"
+    assert 2 <= build_result.solvent_molecules_added <= 4
+    assert build_result.target_average_coordination_numbers == {"Pb": 2.0}
+    assert build_result.achieved_average_coordination_numbers is not None
+    assert build_result.achieved_average_coordination_numbers["Pb"] >= 2.0
+
+
+def test_solvent_shell_builder_prefers_octahedral_vacancies_for_center_candidates():
+    center_atom = PDBAtom(
+        atom_id=1,
+        atom_name="PB1",
+        residue_name="PBI",
+        residue_number=1,
+        coordinates=np.array([0.0, 0.0, 0.0], dtype=float),
+        element="Pb",
+    )
+    solute_atoms = [
+        center_atom,
+        PDBAtom(
+            atom_id=2,
+            atom_name="I1",
+            residue_name="PBI",
+            residue_number=1,
+            coordinates=np.array([2.6, 0.0, 0.0], dtype=float),
+            element="I",
+        ),
+        PDBAtom(
+            atom_id=3,
+            atom_name="I2",
+            residue_name="PBI",
+            residue_number=1,
+            coordinates=np.array([-2.6, 0.0, 0.0], dtype=float),
+            element="I",
+        ),
+    ]
+
+    candidate_positions = (
+        solvent_shell_builder_module._coordination_candidate_positions(
+            center_atoms=[center_atom],
+            solute_atoms=solute_atoms,
+            existing_anchor_positions=[],
+            solute_distance_cutoffs_a={"Pb": 2.6},
+        )
+    )
+
+    assert len(candidate_positions) >= 4
+    leading_positions = candidate_positions[:4]
+    assert all(abs(float(position[0])) < 0.2 for position in leading_positions)
+    assert any(abs(float(position[1])) > 2.0 for position in leading_positions)
+    assert any(abs(float(position[2])) > 2.0 for position in leading_positions)
+
+
+def test_solvent_shell_builder_builds_partial_xyz_output_pdb(tmp_path):
+    reference_library_dir, _reference_path = (
+        _build_test_solvent_reference_library(tmp_path)
+    )
+    input_path = _write_test_partial_solvent_shell_xyz(tmp_path)
+
+    analysis_result = analyze_solvent_shell(
+        input_path,
+        "water_test",
+        reference_library_dir=reference_library_dir,
+    )
+    output_path = tmp_path / "solvent_shell_partial_xyz_output.pdb"
+    build_result = build_solvent_shell_output(
+        input_path,
+        "water_test",
+        output_path=output_path,
+        director_atom_name="O1",
+        minimum_solvent_atom_separation_a=1.2,
+        solute_distance_cutoffs_a={"I": 3.0, "Pb": 2.6},
+        reference_library_dir=reference_library_dir,
+        analysis_result=analysis_result,
+    )
+
+    output_structure = PDBStructure.from_file(output_path)
+    solvent_atoms = [
+        atom for atom in output_structure.atoms if atom.residue_name == "HOH"
+    ]
+    oxygen_atoms = [atom for atom in solvent_atoms if atom.element == "O"]
+
+    assert build_result.build_mode == "partial_solvent_completion"
+    assert build_result.solvent_molecules_added == 1
+    assert build_result.solvent_atoms_added == 2
+    assert build_result.partial_candidates_completed == 1
+    assert build_result.replaced_source_atom_count == 1
+    assert len(output_structure.atoms) == 5
+    assert len(solvent_atoms) == 3
+    assert len(oxygen_atoms) == 1
+    assert np.allclose(
+        oxygen_atoms[0].coordinates,
+        np.array([0.0, 2.0, 0.0], dtype=float),
+    )
+
+
+def test_solvent_shell_builder_window_reports_residue_breakdown(tmp_path):
+    qapp()
+    reference_library_dir, reference_path = (
+        _build_test_solvent_reference_library(tmp_path)
+    )
+    input_path = _write_test_solvent_shell_pdb(
+        tmp_path,
+        reference_path=reference_path,
+    )
+    window = SolventShellBuilderMainWindow(
+        initial_input_path=input_path,
+        reference_library_dir=reference_library_dir,
+    )
+
+    preset_index = window.reference_preset_combo.findData("water_test")
+    assert preset_index >= 0
+    window.reference_preset_combo.setCurrentIndex(preset_index)
+    window._analyze_input_structure()
+
+    central_layout = window.centralWidget().layout()
+    assert central_layout.itemAt(1).widget() is window._pane_splitter
+    assert window._pane_splitter.count() == 2
+    assert window._pane_splitter.widget(0) is window._left_scroll_area
+    assert window._pane_splitter.widget(1) is window._right_scroll_area
+    assert window._left_scroll_area.widget() is window._left_panel
+    assert window._right_scroll_area.widget() is window._right_panel
+    assert window.cluster_status_group.parentWidget() is window._left_panel
+    assert "Residue HOH" in window.reference_details_box.toPlainText()
+    assert window.structure_viewer.current_structure is not None
+    assert window.structure_viewer.current_structure.file_path == input_path
+    assert "complete solvent molecules detected" in (
+        window.cluster_status_headline_label.text().lower()
+    )
+    assert (
+        "No solvent molecules: no" in window.cluster_status_stats_label.text()
+    )
+    assert "Partial solvent molecules: no" in (
+        window.cluster_status_stats_label.text()
+    )
+    assert "Complete solvent molecules: yes" in (
+        window.cluster_status_stats_label.text()
+    )
+    assert (
+        "Complete solvent count: 2" in window.cluster_status_stats_label.text()
+    )
+    assert "Solvent molecules detected: 2" in window.summary_box.toPlainText()
+    assert "PDB residue matches:" in window.summary_box.toPlainText()
+    assert window.residue_table.rowCount() == 2
+    table_rows = {
+        window.residue_table.item(row, 0).text(): {
+            "molecules": window.residue_table.item(row, 1).text(),
+            "numbers": window.residue_table.item(row, 2).text(),
+        }
+        for row in range(window.residue_table.rowCount())
+    }
+    assert table_rows == {
+        "ALT": {"molecules": "1", "numbers": "3"},
+        "HOH": {"molecules": "1", "numbers": "2"},
+    }
+    assert "matched the selected solvent geometry" in (
+        window.residue_status_label.text().lower()
+    )
+    window.close()
+
+
+def test_solvent_shell_builder_window_reports_incomplete_residue_mismatch(
+    tmp_path,
+):
+    qapp()
+    reference_library_dir, reference_path = (
+        _build_test_solvent_reference_library(tmp_path)
+    )
+    input_path = _write_test_incomplete_solvent_shell_pdb(
+        tmp_path,
+        reference_path=reference_path,
+    )
+    window = SolventShellBuilderMainWindow(
+        initial_input_path=input_path,
+        reference_library_dir=reference_library_dir,
+    )
+
+    preset_index = window.reference_preset_combo.findData("water_test")
+    assert preset_index >= 0
+    window.reference_preset_combo.setCurrentIndex(preset_index)
+    window._analyze_input_structure()
+
+    assert "complete and partial solvent molecules detected" in (
+        window.cluster_status_headline_label.text().lower()
+    )
+    assert (
+        "No solvent molecules: no" in window.cluster_status_stats_label.text()
+    )
+    assert "Partial solvent molecules: yes" in (
+        window.cluster_status_stats_label.text()
+    )
+    assert "Complete solvent molecules: yes" in (
+        window.cluster_status_stats_label.text()
+    )
+    assert (
+        "Complete solvent count: 1" in window.cluster_status_stats_label.text()
+    )
+    assert "Partial solvent residue count: 1" in (
+        window.cluster_status_stats_label.text()
+    )
+    assert (
+        "Residue mismatches preserved: 1" in window.summary_box.toPlainText()
+    )
+    assert window.mismatch_table.rowCount() == 1
+    assert window.mismatch_table.item(0, 0).text() == "HOH"
+    assert window.mismatch_table.item(0, 1).text() == "3"
+    assert window.mismatch_table.item(0, 2).text() == "2"
+    assert window.mismatch_table.item(0, 3).text() == "2/3"
+    assert window.mismatch_table.item(0, 4).text() == "H2"
+    assert window.mismatch_table.item(0, 5).text() == "none"
+    assert (
+        "missing-atom details" in window.mismatch_status_label.text().lower()
+    )
+    window.close()
+
+
+def test_solvent_shell_builder_window_reports_partial_xyz_candidates(tmp_path):
+    qapp()
+    reference_library_dir, _reference_path = (
+        _build_test_solvent_reference_library(tmp_path)
+    )
+    input_path = _write_test_partial_solvent_shell_xyz(tmp_path)
+    window = SolventShellBuilderMainWindow(
+        initial_input_path=input_path,
+        reference_library_dir=reference_library_dir,
+    )
+
+    preset_index = window.reference_preset_combo.findData("water_test")
+    assert preset_index >= 0
+    window.reference_preset_combo.setCurrentIndex(preset_index)
+    window._analyze_input_structure()
+
+    assert "partial solvent molecules detected" in (
+        window.cluster_status_headline_label.text().lower()
+    )
+    assert "Partial solvent molecules: yes" in (
+        window.cluster_status_stats_label.text()
+    )
+    assert "Partial solvent candidate count: 1" in (
+        window.cluster_status_stats_label.text()
+    )
+    assert window.mismatch_table.rowCount() == 1
+    assert window.mismatch_table.item(0, 0).text() == "HOH"
+    assert window.mismatch_table.item(0, 3).text() == "1/3"
+    assert window.mismatch_table.item(0, 4).text() == "H1, H2"
+    assert "xyz atom sets" in window.mismatch_status_label.text().lower()
+    window.close()
+
+
+def test_solvent_shell_builder_window_populates_build_controls_and_writes_output(
+    tmp_path,
+):
+    qapp()
+    reference_library_dir, _reference_path = (
+        _build_test_solvent_reference_library(tmp_path)
+    )
+    input_path = _write_test_partial_solvent_shell_xyz(tmp_path)
+    output_path = tmp_path / "beta_builder_output.pdb"
+    window = SolventShellBuilderMainWindow(
+        initial_input_path=input_path,
+        reference_library_dir=reference_library_dir,
+    )
+
+    preset_index = window.reference_preset_combo.findData("water_test")
+    assert preset_index >= 0
+    window.reference_preset_combo.setCurrentIndex(preset_index)
+    window._analyze_input_structure()
+
+    assert [
+        window.director_atom_combo.itemText(index) for index in range(3)
+    ] == [
+        "O1",
+        "H1",
+        "H2",
+    ]
+    assert window.director_atom_combo.currentData() == "O1"
+    assert window.build_output_button.isEnabled() is True
+    assert window.solute_cutoff_table.rowCount() == 2
+    assert window.solute_cutoff_table.item(0, 0).text() == "I"
+    assert window.solute_cutoff_table.item(0, 1).text() == "1"
+    assert window.solute_cutoff_table.item(1, 0).text() == "Pb"
+    assert window.solute_cutoff_table.item(1, 1).text() == "1"
+
+    window.output_path_edit.setText(str(output_path))
+    window._build_solvated_output()
+
+    assert output_path.is_file()
+    assert (
+        "Generated solvent shell output:" in window.summary_box.toPlainText()
+    )
+    assert "Build mode: partial_solvent_completion" in (
+        window.summary_box.toPlainText()
+    )
+    assert (
+        "Previewing generated output" in window.visualizer_status_label.text()
+    )
+    window.close()
+
+
+def test_solvent_shell_builder_window_requires_coordination_targets_for_no_solvent_build(
+    tmp_path,
+):
+    qapp()
+    reference_library_dir, _reference_path = (
+        _build_test_solvent_reference_library(tmp_path)
+    )
+    input_path = _write_test_no_solvent_mixed_shell_pdb(tmp_path)
+    output_path = tmp_path / "beta_coordination_target_output.pdb"
+    window = SolventShellBuilderMainWindow(
+        initial_input_path=input_path,
+        reference_library_dir=reference_library_dir,
+    )
+
+    preset_index = window.reference_preset_combo.findData("water_test")
+    assert preset_index >= 0
+    window.reference_preset_combo.setCurrentIndex(preset_index)
+    window._analyze_input_structure()
+
+    assert window.solute_cutoff_table.rowCount() == 2
+    assert window.build_output_button.isEnabled() is False
+    assert (
+        "needs coordination targets"
+        in window.build_status_label.text().lower()
+    )
+    assert window.solute_cutoff_table.item(0, 0).text() == "I"
+    assert window.solute_cutoff_table.item(1, 0).text() == "Pb"
+
+    pb_center_item = window.solute_cutoff_table.item(1, 2)
+    assert pb_center_item is not None
+    pb_center_item.setCheckState(Qt.CheckState.Checked)
+    pb_coordination_spin = window.solute_cutoff_table.cellWidget(1, 3)
+    assert isinstance(pb_coordination_spin, QDoubleSpinBox)
+    pb_coordination_spin.setValue(2.0)
+
+    assert window.build_output_button.isEnabled() is True
+    window.output_path_edit.setText(str(output_path))
+    window._build_solvated_output()
+
+    assert output_path.is_file()
+    assert (
+        "Target average coordination: Pb:2" in window.summary_box.toPlainText()
+    )
+    assert (
+        "Achieved average coordination: Pb:"
+        in window.summary_box.toPlainText()
+    )
+    window.close()
+
+
+def test_solvent_shell_builder_window_uses_selected_match_tolerance(tmp_path):
+    qapp()
+    reference_library_dir, reference_path = (
+        _build_test_solvent_reference_library(tmp_path)
+    )
+    input_path = _write_test_solvent_shell_pdb(
+        tmp_path,
+        reference_path=reference_path,
+    )
+    window = SolventShellBuilderMainWindow(
+        initial_input_path=input_path,
+        reference_library_dir=reference_library_dir,
+    )
+
+    assert window.reference_match_tolerance_spin.value() == pytest.approx(
+        DEFAULT_REFERENCE_MATCH_TOLERANCE_A
+    )
+    window.reference_match_tolerance_spin.setValue(0.5)
+    preset_index = window.reference_preset_combo.findData("water_test")
+    assert preset_index >= 0
+    window.reference_preset_combo.setCurrentIndex(preset_index)
+    window._analyze_input_structure()
+
+    assert (
+        "Reference match tolerance: 0.5 A" in window.summary_box.toPlainText()
+    )
+    window.close()
 
 
 def test_rmcsetup_ui_can_compute_packmol_plan_and_reload(tmp_path):
@@ -2099,7 +4207,7 @@ def test_rmcsetup_ui_packmol_preview_includes_single_atom_model_sources(
     window._calculate_solution_properties()
     window._compute_representative_clusters()
     _wait_for_representative_worker(window)
-    window.coordinated_solvent_mode_combo.setCurrentIndex(1)
+    _configure_integrated_rmcsetup_solvent_panel(window)
     window._build_representative_solvent_outputs()
     window.packmol_box_side_spin.setValue(80.0)
 
@@ -2122,6 +4230,8 @@ def test_rmcsetup_ui_can_build_packmol_setup_and_reload(tmp_path):
     project_dir, _paths = _build_sample_saxs_project(tmp_path)
     window = RMCSetupMainWindow(initial_project_dir=project_dir)
 
+    assert window.packmol_tolerance_spin.value() == pytest.approx(2.0)
+
     window.solution_density_spin.setValue(1.05)
     window.solute_stoich_edit.setText("Pb1I2")
     window.solvent_stoich_edit.setText("C3H7NO")
@@ -2132,26 +4242,155 @@ def test_rmcsetup_ui_can_build_packmol_setup_and_reload(tmp_path):
     window._calculate_solution_properties()
     window._compute_representative_clusters()
     _wait_for_representative_worker(window)
-    window.coordinated_solvent_mode_combo.setCurrentIndex(1)
+    _configure_integrated_rmcsetup_solvent_panel(window)
     window._build_representative_solvent_outputs()
     window.packmol_box_side_spin.setValue(80.0)
     window._compute_packmol_plan()
+    window.packmol_tolerance_spin.setValue(2.2)
 
     window._build_packmol_setup()
 
+    assert window._project_source_state is not None
+    assert window._project_source_state.packmol_setup is not None
+    assert "Packmol tolerance: 2.200 A" in (
+        window.packmol_build_summary_box.toPlainText()
+    )
+    assert "tolerance 2.200" in Path(
+        window._project_source_state.packmol_setup.packmol_input_path
+    ).read_text(encoding="utf-8")
     assert "Representative PDBs copied:" in (
         window.packmol_build_summary_box.toPlainText()
     )
+    assert window.open_packmol_setup_folder_button.isEnabled() is True
     assert "Built Packmol setup inputs and audit report." in (
         window.run_log_box.toPlainText()
     )
     assert "packmol_combined.inp" in window.output_summary_box.toPlainText()
 
     reloaded = RMCSetupMainWindow(initial_project_dir=project_dir)
+    assert reloaded.packmol_tolerance_spin.value() == pytest.approx(2.2)
+    assert "Packmol tolerance: 2.200 A" in (
+        reloaded.packmol_build_summary_box.toPlainText()
+    )
     assert "Representative PDBs copied:" in (
         reloaded.packmol_build_summary_box.toPlainText()
     )
+    assert reloaded.open_packmol_setup_folder_button.isEnabled() is True
     assert "packmol_audit.md" in reloaded.output_summary_box.toPlainText()
+
+
+def test_rmcsetup_ui_can_open_packmol_setup_folder(
+    tmp_path,
+    monkeypatch,
+):
+    qapp()
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    window = RMCSetupMainWindow(initial_project_dir=project_dir)
+    opened_paths: list[Path] = []
+    monkeypatch.setattr(
+        window,
+        "_open_path_in_file_manager",
+        lambda path: opened_paths.append(path),
+    )
+
+    window.solution_density_spin.setValue(1.05)
+    window.solute_stoich_edit.setText("Pb1I2")
+    window.solvent_stoich_edit.setText("C3H7NO")
+    window.molar_mass_solute_spin.setValue(461.0)
+    window.molar_mass_solvent_spin.setValue(73.09)
+    window.mass_solute_spin.setValue(4.61)
+    window.mass_solvent_spin.setValue(95.39)
+    window._calculate_solution_properties()
+    window._compute_representative_clusters()
+    _wait_for_representative_worker(window)
+    _configure_integrated_rmcsetup_solvent_panel(window)
+    window._build_representative_solvent_outputs()
+    window.packmol_box_side_spin.setValue(80.0)
+    window._compute_packmol_plan()
+    window._build_packmol_setup()
+
+    assert window.open_packmol_setup_folder_button.isEnabled() is True
+
+    window.open_packmol_setup_folder_button.click()
+
+    assert opened_paths == [
+        window._project_source_state.rmcsetup_paths.packmol_inputs_dir.resolve()
+    ]
+    assert "Opened Packmol setup folder in Finder/file manager:" in (
+        window.run_log_box.toPlainText()
+    )
+    assert window.statusBar().currentMessage() == (
+        "Opened Packmol setup folder: packmol_inputs"
+    )
+
+
+def test_rmcsetup_ui_syncs_packmol_setup_to_linked_docker_container(
+    tmp_path,
+    monkeypatch,
+):
+    qapp()
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    fake_client = _FakePackmolDockerClient()
+    monkeypatch.setattr(
+        RMCSetupMainWindow,
+        "_create_packmol_docker_client",
+        lambda self: fake_client,
+    )
+    window = RMCSetupMainWindow(initial_project_dir=project_dir)
+    assert window._project_source_state is not None
+
+    linked = PackmolDockerLink(
+        display_name="Mounted Packmol",
+        container_name="packmol-dev",
+        container_project_root="/packmol_input_files/project_alpha",
+        packmol_command="packmol",
+        shell_command="sh",
+        packmol_version="Packmol version 20.14.4",
+        last_verified_at="2026-04-17T12:30:00",
+        container_id="sha256:sync",
+        image_name="packmol:test-image",
+        packmol_command_path="/usr/local/bin/packmol",
+    )
+    window._save_packmol_docker_link(linked)
+    window.packmol_docker_summary_box.setPlainText(
+        window._packmol_docker_summary_text()
+    )
+
+    window.solution_density_spin.setValue(1.05)
+    window.solute_stoich_edit.setText("Pb1I2")
+    window.solvent_stoich_edit.setText("C3H7NO")
+    window.molar_mass_solute_spin.setValue(461.0)
+    window.molar_mass_solvent_spin.setValue(73.09)
+    window.mass_solute_spin.setValue(4.61)
+    window.mass_solvent_spin.setValue(95.39)
+    window._calculate_solution_properties()
+    window._compute_representative_clusters()
+    _wait_for_representative_worker(window)
+    _configure_integrated_rmcsetup_solvent_panel(window)
+    window._build_representative_solvent_outputs()
+    window.packmol_box_side_spin.setValue(80.0)
+    window._compute_packmol_plan()
+
+    window._build_packmol_setup()
+
+    assert fake_client.synced_calls
+    assert fake_client.synced_calls[0][0] == "packmol-dev"
+    assert window._project_source_state.packmol_docker_link is not None
+    assert (
+        window._project_source_state.packmol_docker_link.last_sync_status
+        == ("success")
+    )
+    assert "/packmol_input_files/project_alpha/rmcsetup/packmol_inputs" in (
+        window.packmol_build_summary_box.toPlainText()
+    )
+    assert "Last sync status: success" in (
+        window.packmol_docker_summary_box.toPlainText()
+    )
+
+    reloaded = RMCSetupMainWindow(initial_project_dir=project_dir)
+    assert "Last sync status: success" in (
+        reloaded.packmol_docker_summary_box.toPlainText()
+    )
 
 
 def test_rmcsetup_ui_can_generate_constraints_and_reload(tmp_path):
@@ -2169,7 +4408,7 @@ def test_rmcsetup_ui_can_generate_constraints_and_reload(tmp_path):
     window._calculate_solution_properties()
     window._compute_representative_clusters()
     _wait_for_representative_worker(window)
-    window.coordinated_solvent_mode_combo.setCurrentIndex(1)
+    _configure_integrated_rmcsetup_solvent_panel(window)
     window._build_representative_solvent_outputs()
     window.packmol_box_side_spin.setValue(80.0)
     window._compute_packmol_plan()
@@ -2182,6 +4421,8 @@ def test_rmcsetup_ui_can_generate_constraints_and_reload(tmp_path):
     assert "Per-structure files:" in (
         window.constraints_summary_box.toPlainText()
     )
+    assert window.open_constraints_folder_button.isEnabled() is True
+    assert window.preview_constraints_button.isEnabled() is True
     assert (
         "Generated per-structure constraints and merged fullrmc constraints."
         in (window.run_log_box.toPlainText())
@@ -2200,6 +4441,99 @@ def test_rmcsetup_ui_can_generate_constraints_and_reload(tmp_path):
     assert "Per-structure files:" in (
         reloaded.constraints_summary_box.toPlainText()
     )
+    assert reloaded.open_constraints_folder_button.isEnabled() is True
+    assert reloaded.preview_constraints_button.isEnabled() is True
+
+
+def test_rmcsetup_ui_can_open_constraints_folder(
+    tmp_path,
+    monkeypatch,
+):
+    qapp()
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    window = RMCSetupMainWindow(initial_project_dir=project_dir)
+    opened_paths: list[Path] = []
+    monkeypatch.setattr(
+        window,
+        "_open_path_in_file_manager",
+        lambda path: opened_paths.append(path),
+    )
+
+    window.solution_density_spin.setValue(1.05)
+    window.solute_stoich_edit.setText("Pb1I2")
+    window.solvent_stoich_edit.setText("C3H7NO")
+    window.molar_mass_solute_spin.setValue(461.0)
+    window.molar_mass_solvent_spin.setValue(73.09)
+    window.mass_solute_spin.setValue(4.61)
+    window.mass_solvent_spin.setValue(95.39)
+    window._calculate_solution_properties()
+    window._compute_representative_clusters()
+    _wait_for_representative_worker(window)
+    _configure_integrated_rmcsetup_solvent_panel(window)
+    window._build_representative_solvent_outputs()
+    window.packmol_box_side_spin.setValue(80.0)
+    window._compute_packmol_plan()
+    window._build_packmol_setup()
+    window._generate_constraints()
+
+    assert window.open_constraints_folder_button.isEnabled() is True
+
+    window.open_constraints_folder_button.click()
+
+    assert window._project_source_state is not None
+    assert window._project_source_state.constraint_generation is not None
+    assert opened_paths == [
+        Path(
+            window._project_source_state.constraint_generation.merged_constraints_path
+        ).resolve()
+    ]
+    assert "Opened constraints file location in Finder/file manager:" in (
+        window.run_log_box.toPlainText()
+    )
+    assert window.statusBar().currentMessage() == (
+        "Opened constraints file location: merged_fullrmc_constraints.py"
+    )
+
+
+def test_rmcsetup_ui_can_preview_merged_constraints(
+    tmp_path,
+):
+    qapp()
+    project_dir, _paths = _build_sample_saxs_project(tmp_path)
+    window = RMCSetupMainWindow(initial_project_dir=project_dir)
+
+    window.solution_density_spin.setValue(1.05)
+    window.solute_stoich_edit.setText("Pb1I2")
+    window.solvent_stoich_edit.setText("C3H7NO")
+    window.molar_mass_solute_spin.setValue(461.0)
+    window.molar_mass_solvent_spin.setValue(73.09)
+    window.mass_solute_spin.setValue(4.61)
+    window.mass_solvent_spin.setValue(95.39)
+    window._calculate_solution_properties()
+    window._compute_representative_clusters()
+    _wait_for_representative_worker(window)
+    _configure_integrated_rmcsetup_solvent_panel(window)
+    window._build_representative_solvent_outputs()
+    window.packmol_box_side_spin.setValue(80.0)
+    window._compute_packmol_plan()
+    window._build_packmol_setup()
+    window._generate_constraints()
+
+    assert window.preview_constraints_button.isEnabled() is True
+
+    window.preview_constraints_button.click()
+
+    assert window._constraints_preview_window is not None
+    assert "BOND_ANGLE_CONSTRAINTS = {" in (
+        window._constraints_preview_window.text_box.toPlainText()
+    )
+    assert "BOND_LENGTH_CONSTRAINTS = {" in (
+        window._constraints_preview_window.text_box.toPlainText()
+    )
+    assert "Opened merged constraints preview:" in (
+        window.run_log_box.toPlainText()
+    )
+    window._constraints_preview_window.close()
 
 
 def test_rmcsetup_cluster_validation_runs_in_backend_for_cluster_drift(
@@ -2324,7 +4658,7 @@ def test_rmcsetup_ui_end_to_end_pipeline_updates_readiness_and_outputs(
     window.representative_angle_triplet_table.item(0, 4).setText("3.5")
     window._compute_representative_clusters()
     _wait_for_representative_worker(window)
-    window.coordinated_solvent_mode_combo.setCurrentIndex(1)
+    _configure_integrated_rmcsetup_solvent_panel(window)
     window._build_representative_solvent_outputs()
     window.packmol_box_side_spin.setValue(80.0)
     window._compute_packmol_plan()

@@ -8,13 +8,24 @@ from pathlib import Path
 
 import numpy as np
 
-from saxshell.fullrmc.representatives import RepresentativeSelectionMetadata
+from saxshell.fullrmc.representatives import (
+    RepresentativeSelectionMetadata,
+    validate_representative_selection_covers_distribution,
+)
 from saxshell.fullrmc.solution_properties import (
     SolutionProperties,
     SolutionPropertiesMetadata,
 )
-from saxshell.fullrmc.solvent_handling import SolventHandlingMetadata
-from saxshell.structure import PDBStructure
+from saxshell.fullrmc.solvent_handling import (
+    RepresentativeSolventDistributionAnalysis,
+    SolventHandlingMetadata,
+    SolventHandlingSettings,
+    analyze_representative_solvent_distribution,
+    representative_source_solvent_mode_to_variant,
+)
+from saxshell.saxs.debye import load_structure_file
+from saxshell.structure import PDBAtom, PDBStructure
+from saxshell.xyz2pdb import resolve_reference_path
 
 if False:  # pragma: no cover
     from .project_loader import RMCDreamProjectSource
@@ -24,6 +35,7 @@ if False:  # pragma: no cover
 class PackmolPlanningSettings:
     planning_mode: str = "per_element"
     box_side_length_a: float = 100.0
+    free_solvent_reference: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -44,6 +56,88 @@ class PackmolPlanningSettings:
         return cls(
             planning_mode=mode,
             box_side_length_a=max(box_side_length_a, 1.0),
+            free_solvent_reference=_optional_text(
+                source.get("free_solvent_reference")
+            ),
+        )
+
+
+@dataclass(slots=True)
+class PackmolSolventAllocationEntry:
+    structure: str
+    motif: str
+    param: str
+    planned_count: int
+    solvent_molecules_per_cluster: int
+    solvent_molecules_total: int
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: dict[str, object],
+    ) -> "PackmolSolventAllocationEntry":
+        return cls(
+            structure=str(payload.get("structure", "")).strip(),
+            motif=str(payload.get("motif", "no_motif")).strip() or "no_motif",
+            param=str(payload.get("param", "")).strip(),
+            planned_count=int(payload.get("planned_count", 0)),
+            solvent_molecules_per_cluster=int(
+                payload.get("solvent_molecules_per_cluster", 0)
+            ),
+            solvent_molecules_total=int(
+                payload.get("solvent_molecules_total", 0)
+            ),
+        )
+
+
+@dataclass(slots=True)
+class PackmolSolventAllocation:
+    reference_name: str | None
+    reference_path: str | None
+    target_solvent_molecules: int
+    solvent_molecules_in_clusters: int
+    free_solvent_molecules: int
+    entries: list[PackmolSolventAllocationEntry]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "reference_name": self.reference_name,
+            "reference_path": self.reference_path,
+            "target_solvent_molecules": self.target_solvent_molecules,
+            "solvent_molecules_in_clusters": (
+                self.solvent_molecules_in_clusters
+            ),
+            "free_solvent_molecules": self.free_solvent_molecules,
+            "entries": [entry.to_dict() for entry in self.entries],
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: dict[str, object] | None,
+    ) -> "PackmolSolventAllocation | None":
+        if not payload:
+            return None
+        return cls(
+            reference_name=_optional_text(payload.get("reference_name")),
+            reference_path=_optional_text(payload.get("reference_path")),
+            target_solvent_molecules=int(
+                payload.get("target_solvent_molecules", 0)
+            ),
+            solvent_molecules_in_clusters=int(
+                payload.get("solvent_molecules_in_clusters", 0)
+            ),
+            free_solvent_molecules=int(
+                payload.get("free_solvent_molecules", 0)
+            ),
+            entries=[
+                PackmolSolventAllocationEntry.from_dict(dict(entry))
+                for entry in payload.get("entries", [])
+                if isinstance(entry, dict)
+            ],
         )
 
 
@@ -101,6 +195,7 @@ class PackmolPlanningMetadata:
     target_element_number_density_a3: dict[str, float]
     achieved_total_number_density_a3: float
     achieved_element_number_density_a3: dict[str, float]
+    solvent_allocation: PackmolSolventAllocation | None
     entries: list[PackmolPlanningEntry]
     report_text: str
 
@@ -124,6 +219,11 @@ class PackmolPlanningMetadata:
             ),
             "achieved_element_number_density_a3": dict(
                 self.achieved_element_number_density_a3
+            ),
+            "solvent_allocation": (
+                None
+                if self.solvent_allocation is None
+                else self.solvent_allocation.to_dict()
             ),
             "entries": [entry.to_dict() for entry in self.entries],
             "report_text": self.report_text,
@@ -167,6 +267,11 @@ class PackmolPlanningMetadata:
                     payload.get("achieved_element_number_density_a3", {})
                 ).items()
             },
+            solvent_allocation=PackmolSolventAllocation.from_dict(
+                payload.get("solvent_allocation")
+                if isinstance(payload.get("solvent_allocation"), dict)
+                else None
+            ),
             entries=[
                 PackmolPlanningEntry.from_dict(dict(entry))
                 for entry in payload.get("entries", [])
@@ -181,15 +286,41 @@ class PackmolPlanningMetadata:
             f"Box side: {self.settings.box_side_length_a:.3f} A",
             f"Saved at: {self.updated_at}",
             f"Planned clusters: {sum(entry.planned_count for entry in self.entries)}",
-            (
-                "Target total number density: "
-                f"{self.target_total_number_density_a3:.6g} atoms/A^3"
-            ),
-            (
-                "Achieved total number density: "
-                f"{self.achieved_total_number_density_a3:.6g} atoms/A^3"
-            ),
         ]
+        if self.solvent_allocation is not None:
+            if self.solvent_allocation.reference_name:
+                lines.append(
+                    "Free solvent structure: "
+                    f"{self.solvent_allocation.reference_name}"
+                )
+            lines.extend(
+                [
+                    (
+                        "Total solvent molecules: "
+                        f"{self.solvent_allocation.target_solvent_molecules}"
+                    ),
+                    (
+                        "Cluster solvent molecules: "
+                        f"{self.solvent_allocation.solvent_molecules_in_clusters}"
+                    ),
+                    (
+                        "Free solvent molecules: "
+                        f"{self.solvent_allocation.free_solvent_molecules}"
+                    ),
+                ]
+            )
+        lines.extend(
+            [
+                (
+                    "Target total number density: "
+                    f"{self.target_total_number_density_a3:.6g} atoms/A^3"
+                ),
+                (
+                    "Achieved total number density: "
+                    f"{self.achieved_total_number_density_a3:.6g} atoms/A^3"
+                ),
+            ]
+        )
         if self.entries:
             first = self.entries[0]
             lines.extend(
@@ -221,8 +352,11 @@ def build_packmol_plan(
         or not active_representatives.representative_entries
     ):
         raise ValueError(
-            "Compute representative clusters before planning the Packmol box."
+            "Save representative structures before planning the Packmol box."
         )
+    validate_representative_selection_covers_distribution(
+        active_representatives
+    )
     active_solution = solution_metadata or project_source.solution_properties
     if active_solution.result is None:
         raise ValueError(
@@ -237,9 +371,18 @@ def build_packmol_plan(
     target_total_nd = float(solution.number_density_A3)
     target_element_nd = _element_number_density(solution)
 
+    active_solvent = solvent_metadata or project_source.solvent_handling
+    solvent_analysis = _build_packmol_solvent_analysis(
+        project_source,
+        settings,
+        active_representatives,
+        active_solvent,
+    )
+
     composition_lookup = _build_composition_lookup(
         active_representatives,
-        solvent_metadata or project_source.solvent_handling,
+        active_solvent,
+        solvent_analysis=solvent_analysis,
     )
     keys: list[tuple[str, str, str]] = []
     weights: list[float] = []
@@ -320,6 +463,14 @@ def build_packmol_plan(
             )
         )
 
+    solvent_allocation = _build_solvent_allocation(
+        settings=settings,
+        box_targets=box_targets,
+        representative_metadata=active_representatives,
+        planning_entries=entries,
+        solvent_metadata=active_solvent,
+        solvent_analysis=solvent_analysis,
+    )
     report_text = _build_plan_report(
         settings=settings,
         box_targets=box_targets,
@@ -328,6 +479,7 @@ def build_packmol_plan(
         target_element_nd=target_element_nd,
         achieved_total_nd=achieved_total_nd,
         achieved_element_nd=achieved_element_nd,
+        solvent_allocation=solvent_allocation,
     )
     metadata = PackmolPlanningMetadata(
         settings=settings,
@@ -338,6 +490,7 @@ def build_packmol_plan(
         target_element_number_density_a3=target_element_nd,
         achieved_total_number_density_a3=achieved_total_nd,
         achieved_element_number_density_a3=achieved_element_nd,
+        solvent_allocation=solvent_allocation,
         entries=entries,
         report_text=report_text,
     )
@@ -389,14 +542,22 @@ def _element_number_density(solution: SolutionProperties) -> dict[str, float]:
 def _build_composition_lookup(
     metadata: RepresentativeSelectionMetadata,
     solvent_metadata: SolventHandlingMetadata | None,
+    *,
+    solvent_analysis: RepresentativeSolventDistributionAnalysis | None = None,
 ) -> dict[tuple[str, str, str], tuple[dict[str, int], int, str]]:
     lookup: dict[tuple[str, str, str], tuple[dict[str, int], int, str]] = {}
     solvent_lookup: dict[tuple[str, str, str], Path] = {}
+    analysis_lookup: dict[tuple[str, str, str], object] = {}
     if solvent_metadata is not None:
         for entry in solvent_metadata.entries:
             solvent_lookup[(entry.structure, entry.motif, entry.param)] = Path(
                 entry.no_solvent_pdb
             )
+    if solvent_analysis is not None:
+        analysis_lookup = {
+            (entry.structure, entry.motif, entry.param): entry
+            for entry in solvent_analysis.entries
+        }
 
     for entry in metadata.representative_entries:
         key = (entry.structure, entry.motif, entry.param)
@@ -410,6 +571,22 @@ def _build_composition_lookup(
                 counts,
                 len(structure.atoms),
                 "pdb_no_solvent",
+            )
+            continue
+        analysis_entry = analysis_lookup.get(key)
+        if analysis_entry is not None:
+            structure = _strip_detected_solvent_atoms(
+                _load_structure_as_pdb(
+                    entry.source_file,
+                    structure_label=entry.structure,
+                ),
+                analysis_entry.analysis_result,
+            )
+            counts = _count_elements(structure)
+            lookup[key] = (
+                counts,
+                len(structure.atoms),
+                "analyzed_source_no_solvent",
             )
             continue
         lookup[key] = (
@@ -520,6 +697,7 @@ def _build_plan_report(
     target_element_nd: dict[str, float],
     achieved_total_nd: float,
     achieved_element_nd: dict[str, float],
+    solvent_allocation: PackmolSolventAllocation | None,
 ) -> str:
     lines = [
         "== Packmol Planning ==",
@@ -530,19 +708,56 @@ def _build_plan_report(
             f"{int(box_targets.get('solute_molecules', 0))} solute molecules, "
             f"{int(box_targets.get('solvent_molecules', 0))} solvent molecules"
         ),
-        ("Target total number density: " f"{target_total_nd:.6f} atoms/A^3"),
-        (
-            "Achieved total number density (cluster plan): "
-            f"{achieved_total_nd:.6f} atoms/A^3"
-        ),
-        "",
-        "Counts per cluster bin:",
     ]
+    if solvent_allocation is not None:
+        if solvent_allocation.reference_name:
+            lines.append(
+                "Free solvent structure: "
+                f"{solvent_allocation.reference_name}"
+            )
+        lines.extend(
+            [
+                (
+                    "Solvent allocation: "
+                    f"{solvent_allocation.solvent_molecules_in_clusters} in cluster files, "
+                    f"{solvent_allocation.free_solvent_molecules} free solvent molecules"
+                ),
+            ]
+        )
+    lines.extend(
+        [
+            (
+                "Target total number density: "
+                f"{target_total_nd:.6f} atoms/A^3"
+            ),
+            (
+                "Achieved total number density (cluster plan): "
+                f"{achieved_total_nd:.6f} atoms/A^3"
+            ),
+            "",
+            "Counts per cluster bin:",
+        ]
+    )
     for entry in entries:
         lines.append(
             f"  - {entry.structure}/{entry.motif}: {entry.planned_count} "
             f"(selected weight {entry.selected_weight:.6g})"
         )
+    if solvent_allocation is not None and solvent_allocation.entries:
+        lines.extend(["", "Embedded cluster solvent contributions:"])
+        for allocation_entry in solvent_allocation.entries:
+            if (
+                allocation_entry.planned_count <= 0
+                or allocation_entry.solvent_molecules_total <= 0
+            ):
+                continue
+            lines.append(
+                "  - "
+                f"{allocation_entry.structure}/{allocation_entry.motif}: "
+                f"{allocation_entry.planned_count} x "
+                f"{allocation_entry.solvent_molecules_per_cluster} = "
+                f"{allocation_entry.solvent_molecules_total}"
+            )
     if target_element_nd:
         lines.extend(
             [
@@ -623,10 +838,291 @@ def _write_plan_reports(
             )
 
 
+def _build_packmol_solvent_analysis(
+    project_source: "RMCDreamProjectSource",
+    settings: PackmolPlanningSettings,
+    representative_metadata: RepresentativeSelectionMetadata,
+    solvent_metadata: SolventHandlingMetadata | None,
+) -> RepresentativeSolventDistributionAnalysis | None:
+    if solvent_metadata is not None:
+        return None
+    if not _representatives_contain_solvent(representative_metadata):
+        return None
+    reference_identifier = _optional_text(settings.free_solvent_reference)
+    if reference_identifier is None:
+        raise ValueError(
+            "Choose a free-solvent structure before planning counts for "
+            "representative files that already contain solvent, or build "
+            "solvent-handling outputs first."
+        )
+    return analyze_representative_solvent_distribution(
+        project_source,
+        _solvent_settings_for_reference(reference_identifier),
+        representative_metadata=representative_metadata,
+    )
+
+
+def _build_solvent_allocation(
+    *,
+    settings: PackmolPlanningSettings,
+    box_targets: dict[str, object],
+    representative_metadata: RepresentativeSelectionMetadata,
+    planning_entries: list[PackmolPlanningEntry],
+    solvent_metadata: SolventHandlingMetadata | None,
+    solvent_analysis: RepresentativeSolventDistributionAnalysis | None,
+) -> PackmolSolventAllocation:
+    allocation_entries: list[PackmolSolventAllocationEntry] = []
+    target_solvent_molecules = int(
+        round(float(box_targets.get("solvent_molecules", 0)))
+    )
+    counts_by_key: dict[tuple[str, str, str], int] = {}
+    reference_name, reference_path = _selected_reference_details(
+        settings.free_solvent_reference
+    )
+    if solvent_metadata is not None:
+        counts_by_key = {
+            (
+                entry.structure,
+                entry.motif,
+                entry.param,
+            ): _completed_solvent_count(entry)
+            for entry in solvent_metadata.entries
+        }
+        if reference_path is None:
+            reference_name = _optional_text(solvent_metadata.reference_name)
+            reference_path = _optional_text(solvent_metadata.reference_path)
+    elif solvent_analysis is not None:
+        counts_by_key = {
+            (
+                entry.structure,
+                entry.motif,
+                entry.param,
+            ): _source_solvent_count(entry)
+            for entry in solvent_analysis.entries
+        }
+        if reference_path is None:
+            reference_name = _optional_text(solvent_analysis.reference_name)
+            reference_path = _optional_text(solvent_analysis.reference_path)
+
+    representative_variants = {
+        (
+            entry.structure,
+            entry.motif,
+            entry.param,
+        ): representative_source_solvent_mode_to_variant(
+            entry.source_solvent_mode
+        )
+        for entry in representative_metadata.representative_entries
+    }
+    if not counts_by_key and _representatives_contain_solvent(
+        representative_metadata
+    ):
+        raise ValueError(
+            "Unable to determine how much solvent is already present in the "
+            "representative cluster files. Choose a free-solvent structure "
+            "or build solvent-handling outputs first."
+        )
+
+    solvent_molecules_in_clusters = 0
+    for entry in planning_entries:
+        key = (entry.structure, entry.motif, entry.param)
+        per_cluster = int(counts_by_key.get(key, 0))
+        if per_cluster <= 0 and representative_variants.get(key) in {
+            "full_solvent",
+            "partial_solvent",
+        }:
+            raise ValueError(
+                "Unable to determine the embedded solvent count for "
+                f"{entry.structure}/{entry.motif}. Choose a free-solvent "
+                "structure or build solvent-handling outputs first."
+            )
+        total = int(entry.planned_count) * per_cluster
+        solvent_molecules_in_clusters += total
+        allocation_entries.append(
+            PackmolSolventAllocationEntry(
+                structure=entry.structure,
+                motif=entry.motif,
+                param=entry.param,
+                planned_count=int(entry.planned_count),
+                solvent_molecules_per_cluster=per_cluster,
+                solvent_molecules_total=total,
+            )
+        )
+
+    free_solvent_molecules = max(
+        0,
+        target_solvent_molecules - solvent_molecules_in_clusters,
+    )
+    return PackmolSolventAllocation(
+        reference_name=reference_name,
+        reference_path=reference_path,
+        target_solvent_molecules=target_solvent_molecules,
+        solvent_molecules_in_clusters=solvent_molecules_in_clusters,
+        free_solvent_molecules=free_solvent_molecules,
+        entries=allocation_entries,
+    )
+
+
+def _representatives_contain_solvent(
+    representative_metadata: RepresentativeSelectionMetadata,
+) -> bool:
+    return any(
+        representative_source_solvent_mode_to_variant(
+            entry.source_solvent_mode
+        )
+        in {"full_solvent", "partial_solvent"}
+        for entry in representative_metadata.representative_entries
+    )
+
+
+def _completed_solvent_count(entry: object) -> int:
+    detected_status = str(getattr(entry, "detected_source_status", "")).strip()
+    if detected_status == "partial_solvent":
+        return max(
+            int(getattr(entry, "detected_partial_solvent_count", 0)),
+            0,
+        ) + max(int(getattr(entry, "solvent_molecules_added", 0)), 0)
+    if detected_status == "complete_solvent":
+        return max(
+            int(getattr(entry, "detected_complete_solvent_count", 0)),
+            int(getattr(entry, "solvent_molecules_added", 0)),
+        )
+    return max(int(getattr(entry, "solvent_molecules_added", 0)), 0)
+
+
+def _source_solvent_count(entry: object) -> int:
+    source_status = str(getattr(entry, "source_status", "")).strip()
+    analysis_result = getattr(entry, "analysis_result", None)
+    if analysis_result is None:
+        return 0
+    if source_status == "complete_solvent":
+        return max(
+            int(
+                getattr(analysis_result, "complete_solvent_molecule_count", 0)
+            ),
+            0,
+        )
+    if source_status == "partial_solvent":
+        return max(
+            int(getattr(analysis_result, "partial_solvent_molecule_count", 0)),
+            0,
+        )
+    return 0
+
+
+def _solvent_settings_for_reference(
+    reference_identifier: str,
+) -> SolventHandlingSettings:
+    candidate = Path(reference_identifier).expanduser()
+    if candidate.is_file():
+        return SolventHandlingSettings(
+            reference_source="custom",
+            custom_reference_path=str(candidate.resolve()),
+        )
+    return SolventHandlingSettings(
+        reference_source="preset",
+        preset_name=str(reference_identifier).strip(),
+    )
+
+
+def _selected_reference_details(
+    reference_identifier: str | None,
+) -> tuple[str | None, str | None]:
+    identifier = _optional_text(reference_identifier)
+    if identifier is None:
+        return None, None
+    resolved_reference = resolve_reference_path(identifier).expanduser()
+    return resolved_reference.stem, str(resolved_reference.resolve())
+
+
+def _strip_detected_solvent_atoms(
+    structure: PDBStructure,
+    analysis_result: object,
+) -> PDBStructure:
+    stripped_atom_ids = {
+        int(atom_id)
+        for atom_id in getattr(
+            analysis_result,
+            "complete_solvent_source_atom_ids",
+            (),
+        )
+    }
+    stripped_atom_ids.update(
+        int(atom_id)
+        for atom_id in getattr(
+            analysis_result,
+            "partial_solvent_source_atom_ids",
+            (),
+        )
+    )
+    stripped_atoms = [
+        atom.copy()
+        for atom in structure.atoms
+        if int(atom.atom_id) not in stripped_atom_ids
+    ]
+    for index, atom in enumerate(stripped_atoms, start=1):
+        atom.atom_id = index
+    return PDBStructure(
+        atoms=stripped_atoms,
+        source_name=structure.source_name,
+    )
+
+
+def _load_structure_as_pdb(
+    source_file: str | Path,
+    *,
+    structure_label: str,
+) -> PDBStructure:
+    path = Path(source_file).expanduser().resolve()
+    if path.suffix.lower() == ".pdb":
+        return PDBStructure.from_file(path)
+    positions, elements = load_structure_file(path)
+    counters: dict[str, int] = {}
+    atoms: list[PDBAtom] = []
+    residue_name = _normalized_residue_name(structure_label)
+    for index, (coordinates, element) in enumerate(
+        zip(positions, elements, strict=True),
+        start=1,
+    ):
+        counters[element] = counters.get(element, 0) + 1
+        atoms.append(
+            PDBAtom(
+                atom_id=index,
+                atom_name=f"{element}{counters[element]}",
+                residue_name=residue_name,
+                residue_number=1,
+                coordinates=np.asarray(coordinates, dtype=float),
+                element=str(element),
+            )
+        )
+    return PDBStructure(atoms=atoms, source_name=path.stem)
+
+
+def _count_elements(structure: PDBStructure) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for atom in structure.atoms:
+        counts[atom.element] = counts.get(atom.element, 0) + 1
+    return counts
+
+
+def _normalized_residue_name(text: str) -> str:
+    collapsed = "".join(char for char in str(text).upper() if char.isalnum())
+    return (collapsed or "CLU")[:3]
+
+
+def _optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 __all__ = [
     "PackmolPlanningEntry",
     "PackmolPlanningMetadata",
     "PackmolPlanningSettings",
+    "PackmolSolventAllocation",
+    "PackmolSolventAllocationEntry",
     "build_packmol_plan",
     "load_packmol_planning_metadata",
     "save_packmol_planning_metadata",

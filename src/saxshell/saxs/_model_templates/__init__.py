@@ -47,6 +47,20 @@ class TemplateClusterGeometrySupport:
 
 
 @dataclass(slots=True, frozen=True)
+class TemplateSolutionScatteringSupport:
+    volume_fraction_parameter: str | None = None
+    volume_fraction_kind: str = "solute"
+    volume_fraction_source: str = "saxs_effective"
+    solvent_contribution_scale_mode: str = "unscaled"
+
+
+@dataclass(slots=True, frozen=True)
+class TemplatePrefitSupport:
+    auto_apply_autoscale_on_load: bool = False
+    autoscale_bounds_mode: str = "preserve_existing"
+
+
+@dataclass(slots=True, frozen=True)
 class TemplateSpec:
     name: str
     module_path: Path
@@ -61,6 +75,8 @@ class TemplateSpec:
     param_columns: tuple[str, ...]
     parameters: tuple[TemplateParameter, ...]
     cluster_geometry_support: TemplateClusterGeometrySupport
+    solution_scattering_support: TemplateSolutionScatteringSupport
+    prefit_support: TemplatePrefitSupport
 
     @property
     def label(self) -> str:
@@ -184,6 +200,8 @@ def load_template_spec(
         param_columns=_split_csv(directives["param_columns"]),
         parameters=tuple(_parse_param_lines(module_path)),
         cluster_geometry_support=metadata["cluster_geometry_support"],
+        solution_scattering_support=metadata["solution_scattering_support"],
+        prefit_support=metadata["prefit_support"],
     )
     _validate_template_runtime_contract(spec)
     return spec
@@ -311,6 +329,8 @@ def _load_template_metadata(
             "cluster_geometry_support": TemplateClusterGeometrySupport(
                 supported=False
             ),
+            "solution_scattering_support": TemplateSolutionScatteringSupport(),
+            "prefit_support": TemplatePrefitSupport(),
         }
     payload = json.loads(metadata_path.read_text(encoding="utf-8"))
     display_name = str(payload.get("display_name", "")).strip()
@@ -330,10 +350,20 @@ def _load_template_metadata(
         metadata_path=metadata_path,
         directives=directives,
     )
+    solution_scattering_support = _parse_solution_scattering_support(
+        payload,
+        metadata_path=metadata_path,
+    )
+    prefit_support = _parse_prefit_support(
+        payload,
+        metadata_path=metadata_path,
+    )
     return {
         "display_name": display_name,
         "description": description,
         "cluster_geometry_support": cluster_geometry_support,
+        "solution_scattering_support": solution_scattering_support,
+        "prefit_support": prefit_support,
     }
 
 
@@ -532,6 +562,132 @@ def _parse_cluster_geometry_support(
     )
 
 
+def _parse_solution_scattering_support(
+    payload: dict[str, object],
+    *,
+    metadata_path: Path,
+) -> TemplateSolutionScatteringSupport:
+    capabilities = payload.get("capabilities", {})
+    if not isinstance(capabilities, dict):
+        capabilities = {}
+    raw_support = capabilities.get("solution_scattering_estimator", {})
+    if raw_support is None:
+        raw_support = {}
+    if not isinstance(raw_support, dict):
+        raise ValueError(
+            f"Template metadata file {metadata_path.name} defines "
+            "'capabilities.solution_scattering_estimator' with an invalid "
+            "schema."
+        )
+
+    raw_target = raw_support.get("volume_fraction_target")
+    parameter_name: str | None = None
+    fraction_kind = "solute"
+    fraction_source = "saxs_effective"
+    if raw_target is not None:
+        if not isinstance(raw_target, dict):
+            raise ValueError(
+                f"Template metadata file {metadata_path.name} defines "
+                "'volume_fraction_target' with an invalid schema."
+            )
+        parameter_name = str(raw_target.get("parameter", "")).strip() or None
+        if parameter_name is None:
+            raise ValueError(
+                f"Template metadata file {metadata_path.name} declares a "
+                "volume_fraction_target without a parameter name."
+            )
+        fraction_kind = (
+            str(raw_target.get("fraction_kind", "solute")).strip().lower()
+            or "solute"
+        )
+        if fraction_kind not in {"solute", "solvent"}:
+            raise ValueError(
+                f"Template metadata file {metadata_path.name} declares "
+                f"unsupported fraction_kind {fraction_kind!r}."
+            )
+        fraction_source = (
+            str(raw_target.get("source", "saxs_effective")).strip().lower()
+            or "saxs_effective"
+        )
+        if fraction_source not in {"saxs_effective", "physical"}:
+            raise ValueError(
+                f"Template metadata file {metadata_path.name} declares "
+                f"unsupported volume fraction source {fraction_source!r}."
+            )
+
+    scale_mode = (
+        str(
+            raw_support.get(
+                "solvent_contribution_scale_mode",
+                "unscaled",
+            )
+        )
+        .strip()
+        .lower()
+        or "unscaled"
+    )
+    if scale_mode not in {"unscaled", "global_scale"}:
+        raise ValueError(
+            f"Template metadata file {metadata_path.name} declares unsupported "
+            f"solvent_contribution_scale_mode {scale_mode!r}."
+        )
+
+    return TemplateSolutionScatteringSupport(
+        volume_fraction_parameter=parameter_name,
+        volume_fraction_kind=fraction_kind,
+        volume_fraction_source=fraction_source,
+        solvent_contribution_scale_mode=scale_mode,
+    )
+
+
+def _parse_prefit_support(
+    payload: dict[str, object],
+    *,
+    metadata_path: Path,
+) -> TemplatePrefitSupport:
+    capabilities = payload.get("capabilities", {})
+    if not isinstance(capabilities, dict):
+        capabilities = {}
+    raw_support = capabilities.get("prefit", {})
+    if raw_support is None:
+        raw_support = {}
+    if not isinstance(raw_support, dict):
+        raise ValueError(
+            f"Template metadata file {metadata_path.name} defines "
+            "'capabilities.prefit' with an invalid schema."
+        )
+
+    auto_apply_payload = raw_support.get(
+        "auto_apply_autoscale_on_load",
+        False,
+    )
+    if isinstance(auto_apply_payload, bool):
+        auto_apply = auto_apply_payload
+    else:
+        auto_apply = _parse_bool_directive(
+            str(auto_apply_payload),
+            field_name="capabilities.prefit.auto_apply_autoscale_on_load",
+            source_name=f"Template metadata file {metadata_path.name}",
+        )
+
+    bounds_mode = (
+        str(raw_support.get("autoscale_bounds_mode", "preserve_existing"))
+        .strip()
+        .lower()
+        or "preserve_existing"
+    )
+    if bounds_mode not in {"preserve_existing", "adaptive"}:
+        raise ValueError(
+            f"Template metadata file {metadata_path.name} declares unsupported "
+            f"autoscale_bounds_mode {bounds_mode!r}."
+        )
+
+    return TemplatePrefitSupport(
+        auto_apply_autoscale_on_load=auto_apply,
+        autoscale_bounds_mode=bounds_mode,
+    )
+
+
 def _parse_bool_directive(
     value: str,
     *,
@@ -552,7 +708,9 @@ def _parse_bool_directive(
 __all__ = [
     "TemplateClusterGeometrySupport",
     "TemplateParameter",
+    "TemplatePrefitSupport",
     "TemplateRuntimeMetadataBinding",
+    "TemplateSolutionScatteringSupport",
     "TemplateSpec",
     "default_template_dir",
     "list_template_specs",

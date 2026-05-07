@@ -47,6 +47,7 @@ from saxshell.saxs.project_manager.prior_plot import (
     build_prior_histogram_export_payload,
     list_secondary_filter_elements,
 )
+from saxshell.saxs.stoichiometry import format_stoich_for_axis
 from saxshell.structure import PDBAtom, PDBStructure
 from saxshell.xyz2pdb import resolve_reference_path
 from saxshell.xyz2pdb.workflow import rotation_matrix_from_to
@@ -2646,6 +2647,146 @@ def test_clusterdynamicsml_window_exports_colormap_and_lifetime_csv(
     assert colormap_rows[0]["time_unit"] == "ps"
     assert any(row["Label"] == "Pb3I2" for row in lifetime_rows)
     assert any(row["Type"] == "Predicted" for row in lifetime_rows)
+    window.close()
+
+
+def test_clusterdynamicsml_window_opens_heatmap_plot_editor_popup(
+    qapp,
+    tmp_path,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    clusters_dir = _build_clusters_dir(tmp_path)
+    experimental_data_file = _write_experimental_data_file(tmp_path)
+
+    result = ClusterDynamicsMLWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        clusters_dir=clusters_dir,
+        experimental_data_file=experimental_data_file,
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=1,
+        target_node_counts=(4, 5),
+    ).analyze()
+
+    window = ClusterDynamicsMLMainWindow(initial_frames_dir=frames_dir)
+    window.show()
+    window.dynamics_plot_panel.set_result(result.dynamics_result)
+    window.dynamics_plot_panel.display_mode_combo.setCurrentIndex(
+        window.dynamics_plot_panel.display_mode_combo.findData("count")
+    )
+    window.dynamics_plot_panel.time_unit_combo.setCurrentIndex(
+        window.dynamics_plot_panel.time_unit_combo.findData("ps")
+    )
+    qapp.processEvents()
+
+    assert window.dynamics_plot_panel.plot_editor_button is not None
+
+    window.dynamics_plot_panel.plot_editor_button.click()
+    qapp.processEvents()
+
+    assert window.dynamics_plot_panel._plot_editor_window is not None
+    assert window.dynamics_plot_panel._plot_editor_window.isVisible()
+    assert (
+        window.dynamics_plot_panel._plot_editor_window.windowTitle()
+        == "Cluster Dynamics Colormap Editor"
+    )
+    assert (
+        window.dynamics_plot_panel._plot_editor_window.save_pickle_button.text()
+        == "Save Pickled Plot"
+    )
+    assert (
+        window.dynamics_plot_panel._plot_editor_window.load_pickle_button.text()
+        == "Load Pickled Plot"
+    )
+    assert window.dynamics_plot_panel._plot_editor_controls is not None
+    assert (
+        window.dynamics_plot_panel._plot_editor_controls.x_axis_unit_combo.currentData()
+        == "ps"
+    )
+    assert (
+        window.dynamics_plot_panel._plot_editor_controls.title_edit.text()
+        == "Time-Binned Cluster Distribution (Counts / bin)"
+    )
+    assert (
+        window.dynamics_plot_panel._plot_editor_controls.x_label_edit.text()
+        == "Time (ps)"
+    )
+    assert (
+        window.dynamics_plot_panel._plot_editor_controls.y_label_edit.text()
+        == "Cluster label"
+    )
+    window.dynamics_plot_panel._plot_editor_controls.x_axis_unit_combo.setCurrentIndex(
+        window.dynamics_plot_panel._plot_editor_controls.x_axis_unit_combo.findData(
+            "fs"
+        )
+    )
+    qapp.processEvents()
+    assert window.dynamics_plot_panel.time_unit_combo.currentData() == "fs"
+    assert (
+        window.dynamics_plot_panel._plot_editor_controls.x_label_edit.text()
+        == "Time (fs)"
+    )
+    first_raw_label = (
+        window.dynamics_plot_panel._plot_editor_controls.label_table.item(
+            0, 0
+        ).text()
+    )
+    assert window.dynamics_plot_panel._plot_editor_controls.label_table.item(
+        0, 1
+    ).text() == format_stoich_for_axis(first_raw_label)
+
+    window.dynamics_plot_panel._plot_editor_window.close()
+    window.close()
+
+
+def test_clusterdynamicsml_window_keeps_live_heatmap_readable_after_plot_edits(
+    qapp,
+    tmp_path,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    clusters_dir = _build_clusters_dir(tmp_path)
+    experimental_data_file = _write_experimental_data_file(tmp_path)
+
+    result = ClusterDynamicsMLWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        clusters_dir=clusters_dir,
+        experimental_data_file=experimental_data_file,
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=1,
+        target_node_counts=(4, 5),
+    ).analyze()
+
+    window = ClusterDynamicsMLMainWindow(initial_frames_dir=frames_dir)
+    window.show()
+    window.dynamics_plot_panel.set_result(result.dynamics_result)
+    qapp.processEvents()
+
+    assert window.dynamics_plot_panel.plot_editor_button is not None
+    window.dynamics_plot_panel.plot_editor_button.click()
+    qapp.processEvents()
+
+    assert window.dynamics_plot_panel._plot_editor_window is not None
+    assert window.dynamics_plot_panel._plot_editor_controls is not None
+
+    controls = window.dynamics_plot_panel._plot_editor_controls
+    controls.title_edit.setText("Edited Heatmap")
+    controls.title_font_spin.setValue(16.0)
+    controls.axis_label_font_spin.setValue(14.0)
+    controls.tick_label_font_spin.setValue(12.0)
+    controls.cluster_label_font_spin.setValue(12.0)
+    controls.title_position_y_spin.setValue(1.12)
+    qapp.processEvents()
+    window.dynamics_plot_panel.canvas.draw()
+
+    axis = window.dynamics_plot_panel.figure.axes[0]
+    assert window.dynamics_plot_panel.canvas.height() >= 250
+    assert axis.get_title() == "Edited Heatmap"
+    assert axis.get_position().height > 0.3
+
+    window.dynamics_plot_panel._plot_editor_window.close()
     window.close()
 
 

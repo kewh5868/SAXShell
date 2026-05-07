@@ -17,10 +17,17 @@ from saxshell.clusterdynamics import (
     save_cluster_dynamics_dataset,
 )
 from saxshell.clusterdynamics.ui.main_window import ClusterDynamicsMainWindow
+from saxshell.clusterdynamics.ui.plot_panel import ClusterDynamicsPlotPanel
+from saxshell.plotting import (
+    igor_inline_to_mathtext,
+    load_pickled_plot_figure,
+    prepare_igor_inline_segments,
+)
 from saxshell.saxs.project_manager import (
     SAXSProjectManager,
     build_project_paths,
 )
+from saxshell.saxs.stoichiometry import format_stoich_for_axis
 
 ATOM_TYPE_DEFINITIONS = {
     "node": [("Pb", None)],
@@ -499,6 +506,369 @@ def test_cluster_dynamics_main_window_exports_colormap_and_lifetime_csv(
     assert pb2i_lifetime["mean_lifetime_fs"] == "15"
     assert pb2i_lifetime["std_lifetime_fs"] == "5"
     window.close()
+
+
+def test_cluster_dynamics_plot_panel_applies_heatmap_editor_settings(
+    qapp,
+    tmp_path,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    result = ClusterDynamicsWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        shell_levels=(1,),
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=2,
+    ).analyze()
+
+    panel = ClusterDynamicsPlotPanel(enable_plot_editor=True)
+    panel.set_result(result)
+    panel.show()
+    qapp.processEvents()
+
+    assert panel.plot_editor_button is not None
+    assert len(result.cluster_labels) > 1
+
+    axis = panel.figure.axes[0]
+    default_tick_texts = [
+        label.get_text()
+        for label in axis.get_yticklabels()
+        if label.get_text()
+    ]
+    expected_default_texts = [
+        format_stoich_for_axis(label) for label in result.cluster_labels
+    ]
+    assert default_tick_texts == expected_default_texts
+
+    panel.plot_editor_button.click()
+    qapp.processEvents()
+
+    assert panel._plot_editor_window is not None
+    assert panel._plot_editor_controls is not None
+
+    controls = panel._plot_editor_controls
+    assert controls.x_axis_unit_combo.currentData() == "fs"
+    auto_vmin = float(axis.images[0].norm.vmin)
+    auto_vmax = float(axis.images[0].norm.vmax)
+    auto_range = auto_vmax - auto_vmin
+    if auto_range > 0.4:
+        manual_vmin = auto_vmin + (0.2 * auto_range)
+        manual_vmax = auto_vmax - (0.2 * auto_range)
+    else:
+        manual_vmin = auto_vmin
+        manual_vmax = auto_vmax + (0.5 * max(auto_range, 1.0))
+
+    assert controls.color_limit_min_spin.value() == pytest.approx(auto_vmin)
+    assert controls.color_limit_max_spin.value() == pytest.approx(auto_vmax)
+    assert not controls.reset_color_limits_button.isEnabled()
+
+    controls.x_axis_unit_combo.setCurrentIndex(
+        controls.x_axis_unit_combo.findData("ps")
+    )
+    qapp.processEvents()
+
+    axis = panel.figure.axes[0]
+    assert controls.x_axis_unit_combo.currentData() == "ps"
+    assert panel.time_unit_combo.currentData() == "ps"
+    assert axis.get_xlabel() == "Time (ps)"
+
+    controls.label_table.setCurrentCell(1, 1)
+    controls._move_label_up()
+    qapp.processEvents()
+
+    controls.title_edit.setText("Edited Heatmap")
+    controls.x_label_edit.setText("Time $^{2}$")
+    controls.y_label_edit.setText("Edited Clusters")
+    controls.colorbar_label_edit.setText("Edited Scale")
+    controls.title_position_x_spin.setValue(0.28)
+    controls.title_position_y_spin.setValue(1.11)
+    controls.colormap_combo.setCurrentIndex(
+        controls.colormap_combo.findData("magma")
+    )
+    controls.aspect_combo.setCurrentIndex(
+        controls.aspect_combo.findData("custom")
+    )
+    controls.aspect_value_spin.setValue(1.5)
+    controls.max_x_ticks_spin.setValue(3)
+    controls.max_y_ticks_spin.setValue(3)
+    controls.x_tick_rotation_spin.setValue(35)
+    controls.y_tick_rotation_spin.setValue(15)
+    controls.tick_label_font_spin.setValue(13.0)
+    controls.cluster_label_font_spin.setValue(15.0)
+    controls.color_limit_min_spin.setValue(manual_vmin)
+    controls.color_limit_max_spin.setValue(manual_vmax)
+    controls.label_table.item(0, 1).setText("Pb$_{2}$I$^{+}$")
+    qapp.processEvents()
+    panel.canvas.draw()
+
+    axis = panel.figure.axes[0]
+    colorbar_axis = panel.figure.axes[1]
+    tick_texts = [
+        label.get_text()
+        for label in axis.get_yticklabels()
+        if label.get_text()
+    ]
+
+    assert axis.get_title() == "Edited Heatmap"
+    assert axis.title.get_position()[0] == pytest.approx(0.28)
+    assert axis.title.get_position()[1] == pytest.approx(1.11)
+    assert axis.get_xlabel() == "Time $^{2}$"
+    assert axis.get_ylabel() == "Edited Clusters"
+    assert float(axis.get_aspect()) == pytest.approx(1.5)
+    assert colorbar_axis.get_ylabel() == "Edited Scale"
+    assert panel.colormap_combo.currentData() == "magma"
+    assert axis.images[0].get_cmap().name == "magma"
+    assert axis.images[0].norm.vmin == pytest.approx(manual_vmin)
+    assert axis.images[0].norm.vmax == pytest.approx(manual_vmax)
+    assert controls.reset_color_limits_button.isEnabled()
+    assert tick_texts[0] == "Pb$_{2}$I$^{+}$"
+    assert tick_texts[1] == expected_default_texts[0]
+    assert axis.get_xticklabels()[0].get_rotation() == pytest.approx(35.0)
+    assert axis.get_yticklabels()[0].get_rotation() == pytest.approx(15.0)
+    assert axis.get_xticklabels()[0].get_fontsize() == pytest.approx(13.0)
+    assert axis.get_yticklabels()[0].get_fontsize() == pytest.approx(15.0)
+
+    controls.reset_color_limits_button.click()
+    qapp.processEvents()
+    panel.canvas.draw()
+
+    axis = panel.figure.axes[0]
+    assert controls.color_limit_min_spin.value() == pytest.approx(auto_vmin)
+    assert controls.color_limit_max_spin.value() == pytest.approx(auto_vmax)
+    assert axis.images[0].norm.vmin == pytest.approx(auto_vmin)
+    assert axis.images[0].norm.vmax == pytest.approx(auto_vmax)
+    assert not controls.reset_color_limits_button.isEnabled()
+
+    panel._plot_editor_window.close()
+    panel.close()
+
+
+def test_igor_inline_text_supports_bold_italic_and_size_segments():
+    segments, has_markup = prepare_igor_inline_segments(
+        r"\f01\f02Hello\f00 World \Z<16>Big",
+        default_font_size=11.0,
+    )
+
+    assert has_markup
+    assert segments[0].text == "Hello"
+    assert segments[0].bold is True
+    assert segments[0].italic is True
+    assert segments[0].font_size == pytest.approx(11.0)
+    assert segments[1].text == " World "
+    assert segments[1].bold is False
+    assert segments[1].italic is False
+    assert segments[1].font_size == pytest.approx(11.0)
+    assert segments[2].text == "Big"
+    assert segments[2].font_size == pytest.approx(16.0)
+
+    assert (
+        igor_inline_to_mathtext(
+            r"\f01 Hello \f00World",
+            default_font_size=11.0,
+        )
+        == r"$\mathbf{\ Hello\ }\mathregular{World}$"
+    )
+
+
+def test_cluster_dynamics_plot_editor_does_not_resync_defaults_while_editing_labels(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    result = ClusterDynamicsWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        shell_levels=(1,),
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=2,
+    ).analyze()
+
+    panel = ClusterDynamicsPlotPanel(enable_plot_editor=True)
+    panel.set_result(result)
+    panel.show()
+    qapp.processEvents()
+    panel.plot_editor_button.click()
+    qapp.processEvents()
+
+    assert panel._plot_editor_controls is not None
+    controls = panel._plot_editor_controls
+
+    sync_calls: list[object] = []
+    original_sync_defaults = controls.sync_defaults
+
+    def _tracking_sync_defaults(defaults):
+        sync_calls.append(defaults)
+        return original_sync_defaults(defaults)
+
+    monkeypatch.setattr(controls, "sync_defaults", _tracking_sync_defaults)
+
+    controls.label_table.item(0, 1).setText("I$^{+}$")
+    qapp.processEvents()
+
+    assert sync_calls == []
+
+    panel._plot_editor_window.close()
+    panel.close()
+
+
+def test_cluster_dynamics_plot_editor_can_save_and_load_pickled_plots(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    result = ClusterDynamicsWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        shell_levels=(1,),
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=2,
+    ).analyze()
+
+    panel = ClusterDynamicsPlotPanel(enable_plot_editor=True)
+    panel.set_result(result)
+    panel.show()
+    qapp.processEvents()
+    panel.plot_editor_button.click()
+    qapp.processEvents()
+
+    assert panel._plot_editor_window is not None
+    assert panel._plot_editor_controls is not None
+
+    editor = panel._plot_editor_window
+    controls = panel._plot_editor_controls
+    pickle_path = tmp_path / "saved_colormap.pkl"
+
+    monkeypatch.setattr(
+        "saxshell.plotting.plot_editor.QFileDialog.getSaveFileName",
+        lambda *args, **kwargs: (
+            str(pickle_path),
+            "Pickled Plot Files (*.pkl)",
+        ),
+    )
+    monkeypatch.setattr(
+        "saxshell.plotting.plot_editor.QFileDialog.getOpenFileName",
+        lambda *args, **kwargs: (
+            str(pickle_path),
+            "Pickled Plot Files (*.pkl)",
+        ),
+    )
+
+    controls.title_edit.setText("Pickled Heatmap")
+    controls.title_position_x_spin.setValue(0.23)
+    controls.title_position_y_spin.setValue(1.14)
+    controls.colormap_combo.setCurrentIndex(
+        controls.colormap_combo.findData("magma")
+    )
+    controls.x_axis_unit_combo.setCurrentIndex(
+        controls.x_axis_unit_combo.findData("ps")
+    )
+    qapp.processEvents()
+
+    assert editor.save_pickled_plot_as() == pickle_path
+    assert pickle_path.is_file()
+
+    pickled_figure = load_pickled_plot_figure(pickle_path)
+    assert pickled_figure.axes[0].get_title() == "Pickled Heatmap"
+    assert pickled_figure.axes[0].images[0].get_cmap().name == "magma"
+    assert pickled_figure.axes[0].title.get_position()[0] == pytest.approx(
+        0.23
+    )
+    assert pickled_figure.axes[0].title.get_position()[1] == pytest.approx(
+        1.14
+    )
+
+    controls.title_edit.setText("Live Heatmap")
+    controls.colormap_combo.setCurrentIndex(
+        controls.colormap_combo.findData("viridis")
+    )
+    controls.x_axis_unit_combo.setCurrentIndex(
+        controls.x_axis_unit_combo.findData("fs")
+    )
+    qapp.processEvents()
+    assert panel.figure.axes[0].get_title() == "Live Heatmap"
+    assert editor.figure.axes[0].get_title() == "Live Heatmap"
+    assert panel.colormap_combo.currentData() == "viridis"
+    assert panel.time_unit_combo.currentData() == "fs"
+
+    assert editor.load_pickled_plot_as() == pickle_path
+    qapp.processEvents()
+    assert not editor.is_showing_pickled_plot()
+    assert editor.figure.axes[0].get_title() == "Pickled Heatmap"
+    assert panel.figure.axes[0].get_title() == "Pickled Heatmap"
+    assert controls.title_edit.text() == "Pickled Heatmap"
+    assert controls.title_position_x_spin.value() == pytest.approx(0.23)
+    assert controls.title_position_y_spin.value() == pytest.approx(1.14)
+    assert panel.figure.axes[0].title.get_position()[0] == pytest.approx(0.23)
+    assert panel.figure.axes[0].title.get_position()[1] == pytest.approx(1.14)
+    assert controls.colormap_combo.currentData() == "magma"
+    assert controls.x_axis_unit_combo.currentData() == "ps"
+    assert panel.colormap_combo.currentData() == "magma"
+    assert panel.time_unit_combo.currentData() == "ps"
+    assert not editor.show_live_preview_button.isEnabled()
+
+    controls.title_edit.setText("Editable After Load")
+    qapp.processEvents()
+    assert panel.figure.axes[0].get_title() == "Editable After Load"
+    assert editor.figure.axes[0].get_title() == "Editable After Load"
+
+    panel._plot_editor_window.close()
+    panel.close()
+
+
+def test_cluster_dynamics_plot_editor_supports_igor_inline_label_markup(
+    qapp,
+    tmp_path,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    result = ClusterDynamicsWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        shell_levels=(1,),
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=2,
+    ).analyze()
+
+    panel = ClusterDynamicsPlotPanel(enable_plot_editor=True)
+    panel.set_result(result)
+    panel.show()
+    qapp.processEvents()
+    panel.plot_editor_button.click()
+    qapp.processEvents()
+
+    assert panel._plot_editor_controls is not None
+    controls = panel._plot_editor_controls
+
+    controls.title_edit.setText(r"\f01\f02Rich\f00 Title")
+    controls.x_label_edit.setText(r"Time \Z<16>\f01fs")
+    controls.label_table.item(0, 1).setText(r"\f01Pb$_{2}$\f00I$^{+}$")
+    qapp.processEvents()
+    panel.canvas.draw()
+
+    axis = panel.figure.axes[0]
+    assert axis.get_title() == r"$\mathbf{\mathit{Rich}}\mathregular{\ Title}$"
+    assert (
+        axis.get_yticklabels()[0].get_text()
+        == r"$\mathbf{Pb}_{2}\mathregular{I}^{+}$"
+    )
+
+    x_label_segments = [
+        text
+        for text in axis.texts
+        if str(text.get_gid()).startswith("heatmap-x-label-")
+    ]
+    assert len(x_label_segments) == 2
+    assert x_label_segments[0].get_text() == r"$\mathregular{Time\ }$"
+    assert x_label_segments[1].get_text() == r"$\mathbf{fs}$"
+    assert x_label_segments[1].get_fontsize() == pytest.approx(16.0)
+
+    panel._plot_editor_window.close()
+    panel.close()
 
 
 def test_cluster_dynamics_main_window_registers_frames_dir_with_project(

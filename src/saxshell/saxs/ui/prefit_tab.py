@@ -35,6 +35,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from saxshell.plotting import (
+    Q_A_INVERSE_LABEL,
+    LinePlotDefaults,
+    LinePlotEditorControls,
+    LinePlotSeriesDefaults,
+    LinePlotSettings,
+    PlotEditorWindow,
+)
 from saxshell.saxs._model_templates import TemplateSpec
 from saxshell.saxs.prefit import (
     ClusterGeometryMetadataRow,
@@ -230,6 +238,9 @@ class PrefitTab(QWidget):
             DEFAULT_IONIC_RADIUS_TYPE
         )
         self._active_template_name: str | None = None
+        self._line_plot_settings = LinePlotSettings()
+        self._plot_editor_window: PlotEditorWindow | None = None
+        self._plot_editor_controls: LinePlotEditorControls | None = None
         self._suspend_template_selection_signal = False
         self._build_ui()
         self._install_field_interaction_watchers()
@@ -600,6 +611,8 @@ class PrefitTab(QWidget):
         self.log_y_checkbox = QCheckBox("Log Y")
         self.log_y_checkbox.setChecked(True)
         self.log_y_checkbox.toggled.connect(self._redraw_current_plot)
+        self.open_plot_editor_button = QPushButton("Open Plot Editor")
+        self.open_plot_editor_button.clicked.connect(self.open_plot_editor)
         self.save_plot_data_button = QPushButton("Export Plot Data")
         self.save_plot_data_button.clicked.connect(
             self.save_plot_data_requested.emit
@@ -610,6 +623,7 @@ class PrefitTab(QWidget):
         controls.addWidget(self.show_structure_factor_trace_checkbox)
         controls.addWidget(self.log_x_checkbox)
         controls.addWidget(self.log_y_checkbox)
+        controls.addWidget(self.open_plot_editor_button)
         controls.addWidget(self.save_plot_data_button)
         controls.addStretch(1)
         layout.addLayout(controls)
@@ -1037,6 +1051,7 @@ class PrefitTab(QWidget):
         self,
         parameter_name: str | None,
         fraction_kind: str | None,
+        fraction_source: str = "saxs_effective",
         solvent_weight_parameter: str | None = None,
     ) -> None:
         target_messages: list[str] = []
@@ -1046,11 +1061,20 @@ class PrefitTab(QWidget):
                 if str(fraction_kind).strip() == "solute"
                 else "solvent"
             )
+            source_label = (
+                "physical volume fraction"
+                if str(fraction_source).strip() == "physical"
+                else "SAXS-effective interaction fraction"
+            )
             target_messages.append(
-                f"{target_label} SAXS-effective interaction fraction -> {parameter_name}"
+                f"{target_label} {source_label} -> {parameter_name}"
             )
         if solvent_weight_parameter:
-            if parameter_name and fraction_kind:
+            if (
+                parameter_name
+                and fraction_kind
+                and str(fraction_source).strip() == "saxs_effective"
+            ):
                 target_messages.append(
                     f"attenuation solvent scale -> {solvent_weight_parameter}"
                 )
@@ -1071,6 +1095,7 @@ class PrefitTab(QWidget):
         self.solute_volume_fraction_widget.set_target_parameter(
             parameter_name,
             fraction_kind,
+            fraction_source,
             solvent_weight_parameter,
         )
 
@@ -1708,20 +1733,236 @@ class PrefitTab(QWidget):
             max_nfev=int(self.nfev_spin.value()),
         )
 
-    def plot_evaluation(
+    def open_plot_editor(self) -> None:
+        if self._plot_editor_window is not None:
+            self._plot_editor_window.show()
+            self._plot_editor_window.raise_()
+            self._plot_editor_window.activateWindow()
+            self._plot_editor_window.refresh_preview()
+            return
+
+        defaults = self._current_plot_defaults(self._current_evaluation)
+        self._line_plot_settings.sync_series(defaults.series_defaults)
+        self._plot_editor_controls = LinePlotEditorControls(
+            settings=self._line_plot_settings,
+            defaults=defaults,
+            parent=self,
+        )
+        self._plot_editor_controls.label_settings_changed.connect(
+            self._redraw_current_plot
+        )
+        self._plot_editor_controls.settings_changed.connect(
+            self._redraw_current_plot
+        )
+        self._plot_editor_window = PlotEditorWindow(
+            window_title="SAXS Prefit Plot Editor",
+            controls_widget=self._plot_editor_controls,
+            render_preview=self._render_plot_editor_preview,
+            pickle_state_provider=self._plot_editor_pickle_state,
+            apply_loaded_pickle_state=self._apply_loaded_plot_editor_pickle_state,
+            parent=self,
+        )
+        self._plot_editor_window.closed.connect(self._on_plot_editor_closed)
+        self._plot_editor_window.refresh_preview()
+        self._plot_editor_window.show()
+        self._plot_editor_window.raise_()
+        self._plot_editor_window.activateWindow()
+
+    def _on_plot_editor_closed(self) -> None:
+        self._plot_editor_window = None
+        self._plot_editor_controls = None
+
+    def _current_plot_defaults(
         self,
         evaluation: PrefitEvaluation | None,
+    ) -> LinePlotDefaults:
+        has_evaluation = evaluation is not None
+        has_experimental = (
+            has_evaluation and evaluation.experimental_intensities is not None
+        )
+        has_residuals = has_evaluation and evaluation.residuals is not None
+        structure_values = (
+            np.asarray(evaluation.structure_factor_trace, dtype=float)
+            if has_evaluation and evaluation.structure_factor_trace is not None
+            else np.asarray([], dtype=float)
+        )
+        has_structure_factor_axis = bool(
+            has_evaluation
+            and self.show_structure_factor_trace_checkbox.isChecked()
+            and np.any(np.isfinite(structure_values))
+        )
+        series_defaults: list[LinePlotSeriesDefaults] = []
+        if (
+            has_experimental
+            and self.show_experimental_trace_checkbox.isChecked()
+        ):
+            series_defaults.append(
+                LinePlotSeriesDefaults(
+                    key="experimental",
+                    label="Experimental",
+                    axis_label="Main",
+                )
+            )
+        if (
+            has_evaluation
+            and self.show_solvent_trace_checkbox.isChecked()
+            and evaluation.solvent_contribution is not None
+        ):
+            solvent_values = np.asarray(
+                evaluation.solvent_contribution,
+                dtype=float,
+            )
+            solvent_mask = np.isfinite(solvent_values)
+            if self.log_y_checkbox.isChecked():
+                solvent_mask &= solvent_values > 0.0
+            if np.any(solvent_mask):
+                series_defaults.append(
+                    LinePlotSeriesDefaults(
+                        key="solvent_contribution",
+                        label="Solvent contribution",
+                        axis_label="Main",
+                    )
+                )
+        if has_structure_factor_axis:
+            series_defaults.append(
+                LinePlotSeriesDefaults(
+                    key="structure_factor",
+                    label="Structure factor S(q)",
+                    axis_label="Structure Factor",
+                )
+            )
+        if has_evaluation and self.show_model_trace_checkbox.isChecked():
+            series_defaults.append(
+                LinePlotSeriesDefaults(
+                    key="model",
+                    label="Model",
+                    axis_label="Main",
+                )
+            )
+        if has_experimental and has_residuals:
+            series_defaults.append(
+                LinePlotSeriesDefaults(
+                    key="residual",
+                    label="Residual",
+                    axis_label="Residual",
+                )
+            )
+        return LinePlotDefaults(
+            title="",
+            x_label=Q_A_INVERSE_LABEL,
+            primary_y_label="Intensity (arb. units)",
+            secondary_y_label="S(q)",
+            residual_y_label="Residual",
+            has_secondary_y_axis=has_structure_factor_axis,
+            has_residual_y_axis=bool(has_experimental and has_residuals),
+            has_annotation=has_evaluation,
+            default_legend_location="best",
+            default_show_annotation=True,
+            series_defaults=tuple(series_defaults),
+        )
+
+    def _refresh_plot_editor_controls(self, *, force: bool = False) -> None:
+        if self._plot_editor_controls is None:
+            return
+        defaults = self._current_plot_defaults(self._current_evaluation)
+        self._line_plot_settings.sync_series(defaults.series_defaults)
+        if force or self._plot_editor_controls.needs_default_sync(defaults):
+            self._plot_editor_controls.sync_defaults(defaults)
+
+    def _plot_editor_pickle_state(self) -> dict[str, object]:
+        return {
+            "plot_editor_state": {
+                "kind": "line_plot_editor_state",
+                "version": 1,
+                "plot_context": "saxs_prefit_preview",
+                "line_plot_settings": self._line_plot_settings.to_dict(),
+                "panel_state": {
+                    "show_experimental": bool(
+                        self.show_experimental_trace_checkbox.isChecked()
+                    ),
+                    "show_model": bool(
+                        self.show_model_trace_checkbox.isChecked()
+                    ),
+                    "show_solvent": bool(
+                        self.show_solvent_trace_checkbox.isChecked()
+                    ),
+                    "show_structure_factor": bool(
+                        self.show_structure_factor_trace_checkbox.isChecked()
+                    ),
+                    "log_x": bool(self.log_x_checkbox.isChecked()),
+                    "log_y": bool(self.log_y_checkbox.isChecked()),
+                },
+            }
+        }
+
+    def _apply_loaded_plot_editor_pickle_state(
+        self,
+        payload: dict[str, object],
+    ) -> bool:
+        editor_state = payload.get("plot_editor_state")
+        if not isinstance(editor_state, dict):
+            return False
+        if str(editor_state.get("kind")) != "line_plot_editor_state":
+            return False
+        if str(editor_state.get("plot_context")) != "saxs_prefit_preview":
+            return False
+        plot_settings = editor_state.get("line_plot_settings")
+        if isinstance(plot_settings, dict):
+            self._line_plot_settings.update_from_dict(plot_settings)
+        panel_state = editor_state.get("panel_state")
+        if isinstance(panel_state, dict):
+            self.show_experimental_trace_checkbox.setChecked(
+                bool(panel_state.get("show_experimental", True))
+            )
+            self.show_model_trace_checkbox.setChecked(
+                bool(panel_state.get("show_model", True))
+            )
+            self.show_solvent_trace_checkbox.setChecked(
+                bool(panel_state.get("show_solvent", False))
+            )
+            self.show_structure_factor_trace_checkbox.setChecked(
+                bool(panel_state.get("show_structure_factor", False))
+            )
+            self.log_x_checkbox.setChecked(
+                bool(panel_state.get("log_x", True))
+            )
+            self.log_y_checkbox.setChecked(
+                bool(panel_state.get("log_y", True))
+            )
+        self._refresh_plot_editor_controls(force=True)
+        self._redraw_current_plot()
+        return True
+
+    def _render_plot_editor_preview(self, figure: Figure) -> None:
+        self._render_evaluation_figure(
+            figure,
+            self._current_evaluation,
+            interactive=False,
+        )
+
+    def _render_evaluation_figure(
+        self,
+        figure: Figure,
+        evaluation: PrefitEvaluation | None,
+        *,
+        interactive: bool,
     ) -> None:
-        self._current_evaluation = evaluation
-        self._legend_line_map.clear()
-        self._legend_handle_lookup.clear()
-        for axis in self.figure.axes:
-            axis.set_xscale("linear")
-        self.figure.clear()
+        if interactive:
+            self._legend_line_map.clear()
+            self._legend_handle_lookup.clear()
+        for axis in figure.axes:
+            try:
+                axis.set_xscale("linear")
+                axis.set_yscale("linear")
+            except Exception:
+                continue
+        figure.clear()
         self._update_prefit_trace_toggle_state(evaluation)
         self._update_plot_group_title()
+        defaults = self._current_plot_defaults(evaluation)
+        self._line_plot_settings.sync_series(defaults.series_defaults)
         if evaluation is None:
-            axis = self.figure.add_subplot(111)
+            axis = figure.add_subplot(111)
             axis.text(
                 0.5,
                 0.5,
@@ -1730,21 +1971,24 @@ class PrefitTab(QWidget):
                 va="center",
             )
             axis.set_axis_off()
-            self.canvas.draw()
+            if interactive:
+                self._refresh_plot_editor_controls(force=True)
+            figure.tight_layout()
             return
 
         has_experimental = evaluation.experimental_intensities is not None
         has_residuals = evaluation.residuals is not None
         if has_experimental and has_residuals:
-            grid = self.figure.add_gridspec(2, 1, height_ratios=[3, 1])
-            top = self.figure.add_subplot(grid[0, 0])
-            bottom = self.figure.add_subplot(grid[1, 0], sharex=top)
+            grid = figure.add_gridspec(2, 1, height_ratios=[3, 1])
+            top = figure.add_subplot(grid[0, 0])
+            bottom = figure.add_subplot(grid[1, 0], sharex=top)
         else:
-            top = self.figure.add_subplot(111)
+            top = figure.add_subplot(111)
             bottom = None
 
-        plotted_lines = []
+        plotted_lines: list[object] = []
         structure_axis = None
+        font_family = self._line_plot_settings.font_family.strip()
 
         if (
             has_experimental
@@ -1754,7 +1998,10 @@ class PrefitTab(QWidget):
                 evaluation.q_values,
                 evaluation.experimental_intensities,
                 color="black",
-                label="Experimental",
+                label=self._line_plot_settings.display_series_label(
+                    "experimental",
+                    "Experimental",
+                ),
             )
             plotted_lines.append(experimental_line)
 
@@ -1775,7 +2022,10 @@ class PrefitTab(QWidget):
                     solvent_values[solvent_mask],
                     color="green",
                     linewidth=1.5,
-                    label="Solvent contribution",
+                    label=self._line_plot_settings.display_series_label(
+                        "solvent_contribution",
+                        "Solvent contribution",
+                    ),
                 )
                 plotted_lines.append(solvent_line)
 
@@ -1801,9 +2051,17 @@ class PrefitTab(QWidget):
                     color="tab:purple",
                     linestyle="--",
                     linewidth=1.5,
-                    label="Structure factor S(q)",
+                    label=self._line_plot_settings.display_series_label(
+                        "structure_factor",
+                        "Structure factor S(q)",
+                    ),
                 )
-                structure_axis.set_ylabel("S(q)", color="tab:purple")
+                structure_axis.set_ylabel(
+                    self._line_plot_settings.resolve_secondary_y_label(
+                        defaults
+                    ),
+                    color="tab:purple",
+                )
                 structure_axis.tick_params(axis="y", colors="tab:purple")
                 structure_axis.spines["right"].set_color("tab:purple")
                 plotted_lines.append(structure_line)
@@ -1813,29 +2071,81 @@ class PrefitTab(QWidget):
                 evaluation.q_values,
                 evaluation.model_intensities,
                 color="tab:red",
-                label="Model",
+                label=self._line_plot_settings.display_series_label(
+                    "model",
+                    "Model",
+                ),
             )
             plotted_lines.append(model_line)
+
         top.set_xscale("log" if self.log_x_checkbox.isChecked() else "linear")
         top.set_yscale("log" if self.log_y_checkbox.isChecked() else "linear")
-        top.set_ylabel("Intensity (arb. units)")
-        top.text(
-            0.02,
-            0.02,
-            "\n".join(self._prefit_metric_lines(evaluation)),
-            transform=top.transAxes,
-            ha="left",
-            va="bottom",
-            fontsize=9,
-            bbox={
-                "boxstyle": "round,pad=0.35",
-                "facecolor": "white",
-                "edgecolor": "0.6",
-                "alpha": 0.85,
-            },
+        top.set_ylabel(
+            self._line_plot_settings.resolve_primary_y_label(defaults)
         )
-        if plotted_lines:
-            self._build_interactive_legend(top, plotted_lines)
+        if self._line_plot_settings.resolve_show_annotation(defaults):
+            annotation_kwargs: dict[str, object] = {
+                "transform": top.transAxes,
+                "ha": "left",
+                "va": "bottom",
+                "fontsize": self._line_plot_settings.annotation_font_size,
+                "bbox": {
+                    "boxstyle": "round,pad=0.35",
+                    "facecolor": "white",
+                    "edgecolor": "0.6",
+                    "alpha": 0.85,
+                },
+            }
+            if font_family:
+                annotation_kwargs["fontfamily"] = font_family
+            top.text(
+                0.02,
+                0.02,
+                "\n".join(self._prefit_metric_lines(evaluation)),
+                **annotation_kwargs,
+            )
+
+        title = self._line_plot_settings.resolve_title(defaults)
+        if title:
+            title_kwargs: dict[str, object] = {
+                "x": self._line_plot_settings.resolve_title_position_x(
+                    defaults
+                ),
+                "y": self._line_plot_settings.resolve_title_position_y(
+                    defaults
+                ),
+                "fontsize": self._line_plot_settings.title_font_size,
+            }
+            if font_family:
+                title_kwargs["fontfamily"] = font_family
+            top.set_title(title, **title_kwargs)
+        else:
+            top.set_title("")
+
+        if plotted_lines and self._line_plot_settings.resolve_show_legend(
+            defaults
+        ):
+            legend_location = self._line_plot_settings.resolve_legend_location(
+                defaults
+            )
+            legend_font_size = self._line_plot_settings.legend_font_size
+            if interactive:
+                self._build_interactive_legend(
+                    top,
+                    plotted_lines,
+                    location=legend_location,
+                    font_size=legend_font_size,
+                    font_family=font_family,
+                )
+            else:
+                preview_legend = top.legend(
+                    handles=plotted_lines,
+                    loc=legend_location,
+                    fontsize=legend_font_size,
+                )
+                if preview_legend is not None and font_family:
+                    for text in preview_legend.get_texts():
+                        text.set_fontfamily(font_family)
 
         if bottom is not None and evaluation.residuals is not None:
             bottom.axhline(0.0, color="0.5", linewidth=1.0)
@@ -1843,16 +2153,122 @@ class PrefitTab(QWidget):
                 evaluation.q_values,
                 evaluation.residuals,
                 color="tab:blue",
+                label=self._line_plot_settings.display_series_label(
+                    "residual",
+                    "Residual",
+                ),
             )
             bottom.set_xscale(
                 "log" if self.log_x_checkbox.isChecked() else "linear"
             )
-            bottom.set_xlabel("q (Å⁻¹)")
-            bottom.set_ylabel("Residual")
+            bottom.set_xlabel(
+                self._line_plot_settings.resolve_x_label(defaults)
+            )
+            bottom.set_ylabel(
+                self._line_plot_settings.resolve_residual_y_label(defaults)
+            )
         else:
-            top.set_xlabel("q (Å⁻¹)")
-        self.figure.tight_layout()
+            top.set_xlabel(self._line_plot_settings.resolve_x_label(defaults))
+
+        x_axis_label_font_size = self._line_plot_settings.axis_label_font_size
+        x_tick_label_font_size = self._line_plot_settings.tick_label_font_size
+        primary_axis_label_font_size = (
+            self._line_plot_settings.resolve_primary_axis_label_font_size(
+                defaults
+            )
+        )
+        primary_tick_label_font_size = (
+            self._line_plot_settings.resolve_primary_tick_label_font_size(
+                defaults
+            )
+        )
+        secondary_axis_label_font_size = (
+            self._line_plot_settings.resolve_secondary_axis_label_font_size(
+                defaults
+            )
+        )
+        secondary_tick_label_font_size = (
+            self._line_plot_settings.resolve_secondary_tick_label_font_size(
+                defaults
+            )
+        )
+
+        for axis in figure.axes:
+            axis.xaxis.label.set_fontsize(x_axis_label_font_size)
+            axis.tick_params(
+                axis="x",
+                which="both",
+                labelsize=x_tick_label_font_size,
+            )
+            if font_family:
+                axis.xaxis.label.set_fontfamily(font_family)
+            for label in list(axis.get_xticklabels()) + list(
+                axis.get_xticklabels(minor=True)
+            ):
+                if font_family:
+                    label.set_fontfamily(font_family)
+
+        for axis in (top, bottom):
+            if axis is None:
+                continue
+            axis.yaxis.label.set_fontsize(primary_axis_label_font_size)
+            axis.tick_params(
+                axis="y",
+                which="both",
+                labelsize=primary_tick_label_font_size,
+            )
+            axis.yaxis.get_offset_text().set_fontsize(
+                primary_tick_label_font_size
+            )
+            if font_family:
+                axis.yaxis.label.set_fontfamily(font_family)
+                axis.yaxis.get_offset_text().set_fontfamily(font_family)
+            for label in list(axis.get_yticklabels()) + list(
+                axis.get_yticklabels(minor=True)
+            ):
+                if font_family:
+                    label.set_fontfamily(font_family)
+
+        if structure_axis is not None:
+            structure_axis.yaxis.label.set_fontsize(
+                secondary_axis_label_font_size
+            )
+            structure_axis.tick_params(
+                axis="y",
+                which="both",
+                labelsize=secondary_tick_label_font_size,
+            )
+            structure_axis.yaxis.get_offset_text().set_fontsize(
+                secondary_tick_label_font_size
+            )
+            if font_family:
+                structure_axis.yaxis.label.set_fontfamily(font_family)
+                structure_axis.yaxis.get_offset_text().set_fontfamily(
+                    font_family
+                )
+            for label in list(structure_axis.get_yticklabels()) + list(
+                structure_axis.get_yticklabels(minor=True)
+            ):
+                if font_family:
+                    label.set_fontfamily(font_family)
+
+        if interactive:
+            self._refresh_plot_editor_controls()
+        figure.tight_layout()
+
+    def plot_evaluation(
+        self,
+        evaluation: PrefitEvaluation | None,
+    ) -> None:
+        self._current_evaluation = evaluation
+        self._render_evaluation_figure(
+            self.figure,
+            evaluation,
+            interactive=True,
+        )
         self.canvas.draw()
+        if self._plot_editor_window is not None:
+            self._plot_editor_window.refresh_preview()
 
     def current_evaluation(self) -> PrefitEvaluation | None:
         return self._current_evaluation
@@ -2657,10 +3073,21 @@ class PrefitTab(QWidget):
         self.cluster_geometry_progress_bar.setValue(0)
         self.cluster_geometry_progress_bar.setFormat("%v / %m files")
 
-    def _build_interactive_legend(self, axis, lines: list[object]) -> None:
-        legend = axis.legend(handles=lines, loc="best")
+    def _build_interactive_legend(
+        self,
+        axis,
+        lines: list[object],
+        *,
+        location: str = "best",
+        font_size: float = 9.0,
+        font_family: str = "",
+    ) -> None:
+        legend = axis.legend(handles=lines, loc=location, fontsize=font_size)
         if legend is None:
             return
+        if font_family:
+            for text in legend.get_texts():
+                text.set_fontfamily(font_family)
         legend_handles = getattr(legend, "legend_handles", None)
         if legend_handles is None:
             legend_handles = getattr(legend, "legendHandles", [])

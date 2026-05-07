@@ -6,7 +6,7 @@ workflow.
 The design goal is simple: keep the contrast workflow fully separated from the
 legacy no-contrast SAXS builder except at explicit routing and reload seams.
 
-## Main entry points
+## Main code paths
 
 The feature spans three layers:
 

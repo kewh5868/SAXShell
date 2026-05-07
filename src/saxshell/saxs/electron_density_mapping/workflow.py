@@ -18,6 +18,7 @@ try:
 except ImportError:  # pragma: no cover - optional import until runtime
     xraydb = None
 
+from saxshell.saxs.born_refinement.backend import build_shared_q_grid
 from saxshell.saxs.contrast.electron_density import (
     CONTRAST_SOLVENT_METHOD_DIRECT,
     CONTRAST_SOLVENT_METHOD_NEAT,
@@ -985,6 +986,47 @@ class ElectronDensityStructure:
             self.coordinates[int(self.nearest_atom_index)],
             dtype=float,
         )
+
+
+def legacy_born_average_default_mesh_settings(
+    structure: ElectronDensityStructure | None = None,
+) -> ElectronDensityMeshSettings:
+    target_rmax = 8.0
+    if structure is not None:
+        target_rmax = max(float(np.ceil(float(structure.rmax) + 2.0)), 0.01)
+    return ElectronDensityMeshSettings(
+        rstep=0.25,
+        theta_divisions=120,
+        phi_divisions=60,
+        rmax=target_rmax,
+    ).normalized()
+
+
+def legacy_born_average_default_smearing_settings() -> (
+    ElectronDensitySmearingSettings
+):
+    return ElectronDensitySmearingSettings(
+        debye_waller_factor=0.0
+    ).normalized()
+
+
+def legacy_born_average_default_fourier_settings(
+    *,
+    q_min: float = 0.01,
+    q_max: float = 1.2,
+    q_step: float = 0.01,
+    r_max: float = 1.0,
+) -> ElectronDensityFourierTransformSettings:
+    return ElectronDensityFourierTransformSettings(
+        r_min=0.0,
+        r_max=max(float(r_max), 0.01),
+        domain_mode="legacy",
+        window_function="none",
+        q_min=float(q_min),
+        q_max=float(q_max),
+        q_step=float(q_step),
+        resampling_points=4096,
+    ).normalized()
 
 
 @dataclass(slots=True, frozen=True)
@@ -2293,15 +2335,11 @@ def _q_values_from_transform_settings(
     settings: ElectronDensityFourierTransformSettings,
 ) -> np.ndarray:
     normalized = settings.normalized()
-    q_values = np.arange(
+    return build_shared_q_grid(
         float(normalized.q_min),
-        float(normalized.q_max) + float(normalized.q_step) * 0.5,
-        float(normalized.q_step),
-        dtype=float,
+        float(normalized.q_max),
+        q_step=float(normalized.q_step),
     )
-    if q_values.size > 0 and q_values[-1] > float(normalized.q_max) + 1.0e-12:
-        q_values = q_values[:-1]
-    return np.asarray(q_values, dtype=float)
 
 
 def _validated_debye_q_values(
@@ -3593,6 +3631,9 @@ __all__ = [
     "compute_electron_density_scattering_profile",
     "compute_single_atom_debye_scattering_profile_for_input",
     "inspect_structure_input",
+    "legacy_born_average_default_fourier_settings",
+    "legacy_born_average_default_mesh_settings",
+    "legacy_born_average_default_smearing_settings",
     "load_electron_density_structure",
     "prepare_single_atom_debye_scattering_preview",
     "prepare_electron_density_fourier_transform",

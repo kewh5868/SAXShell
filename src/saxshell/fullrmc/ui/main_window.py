@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from datetime import datetime
@@ -13,7 +14,8 @@ from matplotlib.backends.backend_qtagg import (
     NavigationToolbar2QT as NavigationToolbar,
 )
 from matplotlib.figure import Figure
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QSettings, Qt, QThread, QUrl, Signal, Slot
+from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -55,6 +57,13 @@ from saxshell.fullrmc.constraint_generation import (
     ConstraintGenerationSettings,
     build_constraint_generation,
 )
+from saxshell.fullrmc.packmol_docker import (
+    DEFAULT_PACKMOL_CONTAINER_ROOT,
+    PackmolDockerClient,
+    PackmolDockerLink,
+    PackmolDockerSyncResult,
+    save_packmol_docker_link_metadata,
+)
 from saxshell.fullrmc.packmol_planning import (
     PackmolPlanningMetadata,
     PackmolPlanningSettings,
@@ -74,6 +83,7 @@ from saxshell.fullrmc.representatives import (
     RepresentativeSelectionMetadata,
     RepresentativeSelectionSettings,
     build_representative_preview_clusters,
+    representative_source_solvent_mode_to_variant,
     select_distribution_representatives,
     select_first_file_representatives,
 )
@@ -94,23 +104,48 @@ from saxshell.fullrmc.solution_property_presets import (
 )
 from saxshell.fullrmc.solvent_handling import (
     GeneratedPDBInspection,
+    RepresentativeSolventDistributionAnalysis,
+    SoluteAtomBuildSetting,
     SolventHandlingMetadata,
     SolventHandlingSettings,
+    analyze_representative_solvent_distribution,
+    available_representative_structure_modes,
     build_generated_pdb_inspections,
     build_representative_solvent_outputs,
     list_solvent_reference_presets,
+    representative_structure_mode_label,
+    representative_structure_path_for_mode,
+    resolved_representative_structure_mode,
+    save_solvent_handling_metadata,
+    solvent_entry_lookup_for_representatives,
+)
+from saxshell.fullrmc.solvent_shell_builder import (
+    DEFAULT_REFERENCE_MATCH_TOLERANCE_A,
+    default_director_atom_name,
+    reference_atom_choices,
+)
+from saxshell.fullrmc.ui.constraints_preview_window import (
+    ConstraintsPreviewWindow,
 )
 from saxshell.fullrmc.ui.generated_pdb_preview_window import (
     GeneratedPDBPreviewWindow,
 )
+from saxshell.fullrmc.ui.packmol_docker_dialog import PackmolDockerLinkDialog
 from saxshell.fullrmc.ui.representative_preview_window import (
     RepresentativePreviewWindow,
 )
+from saxshell.plotting import Q_A_INVERSE_LABEL
 from saxshell.saxs.dream import (
     DreamModelPlotData,
     DreamSummary,
     DreamViolinPlotData,
     SAXSDreamResultsLoader,
+)
+from saxshell.saxs.electron_density_mapping.ui.viewer import (
+    ElectronDensityStructureViewer,
+)
+from saxshell.saxs.electron_density_mapping.workflow import (
+    load_electron_density_structure,
 )
 from saxshell.saxs.project_manager import (
     DreamBestFitSelection,
@@ -178,6 +213,7 @@ _PACKMOL_PREVIEW_COLORS = (
     "#d0b060",
     "#5f9e8f",
 )
+_PACKMOL_DOCKER_PRESETS_KEY = "packmol_docker_presets"
 _READINESS_TASK_DETAILS = {
     "project_source": {
         "title": "Project Source",
@@ -225,31 +261,40 @@ _READINESS_TASK_DETAILS = {
         ),
     },
     "representative_selection": {
-        "title": "Representative Clusters",
+        "title": "Representative Structures",
         "purpose": (
-            "Choose one representative structure for each active DREAM "
-            "cluster bin."
+            "Load the saved representative structures that will be combined "
+            "with the active DREAM weights for the Solvent Shell Builder, "
+            "Packmol planning, Packmol setup, and cluster-specific "
+            "constraints."
         ),
         "needed": (
-            "An active DREAM selection. For bond/angle mode, bond-pair and "
-            "angle-triplet definitions are also needed."
+            "A saved representative-structure set in the SAXS project plus "
+            "an active DREAM selection so the current model weights remain "
+            "available downstream."
         ),
         "prerequisites": (
-            "The SAXS project must be loaded and a DREAM model must be "
-            "selected. Cluster-source data must also be available."
+            "The SAXS project must be loaded. Use the dedicated "
+            "Representative Structures tool to create or update the saved "
+            "structure set for this project."
         ),
     },
     "solvent_outputs": {
-        "title": "Representative PDB Outputs",
+        "title": "Solvent Shell Builder",
         "purpose": (
-            "Build the representative no-solvent and solvent-completed PDB "
-            "files used for inspection and Packmol setup."
+            "Use the active representative structure set directly when it "
+            "already has full solvent, or build the missing solvent shell "
+            "for no-solvent and partial-solvent representatives."
         ),
         "needed": (
-            "A coordinated-solvent mode and either a bundled solvent preset "
-            "or a custom solvent-reference PDB."
+            "Either imported representative structures that already provide "
+            "the Full solvent set, or a solvent reference plus the saved "
+            "representative solvent outputs with Full solvent selected as "
+            "active."
         ),
-        "prerequisites": ("Representative clusters must already be computed."),
+        "prerequisites": (
+            "Representative structures must already be saved for the project."
+        ),
     },
     "packmol_plan": {
         "title": "Packmol Plan",
@@ -259,10 +304,10 @@ _READINESS_TASK_DETAILS = {
         ),
         "needed": (
             "Packmol planning mode, box side length, saved solution "
-            "properties, and saved representative clusters."
+            "properties, and saved representative structures."
         ),
         "prerequisites": (
-            "Solution properties and representative clusters must both be "
+            "Solution properties and representative structures must both be "
             "available first."
         ),
     },
@@ -273,8 +318,8 @@ _READINESS_TASK_DETAILS = {
             "the simulation box."
         ),
         "needed": (
-            "A saved Packmol plan and the generated representative solvent "
-            "PDB files."
+            "A saved Packmol plan and the Full solvent representative "
+            "structure set."
         ),
         "prerequisites": (
             "Packmol planning and representative PDB solvent outputs must "
@@ -384,19 +429,38 @@ class RMCSetupMainWindow(QMainWindow):
         self.setWindowTitle("SAXSShell (rmcsetup)")
         self.setWindowIcon(load_saxshell_icon())
         self.resize(1080, 860)
+        self._build_menu_bar()
 
         self.project_manager = SAXSProjectManager()
         self._project_source_state: RMCDreamProjectSource | None = None
+        self._child_tool_windows: list[object] = []
         self._representative_preview_window: (
             RepresentativePreviewWindow | None
         ) = None
         self._generated_pdb_preview_window: (
             GeneratedPDBPreviewWindow | None
         ) = None
+        self._constraints_preview_window: ConstraintsPreviewWindow | None = (
+            None
+        )
+        self._solvent_distribution_analysis: (
+            RepresentativeSolventDistributionAnalysis | None
+        ) = None
         self._updating_dream_controls = False
         self._representative_presets: dict[str, BondAnalysisPreset] = {}
         self._solution_presets: dict[str, SolutionPropertiesPreset] = {}
-        self._generated_pdb_inspections: list[GeneratedPDBInspection] = []
+        self._generated_pdb_inspections: list[
+            GeneratedPDBInspection | None
+        ] = []
+        self._solvent_table_preview_paths: list[Path | None] = []
+        self._solvent_table_details: list[str] = []
+        self._updating_generated_pdb_mode_combo = False
+        self._solvent_cutoff_spins: dict[str, QDoubleSpinBox] = {}
+        self._solvent_coordination_center_items: dict[
+            str, QTableWidgetItem
+        ] = {}
+        self._solvent_coordination_target_spins: dict[str, QDoubleSpinBox] = {}
+        self._updating_solvent_table = False
         self._current_dream_model_plot_data: DreamModelPlotData | None = None
         self._representative_thread: QThread | None = None
         self._representative_worker: RepresentativeSelectionWorker | None = (
@@ -407,6 +471,8 @@ class RMCSetupMainWindow(QMainWindow):
         self._dream_results_loader_cache: dict[
             Path, SAXSDreamResultsLoader
         ] = {}
+        self._section_toggle_buttons: dict[str, QToolButton] = {}
+        self._section_content_widgets: dict[str, QWidget] = {}
         self._readiness_checkboxes: dict[str, QCheckBox] = {}
         self._available_solvent_presets = list_solvent_reference_presets()
         self._dream_model_preview_figure = Figure(
@@ -568,6 +634,11 @@ class RMCSetupMainWindow(QMainWindow):
                 "Ready",
                 "Checked after the SAXS project source loads successfully.",
             ),
+            section_key="project_source",
+        )
+        project_content_layout = self._create_collapsible_section_layout(
+            project_layout,
+            "project_source",
         )
         project_row = QHBoxLayout()
         self.project_dir_edit = QLineEdit()
@@ -586,12 +657,12 @@ class RMCSetupMainWindow(QMainWindow):
         self.refresh_button = QPushButton("Reload Project")
         self.refresh_button.clicked.connect(self._refresh_project_source)
         project_row.addWidget(self.refresh_button)
-        project_layout.addLayout(project_row)
+        project_content_layout.addLayout(project_row)
 
         self.project_summary_box = QPlainTextEdit()
         self.project_summary_box.setReadOnly(True)
         self.project_summary_box.setMinimumHeight(170)
-        project_layout.addWidget(self.project_summary_box)
+        project_content_layout.addWidget(self.project_summary_box)
         self._left_layout.addWidget(self.project_group)
 
         self.output_group = QGroupBox("RMCSetup Output Structure")
@@ -611,6 +682,11 @@ class RMCSetupMainWindow(QMainWindow):
                 "Ready",
                 "Checked after a DREAM run is selected for rmcsetup.",
             ),
+            section_key="dream_selection",
+        )
+        dream_content_layout = self._create_collapsible_section_layout(
+            dream_layout,
+            "dream_selection",
         )
         dream_form = QFormLayout()
 
@@ -680,12 +756,12 @@ class RMCSetupMainWindow(QMainWindow):
         interval_container = QWidget()
         interval_container.setLayout(interval_row)
         dream_form.addRow("Credible interval (%)", interval_container)
-        dream_layout.addLayout(dream_form)
+        dream_content_layout.addLayout(dream_form)
 
         self.dream_source_summary_box = QPlainTextEdit()
         self.dream_source_summary_box.setReadOnly(True)
         self.dream_source_summary_box.setMinimumHeight(170)
-        dream_layout.addWidget(self.dream_source_summary_box)
+        dream_content_layout.addWidget(self.dream_source_summary_box)
         self._left_layout.addWidget(self.dream_group)
 
         self.favorite_group = QGroupBox("Saved DREAM Model")
@@ -729,6 +805,11 @@ class RMCSetupMainWindow(QMainWindow):
                 "Ready",
                 "Checked after solution properties are calculated.",
             ),
+            section_key="solution_properties",
+        )
+        solution_content_layout = self._create_collapsible_section_layout(
+            solution_layout,
+            "solution_properties",
         )
         self.solution_preset_group = QGroupBox("Solution Presets")
         solution_preset_layout = QVBoxLayout(self.solution_preset_group)
@@ -753,7 +834,7 @@ class RMCSetupMainWindow(QMainWindow):
         )
         self.solution_preset_hint_label.setWordWrap(True)
         solution_preset_layout.addWidget(self.solution_preset_hint_label)
-        solution_layout.addWidget(self.solution_preset_group)
+        solution_content_layout.addWidget(self.solution_preset_group)
         solution_form = QFormLayout()
 
         self.solution_mode_combo = QComboBox()
@@ -822,13 +903,13 @@ class RMCSetupMainWindow(QMainWindow):
             "Solvent molar mass (g/mol)",
             self.molar_mass_solvent_spin,
         )
-        solution_layout.addLayout(solution_form)
+        solution_content_layout.addLayout(solution_form)
         self.solution_mode_hint_label = QLabel()
         self.solution_mode_hint_label.setWordWrap(True)
         self.solution_mode_hint_label.setText(
             solution_properties_mode_hint_text("mass")
         )
-        solution_layout.addWidget(self.solution_mode_hint_label)
+        solution_content_layout.addWidget(self.solution_mode_hint_label)
 
         self.solution_mode_stack = QStackedWidget()
 
@@ -909,7 +990,7 @@ class RMCSetupMainWindow(QMainWindow):
         )
         self.solution_mode_stack.addWidget(molarity_page)
 
-        solution_layout.addWidget(self.solution_mode_stack)
+        solution_content_layout.addWidget(self.solution_mode_stack)
 
         solution_button_row = QHBoxLayout()
         self.calculate_solution_button = QPushButton("Calculate")
@@ -918,19 +999,19 @@ class RMCSetupMainWindow(QMainWindow):
         )
         solution_button_row.addWidget(self.calculate_solution_button)
         solution_button_row.addStretch(1)
-        solution_layout.addLayout(solution_button_row)
+        solution_content_layout.addLayout(solution_button_row)
 
         self.solution_output_box = QPlainTextEdit()
         self.solution_output_box.setReadOnly(True)
         self.solution_output_box.setMinimumHeight(220)
-        solution_layout.addWidget(self.solution_output_box)
+        solution_content_layout.addWidget(self.solution_output_box)
         self._left_layout.addWidget(self.solution_group)
 
         self.dream_preview_group = QGroupBox("Selected DREAM Model Preview")
         dream_preview_layout = QVBoxLayout(self.dream_preview_group)
         self.dream_preview_intro_label = QLabel(
             "Preview the selected DREAM model fit and posterior weight "
-            "distributions before building representative clusters or "
+            "distributions before loading representative structures or "
             "Packmol inputs."
         )
         self.dream_preview_intro_label.setWordWrap(True)
@@ -994,19 +1075,49 @@ class RMCSetupMainWindow(QMainWindow):
         dream_preview_layout.addWidget(self._dream_preview_splitter)
         self._right_layout.addWidget(self.dream_preview_group)
 
-        self.representative_group = QGroupBox(
-            "Representative Cluster Selection"
-        )
+        self.representative_group = QGroupBox("Representative Structures")
         representative_layout = QVBoxLayout(self.representative_group)
         self._add_group_readiness_row(
             representative_layout,
             (
                 "representative_selection",
                 "Ready",
-                "Checked after representative clusters are computed.",
+                "Checked after representative structures are saved and "
+                "loaded for the active project.",
             ),
+            section_key="representative_selection",
         )
-        representative_form = QFormLayout()
+        representative_content_layout = (
+            self._create_collapsible_section_layout(
+                representative_layout,
+                "representative_selection",
+            )
+        )
+        self.representative_intro_label = QLabel(
+            "rmcsetup consumes saved representative structures from the "
+            "dedicated Representative Structures tool. Those saved files are "
+            "combined here with the selected DREAM distribution weights, the "
+            "solution density targets, Solvent Shell Builder, Packmol planning, "
+            "and cluster-specific constraint generation."
+        )
+        self.representative_intro_label.setWordWrap(True)
+        representative_content_layout.addWidget(
+            self.representative_intro_label
+        )
+        self.representative_workflow_label = QLabel(
+            "Use Open Representative Structures to create or update the "
+            "saved project set, then reload it here. The active DREAM model "
+            "selection in rmcsetup remains the source of the fitted weights "
+            "used for downstream box planning and constraint generation."
+        )
+        self.representative_workflow_label.setWordWrap(True)
+        representative_content_layout.addWidget(
+            self.representative_workflow_label
+        )
+
+        self.representative_mode_widget = QWidget()
+        representative_form = QFormLayout(self.representative_mode_widget)
+        representative_form.setContentsMargins(0, 0, 0, 0)
         self.representative_mode_combo = QComboBox()
         for label, value in _REPRESENTATIVE_MODE_ITEMS:
             self.representative_mode_combo.addItem(label, value)
@@ -1017,7 +1128,10 @@ class RMCSetupMainWindow(QMainWindow):
             "Selection mode",
             self.representative_mode_combo,
         )
-        representative_layout.addLayout(representative_form)
+        self.representative_mode_widget.setVisible(False)
+        representative_content_layout.addWidget(
+            self.representative_mode_widget
+        )
 
         self.representative_preset_group = QGroupBox("Bondanalysis Presets")
         representative_preset_layout = QVBoxLayout(
@@ -1055,7 +1169,10 @@ class RMCSetupMainWindow(QMainWindow):
         representative_preset_layout.addWidget(
             self.representative_preset_hint_label
         )
-        representative_layout.addWidget(self.representative_preset_group)
+        self.representative_preset_group.setVisible(False)
+        representative_content_layout.addWidget(
+            self.representative_preset_group
+        )
 
         self.representative_bond_pairs_row = QGroupBox("Bond Pairs")
         representative_bond_pairs_layout = QVBoxLayout(
@@ -1093,7 +1210,10 @@ class RMCSetupMainWindow(QMainWindow):
             self.representative_bond_pair_table
         )
         self._add_empty_representative_bond_pair_row(blocked=True)
-        representative_layout.addWidget(self.representative_bond_pairs_row)
+        self.representative_bond_pairs_row.setVisible(False)
+        representative_content_layout.addWidget(
+            self.representative_bond_pairs_row
+        )
 
         self.representative_angle_triplets_row = QGroupBox("Angle Triplets")
         representative_angle_triplets_layout = QVBoxLayout(
@@ -1139,7 +1259,10 @@ class RMCSetupMainWindow(QMainWindow):
             self.representative_angle_triplet_table
         )
         self._add_empty_representative_angle_triplet_row(blocked=True)
-        representative_layout.addWidget(self.representative_angle_triplets_row)
+        self.representative_angle_triplets_row.setVisible(False)
+        representative_content_layout.addWidget(
+            self.representative_angle_triplets_row
+        )
 
         self.representative_advanced_toggle = QPushButton(
             "Show Advanced Settings"
@@ -1148,7 +1271,10 @@ class RMCSetupMainWindow(QMainWindow):
         self.representative_advanced_toggle.toggled.connect(
             self._toggle_representative_advanced_settings
         )
-        representative_layout.addWidget(self.representative_advanced_toggle)
+        self.representative_advanced_toggle.setVisible(False)
+        representative_content_layout.addWidget(
+            self.representative_advanced_toggle
+        )
 
         self.representative_advanced_widget = QWidget()
         representative_advanced_layout = QFormLayout(
@@ -1190,71 +1316,87 @@ class RMCSetupMainWindow(QMainWindow):
             self.representative_angle_weight_spin,
         )
         self.representative_advanced_widget.setVisible(False)
-        representative_layout.addWidget(self.representative_advanced_widget)
+        representative_content_layout.addWidget(
+            self.representative_advanced_widget
+        )
 
         representative_button_row = QHBoxLayout()
         self.compute_representatives_button = QPushButton(
-            "Compute Representative Clusters"
+            "Open Representative Structures"
         )
         self.compute_representatives_button.clicked.connect(
-            self._compute_representative_clusters
+            self._open_representative_structures_tool
         )
         representative_button_row.addWidget(
             self.compute_representatives_button
         )
         self.preview_representatives_button = QPushButton(
-            "Preview Representative Analysis"
+            "Reload Saved Representative Structures"
         )
         self.preview_representatives_button.clicked.connect(
-            self._preview_representative_clusters
+            self._reload_saved_representative_structures
         )
         representative_button_row.addWidget(
             self.preview_representatives_button
         )
         representative_button_row.addStretch(1)
-        representative_layout.addLayout(representative_button_row)
+        representative_content_layout.addLayout(representative_button_row)
 
         self.representative_status_label = QLabel(
-            "Representative selection: idle"
+            "Representative structures: waiting for saved project data."
         )
         self.representative_status_label.setWordWrap(True)
-        representative_layout.addWidget(self.representative_status_label)
+        representative_content_layout.addWidget(
+            self.representative_status_label
+        )
         self.representative_progress_bar = QProgressBar()
         self.representative_progress_bar.setRange(0, 1)
         self.representative_progress_bar.setValue(0)
-        representative_layout.addWidget(self.representative_progress_bar)
+        self.representative_progress_bar.setVisible(False)
+        representative_content_layout.addWidget(
+            self.representative_progress_bar
+        )
 
         self.representative_summary_box = QPlainTextEdit()
         self.representative_summary_box.setReadOnly(True)
         self.representative_summary_box.setMinimumHeight(210)
-        representative_layout.addWidget(self.representative_summary_box)
+        representative_content_layout.addWidget(
+            self.representative_summary_box
+        )
         self._right_layout.addWidget(self.representative_group)
 
-        self.solvent_group = QGroupBox("Solvent Handling")
+        self.solvent_group = QGroupBox("Solvent Shell Builder")
         solvent_layout = QVBoxLayout(self.solvent_group)
         self._add_group_readiness_row(
             solvent_layout,
             (
                 "solvent_outputs",
                 "Ready",
-                "Checked after solvent-aware representative PDB outputs are built.",
+                "Checked when the active representative structure set already "
+                "has full solvent.",
             ),
+            section_key="solvent_outputs",
         )
-        solvent_form = QFormLayout()
+        solvent_content_layout = self._create_collapsible_section_layout(
+            solvent_layout,
+            "solvent_outputs",
+        )
+        self.solvent_intro_label = QLabel(
+            "This subsection is active for no-solvent and partial-solvent "
+            "representative structure sets. The build action analyzes the "
+            "selected representatives, then writes the completed full-solvent "
+            "PDBs for previewing and Packmol."
+        )
+        self.solvent_intro_label.setWordWrap(True)
+        solvent_content_layout.addWidget(self.solvent_intro_label)
 
-        self.coordinated_solvent_mode_combo = QComboBox()
-        for label, value in _COORDINATED_SOLVENT_MODE_ITEMS:
-            self.coordinated_solvent_mode_combo.addItem(label, value)
-        solvent_form.addRow(
-            "Coordinated solvent mode",
-            self.coordinated_solvent_mode_combo,
-        )
+        solvent_form = QFormLayout()
 
         self.solvent_reference_source_combo = QComboBox()
         for label, value in _SOLVENT_REFERENCE_SOURCE_ITEMS:
             self.solvent_reference_source_combo.addItem(label, value)
         self.solvent_reference_source_combo.currentIndexChanged.connect(
-            self._update_solvent_reference_widgets
+            self._handle_solvent_reference_source_changed
         )
         solvent_form.addRow(
             "Reference source",
@@ -1264,12 +1406,18 @@ class RMCSetupMainWindow(QMainWindow):
         self.solvent_preset_combo = QComboBox()
         for preset in self._available_solvent_presets:
             self.solvent_preset_combo.addItem(preset.name, preset.name)
+        self.solvent_preset_combo.currentIndexChanged.connect(
+            self._handle_solvent_reference_changed
+        )
         solvent_form.addRow("Preset reference", self.solvent_preset_combo)
 
         solvent_path_row = QHBoxLayout()
         self.solvent_reference_edit = QLineEdit()
         self.solvent_reference_edit.setPlaceholderText(
             "Choose a solvent reference PDB"
+        )
+        self.solvent_reference_edit.editingFinished.connect(
+            self._handle_solvent_reference_changed
         )
         solvent_path_row.addWidget(self.solvent_reference_edit, stretch=1)
         self.browse_solvent_reference_button = QPushButton("Browse...")
@@ -1281,45 +1429,143 @@ class RMCSetupMainWindow(QMainWindow):
         solvent_path_widget.setLayout(solvent_path_row)
         solvent_form.addRow("Custom reference PDB", solvent_path_widget)
 
+        self.solvent_reference_match_tolerance_spin = self._new_float_spin(
+            maximum=5.0,
+            step=0.05,
+            decimals=3,
+            value=DEFAULT_REFERENCE_MATCH_TOLERANCE_A,
+        )
+        self.solvent_reference_match_tolerance_spin.valueChanged.connect(
+            self._handle_solvent_analysis_setting_changed
+        )
+        solvent_form.addRow(
+            "Reference match tolerance (A)",
+            self.solvent_reference_match_tolerance_spin,
+        )
+
+        self.solvent_director_atom_combo = QComboBox()
+        solvent_form.addRow(
+            "Director atom",
+            self.solvent_director_atom_combo,
+        )
+
         self.solvent_minimum_separation_spin = self._new_float_spin(
             maximum=10.0,
             step=0.1,
             decimals=2,
             value=1.2,
         )
+        self.solvent_minimum_separation_spin.valueChanged.connect(
+            self._update_solvent_build_panel_state
+        )
         solvent_form.addRow(
             "Minimum solvent atom separation (A)",
             self.solvent_minimum_separation_spin,
         )
-        solvent_layout.addLayout(solvent_form)
+        solvent_content_layout.addLayout(solvent_form)
+
+        self.solvent_reference_details_box = QPlainTextEdit()
+        self.solvent_reference_details_box.setReadOnly(True)
+        self.solvent_reference_details_box.setMinimumHeight(90)
+        solvent_content_layout.addWidget(self.solvent_reference_details_box)
+
+        self.solvent_status_group = QGroupBox(
+            "Detected Representative Solvent State"
+        )
+        solvent_status_layout = QVBoxLayout(self.solvent_status_group)
+        self.solvent_status_headline_label = QLabel(
+            "No representative solvent state has been determined yet."
+        )
+        self.solvent_status_headline_label.setWordWrap(True)
+        solvent_status_layout.addWidget(self.solvent_status_headline_label)
+        self.solvent_status_stats_label = QLabel(
+            "Save representative structures, choose a solvent reference, "
+            "and press Build Solvent-Decorated Representative PDBs."
+        )
+        self.solvent_status_stats_label.setWordWrap(True)
+        self.solvent_status_stats_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        solvent_status_layout.addWidget(self.solvent_status_stats_label)
+        solvent_content_layout.addWidget(self.solvent_status_group)
+
+        self.solvent_cutoff_group = QGroupBox("Solute Coordination Settings")
+        solvent_cutoff_layout = QVBoxLayout(self.solvent_cutoff_group)
+        self.solvent_cutoff_status_label = QLabel(
+            "Analyze or build the representative structures to populate the "
+            "solute atom types used for solvent-shell building."
+        )
+        self.solvent_cutoff_status_label.setWordWrap(True)
+        solvent_cutoff_layout.addWidget(self.solvent_cutoff_status_label)
+        self.solvent_cutoff_table = QTableWidget(0, 5)
+        self.solvent_cutoff_table.setHorizontalHeaderLabels(
+            [
+                "Element",
+                "Count",
+                "Coordination Center",
+                "Avg Coord #",
+                "Director Distance (A)",
+            ]
+        )
+        self.solvent_cutoff_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.solvent_cutoff_table.itemChanged.connect(
+            self._handle_solvent_coordination_table_item_changed
+        )
+        self.solvent_cutoff_table.horizontalHeader().setStretchLastSection(
+            True
+        )
+        solvent_cutoff_layout.addWidget(self.solvent_cutoff_table)
+        solvent_content_layout.addWidget(self.solvent_cutoff_group)
 
         solvent_button_row = QHBoxLayout()
+        self.analyze_solvent_outputs_button = QPushButton(
+            "Analyze / Refresh Solvent State"
+        )
+        self.analyze_solvent_outputs_button.clicked.connect(
+            self._analyze_representative_solvent_states
+        )
+        solvent_button_row.addWidget(self.analyze_solvent_outputs_button)
         self.build_solvent_outputs_button = QPushButton(
-            "Build Representative PDBs"
+            "Build Solvent-Decorated Representative PDBs"
         )
         self.build_solvent_outputs_button.clicked.connect(
             self._build_representative_solvent_outputs
         )
         solvent_button_row.addWidget(self.build_solvent_outputs_button)
         solvent_button_row.addStretch(1)
-        solvent_layout.addLayout(solvent_button_row)
+        solvent_content_layout.addLayout(solvent_button_row)
 
         self.solvent_summary_box = QPlainTextEdit()
         self.solvent_summary_box.setReadOnly(True)
         self.solvent_summary_box.setMinimumHeight(190)
-        solvent_layout.addWidget(self.solvent_summary_box)
+        solvent_content_layout.addWidget(self.solvent_summary_box)
 
         self.generated_pdb_group = QGroupBox(
-            "Generated Representative PDB Files"
+            "Active Representative Structures"
         )
         generated_pdb_layout = QVBoxLayout(self.generated_pdb_group)
         self.generated_pdb_intro_label = QLabel(
-            "Browse the generated no-solvent and completed representative "
-            "PDB files, review residue assignments, and open a 3D preview "
-            "of the selected structure."
+            "Choose the active representative structure set, then select a "
+            "row to inspect the currently selected representative structure "
+            "and preview it directly below. Solvent-aware variants appear "
+            "here after the Solvent Shell Builder has run."
         )
         self.generated_pdb_intro_label.setWordWrap(True)
         generated_pdb_layout.addWidget(self.generated_pdb_intro_label)
+
+        generated_pdb_mode_row = QHBoxLayout()
+        generated_pdb_mode_row.addWidget(QLabel("Active structure set"))
+        self.generated_pdb_mode_combo = QComboBox()
+        self.generated_pdb_mode_combo.currentIndexChanged.connect(
+            self._handle_generated_pdb_mode_changed
+        )
+        generated_pdb_mode_row.addWidget(
+            self.generated_pdb_mode_combo,
+            stretch=1,
+        )
+        generated_pdb_layout.addLayout(generated_pdb_mode_row)
 
         generated_pdb_button_row = QHBoxLayout()
         self.open_generated_pdb_preview_button = QPushButton(
@@ -1334,16 +1580,15 @@ class RMCSetupMainWindow(QMainWindow):
         generated_pdb_button_row.addStretch(1)
         generated_pdb_layout.addLayout(generated_pdb_button_row)
 
-        self.generated_pdb_table = QTableWidget(0, 7)
+        self.generated_pdb_table = QTableWidget(0, 6)
         self.generated_pdb_table.setHorizontalHeaderLabels(
             [
                 "Representative",
-                "Variant",
-                "File",
+                "Detected State",
+                "Active Set",
+                "Structure File",
                 "Atoms",
-                "Elements",
-                "Solvent Molecules",
-                "Molecule Residues",
+                "Source",
             ]
         )
         self.generated_pdb_table.setSelectionBehavior(
@@ -1366,9 +1611,20 @@ class RMCSetupMainWindow(QMainWindow):
 
         self.generated_pdb_details_box = QPlainTextEdit()
         self.generated_pdb_details_box.setReadOnly(True)
-        self.generated_pdb_details_box.setMinimumHeight(210)
+        self.generated_pdb_details_box.setMinimumHeight(150)
         generated_pdb_layout.addWidget(self.generated_pdb_details_box)
-        solvent_layout.addWidget(self.generated_pdb_group)
+
+        self.generated_pdb_viewer_status_label = QLabel(
+            "Select a representative row to preview the active structure."
+        )
+        self.generated_pdb_viewer_status_label.setWordWrap(True)
+        generated_pdb_layout.addWidget(self.generated_pdb_viewer_status_label)
+        self.generated_pdb_viewer = ElectronDensityStructureViewer(
+            self.generated_pdb_group
+        )
+        self.generated_pdb_viewer.setMinimumHeight(360)
+        generated_pdb_layout.addWidget(self.generated_pdb_viewer, stretch=1)
+        representative_content_layout.addWidget(self.generated_pdb_group)
         self._right_layout.addWidget(self.solvent_group)
 
         self.packmol_group = QGroupBox("Packmol Planning")
@@ -1385,7 +1641,26 @@ class RMCSetupMainWindow(QMainWindow):
                 "Setup Ready",
                 "Checked after Packmol setup inputs are built.",
             ),
+            section_key="packmol",
         )
+        packmol_content_layout = self._create_collapsible_section_layout(
+            packmol_layout,
+            "packmol",
+        )
+        self.packmol_docker_group = QGroupBox("Linked Packmol Docker")
+        packmol_docker_layout = QVBoxLayout(self.packmol_docker_group)
+        self.packmol_docker_hint_label = QLabel(
+            "Use Tools > Link Packmol Docker Container to validate a "
+            "container, confirm Packmol is installed, and select the "
+            f"container-side project folder inside {DEFAULT_PACKMOL_CONTAINER_ROOT}."
+        )
+        self.packmol_docker_hint_label.setWordWrap(True)
+        packmol_docker_layout.addWidget(self.packmol_docker_hint_label)
+        self.packmol_docker_summary_box = QPlainTextEdit()
+        self.packmol_docker_summary_box.setReadOnly(True)
+        self.packmol_docker_summary_box.setMinimumHeight(150)
+        packmol_docker_layout.addWidget(self.packmol_docker_summary_box)
+        packmol_content_layout.addWidget(self.packmol_docker_group)
         packmol_form = QFormLayout()
 
         self.packmol_planning_mode_combo = QComboBox()
@@ -1406,7 +1681,12 @@ class RMCSetupMainWindow(QMainWindow):
             "Box side length (A)",
             self.packmol_box_side_spin,
         )
-        packmol_layout.addLayout(packmol_form)
+        self.packmol_free_solvent_combo = QComboBox()
+        packmol_form.addRow(
+            "Free solvent structure",
+            self.packmol_free_solvent_combo,
+        )
+        packmol_content_layout.addLayout(packmol_form)
 
         packmol_button_row = QHBoxLayout()
         self.compute_packmol_plan_button = QPushButton(
@@ -1416,25 +1696,41 @@ class RMCSetupMainWindow(QMainWindow):
             self._compute_packmol_plan
         )
         packmol_button_row.addWidget(self.compute_packmol_plan_button)
+        packmol_button_row.addWidget(QLabel("Tolerance (A)"))
+        self.packmol_tolerance_spin = QDoubleSpinBox()
+        self.packmol_tolerance_spin.setDecimals(3)
+        self.packmol_tolerance_spin.setRange(0.1, 100.0)
+        self.packmol_tolerance_spin.setSingleStep(0.1)
+        self.packmol_tolerance_spin.setValue(2.0)
+        self.packmol_tolerance_spin.setSuffix(" A")
+        packmol_button_row.addWidget(self.packmol_tolerance_spin)
         self.build_packmol_setup_button = QPushButton("Build Packmol Setup")
         self.build_packmol_setup_button.clicked.connect(
             self._build_packmol_setup
         )
         packmol_button_row.addWidget(self.build_packmol_setup_button)
+        self.open_packmol_setup_folder_button = QPushButton(
+            "Open Packmol Setup Folder"
+        )
+        self.open_packmol_setup_folder_button.clicked.connect(
+            self._open_packmol_setup_folder
+        )
+        self.open_packmol_setup_folder_button.setEnabled(False)
+        packmol_button_row.addWidget(self.open_packmol_setup_folder_button)
         packmol_button_row.addStretch(1)
-        packmol_layout.addLayout(packmol_button_row)
+        packmol_content_layout.addLayout(packmol_button_row)
 
         self.packmol_plan_summary_box = QPlainTextEdit()
         self.packmol_plan_summary_box.setReadOnly(True)
         self.packmol_plan_summary_box.setMinimumHeight(180)
-        packmol_layout.addWidget(self.packmol_plan_summary_box)
-        packmol_layout.addWidget(self._packmol_plan_toolbar)
+        packmol_content_layout.addWidget(self.packmol_plan_summary_box)
+        packmol_content_layout.addWidget(self._packmol_plan_toolbar)
         self._packmol_plan_canvas.setMinimumHeight(260)
-        packmol_layout.addWidget(self._packmol_plan_canvas)
+        packmol_content_layout.addWidget(self._packmol_plan_canvas)
         self.packmol_build_summary_box = QPlainTextEdit()
         self.packmol_build_summary_box.setReadOnly(True)
         self.packmol_build_summary_box.setMinimumHeight(150)
-        packmol_layout.addWidget(self.packmol_build_summary_box)
+        packmol_content_layout.addWidget(self.packmol_build_summary_box)
         self._right_layout.addWidget(self.packmol_group)
 
         self.constraints_group = QGroupBox("Constraint Generation")
@@ -1468,6 +1764,22 @@ class RMCSetupMainWindow(QMainWindow):
             self._generate_constraints
         )
         constraints_button_row.addWidget(self.generate_constraints_button)
+        self.open_constraints_folder_button = QPushButton(
+            "Open Constraints Folder"
+        )
+        self.open_constraints_folder_button.clicked.connect(
+            self._open_constraints_folder
+        )
+        self.open_constraints_folder_button.setEnabled(False)
+        constraints_button_row.addWidget(self.open_constraints_folder_button)
+        self.preview_constraints_button = QPushButton(
+            "Show Merged Constraints"
+        )
+        self.preview_constraints_button.clicked.connect(
+            self._open_constraints_preview
+        )
+        self.preview_constraints_button.setEnabled(False)
+        constraints_button_row.addWidget(self.preview_constraints_button)
         constraints_button_row.addStretch(1)
         constraints_layout.addLayout(constraints_button_row)
 
@@ -1485,10 +1797,11 @@ class RMCSetupMainWindow(QMainWindow):
             "\n".join(
                 [
                     "1. Load a SAXS project and choose a DREAM result source.",
-                    "2. Validate cluster sources and select representative-cluster mode.",
-                    "3. Enter solution properties for Packmol box construction.",
-                    "4. Compute representative structures and inspect Packmol planning counts.",
-                    "5. Build representative structures, constraints, and fullrmc inputs.",
+                    "2. Open Representative Structures and save the representative project set.",
+                    "3. Enter solution properties for the target box density and composition.",
+                    "4. Build solvent shells as needed and convert DREAM "
+                    "weights into Packmol cluster counts.",
+                    "5. Build the Packmol box inputs and cluster-specific fullrmc constraints.",
                 ]
             )
         )
@@ -1516,6 +1829,116 @@ class RMCSetupMainWindow(QMainWindow):
             self.set_project_dir(initial_project_dir)
         else:
             self._refresh_project_source()
+
+    def _build_menu_bar(self) -> None:
+        menu_bar = self.menuBar()
+        self.tools_menu = menu_bar.addMenu("Tools")
+        self.open_representative_structures_action = QAction(
+            "Open Representative Structures",
+            self,
+        )
+        self.open_representative_structures_action.triggered.connect(
+            self._open_representative_structures_tool
+        )
+        self.tools_menu.addAction(self.open_representative_structures_action)
+        self.link_packmol_docker_action = QAction(
+            "Link Packmol Docker Container",
+            self,
+        )
+        self.link_packmol_docker_action.triggered.connect(
+            self._open_packmol_docker_link_dialog
+        )
+        self.tools_menu.addSeparator()
+        self.tools_menu.addAction(self.link_packmol_docker_action)
+
+    def _track_child_tool_window(self, window: object) -> None:
+        if window in self._child_tool_windows:
+            return
+        if isinstance(window, QWidget):
+            window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        destroyed_signal = getattr(window, "destroyed", None)
+        if destroyed_signal is not None and hasattr(
+            destroyed_signal, "connect"
+        ):
+            destroyed_signal.connect(
+                lambda _obj=None, win=window: self._forget_child_tool_window(
+                    win
+                )
+            )
+        self._child_tool_windows.append(window)
+
+    def _forget_child_tool_window(self, window: object) -> None:
+        self._child_tool_windows = [
+            existing
+            for existing in self._child_tool_windows
+            if existing is not window
+        ]
+
+    def _reload_saved_representative_structures(self) -> None:
+        if self.project_dir() is None:
+            QMessageBox.information(
+                self,
+                "No SAXS project loaded",
+                "Load a SAXS project before reloading representative structures.",
+            )
+            return
+        self._append_run_log("Reloading saved representative structures.")
+        self._refresh_project_source()
+
+    def _handle_representative_structure_results_changed(
+        self,
+        project_dir_text: str,
+    ) -> None:
+        current_project_dir = self.project_dir()
+        if current_project_dir is None:
+            return
+        try:
+            changed_project_dir = Path(project_dir_text).expanduser().resolve()
+        except Exception:
+            return
+        if changed_project_dir != current_project_dir:
+            return
+        self._append_run_log(
+            "Representative structures were updated in the dedicated tool; "
+            "reloading the saved project set."
+        )
+        self._refresh_project_source()
+
+    def _open_representative_structures_tool(self) -> None:
+        from saxshell.representativefinder.ui.main_window import (
+            launch_representativefinder_ui,
+        )
+
+        state = self._project_source_state
+        if state is None:
+            QMessageBox.information(
+                self,
+                "No SAXS project loaded",
+                "Load a SAXS project before opening Representative Structures.",
+            )
+            return
+        project_dir = Path(state.settings.project_dir).resolve()
+        initial_input_path = state.settings.resolved_clusters_dir
+        window = launch_representativefinder_ui(
+            initial_project_dir=project_dir,
+            initial_input_path=initial_input_path,
+        )
+        project_results_changed = getattr(
+            window, "project_results_changed", None
+        )
+        if project_results_changed is not None and hasattr(
+            project_results_changed, "connect"
+        ):
+            project_results_changed.connect(
+                self._handle_representative_structure_results_changed
+            )
+        self._track_child_tool_window(window)
+        self.statusBar().showMessage(
+            f"Opened representative structures for {project_dir}"
+        )
+        self._append_run_log(
+            "Opened the Representative Structures tool for this project."
+        )
 
     def project_dir(self) -> Path | None:
         text = self.project_dir_edit.text().strip()
@@ -1545,6 +1968,112 @@ class RMCSetupMainWindow(QMainWindow):
 
     def _toggle_software_details(self, checked: bool) -> None:
         self.software_details_panel.setVisible(checked)
+
+    def _packmol_docker_settings(self) -> QSettings:
+        return QSettings("SAXShell", "RMCSetup")
+
+    def _create_packmol_docker_client(self) -> PackmolDockerClient:
+        return PackmolDockerClient()
+
+    def _recent_packmol_docker_presets(self) -> list[PackmolDockerLink]:
+        raw_value = self._packmol_docker_settings().value(
+            _PACKMOL_DOCKER_PRESETS_KEY,
+            "[]",
+        )
+        if isinstance(raw_value, str):
+            try:
+                payload = json.loads(raw_value)
+            except Exception:
+                payload = []
+        elif isinstance(raw_value, (list, tuple)):
+            payload = list(raw_value)
+        else:
+            payload = []
+        presets: list[PackmolDockerLink] = []
+        for entry in payload:
+            preset = PackmolDockerLink.from_dict(
+                dict(entry) if isinstance(entry, dict) else None
+            )
+            if preset is not None:
+                presets.append(preset)
+        return presets
+
+    def _remember_packmol_docker_preset(
+        self,
+        link: PackmolDockerLink,
+    ) -> None:
+        preset = PackmolDockerLink.from_dict(link.to_preset_dict())
+        if preset is None:
+            return
+        signature = (
+            preset.container_name,
+            preset.packmol_command,
+            preset.shell_command,
+            preset.container_project_root,
+        )
+        kept = [
+            existing
+            for existing in self._recent_packmol_docker_presets()
+            if (
+                existing.container_name,
+                existing.packmol_command,
+                existing.shell_command,
+                existing.container_project_root,
+            )
+            != signature
+        ]
+        payload = [preset.to_preset_dict()] + [
+            item.to_preset_dict() for item in kept[:7]
+        ]
+        self._packmol_docker_settings().setValue(
+            _PACKMOL_DOCKER_PRESETS_KEY,
+            json.dumps(payload),
+        )
+
+    def _save_packmol_docker_link(
+        self,
+        link: PackmolDockerLink | None,
+    ) -> None:
+        state = self._project_source_state
+        if state is None:
+            return
+        save_packmol_docker_link_metadata(
+            state.rmcsetup_paths.packmol_docker_link_path,
+            link,
+        )
+        state.packmol_docker_link = link
+
+    def _open_packmol_docker_link_dialog(self) -> None:
+        state = self._project_source_state
+        if state is None:
+            QMessageBox.information(
+                self,
+                "No SAXS project loaded",
+                "Load a SAXS project before linking a Packmol Docker container.",
+            )
+            return
+        dialog = PackmolDockerLinkDialog(
+            current_link=state.packmol_docker_link,
+            recent_presets=self._recent_packmol_docker_presets(),
+            docker_client=self._create_packmol_docker_client(),
+            parent=self,
+        )
+        if not dialog.exec():
+            return
+        link = dialog.selected_link()
+        if link is None:
+            return
+        link.linked_at = datetime.now().isoformat(timespec="seconds")
+        self._remember_packmol_docker_preset(link)
+        self._save_packmol_docker_link(link)
+        self.packmol_docker_summary_box.setPlainText(
+            self._packmol_docker_summary_text(state.packmol_setup)
+        )
+        self.output_summary_box.setPlainText(self._output_structure_text())
+        self._append_run_log(
+            "Linked Packmol Docker container "
+            f"{link.container_name} at {link.container_project_root}."
+        )
 
     def _refresh_project_source(self) -> None:
         self._set_task_progress("Loading project source...", 10)
@@ -1693,10 +2222,17 @@ class RMCSetupMainWindow(QMainWindow):
         paths = state.rmcsetup_paths
         lines = [
             f"Root: {paths.rmcsetup_dir}",
-            f"Representative clusters: {paths.representative_clusters_dir}",
+            (
+                "Representative structures root: "
+                f"{paths.representative_clusters_dir}"
+            ),
             (
                 "Representative metadata: "
                 f"{paths.representative_selection_path}"
+            ),
+            (
+                "Partial-solvent representatives: "
+                f"{paths.representative_partial_solvent_dir}"
             ),
             f"PDBs without solvent: {paths.pdb_no_solvent_dir}",
             f"PDBs with solvent: {paths.pdb_with_solvent_dir}",
@@ -1706,6 +2242,7 @@ class RMCSetupMainWindow(QMainWindow):
             ("Distribution metadata: " f"{paths.distribution_selection_path}"),
             ("Solution metadata: " f"{paths.solution_properties_path}"),
             ("Solvent metadata: " f"{paths.solvent_handling_path}"),
+            ("Packmol Docker link: " f"{paths.packmol_docker_link_path}"),
             ("Packmol plan metadata: " f"{paths.packmol_plan_path}"),
             ("Packmol setup metadata: " f"{paths.packmol_setup_path}"),
             ("Constraint metadata: " f"{paths.constraint_generation_path}"),
@@ -1914,9 +2451,31 @@ class RMCSetupMainWindow(QMainWindow):
         self,
         layout: QVBoxLayout,
         *definitions: tuple[str, str, str],
+        section_key: str | None = None,
     ) -> None:
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
+        if section_key is not None:
+            toggle = QToolButton()
+            toggle.setCheckable(True)
+            toggle.setChecked(True)
+            toggle.setArrowType(Qt.ArrowType.DownArrow)
+            toggle.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+            )
+            toggle.setText("Collapse")
+            toggle.setToolTip(
+                "Collapse or expand this section while keeping its "
+                "readiness status visible."
+            )
+            toggle.toggled.connect(
+                lambda checked, key=section_key: self._toggle_section_content(
+                    key,
+                    checked,
+                )
+            )
+            self._section_toggle_buttons[section_key] = toggle
+            row.addWidget(toggle)
         row.addStretch(1)
         for key, label, tooltip in definitions:
             checkbox = QCheckBox(label)
@@ -1927,6 +2486,38 @@ class RMCSetupMainWindow(QMainWindow):
             self._readiness_checkboxes[key] = checkbox
             row.addWidget(checkbox)
         layout.addLayout(row)
+
+    def _create_collapsible_section_layout(
+        self,
+        layout: QVBoxLayout,
+        section_key: str,
+    ) -> QVBoxLayout:
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(layout.spacing())
+        layout.addWidget(content_widget)
+        self._section_content_widgets[section_key] = content_widget
+        self._toggle_section_content(section_key, True)
+        return content_layout
+
+    def _toggle_section_content(
+        self,
+        section_key: str,
+        expanded: bool,
+    ) -> None:
+        content_widget = self._section_content_widgets.get(section_key)
+        if content_widget is not None:
+            content_widget.setVisible(expanded)
+        toggle = self._section_toggle_buttons.get(section_key)
+        if toggle is not None:
+            toggle.blockSignals(True)
+            toggle.setChecked(expanded)
+            toggle.setArrowType(
+                Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+            )
+            toggle.setText("Collapse" if expanded else "Expand")
+            toggle.blockSignals(False)
 
     def _readiness_states(self) -> dict[str, bool]:
         state = self._project_source_state
@@ -1943,7 +2534,8 @@ class RMCSetupMainWindow(QMainWindow):
                 has_project and state.representative_selection is not None
             ),
             "solvent_outputs": (
-                has_project and state.solvent_handling is not None
+                has_project
+                and self._active_representative_structure_set_is_ready()
             ),
             "packmol_plan": (
                 has_project and state.packmol_planning is not None
@@ -2173,23 +2765,16 @@ class RMCSetupMainWindow(QMainWindow):
         )
         self._set_widget_tooltip(
             self.compute_representatives_button,
-            "Compute and save the representative clusters for the current "
-            "DREAM model selection.",
+            "Open the dedicated Representative Structures tool for this "
+            "project.",
         )
         self._set_widget_tooltip(
             self.representative_progress_bar,
-            "Progress for the background representative-cluster selection job.",
+            "Progress for the legacy in-panel representative-selection job.",
         )
         self._set_widget_tooltip(
             self.preview_representatives_button,
-            "Open a preview window for the saved representative cluster "
-            "analysis.",
-        )
-        self._set_widget_tooltip(
-            self.coordinated_solvent_mode_combo,
-            "Choose whether coordinated solvent is removed, partially "
-            "retained, or fully retained around each representative "
-            "cluster.",
+            "Reload the saved representative structures from this project.",
         )
         self._set_widget_tooltip(
             self.solvent_reference_source_combo,
@@ -2203,33 +2788,60 @@ class RMCSetupMainWindow(QMainWindow):
         self._set_widget_tooltip(
             self.solvent_reference_edit,
             "Path to the custom solvent-reference PDB used for coordinated "
-            "solvent handling.",
+            "solvent-shell building.",
         )
         self._set_widget_tooltip(
             self.browse_solvent_reference_button,
             "Browse for a custom solvent-reference PDB file.",
         )
         self._set_widget_tooltip(
+            self.solvent_reference_match_tolerance_spin,
+            "Tolerance used while matching the selected solvent reference "
+            "against each representative structure.",
+        )
+        self._set_widget_tooltip(
+            self.solvent_director_atom_combo,
+            "Reference atom that should point toward the solute cluster "
+            "during solvent-shell building.",
+        )
+        self._set_widget_tooltip(
             self.solvent_minimum_separation_spin,
             "Minimum allowed distance between placed solvent atoms and the "
-            "surrounding coordination sphere during partial-solvent "
-            "completion. The anchor atom fixed to the shell site is "
-            "excluded from this clash check.",
+            "surrounding coordination sphere during solvent-shell "
+            "placement and refinement.",
+        )
+        self._set_widget_tooltip(
+            self.analyze_solvent_outputs_button,
+            "Analyze every saved representative structure to determine the "
+            "current coordinated-solvent state of the representative set.",
+        )
+        self._set_widget_tooltip(
+            self.solvent_cutoff_table,
+            "Choose which solute elements are coordination centers, set "
+            "their target average coordination numbers, and define the "
+            "director-atom cutoff distance used for solvent placement.",
         )
         self._set_widget_tooltip(
             self.build_solvent_outputs_button,
-            "Build the representative cluster PDB outputs with the chosen "
-            "solvent-handling mode.",
+            "Build the stripped and solvent-decorated representative PDB "
+            "outputs using the current automatic solvent analysis and "
+            "coordination settings.",
+        )
+        self._set_widget_tooltip(
+            self.generated_pdb_mode_combo,
+            "Choose which saved representative structure set is active for "
+            "the table, viewer, and Packmol setup: source, no solvent, "
+            "partial solvent, or full solvent when available.",
         )
         self._set_widget_tooltip(
             self.generated_pdb_table,
-            "Review the generated no-solvent and completed representative "
-            "PDB files, then double-click a row to open its structure preview.",
+            "Review the currently active representative structures and "
+            "select one row to inspect it in the embedded viewer.",
         )
         self._set_widget_tooltip(
             self.open_generated_pdb_preview_button,
-            "Open a 3D preview window for the currently selected generated "
-            "representative PDB file.",
+            "Open a 3D preview window for the currently selected saved "
+            "no-solvent or full-solvent representative PDB file.",
         )
         self._set_widget_tooltip(
             self.packmol_planning_mode_combo,
@@ -2241,6 +2853,11 @@ class RMCSetupMainWindow(QMainWindow):
             "Side length of the cubic Packmol box used for count planning.",
         )
         self._set_widget_tooltip(
+            self.packmol_free_solvent_combo,
+            "Choose the solvent structure file used for the free bulk "
+            "solvent population in the Packmol box.",
+        )
+        self._set_widget_tooltip(
             self.compute_packmol_plan_button,
             "Compute cluster counts and target weights for the current "
             "Packmol plan.",
@@ -2248,7 +2865,12 @@ class RMCSetupMainWindow(QMainWindow):
         self._set_widget_tooltip(
             self.build_packmol_setup_button,
             "Build Packmol input files and audit outputs from the saved "
-            "plan.",
+            "plan using the active Full solvent representative structure set.",
+        )
+        self._set_widget_tooltip(
+            self.packmol_tolerance_spin,
+            "Tolerance written into the Packmol input file for the setup "
+            "build.",
         )
         self._set_widget_tooltip(
             self.constraint_length_tolerance_spin,
@@ -2264,6 +2886,16 @@ class RMCSetupMainWindow(QMainWindow):
             self.generate_constraints_button,
             "Generate per-structure and merged fullrmc constraints from the "
             "selected representative structures.",
+        )
+        self._set_widget_tooltip(
+            self.open_constraints_folder_button,
+            "Open the folder that contains the generated merged fullrmc "
+            "constraints file and per-structure constraint files.",
+        )
+        self._set_widget_tooltip(
+            self.preview_constraints_button,
+            "Open a copy-friendly window that shows the merged fullrmc "
+            "constraints file contents.",
         )
 
     def _on_posterior_filter_changed(self) -> None:
@@ -2305,16 +2937,31 @@ class RMCSetupMainWindow(QMainWindow):
         self.representative_group.setEnabled(state is not None)
         if state is None:
             self._apply_representative_metadata(None)
+            self.compute_representatives_button.setEnabled(False)
             self.preview_representatives_button.setEnabled(False)
+            self.representative_status_label.setText(
+                "Representative structures: no SAXS project loaded."
+            )
             self.representative_summary_box.setPlainText(
                 "Load a SAXS project and choose a DREAM source before "
-                "selecting representative cluster files."
+                "loading saved representative structures."
             )
             return
         self._apply_representative_metadata(state.representative_selection)
-        self.preview_representatives_button.setEnabled(
-            state.representative_selection is not None
-        )
+        self.compute_representatives_button.setEnabled(True)
+        self.preview_representatives_button.setEnabled(True)
+        if state.representative_selection is None:
+            self.representative_status_label.setText(
+                "Representative structures: no saved project set loaded."
+            )
+        else:
+            selection_mode = (
+                state.representative_selection.selection_mode or "unknown"
+            )
+            self.representative_status_label.setText(
+                "Representative structures: saved project set loaded "
+                f"({selection_mode})."
+            )
         self.representative_summary_box.setPlainText(
             self._representative_summary_text(
                 state.representative_selection,
@@ -2326,19 +2973,18 @@ class RMCSetupMainWindow(QMainWindow):
         self.solvent_group.setEnabled(state is not None)
         if state is None:
             self._apply_solvent_metadata(None)
+            self.analyze_solvent_outputs_button.setEnabled(False)
             self.build_solvent_outputs_button.setEnabled(False)
             self.solvent_summary_box.setPlainText(
-                "Load a SAXS project and compute representative clusters before "
-                "building solvent-aware representative PDB outputs."
+                "Load a SAXS project and save representative structures before "
+                "running the Solvent Shell Builder."
             )
             return
         self._apply_solvent_metadata(state.solvent_handling)
-        self.build_solvent_outputs_button.setEnabled(
-            state.representative_selection is not None
-        )
         self.solvent_summary_box.setPlainText(
             self._solvent_summary_text(state.solvent_handling)
         )
+        self._update_solvent_build_panel_state()
 
     def _populate_packmol_planning_controls(self) -> None:
         state = self._project_source_state
@@ -2347,14 +2993,20 @@ class RMCSetupMainWindow(QMainWindow):
             self._apply_packmol_planning_metadata(None)
             self.compute_packmol_plan_button.setEnabled(False)
             self.build_packmol_setup_button.setEnabled(False)
+            self.packmol_free_solvent_combo.setEnabled(False)
             self.packmol_plan_summary_box.setPlainText(
                 "Load a SAXS project, calculate solution properties, and "
-                "compute representative clusters before planning Packmol "
+                "save representative structures before planning Packmol "
                 "cluster counts."
             )
             self.packmol_build_summary_box.setPlainText(
-                "Build Packmol setup after computing cluster counts and "
-                "solvent-aware representative PDB outputs."
+                "Build Packmol setup after computing cluster counts, "
+                "choosing a free-solvent structure, and preparing the "
+                "active full-solvent representative files."
+            )
+            self.open_packmol_setup_folder_button.setEnabled(False)
+            self.packmol_docker_summary_box.setPlainText(
+                self._packmol_docker_summary_text()
             )
             return
         self._apply_packmol_planning_metadata(state.packmol_planning)
@@ -2364,12 +3016,18 @@ class RMCSetupMainWindow(QMainWindow):
         )
         self.build_packmol_setup_button.setEnabled(
             state.packmol_planning is not None
-            and state.solvent_handling is not None
+            and self._active_representative_structure_set_is_ready()
+        )
+        self.packmol_free_solvent_combo.setEnabled(
+            self.packmol_free_solvent_combo.count() > 0
         )
         self.packmol_plan_summary_box.setPlainText(
             self._packmol_plan_summary_text(state.packmol_planning)
         )
         self._apply_packmol_setup_metadata(state.packmol_setup)
+        self.packmol_docker_summary_box.setPlainText(
+            self._packmol_docker_summary_text(state.packmol_setup)
+        )
 
     def _populate_constraint_controls(self) -> None:
         state = self._project_source_state
@@ -2377,6 +3035,8 @@ class RMCSetupMainWindow(QMainWindow):
         if state is None:
             self._apply_constraint_metadata(None)
             self.generate_constraints_button.setEnabled(False)
+            self.open_constraints_folder_button.setEnabled(False)
+            self.preview_constraints_button.setEnabled(False)
             self.constraints_summary_box.setPlainText(
                 "Build Packmol setup inputs before generating per-structure "
                 "constraint files and the merged fullrmc constraints file."
@@ -2386,6 +3046,9 @@ class RMCSetupMainWindow(QMainWindow):
         self.generate_constraints_button.setEnabled(
             state.packmol_setup is not None
         )
+        has_constraints = state.constraint_generation is not None
+        self.open_constraints_folder_button.setEnabled(has_constraints)
+        self.preview_constraints_button.setEnabled(has_constraints)
 
     def _selected_representative_mode(self) -> str:
         return str(
@@ -2422,6 +3085,11 @@ class RMCSetupMainWindow(QMainWindow):
         self.representative_bond_weight_spin.setValue(settings.bond_weight)
         self.representative_angle_weight_spin.setValue(settings.angle_weight)
         self._update_representative_mode_widgets()
+        self._refresh_generated_pdb_mode_combo()
+        state = self._project_source_state
+        self._refresh_generated_pdb_browser(
+            state.solvent_handling if state is not None else None
+        )
 
     def _selected_representative_preset_name(self) -> str | None:
         payload = self.representative_preset_combo.currentData()
@@ -2764,6 +3432,165 @@ class RMCSetupMainWindow(QMainWindow):
         item = table.item(row, column)
         return item.text().strip() if item is not None else ""
 
+    def _available_generated_pdb_mode_items(
+        self,
+    ) -> list[tuple[str, str]]:
+        state = self._project_source_state
+        if state is None or state.representative_selection is None:
+            return []
+        return [
+            (representative_structure_mode_label(mode), mode)
+            for mode in available_representative_structure_modes(
+                state.representative_selection,
+                state.solvent_handling,
+            )
+        ]
+
+    def _active_generated_pdb_mode(self) -> str:
+        state = self._project_source_state
+        if state is None or state.representative_selection is None:
+            return "source"
+        preferred = self.generated_pdb_mode_combo.currentData()
+        preferred_mode = (
+            str(preferred).strip() if preferred is not None else None
+        )
+        return resolved_representative_structure_mode(
+            state.representative_selection,
+            state.solvent_handling,
+            preferred_mode=preferred_mode,
+        )
+
+    def _active_representative_structure_set_is_ready(self) -> bool:
+        state = self._project_source_state
+        return bool(
+            state is not None
+            and state.representative_selection is not None
+            and self._active_generated_pdb_mode() == "full_solvent"
+        )
+
+    def _solvent_shell_builder_required(self) -> bool:
+        state = self._project_source_state
+        return bool(
+            state is not None
+            and state.representative_selection is not None
+            and self._active_generated_pdb_mode() != "full_solvent"
+        )
+
+    def _set_solvent_shell_builder_controls_enabled(
+        self,
+        enabled: bool,
+    ) -> None:
+        for widget in (
+            self.solvent_reference_source_combo,
+            self.solvent_preset_combo,
+            self.solvent_reference_edit,
+            self.browse_solvent_reference_button,
+            self.solvent_reference_match_tolerance_spin,
+            self.solvent_director_atom_combo,
+            self.solvent_minimum_separation_spin,
+            self.solvent_reference_details_box,
+            self.solvent_status_group,
+            self.solvent_cutoff_group,
+        ):
+            widget.setEnabled(enabled)
+
+    def _solvent_build_has_required_coordination_settings(
+        self,
+        analysis: RepresentativeSolventDistributionAnalysis,
+    ) -> bool:
+        if analysis.distribution_status in {
+            "complete_solvent",
+            "partial_solvent",
+            "mixed_complete_and_partial",
+        }:
+            return True
+        selected_settings = self._selected_solvent_coordination_settings()
+        return any(
+            setting.coordination_center
+            and float(setting.target_coordination_number) > 0.0
+            and float(setting.director_distance_cutoff_a) > 0.0
+            for setting in selected_settings.values()
+        )
+
+    def _representative_entry_selected_state_text(
+        self,
+        representative_entry: object,
+        active_mode: str,
+    ) -> str:
+        source_variant = representative_source_solvent_mode_to_variant(
+            getattr(representative_entry, "source_solvent_mode", None)
+        )
+        if active_mode == "full_solvent":
+            return "Full solvent analyzed"
+        if source_variant == active_mode:
+            return f"{representative_structure_mode_label(active_mode)} source"
+        if active_mode in {
+            "no_solvent",
+            "partial_solvent",
+            "full_solvent",
+        }:
+            return (
+                f"{representative_structure_mode_label(active_mode)} selected"
+            )
+        return "Not analyzed"
+
+    def _refresh_generated_pdb_mode_combo(self) -> None:
+        state = self._project_source_state
+        items = self._available_generated_pdb_mode_items()
+        preferred_mode: str | None = None
+        if state is not None and state.solvent_handling is not None:
+            preferred_mode = str(
+                state.solvent_handling.settings.coordinated_solvent_mode
+            ).strip()
+        current = self.generated_pdb_mode_combo.currentData()
+        if current is not None and str(current).strip():
+            preferred_mode = str(current).strip()
+        self._updating_generated_pdb_mode_combo = True
+        try:
+            self.generated_pdb_mode_combo.clear()
+            for label, mode in items:
+                self.generated_pdb_mode_combo.addItem(label, mode)
+            self.generated_pdb_mode_combo.setEnabled(len(items) > 1)
+            if not items:
+                return
+            resolved_mode = resolved_representative_structure_mode(
+                state.representative_selection if state is not None else None,
+                state.solvent_handling if state is not None else None,
+                preferred_mode=preferred_mode,
+            )
+            self._set_combo_value(self.generated_pdb_mode_combo, resolved_mode)
+        finally:
+            self._updating_generated_pdb_mode_combo = False
+
+    def _handle_generated_pdb_mode_changed(self) -> None:
+        if self._updating_generated_pdb_mode_combo:
+            return
+        state = self._project_source_state
+        if state is None or state.representative_selection is None:
+            return
+        resolved_mode = self._active_generated_pdb_mode()
+        if state.solvent_handling is not None:
+            state.solvent_handling.settings.coordinated_solvent_mode = (
+                resolved_mode
+            )
+            save_solvent_handling_metadata(
+                state.rmcsetup_paths.solvent_handling_path,
+                state.solvent_handling,
+            )
+            self.solvent_summary_box.setPlainText(
+                self._solvent_summary_text(state.solvent_handling)
+            )
+        self._refresh_generated_pdb_browser(
+            state.solvent_handling if state is not None else None
+        )
+        self.solvent_summary_box.setPlainText(
+            self._solvent_summary_text(state.solvent_handling)
+        )
+        self._update_solvent_status_panel(state.solvent_handling)
+        self._update_solvent_build_panel_state()
+        self._populate_packmol_planning_controls()
+        self._update_readiness_progress()
+
     def _apply_solvent_metadata(
         self,
         metadata: SolventHandlingMetadata | None,
@@ -2774,10 +3601,6 @@ class RMCSetupMainWindow(QMainWindow):
             else SolventHandlingSettings()
         )
         self._set_combo_value(
-            self.coordinated_solvent_mode_combo,
-            settings.coordinated_solvent_mode,
-        )
-        self._set_combo_value(
             self.solvent_reference_source_combo,
             settings.reference_source,
         )
@@ -2785,59 +3608,227 @@ class RMCSetupMainWindow(QMainWindow):
         self.solvent_reference_edit.setText(
             settings.custom_reference_path or ""
         )
+        self.solvent_reference_match_tolerance_spin.setValue(
+            settings.reference_match_tolerance_a
+        )
         self.solvent_minimum_separation_spin.setValue(
             settings.minimum_solvent_atom_separation_a
         )
+        self._solvent_distribution_analysis = None
         self._update_solvent_reference_widgets()
+        self._populate_solvent_director_atom_choices(
+            selected_name=settings.director_atom_name
+        )
+        self._update_solvent_reference_details()
+        counts = (
+            metadata.aggregate_solute_element_counts
+            if metadata is not None
+            else {}
+        )
+        self._populate_solvent_cutoff_table(
+            counts,
+            settings.solute_atom_settings,
+        )
+        self._refresh_generated_pdb_mode_combo()
         self._refresh_generated_pdb_browser(metadata)
+        self._update_solvent_status_panel(metadata)
+        self._update_solvent_build_panel_state()
 
     def _refresh_generated_pdb_browser(
         self,
         metadata: SolventHandlingMetadata | None,
     ) -> None:
+        state = self._project_source_state
         self._generated_pdb_inspections = []
+        self._solvent_table_preview_paths = []
+        self._solvent_table_details = []
         self.generated_pdb_table.setRowCount(0)
-        if metadata is None:
+        self.generated_pdb_viewer.draw_placeholder()
+        self.generated_pdb_group.setEnabled(
+            state is not None and state.representative_selection is not None
+        )
+        if state is None or state.representative_selection is None:
             self.generated_pdb_details_box.setPlainText(
-                "Build representative PDB outputs to browse the generated "
-                "no-solvent and completed PDB files."
+                "Open Representative Structures, save the project set, and "
+                "reload it here to browse the active representative "
+                "structures."
             )
-            self.open_generated_pdb_preview_button.setEnabled(False)
-            return
-        try:
-            inspections = build_generated_pdb_inspections(metadata)
-        except Exception as exc:
-            self.generated_pdb_details_box.setPlainText(
-                f"Unable to inspect generated PDB files: {exc}"
+            self.generated_pdb_viewer_status_label.setText(
+                "Select a representative row to preview the active structure."
             )
             self.open_generated_pdb_preview_button.setEnabled(False)
             return
 
-        self._generated_pdb_inspections = inspections
-        self.generated_pdb_table.setRowCount(len(inspections))
-        for row, inspection in enumerate(inspections):
+        active_mode = self._active_generated_pdb_mode()
+        active_mode_label = representative_structure_mode_label(active_mode)
+        inspection_lookup: dict[
+            tuple[str, str, str, str], GeneratedPDBInspection
+        ] = {}
+        inspection_error: str | None = None
+        if metadata is not None:
+            try:
+                inspections = build_generated_pdb_inspections(metadata)
+            except Exception as exc:
+                inspection_error = str(exc)
+            else:
+                inspection_lookup = {
+                    (
+                        inspection.structure,
+                        inspection.motif,
+                        inspection.param,
+                        inspection.file_role,
+                    ): inspection
+                    for inspection in inspections
+                }
+
+        solvent_lookup = solvent_entry_lookup_for_representatives(
+            state.representative_selection,
+            metadata,
+        )
+        self.generated_pdb_table.setRowCount(
+            len(state.representative_selection.representative_entries)
+        )
+        for row, representative_entry in enumerate(
+            state.representative_selection.representative_entries
+        ):
+            key = (
+                representative_entry.structure,
+                representative_entry.motif,
+                representative_entry.param,
+            )
+            solvent_entry = solvent_lookup.get(key)
+            file_role: str | None = None
+            if active_mode == "full_solvent":
+                file_role = "completed"
+            elif active_mode == "no_solvent":
+                file_role = "no_solvent"
+            inspection = (
+                inspection_lookup.get((*key, file_role))
+                if file_role is not None
+                else None
+            )
+            preview_path = representative_structure_path_for_mode(
+                representative_entry,
+                solvent_entry,
+                active_mode,
+            )
+            source_text = representative_entry.analysis_source or "n/a"
+            atom_count = representative_entry.atom_count
+            if solvent_entry is not None:
+                if active_mode == "full_solvent":
+                    atom_count = solvent_entry.atom_count_completed
+                    source_text = (
+                        solvent_entry.completion_strategy
+                        or "saved Solvent Shell Builder output"
+                    )
+                elif active_mode == "no_solvent":
+                    atom_count = solvent_entry.atom_count_no_solvent
+                    source_text = "saved no-solvent export"
+                elif active_mode == "partial_solvent":
+                    source_text = "representative selection source"
+            if inspection is not None and inspection.exists:
+                atom_count = inspection.atom_count
+
+            detected_state = (
+                solvent_entry.detected_source_status_text
+                if solvent_entry is not None
+                else self._representative_entry_selected_state_text(
+                    representative_entry,
+                    active_mode,
+                )
+            )
             values = [
-                inspection.representative_label,
-                inspection.variant_label,
-                inspection.file_name,
-                str(inspection.atom_count) if inspection.exists else "Missing",
-                inspection.element_counts_text,
-                str(inspection.solvent_molecule_count),
-                inspection.molecule_residue_text,
+                (
+                    representative_entry.structure
+                    if representative_entry.motif == "no_motif"
+                    else (
+                        f"{representative_entry.structure}/"
+                        f"{representative_entry.motif}"
+                    )
+                ),
+                detected_state,
+                active_mode_label,
+                preview_path.name,
+                str(atom_count),
+                source_text,
             ]
+            details_lines = [
+                f"Representative: {values[0]}",
+                f"Detected source solvent state: {detected_state}",
+                f"Active structure set: {active_mode_label}",
+                f"Structure file: {preview_path}",
+                (
+                    "Selected weight: "
+                    f"{representative_entry.selected_weight:.6g}"
+                ),
+                f"Cluster count: {representative_entry.cluster_count}",
+                (
+                    "Representative atom count: "
+                    f"{representative_entry.atom_count}"
+                ),
+                (
+                    "Representative selection source: "
+                    f"{representative_entry.analysis_source}"
+                ),
+            ]
+            if representative_entry.element_counts:
+                details_lines.append(
+                    "Representative elements: "
+                    + ", ".join(
+                        f"{element}:{count}"
+                        for element, count in sorted(
+                            representative_entry.element_counts.items()
+                        )
+                    )
+                )
+            if solvent_entry is not None:
+                details_lines.extend(
+                    [
+                        f"No-solvent PDB: {solvent_entry.no_solvent_pdb}",
+                        f"Full-solvent PDB: {solvent_entry.completed_pdb}",
+                        (
+                            "Saved solvent-handling strategy: "
+                            f"{solvent_entry.completion_strategy or 'n/a'}"
+                        ),
+                    ]
+                )
+            detail_sections = ["\n".join(details_lines)]
+            if inspection is not None:
+                detail_sections.append(inspection.details_text())
+            if solvent_entry is not None and solvent_entry.analysis_summary:
+                detail_sections.append(solvent_entry.analysis_summary)
+            if solvent_entry is not None and solvent_entry.build_summary:
+                detail_sections.append(solvent_entry.build_summary)
+            if inspection_error:
+                detail_sections.append(
+                    "Generated structure inspection warning:\n"
+                    + inspection_error
+                )
+            self._generated_pdb_inspections.append(inspection)
+            self._solvent_table_preview_paths.append(
+                preview_path if preview_path.is_file() else None
+            )
+            self._solvent_table_details.append(
+                "\n\n".join(section for section in detail_sections if section)
+            )
             for column, value in enumerate(values):
                 self.generated_pdb_table.setItem(
                     row,
                     column,
                     QTableWidgetItem(value),
                 )
-        if inspections:
+
+        if state.representative_selection.representative_entries:
             self.generated_pdb_table.selectRow(0)
-        else:
-            self.generated_pdb_details_box.setPlainText(
-                "No generated representative PDB files are available."
-            )
-            self.open_generated_pdb_preview_button.setEnabled(False)
+            return
+
+        self.generated_pdb_details_box.setPlainText(
+            "No representative structures are available for browsing."
+        )
+        self.generated_pdb_viewer_status_label.setText(
+            "No representative structures are available for preview."
+        )
+        self.open_generated_pdb_preview_button.setEnabled(False)
 
     def _selected_generated_pdb_inspection(
         self,
@@ -2848,16 +3839,27 @@ class RMCSetupMainWindow(QMainWindow):
         return self._generated_pdb_inspections[row]
 
     def _on_generated_pdb_selection_changed(self) -> None:
-        inspection = self._selected_generated_pdb_inspection()
-        if inspection is None:
+        row = self.generated_pdb_table.currentRow()
+        if row < 0 or row >= len(self._solvent_table_details):
             self.generated_pdb_details_box.setPlainText(
-                "Select a generated PDB row to review its residue details."
+                "Select a representative row to review the active structure details."
+            )
+            self.generated_pdb_viewer.draw_placeholder()
+            self.generated_pdb_viewer_status_label.setText(
+                "Select a representative row to preview the active structure."
             )
             self.open_generated_pdb_preview_button.setEnabled(False)
             return
-        self.generated_pdb_details_box.setPlainText(inspection.details_text())
+        self.generated_pdb_details_box.setPlainText(
+            self._solvent_table_details[row]
+        )
+        preview_path = self._solvent_table_preview_paths[row]
+        self._refresh_generated_pdb_viewer(preview_path)
+        inspection = self._selected_generated_pdb_inspection()
         self.open_generated_pdb_preview_button.setEnabled(
-            inspection.exists and inspection.load_error is None
+            inspection is not None
+            and inspection.exists
+            and inspection.load_error is None
         )
 
     def _open_selected_generated_pdb_preview(self) -> None:
@@ -2865,8 +3867,9 @@ class RMCSetupMainWindow(QMainWindow):
         if inspection is None:
             QMessageBox.information(
                 self,
-                "No generated PDB selected",
-                "Select a generated representative PDB before opening the preview window.",
+                "No previewable PDB selected",
+                "Switch to a saved no-solvent or full-solvent representative "
+                "structure set before opening the separate PDB preview window.",
             )
             return
         if not inspection.exists or inspection.load_error is not None:
@@ -2888,10 +3891,273 @@ class RMCSetupMainWindow(QMainWindow):
             f"Opened generated PDB preview: {inspection.file_name}"
         )
 
+    def _refresh_generated_pdb_viewer(
+        self,
+        preview_path: Path | None,
+    ) -> None:
+        if preview_path is None or not preview_path.is_file():
+            self.generated_pdb_viewer.draw_placeholder()
+            self.generated_pdb_viewer_status_label.setText(
+                "No previewable representative structure is available for the selected row."
+            )
+            return
+        try:
+            structure = load_electron_density_structure(
+                preview_path,
+                center_mode="center_of_mass",
+                include_bonds=True,
+                include_comment=True,
+            )
+        except Exception as exc:
+            self.generated_pdb_viewer.draw_placeholder()
+            self.generated_pdb_viewer_status_label.setText(
+                f"Unable to preview {preview_path.name}: {exc}"
+            )
+            return
+        self.generated_pdb_viewer.set_structure(
+            structure,
+            scene_key=f"rmcsetup-solvent:{preview_path}",
+        )
+        self.generated_pdb_viewer_status_label.setText(
+            f"Previewing {preview_path.name} with {structure.atom_count} atom(s)."
+        )
+
+    def _update_solvent_status_panel(
+        self,
+        metadata: SolventHandlingMetadata | None,
+    ) -> None:
+        analysis = self._solvent_distribution_analysis
+        state = self._project_source_state
+        status_lookup = {
+            "complete_solvent": "Complete solvent molecules detected",
+            "partial_solvent": "Partial solvent molecules detected",
+            "no_solvent": "No solvent molecules detected",
+            "mixed_complete_and_partial": (
+                "Complete and partial solvent molecules detected"
+            ),
+            "unknown": "Unknown solvent state",
+        }
+        if (
+            state is not None
+            and self._active_representative_structure_set_is_ready()
+            and (metadata is None or not metadata.entries)
+        ):
+            active_mode = self._active_generated_pdb_mode()
+            self.solvent_status_headline_label.setText(
+                "Full-solvent representative structures are selected."
+            )
+            self.solvent_status_stats_label.setText(
+                "\n".join(
+                    [
+                        "The active representative source files already "
+                        "provide the Full solvent structure set.",
+                        (
+                            "Active representative structure set: "
+                            + representative_structure_mode_label(active_mode)
+                        ),
+                        "Solvent Shell Builder readiness: Ready for Packmol",
+                        (
+                            "Solvent state analysis and solvent-shell "
+                            "building are not required for this selection."
+                        ),
+                    ]
+                )
+            )
+            return
+        if metadata is not None:
+            active_mode = self._active_generated_pdb_mode()
+            self.solvent_status_headline_label.setText(
+                status_lookup.get(
+                    metadata.detected_distribution_status,
+                    metadata.detected_distribution_status.replace("_", " "),
+                )
+            )
+            status_lines = [
+                metadata.detected_distribution_note
+                or "Representative solvent outputs have been generated.",
+                (
+                    "Recognized solute elements: "
+                    + ", ".join(
+                        f"{element}:{count}"
+                        for element, count in sorted(
+                            metadata.aggregate_solute_element_counts.items()
+                        )
+                    )
+                    if metadata.aggregate_solute_element_counts
+                    else "Recognized solute elements: none"
+                ),
+                (
+                    "Active representative structure set: "
+                    + representative_structure_mode_label(active_mode)
+                ),
+                (
+                    "Solvent Shell Builder readiness: Ready for Packmol"
+                    if active_mode == "full_solvent"
+                    else "Solvent Shell Builder readiness: Select Full solvent "
+                    "to mark this step ready for Packmol"
+                ),
+            ]
+            self.solvent_status_stats_label.setText("\n".join(status_lines))
+            return
+        if analysis is None:
+            self.solvent_status_headline_label.setText(
+                "No representative solvent state has been determined yet."
+            )
+            if self._solvent_shell_builder_required():
+                self.solvent_status_stats_label.setText(
+                    "Choose a solvent reference, set coordination options as "
+                    "needed, and press Build Solvent-Decorated Representative "
+                    "PDBs. The required solvent-state analysis will run first."
+                )
+            else:
+                self.solvent_status_stats_label.setText(
+                    "Save representative structures before running the "
+                    "Solvent Shell Builder."
+                )
+            return
+        self.solvent_status_headline_label.setText(
+            status_lookup.get(
+                analysis.distribution_status,
+                analysis.distribution_status.replace("_", " "),
+            )
+        )
+        status_lines = [
+            f"Representative entries analyzed: {len(analysis.entries)}",
+            (
+                "Saved full-solvent representatives are not available yet. "
+                "Build solvent-decorated representative PDBs to store the "
+                "Full solvent representative structure set."
+            ),
+        ]
+        if analysis.distribution_note:
+            status_lines.append(analysis.distribution_note)
+        status_lines.append(
+            (
+                "Recognized solute elements: "
+                + ", ".join(
+                    f"{element}:{count}"
+                    for element, count in sorted(
+                        analysis.aggregate_solute_element_counts.items()
+                    )
+                )
+            )
+            if analysis.aggregate_solute_element_counts
+            else "Recognized solute elements: none"
+        )
+        self.solvent_status_stats_label.setText("\n".join(status_lines))
+
+    def _populate_solvent_cutoff_table(
+        self,
+        element_counts: dict[str, int],
+        element_settings: dict[str, SoluteAtomBuildSetting] | None = None,
+    ) -> None:
+        self._updating_solvent_table = True
+        try:
+            self._solvent_cutoff_spins = {}
+            self._solvent_coordination_center_items = {}
+            self._solvent_coordination_target_spins = {}
+            self.solvent_cutoff_table.setRowCount(0)
+            settings_lookup = element_settings or {}
+            if not element_counts:
+                self.solvent_cutoff_status_label.setText(
+                    "Analyze or build the representative structures to "
+                    "populate the solute atom types used for solvent-shell "
+                    "building."
+                )
+                return
+            self.solvent_cutoff_status_label.setText(
+                "Choose which solute elements should coordinate the solvent, "
+                "set their average coordination targets, and review the "
+                "director-atom cutoffs that will be used across the "
+                "representative set."
+            )
+            sorted_counts = sorted(element_counts.items())
+            self.solvent_cutoff_table.setRowCount(len(sorted_counts))
+            for row, (element, count) in enumerate(sorted_counts):
+                setting = settings_lookup.get(
+                    str(element), SoluteAtomBuildSetting()
+                )
+                self.solvent_cutoff_table.setItem(
+                    row, 0, QTableWidgetItem(str(element))
+                )
+                self.solvent_cutoff_table.setItem(
+                    row, 1, QTableWidgetItem(str(count))
+                )
+                center_item = QTableWidgetItem("")
+                center_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                center_item.setCheckState(
+                    Qt.CheckState.Checked
+                    if setting.coordination_center
+                    else Qt.CheckState.Unchecked
+                )
+                self.solvent_cutoff_table.setItem(row, 2, center_item)
+                self._solvent_coordination_center_items[str(element)] = (
+                    center_item
+                )
+
+                coordination_spin = QDoubleSpinBox(self.solvent_cutoff_table)
+                coordination_spin.setDecimals(2)
+                coordination_spin.setRange(0.0, 12.0)
+                coordination_spin.setSingleStep(0.25)
+                coordination_spin.setValue(
+                    float(setting.target_coordination_number)
+                )
+                coordination_spin.valueChanged.connect(
+                    self._update_solvent_build_panel_state
+                )
+                self.solvent_cutoff_table.setCellWidget(
+                    row, 3, coordination_spin
+                )
+                self._solvent_coordination_target_spins[str(element)] = (
+                    coordination_spin
+                )
+
+                cutoff_spin = QDoubleSpinBox(self.solvent_cutoff_table)
+                cutoff_spin.setDecimals(3)
+                cutoff_spin.setRange(0.0, 20.0)
+                cutoff_spin.setSingleStep(0.1)
+                cutoff_spin.setSuffix(" A")
+                cutoff_spin.setValue(float(setting.director_distance_cutoff_a))
+                cutoff_spin.valueChanged.connect(
+                    self._update_solvent_build_panel_state
+                )
+                self.solvent_cutoff_table.setCellWidget(row, 4, cutoff_spin)
+                self._solvent_cutoff_spins[str(element)] = cutoff_spin
+        finally:
+            self._updating_solvent_table = False
+
+    def _selected_solvent_coordination_settings(
+        self,
+    ) -> dict[str, SoluteAtomBuildSetting]:
+        settings: dict[str, SoluteAtomBuildSetting] = {}
+        for element, cutoff_spin in self._solvent_cutoff_spins.items():
+            center_item = self._solvent_coordination_center_items.get(element)
+            coordination_spin = self._solvent_coordination_target_spins.get(
+                element
+            )
+            settings[str(element)] = SoluteAtomBuildSetting(
+                coordination_center=(
+                    center_item is not None
+                    and center_item.checkState() == Qt.CheckState.Checked
+                ),
+                target_coordination_number=(
+                    float(coordination_spin.value())
+                    if coordination_spin is not None
+                    else 0.0
+                ),
+                director_distance_cutoff_a=float(cutoff_spin.value()),
+            )
+        return settings
+
     def _apply_packmol_planning_metadata(
         self,
         metadata: PackmolPlanningMetadata | None,
     ) -> None:
+        state = self._project_source_state
         settings = (
             metadata.settings
             if metadata is not None
@@ -2902,15 +4168,46 @@ class RMCSetupMainWindow(QMainWindow):
             settings.planning_mode,
         )
         self.packmol_box_side_spin.setValue(settings.box_side_length_a)
+        selected_reference = settings.free_solvent_reference
+        if (
+            selected_reference is None
+            and metadata is not None
+            and metadata.solvent_allocation is not None
+        ):
+            selected_reference = metadata.solvent_allocation.reference_path
+        if (
+            selected_reference is None
+            and state is not None
+            and state.packmol_setup is not None
+        ):
+            selected_reference = (
+                state.packmol_setup.free_solvent_reference_path
+            )
+        if (
+            selected_reference is None
+            and state is not None
+            and state.solvent_handling is not None
+        ):
+            selected_reference = state.solvent_handling.reference_path
+        self._populate_packmol_free_solvent_choices(
+            selected_identifier=selected_reference
+        )
         self._refresh_packmol_plan_plot(metadata)
 
     def _apply_packmol_setup_metadata(
         self,
         metadata: PackmolSetupMetadata | None,
     ) -> None:
+        settings = (
+            metadata.settings
+            if metadata is not None
+            else PackmolSetupSettings()
+        )
+        self.packmol_tolerance_spin.setValue(settings.tolerance_angstrom)
         self.packmol_build_summary_box.setPlainText(
             self._packmol_setup_summary_text(metadata)
         )
+        self.open_packmol_setup_folder_button.setEnabled(metadata is not None)
 
     def _apply_constraint_metadata(
         self,
@@ -2930,6 +4227,8 @@ class RMCSetupMainWindow(QMainWindow):
         self.constraints_summary_box.setPlainText(
             self._constraint_summary_text(metadata)
         )
+        self.open_constraints_folder_button.setEnabled(metadata is not None)
+        self.preview_constraints_button.setEnabled(metadata is not None)
 
     def _on_representative_mode_changed(self) -> None:
         self._update_representative_mode_widgets()
@@ -2959,6 +4258,125 @@ class RMCSetupMainWindow(QMainWindow):
         self.solvent_preset_combo.setEnabled(not use_custom)
         self.solvent_reference_edit.setEnabled(use_custom)
         self.browse_solvent_reference_button.setEnabled(use_custom)
+        self._populate_solvent_director_atom_choices()
+        self._update_solvent_reference_details()
+
+    def _handle_solvent_reference_source_changed(self) -> None:
+        self._update_solvent_reference_widgets()
+        self._clear_solvent_analysis_outputs()
+
+    def _handle_solvent_reference_changed(self) -> None:
+        self._populate_solvent_director_atom_choices()
+        self._update_solvent_reference_details()
+        self._clear_solvent_analysis_outputs()
+
+    def _handle_solvent_analysis_setting_changed(self) -> None:
+        self._clear_solvent_analysis_outputs()
+
+    def _handle_solvent_coordination_table_item_changed(
+        self,
+        _item: QTableWidgetItem,
+    ) -> None:
+        if self._updating_solvent_table:
+            return
+        self._update_solvent_build_panel_state()
+
+    def _selected_solvent_reference_identifier(self) -> str | None:
+        source = str(
+            self.solvent_reference_source_combo.currentData() or "preset"
+        )
+        if source == "custom":
+            reference_path = self.solvent_reference_edit.text().strip()
+            return reference_path or None
+        selected_name = self.solvent_preset_combo.currentData()
+        if selected_name is None:
+            return None
+        return str(selected_name)
+
+    def _populate_solvent_director_atom_choices(
+        self,
+        *,
+        selected_name: str | None = None,
+    ) -> None:
+        self.solvent_director_atom_combo.blockSignals(True)
+        self.solvent_director_atom_combo.clear()
+        reference_identifier = self._selected_solvent_reference_identifier()
+        if reference_identifier is None:
+            self.solvent_director_atom_combo.blockSignals(False)
+            return
+        try:
+            atom_names = reference_atom_choices(reference_identifier)
+            suggested_name = selected_name or default_director_atom_name(
+                reference_identifier
+            )
+        except Exception:
+            self.solvent_director_atom_combo.blockSignals(False)
+            return
+        for atom_name in atom_names:
+            self.solvent_director_atom_combo.addItem(atom_name, atom_name)
+        if suggested_name is not None:
+            suggested_index = self.solvent_director_atom_combo.findData(
+                suggested_name
+            )
+            if suggested_index >= 0:
+                self.solvent_director_atom_combo.setCurrentIndex(
+                    suggested_index
+                )
+        elif atom_names:
+            self.solvent_director_atom_combo.setCurrentIndex(0)
+        self.solvent_director_atom_combo.blockSignals(False)
+
+    def _update_solvent_reference_details(self) -> None:
+        reference_identifier = self._selected_solvent_reference_identifier()
+        if reference_identifier is None:
+            self.solvent_reference_details_box.setPlainText(
+                "Choose a solvent reference before analyzing representative structures."
+            )
+            return
+        try:
+            atom_names = reference_atom_choices(reference_identifier)
+            suggested_director = default_director_atom_name(
+                reference_identifier
+            )
+            reference_path = Path(reference_identifier).expanduser()
+            reference_name = reference_path.stem
+            source_text = (
+                str(reference_path.resolve())
+                if reference_path.is_file()
+                else reference_name
+            )
+        except Exception as exc:
+            self.solvent_reference_details_box.setPlainText(
+                f"Unable to inspect the selected solvent reference: {exc}"
+            )
+            return
+        director_text = suggested_director or "n/a"
+        self.solvent_reference_details_box.setPlainText(
+            f"Reference molecule: {reference_name}\n"
+            f"Atom count: {len(atom_names)}\n"
+            f"Suggested director atom: {director_text}\n"
+            f"Reference source: {source_text}"
+        )
+
+    def _clear_solvent_analysis_outputs(self) -> None:
+        self._solvent_distribution_analysis = None
+        state = self._project_source_state
+        self.solvent_summary_box.setPlainText(
+            self._solvent_summary_text(
+                state.solvent_handling if state is not None else None
+            )
+        )
+        self._populate_solvent_cutoff_table(
+            {},
+            self._selected_solvent_coordination_settings(),
+        )
+        self._refresh_generated_pdb_browser(
+            state.solvent_handling if state is not None else None
+        )
+        self._update_solvent_status_panel(
+            state.solvent_handling if state is not None else None
+        )
+        self._update_solvent_build_panel_state()
 
     def _current_representative_settings(
         self,
@@ -3151,7 +4569,7 @@ class RMCSetupMainWindow(QMainWindow):
             "Computed representative clusters in "
             f"{metadata.selection_mode} mode."
         )
-        self.build_solvent_outputs_button.setEnabled(True)
+        self._populate_solvent_controls()
 
     def _fail_representative_selection(self, message: str) -> None:
         self.compute_representatives_button.setEnabled(True)
@@ -3196,7 +4614,7 @@ class RMCSetupMainWindow(QMainWindow):
                 self,
                 "No representative selection",
                 (
-                    "Compute representative clusters before opening the "
+                    "Save representative structures before opening the "
                     "preview window."
                 ),
             )
@@ -3245,13 +4663,19 @@ class RMCSetupMainWindow(QMainWindow):
         if not selected_path:
             return
         self.solvent_reference_edit.setText(selected_path)
+        self._handle_solvent_reference_changed()
 
     def _current_solvent_settings(self) -> SolventHandlingSettings:
+        selected_mode = self.generated_pdb_mode_combo.currentData()
+        coordinated_solvent_mode = (
+            str(selected_mode).strip()
+            if selected_mode is not None
+            and str(selected_mode).strip()
+            in {"no_solvent", "partial_solvent", "full_solvent"}
+            else "automatic_detection"
+        )
         return SolventHandlingSettings(
-            coordinated_solvent_mode=str(
-                self.coordinated_solvent_mode_combo.currentData()
-                or "no_coordinated_solvent"
-            ),
+            coordinated_solvent_mode=coordinated_solvent_mode,
             reference_source=str(
                 self.solvent_reference_source_combo.currentData() or "preset"
             ),
@@ -3259,10 +4683,130 @@ class RMCSetupMainWindow(QMainWindow):
             custom_reference_path=(
                 self.solvent_reference_edit.text().strip() or None
             ),
+            reference_match_tolerance_a=float(
+                self.solvent_reference_match_tolerance_spin.value()
+            ),
+            director_atom_name=(
+                str(self.solvent_director_atom_combo.currentData())
+                if self.solvent_director_atom_combo.currentData() is not None
+                else None
+            ),
             minimum_solvent_atom_separation_a=float(
                 self.solvent_minimum_separation_spin.value()
             ),
+            solute_atom_settings=self._selected_solvent_coordination_settings(),
         )
+
+    def _update_solvent_build_panel_state(self) -> None:
+        state = self._project_source_state
+        reference_identifier = self._selected_solvent_reference_identifier()
+        has_reference = reference_identifier is not None
+        has_representatives = (
+            state is not None and state.representative_selection is not None
+        )
+        builder_required = self._solvent_shell_builder_required()
+        self._set_solvent_shell_builder_controls_enabled(builder_required)
+        if not builder_required:
+            self.analyze_solvent_outputs_button.setEnabled(False)
+            self.build_solvent_outputs_button.setEnabled(False)
+            return
+        self.analyze_solvent_outputs_button.setEnabled(
+            bool(has_reference and has_representatives)
+        )
+        if not has_reference or not has_representatives:
+            self.build_solvent_outputs_button.setEnabled(False)
+            return
+        analysis = self._solvent_distribution_analysis
+        if analysis is None:
+            self.build_solvent_outputs_button.setEnabled(True)
+            return
+        if self._solvent_build_has_required_coordination_settings(analysis):
+            self.build_solvent_outputs_button.setEnabled(True)
+            return
+        self.build_solvent_outputs_button.setEnabled(False)
+
+    def _analyze_representative_solvent_states(self) -> None:
+        self._run_representative_solvent_analysis(
+            progress_message="Analyzing representative solvent states...",
+            completion_message="Representative solvent analysis ready.",
+            log_completion="Analyzed representative solvent states.",
+        )
+
+    def _run_representative_solvent_analysis(
+        self,
+        *,
+        progress_message: str,
+        completion_message: str | None = None,
+        log_completion: str | None = None,
+    ) -> RepresentativeSolventDistributionAnalysis | None:
+        state = self._project_source_state
+        if state is None:
+            QMessageBox.information(
+                self,
+                "No SAXS project loaded",
+                "Load a SAXS project before analyzing representative solvent states.",
+            )
+            return None
+        if state.representative_selection is None:
+            QMessageBox.information(
+                self,
+                "No representative selection",
+                "Save representative structures before analyzing the representative solvent states.",
+            )
+            return None
+        if self._selected_solvent_reference_identifier() is None:
+            QMessageBox.information(
+                self,
+                "No solvent reference selected",
+                "Choose a bundled preset or custom solvent reference PDB before analyzing the representative structures.",
+            )
+            return None
+        try:
+            self._set_task_progress(
+                progress_message,
+                35,
+            )
+            self._append_run_log("Analyzing representative solvent states.")
+            analysis = analyze_representative_solvent_distribution(
+                state,
+                self._current_solvent_settings(),
+                representative_metadata=state.representative_selection,
+            )
+        except Exception as exc:
+            self._solvent_distribution_analysis = None
+            message = (
+                "Unable to analyze representative solvent states: " f"{exc}"
+            )
+            self.solvent_summary_box.setPlainText(message)
+            self._append_run_log(message)
+            self._set_task_progress("Solvent analysis failed.", 0)
+            QMessageBox.warning(
+                self,
+                "Representative solvent analysis failed",
+                str(exc),
+            )
+            self._populate_solvent_cutoff_table(
+                {},
+                self._selected_solvent_coordination_settings(),
+            )
+            self._refresh_generated_pdb_browser(None)
+            self._update_solvent_status_panel(None)
+            self._update_solvent_build_panel_state()
+            return None
+        self._solvent_distribution_analysis = analysis
+        self.solvent_summary_box.setPlainText(analysis.summary_text())
+        self._populate_solvent_cutoff_table(
+            analysis.aggregate_solute_element_counts,
+            self._selected_solvent_coordination_settings(),
+        )
+        self._refresh_generated_pdb_browser(None)
+        self._update_solvent_status_panel(None)
+        self._update_solvent_build_panel_state()
+        if completion_message is not None:
+            self._set_task_progress(completion_message, 100)
+        if log_completion is not None:
+            self._append_run_log(log_completion)
+        return analysis
 
     def _current_packmol_planning_settings(self) -> PackmolPlanningSettings:
         return PackmolPlanningSettings(
@@ -3270,10 +4814,97 @@ class RMCSetupMainWindow(QMainWindow):
                 self.packmol_planning_mode_combo.currentData() or "per_element"
             ),
             box_side_length_a=float(self.packmol_box_side_spin.value()),
+            free_solvent_reference=self._selected_packmol_free_solvent_reference(),
         )
 
     def _current_packmol_setup_settings(self) -> PackmolSetupSettings:
-        return PackmolSetupSettings()
+        return PackmolSetupSettings(
+            tolerance_angstrom=float(self.packmol_tolerance_spin.value()),
+            free_solvent_reference=self._selected_packmol_free_solvent_reference(),
+        )
+
+    def _selected_packmol_free_solvent_reference(self) -> str | None:
+        current_data = self.packmol_free_solvent_combo.currentData()
+        if current_data is None:
+            return None
+        text = str(current_data).strip()
+        return text or None
+
+    def _normalize_packmol_free_solvent_identifier(
+        self,
+        identifier: str | None,
+    ) -> str | None:
+        if identifier is None:
+            return None
+        text = str(identifier).strip()
+        if not text:
+            return None
+        candidate = Path(text).expanduser()
+        if candidate.is_file():
+            return str(candidate.resolve())
+        for preset in self._available_solvent_presets:
+            preset_path = str(Path(preset.path).expanduser().resolve())
+            if text == preset.name or text == preset_path:
+                return preset_path
+        return None
+
+    def _populate_packmol_free_solvent_choices(
+        self,
+        *,
+        selected_identifier: str | None = None,
+    ) -> None:
+        state = self._project_source_state
+        current_identifier = (
+            selected_identifier
+            or self._selected_packmol_free_solvent_reference()
+        )
+        combo = self.packmol_free_solvent_combo
+        combo.blockSignals(True)
+        combo.clear()
+        seen_paths: set[str] = set()
+        for preset in self._available_solvent_presets:
+            preset_path = str(Path(preset.path).expanduser().resolve())
+            combo.addItem(preset.name, preset_path)
+            seen_paths.add(preset_path)
+
+        extra_identifiers = [
+            current_identifier,
+            (
+                None
+                if state is None or state.solvent_handling is None
+                else state.solvent_handling.reference_path
+            ),
+            (
+                None
+                if state is None or state.packmol_planning is None
+                else state.packmol_planning.settings.free_solvent_reference
+            ),
+            (
+                None
+                if state is None or state.packmol_setup is None
+                else state.packmol_setup.free_solvent_reference_path
+            ),
+        ]
+        for identifier in extra_identifiers:
+            normalized = self._normalize_packmol_free_solvent_identifier(
+                identifier
+            )
+            if normalized is None or normalized in seen_paths:
+                continue
+            combo.addItem(Path(normalized).stem, normalized)
+            seen_paths.add(normalized)
+
+        target_identifier = self._normalize_packmol_free_solvent_identifier(
+            current_identifier
+        )
+        if target_identifier is not None:
+            index = combo.findData(target_identifier)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+        elif combo.count() > 0:
+            combo.setCurrentIndex(0)
+        combo.setEnabled(combo.count() > 0 and state is not None)
+        combo.blockSignals(False)
 
     def _current_constraint_settings(self) -> ConstraintGenerationSettings:
         return ConstraintGenerationSettings(
@@ -3284,6 +4915,49 @@ class RMCSetupMainWindow(QMainWindow):
                 self.constraint_angle_tolerance_spin.value()
             ),
         )
+
+    def _sync_packmol_inputs_to_linked_container(
+        self,
+        setup_metadata: PackmolSetupMetadata,
+    ) -> PackmolDockerSyncResult | None:
+        state = self._project_source_state
+        if state is None or state.packmol_docker_link is None:
+            return None
+        link = state.packmol_docker_link
+        try:
+            result = self._create_packmol_docker_client().sync_packmol_inputs(
+                link,
+                state.rmcsetup_paths.packmol_inputs_dir,
+                packmol_setup_metadata=setup_metadata,
+            )
+        except Exception as exc:
+            link.last_sync_at = datetime.now().isoformat(timespec="seconds")
+            link.last_sync_status = "error"
+            link.last_sync_message = str(exc)
+            self._save_packmol_docker_link(link)
+            self.packmol_docker_summary_box.setPlainText(
+                self._packmol_docker_summary_text(setup_metadata)
+            )
+            self._append_run_log(
+                "Packmol Docker sync failed after local build: " f"{exc}"
+            )
+            QMessageBox.warning(
+                self,
+                "Packmol Docker sync failed",
+                "Packmol inputs were built locally, but syncing them to the "
+                "linked Docker container failed.\n\n"
+                f"{exc}",
+            )
+            return None
+        link.last_sync_at = result.synced_at
+        link.last_sync_status = "success"
+        link.last_sync_message = result.summary_text()
+        self._save_packmol_docker_link(link)
+        self.packmol_docker_summary_box.setPlainText(
+            self._packmol_docker_summary_text(setup_metadata)
+        )
+        self._append_run_log(result.summary_text())
+        return result
 
     def _build_representative_solvent_outputs(self) -> None:
         state = self._project_source_state
@@ -3298,21 +4972,53 @@ class RMCSetupMainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "No representative selection",
-                "Compute representative clusters before building representative PDB outputs.",
+                "Save representative structures before building representative PDB outputs.",
+            )
+            return
+        if not self._solvent_shell_builder_required():
+            QMessageBox.information(
+                self,
+                "Full-solvent representatives selected",
+                "The active representative structure set already has full "
+                "solvent, so solvent-state analysis and solvent-shell "
+                "building are not required.",
+            )
+            return
+        analysis = self._solvent_distribution_analysis
+        if analysis is None:
+            analysis = self._run_representative_solvent_analysis(
+                progress_message=(
+                    "Analyzing representative solvent states before build..."
+                ),
+            )
+            if analysis is None:
+                return
+        if not self._solvent_build_has_required_coordination_settings(
+            analysis
+        ):
+            self._update_solvent_build_panel_state()
+            QMessageBox.information(
+                self,
+                "Coordination settings required",
+                "Select at least one coordination-center element and set "
+                "its average coordination number and director distance "
+                "before building full-solvent representatives from "
+                "no-solvent structures.",
             )
             return
         try:
             self._set_task_progress(
-                "Building solvent-aware representative PDBs...",
+                "Building solvent-decorated representative PDBs...",
                 35,
             )
             self._append_run_log(
-                "Starting solvent-aware representative PDB build."
+                "Starting Solvent Shell Builder representative PDB build."
             )
             solvent_metadata = build_representative_solvent_outputs(
                 state,
                 self._current_solvent_settings(),
                 representative_metadata=state.representative_selection,
+                distribution_analysis=analysis,
             )
         except Exception as exc:
             message = f"Unable to build representative PDB outputs: {exc}"
@@ -3321,11 +5027,12 @@ class RMCSetupMainWindow(QMainWindow):
             self._set_task_progress("Solvent build failed.", 0)
             QMessageBox.warning(
                 self,
-                "Solvent handling failed",
+                "Solvent Shell Builder failed",
                 str(exc),
             )
             return
         state.solvent_handling = solvent_metadata
+        state.packmol_planning = None
         state.packmol_setup = None
         state.constraint_generation = None
         self._apply_solvent_metadata(solvent_metadata)
@@ -3336,10 +5043,12 @@ class RMCSetupMainWindow(QMainWindow):
         self._populate_constraint_controls()
         self._update_readiness_progress()
         self._set_task_progress(
-            "Solvent-aware representative PDBs ready.",
+            "Solvent-decorated representative PDBs ready.",
             100,
         )
-        self._append_run_log("Built representative solvent-aware PDB outputs.")
+        self._append_run_log(
+            "Built solvent-decorated representative PDB outputs."
+        )
 
     def _compute_packmol_plan(self) -> None:
         state = self._project_source_state
@@ -3354,7 +5063,7 @@ class RMCSetupMainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "No representative selection",
-                "Compute representative clusters before planning Packmol counts.",
+                "Save representative structures before planning Packmol counts.",
             )
             return
         if state.solution_properties.result is None:
@@ -3393,14 +5102,12 @@ class RMCSetupMainWindow(QMainWindow):
         state.constraint_generation = None
         self.compute_packmol_plan_button.setEnabled(True)
         self.build_packmol_setup_button.setEnabled(
-            state.solvent_handling is not None
+            self._active_representative_structure_set_is_ready()
         )
         self.packmol_plan_summary_box.setPlainText(
             self._packmol_plan_summary_text(planning_metadata)
         )
-        self.packmol_build_summary_box.setPlainText(
-            self._packmol_setup_summary_text(None)
-        )
+        self._apply_packmol_setup_metadata(None)
         self._populate_constraint_controls()
         self._refresh_packmol_plan_plot(planning_metadata)
         self.output_summary_box.setPlainText(self._output_structure_text())
@@ -3424,11 +5131,20 @@ class RMCSetupMainWindow(QMainWindow):
                 "Compute Packmol cluster counts before generating Packmol inputs.",
             )
             return
-        if state.solvent_handling is None:
+        if not self._active_representative_structure_set_is_ready():
             QMessageBox.information(
                 self,
-                "No solvent handling metadata",
-                "Build representative solvent-aware PDB outputs before generating Packmol inputs.",
+                "Full-solvent representatives not selected",
+                "Select the Full solvent representative structure set in "
+                "Representative Structures before generating Packmol inputs.",
+            )
+            return
+        if self._selected_packmol_free_solvent_reference() is None:
+            QMessageBox.information(
+                self,
+                "No free-solvent structure selected",
+                "Choose the free-solvent structure used for the Packmol "
+                "bulk-solvent population before generating Packmol inputs.",
             )
             return
         try:
@@ -3457,14 +5173,127 @@ class RMCSetupMainWindow(QMainWindow):
             return
         state.packmol_setup = setup_metadata
         state.constraint_generation = None
-        self.packmol_build_summary_box.setPlainText(
-            self._packmol_setup_summary_text(setup_metadata)
-        )
+        self._sync_packmol_inputs_to_linked_container(setup_metadata)
+        self._apply_packmol_setup_metadata(setup_metadata)
         self._populate_constraint_controls()
         self.output_summary_box.setPlainText(self._output_structure_text())
         self._update_readiness_progress()
         self._set_task_progress("Packmol setup ready.", 100)
         self._append_run_log("Built Packmol setup inputs and audit report.")
+
+    def _open_packmol_setup_folder(self) -> None:
+        state = self._project_source_state
+        if state is None or state.packmol_setup is None:
+            QMessageBox.information(
+                self,
+                "No Packmol setup",
+                "Build Packmol setup inputs before opening the setup folder.",
+            )
+            return
+        folder_path = (
+            state.rmcsetup_paths.packmol_inputs_dir.expanduser().resolve()
+        )
+        if not folder_path.is_dir():
+            QMessageBox.warning(
+                self,
+                "Packmol setup folder missing",
+                f"Could not find the Packmol setup folder:\n{folder_path}",
+            )
+            return
+        try:
+            self._open_path_in_file_manager(folder_path)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Packmol setup folder",
+                f"Could not open the Packmol setup folder:\n{exc}",
+            )
+            return
+        self.statusBar().showMessage(
+            f"Opened Packmol setup folder: {folder_path.name}"
+        )
+        self._append_run_log(
+            f"Opened Packmol setup folder in Finder/file manager: {folder_path}"
+        )
+
+    def _open_constraints_folder(self) -> None:
+        state = self._project_source_state
+        if state is None or state.constraint_generation is None:
+            QMessageBox.information(
+                self,
+                "No constraints generated",
+                "Generate constraints before opening the constraints folder.",
+            )
+            return
+        merged_path = (
+            Path(state.constraint_generation.merged_constraints_path)
+            .expanduser()
+            .resolve()
+        )
+        if not merged_path.is_file():
+            QMessageBox.warning(
+                self,
+                "Constraints file missing",
+                f"Could not find the merged constraints file:\n{merged_path}",
+            )
+            return
+        try:
+            self._open_path_in_file_manager(merged_path)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Constraints folder",
+                f"Could not open the constraints folder:\n{exc}",
+            )
+            return
+        self.statusBar().showMessage(
+            f"Opened constraints file location: {merged_path.name}"
+        )
+        self._append_run_log(
+            "Opened constraints file location in Finder/file manager: "
+            f"{merged_path}"
+        )
+
+    def _open_constraints_preview(self) -> None:
+        state = self._project_source_state
+        if state is None or state.constraint_generation is None:
+            QMessageBox.information(
+                self,
+                "No constraints generated",
+                "Generate constraints before opening the merged constraints preview.",
+            )
+            return
+        merged_path = (
+            Path(state.constraint_generation.merged_constraints_path)
+            .expanduser()
+            .resolve()
+        )
+        if not merged_path.is_file():
+            QMessageBox.warning(
+                self,
+                "Constraints preview unavailable",
+                f"Could not find the merged constraints file:\n{merged_path}",
+            )
+            return
+        try:
+            self._constraints_preview_window = ConstraintsPreviewWindow(
+                merged_path,
+                parent=self,
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Constraints preview unavailable",
+                f"Could not open the merged constraints file:\n{exc}",
+            )
+            return
+        self._track_child_tool_window(self._constraints_preview_window)
+        self._constraints_preview_window.show()
+        self._constraints_preview_window.raise_()
+        self._constraints_preview_window.activateWindow()
+        self._append_run_log(
+            f"Opened merged constraints preview: {merged_path.name}"
+        )
 
     def _generate_constraints(self) -> None:
         state = self._project_source_state
@@ -3505,9 +5334,7 @@ class RMCSetupMainWindow(QMainWindow):
             )
             return
         state.constraint_generation = metadata
-        self.constraints_summary_box.setPlainText(
-            self._constraint_summary_text(metadata)
-        )
+        self._apply_constraint_metadata(metadata)
         self.output_summary_box.setPlainText(self._output_structure_text())
         self._update_readiness_progress()
         self._set_task_progress("Constraint generation complete.", 100)
@@ -3848,14 +5675,28 @@ class RMCSetupMainWindow(QMainWindow):
         state = self._project_source_state
         if state is None:
             return (
-                "Load a SAXS project and compute representative clusters before "
-                "building solvent-aware PDB outputs."
+                "Load a SAXS project and save representative structures "
+                "before running the Solvent Shell Builder."
             )
         if metadata is None:
+            active_mode = self._active_generated_pdb_mode()
+            if active_mode == "full_solvent":
+                return (
+                    "Imported representative structures already include the "
+                    "Full solvent structure set, so this step is ready for "
+                    "Packmol without rebuilding solvent outputs.\n\n"
+                    "Solvent state analysis and solvent-shell building are "
+                    "not required for this selection.\n\n"
+                    "Metadata will be written to:\n"
+                    f"{state.rmcsetup_paths.solvent_handling_path}"
+                )
             return (
-                "No representative PDB solvent export has been built yet.\n\n"
-                "Choose a coordinated solvent mode, select a bundled preset or "
-                "custom solvent PDB, and press Build Representative PDBs.\n\n"
+                "No full-solvent representative export has been built yet "
+                f"for the active {representative_structure_mode_label(active_mode)} "
+                "set.\n\n"
+                "Choose a solvent reference, review the coordination "
+                "settings, and press Build Solvent-Decorated Representative "
+                "PDBs. The required solvent-state analysis will run first.\n\n"
                 "Metadata will be written to:\n"
                 f"{state.rmcsetup_paths.solvent_handling_path}"
             )
@@ -3873,15 +5714,17 @@ class RMCSetupMainWindow(QMainWindow):
         if state is None:
             return (
                 "Load a SAXS project, calculate solution properties, and "
-                "compute representative clusters before planning Packmol "
+                "save representative structures before planning Packmol "
                 "cluster counts."
             )
         if metadata is None:
             return (
                 "No Packmol plan has been saved yet.\n\n"
                 "Press Compute Cluster Counts to convert the selected DREAM "
-                "distribution and representative clusters into planned box "
-                "counts and output reports.\n\n"
+                "distribution and representative structures into planned box "
+                "counts, solvent-allocation totals, and output reports.\n\n"
+                "Choose the free-solvent structure above before planning if "
+                "the representative source files already contain solvent.\n\n"
                 "Metadata will be written to:\n"
                 f"{state.rmcsetup_paths.packmol_plan_path}"
             )
@@ -3900,25 +5743,82 @@ class RMCSetupMainWindow(QMainWindow):
         state = self._project_source_state
         if state is None:
             return (
-                "Load a SAXS project, compute representative clusters, "
-                "build solvent-aware representative PDBs, and plan counts "
+                "Load a SAXS project, save representative structures, "
+                "build solvent-decorated representative PDBs, and plan counts "
                 "before generating Packmol inputs."
             )
         if metadata is None:
-            return (
+            if not self._active_representative_structure_set_is_ready():
+                text = (
+                    "No Packmol setup has been built yet.\n\n"
+                    "Select the Full solvent representative structure set in "
+                    "Representative Structures before generating Packmol "
+                    "inputs.\n\n"
+                    "Metadata will be written to:\n"
+                    f"{state.rmcsetup_paths.packmol_setup_path}"
+                )
+                if state.packmol_docker_link is not None:
+                    text += (
+                        "\n\nLinked Docker target:\n"
+                        + state.packmol_docker_link.summary_text()
+                    )
+                return text
+            text = (
                 "No Packmol setup has been built yet.\n\n"
                 "Press Build Packmol Setup to generate representative input "
-                "PDBs, the Packmol .inp file, the solvent single-molecule PDB, "
-                "and the audit report.\n\n"
+                "PDBs, the Packmol .inp file, the selected free-solvent "
+                "single-molecule PDB, and the audit report.\n\n"
                 "Metadata will be written to:\n"
                 f"{state.rmcsetup_paths.packmol_setup_path}"
             )
-        return (
+            if state.packmol_docker_link is not None:
+                text += (
+                    "\n\nLinked Docker target:\n"
+                    + state.packmol_docker_link.summary_text()
+                )
+            return text
+        text = (
             metadata.summary_text()
             + "\n\nMetadata path:\n"
             + str(state.rmcsetup_paths.packmol_setup_path)
             + "\nAudit report:\n"
             + str(state.rmcsetup_paths.packmol_audit_report_path)
+        )
+        if state.packmol_docker_link is not None:
+            text += (
+                "\n\nLinked Docker target:\n"
+                + state.packmol_docker_link.summary_text(
+                    packmol_setup_metadata=metadata
+                )
+            )
+        return text
+
+    def _packmol_docker_summary_text(
+        self,
+        packmol_setup_metadata: PackmolSetupMetadata | None = None,
+    ) -> str:
+        state = self._project_source_state
+        if state is None:
+            return (
+                "Load a SAXS project before linking a Packmol Docker "
+                "container."
+            )
+        if state.packmol_docker_link is None:
+            return (
+                "No Packmol Docker container is linked yet.\n\n"
+                "Use Tools > Link Packmol Docker Container to validate a "
+                "container, confirm Packmol is installed, and choose the "
+                "container-side project folder. The required bind-mounted "
+                f"root inside the container is {DEFAULT_PACKMOL_CONTAINER_ROOT}.\n\n"
+                "Project link metadata will be written to:\n"
+                f"{state.rmcsetup_paths.packmol_docker_link_path}"
+            )
+        return (
+            state.packmol_docker_link.summary_text(
+                packmol_setup_metadata=packmol_setup_metadata
+            )
+            + "\n\nProject link metadata path:\n"
+            + str(state.rmcsetup_paths.packmol_docker_link_path)
         )
 
     def _constraint_summary_text(
@@ -4148,14 +6048,17 @@ class RMCSetupMainWindow(QMainWindow):
         if state is None:
             return (
                 "Load a SAXS project and choose a DREAM source before "
-                "selecting representative cluster files."
+                "loading saved representative structures."
             )
         if metadata is None:
             return (
-                "No representative selection has been saved yet.\n\n"
-                "Choose a DREAM source and press Compute Representative "
-                "Clusters to select one representative structure per active "
-                "cluster bin.\n\n"
+                "No representative structures have been saved yet.\n\n"
+                "Use Open Representative Structures to create or update the "
+                "saved project set, then reload it here. rmcsetup will "
+                "combine those structure files with the selected DREAM "
+                "distribution weights, solution-density targets, solvent "
+                "handling, Packmol planning, and cluster-specific "
+                "constraints.\n\n"
                 "Metadata will be written to:\n"
                 f"{state.rmcsetup_paths.representative_selection_path}"
             )
@@ -4495,7 +6398,7 @@ class RMCSetupMainWindow(QMainWindow):
             )
         axis.set_xscale("log")
         axis.set_yscale("log")
-        axis.set_xlabel("q (Å⁻¹)")
+        axis.set_xlabel(Q_A_INVERSE_LABEL)
         axis.set_ylabel("Intensity (arb. units)")
         axis.set_title(f"DREAM refinement: {plot_data.template_name}")
         axis.text(
@@ -4739,6 +6642,19 @@ class RMCSetupMainWindow(QMainWindow):
     def _append_run_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.run_log_box.appendPlainText(f"[{timestamp}] {message}")
+
+    @staticmethod
+    def _open_path_in_file_manager(path: Path) -> None:
+        resolved_path = path.expanduser().resolve()
+        target_path = (
+            resolved_path if resolved_path.is_dir() else resolved_path.parent
+        )
+        if not target_path.exists():
+            raise FileNotFoundError(target_path)
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(target_path))):
+            raise RuntimeError(
+                "Qt could not open the requested folder in the file manager."
+            )
 
 
 def launch_rmcsetup_ui(

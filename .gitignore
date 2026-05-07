@@ -81,7 +81,10 @@ site/
 
 # pytest
 .pytest_cache/
+tests/born_vs_debye_backend_debug_*/
+tests/contrast_fft_backend_debug_*/
 tests/edm_contiguous_mode_report/
+tests/representativefinder_performance/output_results/
 tests/smearing_analysis_*/
 
 # PyBuilder

@@ -52,23 +52,21 @@ available, and successful exports write the output folder back to the project's
 
 ### From the terminal
 
-Installed package:
-
 ```bash
-xyz2pdb
-xyz2pdb ui path/to/frame_folder
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 \
+  python -m saxshell.xyz2pdb
 ```
 
-From a source checkout:
+You can prefill a frame folder from the source checkout:
 
 ```bash
 PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 \
-  python -m saxshell.xyz2pdb.cli
+  python -m saxshell.xyz2pdb ui path/to/frame_folder
 ```
 
 ## Typical workflow
 
-1. Open `xyz2pdb`.
+1. Open the XYZ-to-PDB converter from the main UI or from the source checkout.
 2. Choose an `XYZ` file or a folder of `XYZ` files.
 3. Click `Analyze Input`.
 4. Check the sample analysis and confirm the detected elements.

@@ -877,7 +877,9 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
 
-        self.dynamics_plot_panel = ClusterDynamicsPlotPanel()
+        self.dynamics_plot_panel = ClusterDynamicsPlotPanel(
+            enable_plot_editor=True
+        )
         self.right_splitter = QSplitter(Qt.Orientation.Vertical)
         self.right_splitter.setChildrenCollapsible(False)
 

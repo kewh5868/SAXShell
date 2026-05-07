@@ -7,6 +7,13 @@ to generate a pyDREAM bundle and launch a Bayesian refinement.
 Like Prefit, DREAM depends on the upstream component and geometry inputs
 prepared earlier in the main UI workflow and by the supporting applications.
 
+In plain language, use this tab when you want uncertainty estimates and a
+posterior distribution, not just one hand-tuned Prefit curve.
+
+!!! info "Image placeholder"
+Add a screenshot of the **SAXS DREAM Fit** tab showing the runtime
+controls, prior-map editor button, and the main results panels.
+
 SAXSShell uses **pyDREAM**, a Python implementation of the
 **MT-DREAM(ZS)** sampler. In plain language, pyDREAM runs several Markov chains
 at once, explores parameter space, and then uses the accepted samples to

@@ -19,8 +19,9 @@ project-backed workflow.
 
 ## Current scope
 
-Unlike project-backed tools such as PDF Calculation, Electron Density Mapping,
-or Debye-Waller Analysis, the X-ray Toolkit windows are intended as focused
+Unlike project-backed tools such as PDF Calculation,
+1D Born Approximation (Average), 3D FFT Born Approximation, or
+Debye-Waller Analysis, the X-ray Toolkit windows are intended as focused
 calculators rather than long-lived saved analysis workspaces.
 
 ## Related pages

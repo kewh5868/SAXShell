@@ -10,6 +10,19 @@ from .constraint_generation import (
     load_constraint_generation_metadata,
     save_constraint_generation_metadata,
 )
+from .packmol_docker import (
+    DEFAULT_PACKMOL_CONTAINER_ROOT,
+    PackmolDockerClient,
+    PackmolDockerContainerRecord,
+    PackmolDockerDirectoryEntry,
+    PackmolDockerLink,
+    PackmolDockerSyncResult,
+    PackmolDockerValidationResult,
+    container_project_root_is_valid,
+    load_packmol_docker_link_metadata,
+    normalize_container_directory,
+    save_packmol_docker_link_metadata,
+)
 from .packmol_planning import (
     PackmolPlanningEntry,
     PackmolPlanningMetadata,
@@ -86,16 +99,34 @@ from .solvent_handling import (
     load_solvent_handling_metadata,
     save_solvent_handling_metadata,
 )
+from .solvent_shell_builder import (
+    DEFAULT_REFERENCE_MATCH_TOLERANCE_A,
+    SolventShellAnalysisResult,
+    SolventShellBuildResult,
+    SolventShellResidueMismatchSummary,
+    SolventShellResidueSummary,
+    analyze_solvent_shell,
+    build_solvent_shell_output,
+    default_director_atom_name,
+    reference_atom_choices,
+)
 
 if TYPE_CHECKING:
     from .ui.main_window import RMCSetupMainWindow, launch_rmcsetup_ui
     from .ui.representative_preview_window import RepresentativePreviewWindow
+    from .ui.solvent_shell_builder_window import (
+        SolventShellBuilderMainWindow,
+        launch_solvent_shell_builder_ui,
+    )
 
 __all__ = [
     "ClusterSourceValidationResult",
     "ConstraintGenerationEntry",
     "ConstraintGenerationMetadata",
     "ConstraintGenerationSettings",
+    "DEFAULT_REFERENCE_MATCH_TOLERANCE_A",
+    "DEFAULT_PACKMOL_CONTAINER_ROOT",
+    "container_project_root_is_valid",
     "RMCDreamProjectSource",
     "RMCDreamRunRecord",
     "RMCSetupPaths",
@@ -103,6 +134,12 @@ __all__ = [
     "collect_cluster_count_rows",
     "DistributionSelectionEntry",
     "DistributionSelectionMetadata",
+    "PackmolDockerClient",
+    "PackmolDockerContainerRecord",
+    "PackmolDockerDirectoryEntry",
+    "PackmolDockerLink",
+    "PackmolDockerSyncResult",
+    "PackmolDockerValidationResult",
     "PackmolPlanningEntry",
     "PackmolPlanningMetadata",
     "PackmolPlanningSettings",
@@ -115,6 +152,10 @@ __all__ = [
     "RepresentativePreviewWindow",
     "RepresentativeSelectionEntry",
     "RepresentativeSelectionIssue",
+    "SolventShellBuildResult",
+    "build_solvent_shell_output",
+    "default_director_atom_name",
+    "reference_atom_choices",
     "RepresentativeSelectionMetadata",
     "RepresentativeSelectionSettings",
     "SolutionProperties",
@@ -122,9 +163,14 @@ __all__ = [
     "SolutionPropertiesPreset",
     "SolutionPropertiesResult",
     "SolutionPropertiesSettings",
+    "SolventShellAnalysisResult",
+    "SolventShellBuilderMainWindow",
+    "SolventShellResidueMismatchSummary",
+    "SolventShellResidueSummary",
     "SolventHandlingEntry",
     "SolventHandlingMetadata",
     "SolventHandlingSettings",
+    "analyze_solvent_shell",
     "build_constraint_generation",
     "build_distribution_selection",
     "build_packmol_setup",
@@ -135,8 +181,10 @@ __all__ = [
     "discover_valid_dream_runs",
     "ensure_rmcsetup_structure",
     "expected_cluster_inventory_rows",
+    "launch_solvent_shell_builder_ui",
     "launch_rmcsetup_ui",
     "load_constraint_generation_metadata",
+    "load_packmol_docker_link_metadata",
     "load_distribution_selection_metadata",
     "load_packmol_setup_metadata",
     "load_packmol_planning_metadata",
@@ -147,9 +195,11 @@ __all__ = [
     "load_solvent_handling_metadata",
     "list_solvent_reference_presets",
     "ordered_solution_property_preset_names",
+    "normalize_container_directory",
     "parse_angle_triplet_text",
     "parse_bond_pair_text",
     "save_constraint_generation_metadata",
+    "save_packmol_docker_link_metadata",
     "save_distribution_selection_metadata",
     "save_packmol_setup_metadata",
     "save_packmol_planning_metadata",
@@ -171,6 +221,22 @@ def __getattr__(name: str):
         exports = {
             "RMCSetupMainWindow": RMCSetupMainWindow,
             "launch_rmcsetup_ui": launch_rmcsetup_ui,
+        }
+        return exports[name]
+    if name in {
+        "SolventShellBuilderMainWindow",
+        "launch_solvent_shell_builder_ui",
+    }:
+        from .ui.solvent_shell_builder_window import (
+            SolventShellBuilderMainWindow,
+            launch_solvent_shell_builder_ui,
+        )
+
+        exports = {
+            "SolventShellBuilderMainWindow": SolventShellBuilderMainWindow,
+            "launch_solvent_shell_builder_ui": (
+                launch_solvent_shell_builder_ui
+            ),
         }
         return exports[name]
     if name == "RepresentativePreviewWindow":

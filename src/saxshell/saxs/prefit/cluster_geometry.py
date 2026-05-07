@@ -435,6 +435,7 @@ class ClusterGeometryMetadataTable:
 def compute_cluster_geometry_metadata(
     clusters_dir: str | Path,
     *,
+    cluster_bins: list[ClusterBin] | tuple[ClusterBin, ...] | None = None,
     extra_cluster_bins: (
         list[ClusterBin] | tuple[ClusterBin, ...] | None
     ) = None,
@@ -458,7 +459,11 @@ def compute_cluster_geometry_metadata(
         active_ionic_radius_type,
         default=DEFAULT_IONIC_RADIUS_TYPE,
     )
-    cluster_bins = list(discover_cluster_bins(resolved_clusters_dir))
+    cluster_bins = (
+        list(cluster_bins)
+        if cluster_bins is not None
+        else list(discover_cluster_bins(resolved_clusters_dir))
+    )
     if extra_cluster_bins:
         cluster_bins.extend(extra_cluster_bins)
     total_files = sum(len(cluster_bin.files) for cluster_bin in cluster_bins)

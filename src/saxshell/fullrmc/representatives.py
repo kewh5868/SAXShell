@@ -6,7 +6,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 import numpy as np
 
@@ -29,6 +29,16 @@ if TYPE_CHECKING:
 
 _STRUCTURE_SUFFIXES = {".pdb", ".xyz"}
 _DEFAULT_QUANTILES = tuple(np.linspace(0.0, 1.0, 11).tolist())
+_PROJECT_REPRESENTATIVE_SOURCE_SOLVENT_MODES = (
+    "nosolv",
+    "partialsolv",
+    "fullsolv",
+)
+_SOURCE_SOLVENT_MODE_BY_VARIANT = {
+    "no_solvent": "nosolv",
+    "partial_solvent": "partialsolv",
+    "full_solvent": "fullsolv",
+}
 RepresentativeSelectionProgressCallback = Callable[[int, int, str], None]
 RepresentativeSelectionLogCallback = Callable[[str], None]
 
@@ -252,11 +262,13 @@ class RepresentativeSelectionEntry:
     source_file_name: str
     atom_count: int
     element_counts: dict[str, int]
+    source_solvent_mode: str = "unknown"
     analysis_source: str = "first_valid_file"
     score_total: float | None = None
     score_bond: float | None = None
     score_angle: float | None = None
     cached_results_path: str | None = None
+    project_cached_results_path: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -266,14 +278,24 @@ class RepresentativeSelectionEntry:
         cls,
         payload: dict[str, object],
     ) -> "RepresentativeSelectionEntry":
+        source_dir = str(payload.get("source_dir", "")).strip()
+        source_file = str(payload.get("source_file", "")).strip()
+        source_solvent_mode = normalize_representative_source_solvent_mode(
+            payload.get("source_solvent_mode")
+        )
+        if source_solvent_mode == "unknown":
+            source_solvent_mode = _infer_representative_source_solvent_mode(
+                source_file=source_file,
+                source_dir=source_dir,
+            )
         return cls(
             structure=str(payload.get("structure", "")).strip(),
             motif=str(payload.get("motif", "no_motif")).strip() or "no_motif",
             param=str(payload.get("param", "")).strip(),
             selected_weight=float(payload.get("selected_weight", 0.0)),
             cluster_count=int(payload.get("cluster_count", 0)),
-            source_dir=str(payload.get("source_dir", "")).strip(),
-            source_file=str(payload.get("source_file", "")).strip(),
+            source_dir=source_dir,
+            source_file=source_file,
             source_file_name=str(payload.get("source_file_name", "")).strip(),
             atom_count=int(payload.get("atom_count", 0)),
             element_counts={
@@ -282,6 +304,7 @@ class RepresentativeSelectionEntry:
                     payload.get("element_counts", {})
                 ).items()
             },
+            source_solvent_mode=source_solvent_mode,
             analysis_source=str(
                 payload.get("analysis_source", "first_valid_file")
             ).strip()
@@ -291,6 +314,9 @@ class RepresentativeSelectionEntry:
             score_angle=_optional_float(payload.get("score_angle")),
             cached_results_path=_optional_text(
                 payload.get("cached_results_path")
+            ),
+            project_cached_results_path=_optional_text(
+                payload.get("project_cached_results_path")
             ),
         )
 
@@ -471,6 +497,154 @@ class RepresentativePreviewCluster:
 
     def all_series(self) -> tuple[RepresentativePreviewSeries, ...]:
         return self.bond_series + self.angle_series
+
+
+def validate_representative_selection_covers_distribution(
+    metadata: RepresentativeSelectionMetadata,
+    *,
+    require_source_files: bool = True,
+) -> None:
+    """Ensure one saved representative exists for each positive
+    weight."""
+
+    expected_entries = [
+        entry
+        for entry in metadata.distribution_selection.entries
+        if float(entry.selected_weight) > 0.0
+    ]
+    representative_entries = list(metadata.representative_entries)
+    representative_lookup: dict[
+        tuple[str, str, str], list[RepresentativeSelectionEntry]
+    ] = {}
+    for entry in representative_entries:
+        representative_lookup.setdefault(
+            _representative_entry_key(entry),
+            [],
+        ).append(entry)
+
+    errors: list[str] = []
+    if expected_entries:
+        expected_keys = {
+            _distribution_entry_key(entry) for entry in expected_entries
+        }
+        missing_entries = [
+            entry
+            for entry in expected_entries
+            if _distribution_entry_key(entry) not in representative_lookup
+        ]
+        duplicate_keys = [
+            key
+            for key in sorted(
+                representative_lookup,
+                key=lambda item: (
+                    _natural_sort_key(item[0]),
+                    _natural_sort_key(item[1]),
+                    _natural_sort_key(item[2]),
+                ),
+            )
+            if key in expected_keys and len(representative_lookup[key]) != 1
+        ]
+        extra_entries = [
+            entry
+            for key, entries in representative_lookup.items()
+            if key not in expected_keys
+            for entry in entries
+        ]
+        expected_issue_keys = set(expected_keys)
+    else:
+        missing_entries = []
+        duplicate_keys = [
+            key
+            for key in sorted(
+                representative_lookup,
+                key=lambda item: (
+                    _natural_sort_key(item[0]),
+                    _natural_sort_key(item[1]),
+                    _natural_sort_key(item[2]),
+                ),
+            )
+            if len(representative_lookup[key]) != 1
+        ]
+        extra_entries = []
+        expected_issue_keys = set()
+
+    if missing_entries:
+        errors.append(
+            "Missing representatives: "
+            + _format_coverage_labels(
+                _coverage_key_label(_distribution_entry_key(entry))
+                for entry in missing_entries
+            )
+        )
+    if duplicate_keys:
+        errors.append(
+            "Duplicate representatives: "
+            + _format_coverage_labels(
+                (
+                    f"{_coverage_key_label(key)} x"
+                    f"{len(representative_lookup[key])}"
+                )
+                for key in duplicate_keys
+            )
+        )
+    if extra_entries:
+        errors.append(
+            "Representatives not present in the selected weight distribution: "
+            + _format_coverage_labels(
+                _representative_entry_label(entry) for entry in extra_entries
+            )
+        )
+
+    if require_source_files:
+        missing_source_labels: list[str] = []
+        for entry in representative_entries:
+            source_file = _optional_text(entry.source_file)
+            if source_file is None:
+                missing_source_labels.append(
+                    f"{_representative_entry_label(entry)} has no source file"
+                )
+                continue
+            source_path = Path(source_file).expanduser().resolve()
+            if not source_path.is_file():
+                missing_source_labels.append(
+                    f"{_representative_entry_label(entry)} -> {source_path}"
+                )
+        if missing_source_labels:
+            errors.append(
+                "Representative source files not found: "
+                + _format_coverage_labels(missing_source_labels)
+            )
+
+    missing_issue_labels = [
+        _representative_issue_label(issue)
+        for issue in metadata.missing_bins
+        if not expected_issue_keys
+        or _representative_issue_key(issue) in expected_issue_keys
+    ]
+    invalid_issue_labels = [
+        _representative_issue_label(issue)
+        for issue in metadata.invalid_bins
+        if not expected_issue_keys
+        or _representative_issue_key(issue) in expected_issue_keys
+    ]
+    if missing_issue_labels:
+        errors.append(
+            "Representative selection still reports missing bins: "
+            + _format_coverage_labels(missing_issue_labels)
+        )
+    if invalid_issue_labels:
+        errors.append(
+            "Representative selection still reports invalid bins: "
+            + _format_coverage_labels(invalid_issue_labels)
+        )
+
+    if errors:
+        raise ValueError(
+            "Representative structures do not match the selected weight "
+            "distribution. Save exactly one representative structure for "
+            "every positive weight before planning or building Packmol. "
+            + " ".join(errors)
+        )
 
 
 def build_distribution_selection(
@@ -810,6 +984,10 @@ def select_first_file_representatives(
                 source_file_name=selected_file.name,
                 atom_count=len(selected_elements),
                 element_counts=dict(Counter(selected_elements)),
+                source_solvent_mode=_infer_representative_source_solvent_mode(
+                    source_file=selected_file,
+                    source_dir=source_dir or selected_file.parent,
+                ),
             )
         )
         processed_work += work_units
@@ -1146,6 +1324,10 @@ def select_distribution_representatives(
                 source_file_name=best_candidate.path.name,
                 atom_count=best_candidate.atom_count,
                 element_counts=dict(best_candidate.element_counts),
+                source_solvent_mode=_infer_representative_source_solvent_mode(
+                    source_file=best_candidate.path,
+                    source_dir=source_dir or best_candidate.path.parent,
+                ),
                 analysis_source=analysis_source,
                 score_total=score_total,
                 score_bond=score_bond,
@@ -1838,6 +2020,51 @@ def _natural_sort_key(value: str) -> list[object]:
     ]
 
 
+def _representative_entry_key(
+    entry: RepresentativeSelectionEntry,
+) -> tuple[str, str, str]:
+    return (
+        str(entry.structure).strip(),
+        str(entry.motif).strip() or "no_motif",
+        str(entry.param).strip(),
+    )
+
+
+def _representative_issue_key(
+    issue: RepresentativeSelectionIssue,
+) -> tuple[str, str, str]:
+    return (
+        str(issue.structure).strip(),
+        str(issue.motif).strip() or "no_motif",
+        str(issue.param).strip(),
+    )
+
+
+def _coverage_key_label(key: tuple[str, str, str]) -> str:
+    structure, motif, param = key
+    if motif == "no_motif":
+        return f"{structure} ({param})"
+    return f"{structure}/{motif} ({param})"
+
+
+def _representative_entry_label(entry: RepresentativeSelectionEntry) -> str:
+    return _coverage_key_label(_representative_entry_key(entry))
+
+
+def _representative_issue_label(issue: RepresentativeSelectionIssue) -> str:
+    return _coverage_key_label(_representative_issue_key(issue))
+
+
+def _format_coverage_labels(labels: Iterable[str]) -> str:
+    values = [str(label) for label in labels if str(label).strip()]
+    if not values:
+        return "none"
+    shown = values[:6]
+    if len(values) > len(shown):
+        shown.append(f"... +{len(values) - len(shown)} more")
+    return "; ".join(shown)
+
+
 def _optional_text(value: object) -> str | None:
     if value is None:
         return None
@@ -1860,6 +2087,88 @@ def _definition_chunks(text: str) -> list[str]:
     ]
 
 
+def normalize_representative_source_solvent_mode(
+    value: object,
+) -> str:
+    text = str(value or "").strip().lower()
+    if text in _PROJECT_REPRESENTATIVE_SOURCE_SOLVENT_MODES:
+        return text
+    return "unknown"
+
+
+def _infer_representative_source_solvent_mode(
+    *,
+    source_file: object = None,
+    source_dir: object = None,
+) -> str:
+    for candidate in (source_file, source_dir):
+        text = _optional_text(candidate)
+        if text is None:
+            continue
+        parts = Path(text).expanduser().resolve().parts
+        for part in reversed(parts):
+            normalized = normalize_representative_source_solvent_mode(part)
+            if normalized != "unknown":
+                return normalized
+    return "unknown"
+
+
+def representative_source_solvent_mode_to_variant(
+    value: object,
+) -> str | None:
+    normalized = normalize_representative_source_solvent_mode(value)
+    if normalized == "nosolv":
+        return "no_solvent"
+    if normalized == "partialsolv":
+        return "partial_solvent"
+    if normalized == "fullsolv":
+        return "full_solvent"
+    return None
+
+
+def representative_variant_to_source_solvent_mode(
+    value: object,
+) -> str | None:
+    normalized = str(value or "").strip().lower()
+    if normalized in _PROJECT_REPRESENTATIVE_SOURCE_SOLVENT_MODES:
+        return normalized
+    return _SOURCE_SOLVENT_MODE_BY_VARIANT.get(normalized)
+
+
+def representative_structure_variant_path(
+    source_file: str | Path,
+    variant: object,
+) -> Path | None:
+    resolved_source = Path(source_file).expanduser().resolve()
+    target_mode = representative_variant_to_source_solvent_mode(variant)
+    if target_mode is None:
+        return None
+    if (
+        normalize_representative_source_solvent_mode(
+            resolved_source.parent.parent.name
+        )
+        == target_mode
+        and resolved_source.is_file()
+    ):
+        return resolved_source
+    if (
+        normalize_representative_source_solvent_mode(
+            resolved_source.parent.parent.name
+        )
+        == "unknown"
+    ):
+        return None
+    candidate = (
+        resolved_source.parent.parent.parent
+        / target_mode
+        / resolved_source.parent.name
+        / resolved_source.name
+    )
+    if candidate.is_file():
+        return candidate.resolve()
+    return None
+
+
 __all__ = [
     "DistributionSelectionEntry",
     "DistributionSelectionMetadata",
@@ -1873,10 +2182,15 @@ __all__ = [
     "build_representative_preview_clusters",
     "load_distribution_selection_metadata",
     "load_representative_selection_metadata",
+    "normalize_representative_source_solvent_mode",
     "parse_angle_triplet_text",
     "parse_bond_pair_text",
+    "representative_source_solvent_mode_to_variant",
+    "representative_structure_variant_path",
+    "representative_variant_to_source_solvent_mode",
     "save_distribution_selection_metadata",
     "save_representative_selection_metadata",
     "select_distribution_representatives",
     "select_first_file_representatives",
+    "validate_representative_selection_covers_distribution",
 ]

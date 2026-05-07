@@ -1,142 +1,137 @@
 # Installation
 
-## Python version
+## Current install path
 
-Use Python 3.12 for the current supported path.
+SAXSShell is not pip-installable yet. Run it from a source checkout and create
+the pinned conda environment from the repository environment file.
 
-The repository CI and local conda guidance are pinned around Python 3.12
-because the current PySide6 stack in this repo is not ready for Python 3.14.
+Use Python 3.12 through the provided `saxshell-py312` environment. The
+repository CI and local guidance are pinned around Python 3.12 because the
+current Qt stack is not ready for Python 3.14.
 
-## Create a conda environment
-
-The current docs examples assume a Python 3.12 environment named
-`saxshell-py312`:
-
-```bash
-conda create -n saxshell-py312 python=3.12
-```
-
-You can either activate that environment first or keep commands explicit with
-`conda run --no-capture-output -n saxshell-py312 ...`. The
-`--no-capture-output` flag is useful for Qt applications because terminal logs
-and tracebacks stay visible.
-
-## Install from PyPI
-
-```bash
-conda run --no-capture-output -n saxshell-py312 python -m pip install saxshell
-```
-
-After installation, confirm the umbrella CLI is available:
-
-```bash
-conda run --no-capture-output -n saxshell-py312 saxshell --help
-```
-
-## Install from source
-
-Clone the repository and install it in editable mode:
+## Clone the repository
 
 ```bash
 git clone https://github.com/kewh5868/SAXSShell.git
 cd SAXSShell
-conda run --no-capture-output -n saxshell-py312 python -m pip install -e .
 ```
 
-This installs the package and the command-line entry points defined in the
-project metadata.
+Run the rest of the commands from the repository root unless a page says
+otherwise.
 
-## Run directly from a source checkout
+## Create the conda environment
 
-If you want to launch the software from the repository root without installing
-editable entry points yet, export `PYTHONPATH=src` and run the relevant module
-inside the conda environment:
+Create the environment from the checked-in `.yml` file:
 
 ```bash
-PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxshell --help
-PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs --help
-PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs ui
+conda env create -f requirements/saxshell-py312.yml
 ```
 
-Common translations from installed CLI form to source-checkout form are:
+If the environment already exists, update it from the same file:
 
-- `mdtrajectory ...` -> `PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory ...`
-- `clusters ...` -> `PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.cluster ...`
-- `blenderxyz ...` -> `PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.toolbox.blender.cli ...`
-- `saxshell saxs ...` -> `PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs ...`
-- `saxshell fullrmc ...` -> `PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.fullrmc ...`
+```bash
+conda env update -n saxshell-py312 -f requirements/saxshell-py312.yml --prune
+```
+
+The examples use `conda run --no-capture-output -n saxshell-py312 ...` so Qt
+logs and tracebacks remain visible in the terminal.
+
+## Launch SAXSShell
+
+Start the main SAXSShell application from the repository root:
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs
+```
+
+The application opens to the main SAXS workflow. Create or select a dedicated
+project folder in **Project Setup** after your trajectory-derived frames and
+clusters are ready.
+
+## Recommended starting point
+
+Before spending time in Prefit or DREAM, prepare the simulation data that the
+SAXS project will consume:
+
+1. Inspect the MD trajectory and export a frame folder with `mdtrajectory`.
+2. Convert exported XYZ frames with `xyz2pdb` only if downstream analysis needs
+   residue-aware PDB files.
+3. Extract stoichiometry-sorted clusters with `clusters`.
+4. Create a dedicated project folder for the SAXSShell session.
+5. Launch SAXSShell and choose that project folder in **Project Setup**.
+
+See [MD Extraction and Cluster Preparation](../user-guide/cluster-extraction.md)
+for the trajectory-to-clusters path.
+
+## Standalone tools
+
+These supporting tools can be used independently from the main SAXSShell
+window, or opened from the main UI when a project-backed workflow is needed:
+
+| Tool                   | Short description                                                                                                            |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `mdtrajectory`         | Inspects MD trajectories, reads optional CP2K energy files, helps choose equilibration cutoffs, and exports selected frames. |
+| `xyz2pdb`              | Converts extracted XYZ frames into residue-aware PDB files using reference molecule definitions.                             |
+| `clusters`             | Extracts stoichiometry-sorted cluster folders from exported XYZ or PDB frames.                                               |
+| `bondanalysis`         | Measures bond-pair and angle distributions from cluster folders.                                                             |
+| `clusterdynamics`      | Builds time-binned cluster population heatmaps, energy overlays, and lifetime summaries.                                     |
+| `clusterdynamicsml`    | Extends observed cluster dynamics with predicted larger structures and model-comparison outputs.                             |
+| `pdfsetup`             | Runs Debyer-backed trajectory-averaged PDF and partial-PDF calculations.                                                     |
+| `blenderxyz`           | Creates publication-style structure renders with Blender.                                                                    |
+| `representativefinder` | Selects representative structures from project-backed stoichiometry folders.                                                 |
+| `structureviewer`      | Opens individual structure files in the SAXSShell structure viewer.                                                          |
+
+From the source checkout, these tools are reached through their Python modules
+inside the `saxshell-py312` environment. For example:
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.mdtrajectory inspect traj.xyz --energy-file traj.ener
+```
+
+## External application dependencies
+
+The conda environment file installs the Python stack. Some optional
+SAXSShell applications call external software that must be installed separately.
+
+| External software | Required by                                           | Install / docs                                                                                                                                                           |
+| ----------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Debyer            | `pdfsetup` PDF and partial-PDF calculations           | [Debyer docs](https://debyer.readthedocs.io/en/latest/) and [Debyer GitHub](https://github.com/wojdyr/debyer)                                                            |
+| Blender           | `blenderxyz` structure rendering                      | [Blender download](https://www.blender.org/download/) and [Blender installation manual](https://docs.blender.org/manual/en/latest/getting_started/installing/index.html) |
+| Packmol           | `fullrmc` Packmol setup and solvent packing workflows | [Packmol GitHub](https://github.com/m3g/packmol) and [Packmol user guide](https://m3g.github.io/packmol/)                                                                |
+| Docker            | `fullrmc` Packmol Docker link workflow                | [Get Docker](https://docs.docker.com/get-started/get-docker/)                                                                                                            |
+
+### Debyer
+
+The `pdfsetup` application launches the `debyer` executable as an external
+backend. SAXSShell does not bundle that binary. Install Debyer separately and
+make sure `debyer` is available on `PATH` before running trajectory-averaged
+PDF calculations.
+
+Debyer's upstream repository documents source builds with `autoconf`,
+`automake`, `gengetopt`, `./configure`, and `make`. Follow the current upstream
+instructions for your platform.
+
+### Blender
+
+The `blenderxyz` renderer needs Blender installed separately. It works best
+when `blender` is on `PATH`, but the renderer UI can also browse to a Blender
+executable or `.app` bundle.
+
+### Packmol and Docker
+
+The `fullrmc` Packmol setup workflow needs Packmol when you are preparing packed
+coordinate files. The Packmol Docker link workflow additionally needs Docker so
+SAXSShell can validate and sync files into a Packmol-ready container.
+
+Install Docker only if you plan to use the Packmol container workflow. If you
+use Packmol outside Docker, make sure the selected workflow can reach the
+`packmol` executable in that environment.
 
 ## Optional docs dependencies
 
 If you want to preview this documentation site locally:
 
 ```bash
-python -m pip install -r requirements/docs.txt
-mkdocs serve
+conda run --no-capture-output -n saxshell-py312 python -m pip install -r requirements/docs.txt
+conda run --no-capture-output -n saxshell-py312 mkdocs serve
 ```
-
-## Installed commands
-
-The current package exposes these top-level tools:
-
-- `saxshell`
-- `mdtrajectory`
-- `clusters`
-- `blenderxyz`
-- `clusterdynamics`
-- `clusterdynamicsml`
-- `bondanalysis`
-- `pdfsetup`
-- `xyz2pdb`
-
-The SAXS and fullrmc CLIs are currently reached through the umbrella command
-rather than separate installed scripts:
-
-```bash
-saxshell saxs --help
-saxshell fullrmc --help
-```
-
-## Installation notes
-
-- The SAXS UI and several other tools use PySide6 for the GUI.
-- The SAXS workflow also depends on scientific Python packages such as NumPy,
-  SciPy, and lmfit.
-- The SAXS Debye component builder uses `xraydb`.
-- The `blenderxyz` application also requires a separate Blender installation:
-  <https://www.blender.org/download/>
-- The Blender renderer works best when `blender` is on `PATH`, but you can also
-  browse to the Blender executable or `.app` bundle from inside the UI.
-
-## Debyer installation for PDF calculations
-
-The `pdfsetup` application uses
-[Debyer](https://debyer.readthedocs.io/en/latest/) as an external backend. That
-means SAXSShell does not bundle the Debyer binary itself. You need to install
-Debyer separately and make sure the `debyer` executable is available on your
-`PATH`.
-
-Useful upstream links:
-
-- Debyer documentation: <https://debyer.readthedocs.io/en/latest/>
-- Debyer GitHub repository: <https://github.com/wojdyr/debyer>
-
-Debyer's official project documentation describes a native build based on its
-own C/C++ source tree and autotools-style setup. SAXSShell's Debyer integration
-does **not** require a Fortran runtime from Debyer itself. If you are installing
-Debyer from source, follow the current upstream instructions rather than
-assuming a Fortran toolchain is needed.
-
-When the PDF application starts, it runs a quick Debyer availability check by:
-
-1. locating `debyer` on `PATH`
-2. attempting a lightweight `debyer --help` subprocess call
-
-If that startup check fails, the PDF UI reports that immediately so you can
-resolve the Debyer installation or local execution permissions before launching
-a long trajectory-average job.
-
-## TODO
-
-TODO: add a short platform-specific troubleshooting section once the current
-conda packaging and GUI runtime guidance are finalized.

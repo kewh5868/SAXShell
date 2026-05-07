@@ -1,17 +1,21 @@
 # GUI Overview
 
 SAXSShell is not a single-window application. The repository contains multiple
-Qt workflows, each with its own UI and CLI entry point.
+Qt workflows, each with its own focused UI and source-checkout module launch.
 
-Most tools install as direct top-level commands. The SAXS and fullrmc
-applications currently route through the umbrella `saxshell` CLI, or through
-`python -m` module execution when you are running from a source checkout.
+The current user-facing install path runs from a source checkout with the
+`saxshell-py312` conda environment. Start the main application from the
+repository root with:
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs
+```
 
 ## Main UI workflow elements
 
-The primary SAXS workflow lives in `saxshell saxs`. Its tabs are not isolated:
-the active template, component list, geometry metadata, and saved state all
-move between them.
+The primary SAXS workflow lives in the main SAXSShell application. Its tabs are
+not isolated: the active template, component list, geometry metadata, and saved
+state all move between them.
 
 Project Setup now separates two linked actions:
 
@@ -25,13 +29,23 @@ The linked supporting-application launches are build-mode aware:
 - `No Contrast (Debye)` stays in the main SAXS UI and runs the direct Debye
   component builder.
 - `Contrast (Debye)` opens the contrast workflow window.
-- `Born Approximation (Average)` opens Electron Density Mapping in
+- `1D Born Approximation (Average)` opens the legacy radial-density workflow in
+  computed-distribution mode.
+- `3D FFT Born Approximation` opens the separate Cartesian FFT Born workflow in
   computed-distribution mode.
 
-### `saxshell saxs`
+### Main SAXSShell Application
 
 Use this for SAXS project management, prefit modeling, pyDREAM refinement, and
 template-driven workflows.
+
+In plain language, this main window is where SAXSShell turns simulation-derived
+cluster populations and representative structures into a model that can be
+compared against experimental SAXS data for solvation-structure analysis.
+
+!!! info "Image placeholder"
+Add a screenshot of the main SAXSShell window showing the tab bar and
+the overall page layout a first-time user sees after opening a project.
 
 ### Project Setup
 
@@ -49,6 +63,10 @@ The **Active Computed Distribution** panel on this tab summarizes the saved
 distribution identity and whether component, prior, Prefit, and DREAM artifacts
 already exist for that branch.
 
+!!! info "Image placeholder"
+Add a screenshot of **Project Setup** with the computed-distribution panel
+and component-build controls visible.
+
 ### SAXS Prefit
 
 Builds the lmfit-side preview around the current template, parameter table, and
@@ -57,9 +75,17 @@ cluster geometry metadata.
 Geometry-aware templates can require component metadata derived from the
 cluster-support workflow before Prefit updates are possible.
 
+!!! info "Image placeholder"
+Add a screenshot of **SAXS Prefit** with the main plot, parameter table,
+and any geometry-aware controls visible.
+
 ### SAXS DREAM Fit
 
 Builds and runs the pyDREAM workflow once Prefit is in a usable state.
+
+!!! info "Image placeholder"
+Add a screenshot of **SAXS DREAM Fit** with the runtime settings, prior-map
+editor button, and results panes visible.
 
 ### Results and export
 
@@ -111,9 +137,9 @@ Use these tools when you want to analyze the sorted clusters themselves.
 
 - `bondanalysis` measures bond-pair and angle distributions from the cluster
   folders.
-- `Debye-Waller Analysis` estimates intra-molecular and inter-molecular
-  Debye-Waller coefficients from sorted PDB cluster folders and saves them in
-  the active project when requested from Project Setup or the Tools menu.
+- `Representative Structures` selects project-backed representative structures
+  from stoichiometry folders. The beta CLI setup path writes a run file for the
+  same backend when headless execution is preferred.
 
 ### Cluster Dynamics
 
@@ -131,14 +157,23 @@ extend the observed structure series.
 Use this section for pair-distribution workflows tied to the active project.
 
 - `pdfsetup` runs Debyer-backed trajectory-averaged PDF and partial-PDF
-  calculations and stores the saved calculation sets in the project.
-- `saxshell fullrmc` remains the downstream setup path for fullrmc-oriented
-  project artifacts.
+  calculations and stores the saved calculation sets in the project. It
+  requires a separate [Debyer](https://debyer.readthedocs.io/en/latest/)
+  installation with `debyer` available to the process.
+- The `fullrmc` workflow remains the downstream setup path for
+  fullrmc-oriented project artifacts.
+- The main SAXS window also exposes `File > Link Packmol Docker Container...`
+  so Packmol can be linked before opening the `fullrmc` setup window. This
+  path requires Docker plus Packmol installed inside the linked container.
+- Inside the `fullrmc` window, `Tools > Link Packmol Docker Container` can
+  validate a Packmol-ready Docker container and remember the selected
+  `/packmol_input_files` project folder for later Packmol input syncs.
 
 ### Visualization
 
 Use `blenderxyz` when you need publication-style structure renders that go
-beyond the inline previewer.
+beyond the inline previewer. It requires a separate
+[Blender](https://www.blender.org/download/) installation.
 
 ### SAXS Calculation Preview
 
@@ -147,13 +182,34 @@ settings outside the main computed-distribution flow.
 
 - `SAXS Contrast Mode` is the `Contrast (Debye)` representative-structure
   workflow.
-- `Electron Density Mapping` is the
-  `Born Approximation (Average)` density-profile and Fourier-transform workflow.
+- `1D Born Approximation` is the
+  `1D Born Approximation (Average)` density-profile and Fourier-transform
+  workflow.
+- `3D FFT Born Approximation` is the separate Cartesian contrast-density FFT
+  workflow.
 
 ### X-ray Toolkit
 
 Use this section for smaller estimate windows such as volume-fraction, number
 density, attenuation, and fluorescence calculators.
+
+### (beta)
+
+Use this section for early-access workflows that are exposed from the main
+`Tools` menu but still need extra caution.
+
+- `Debye-Waller Analysis` estimates intra-molecular and inter-molecular
+  Debye-Waller coefficients from sorted PDB cluster folders and saves them in
+  the active project when requested from Project Setup or the Tools menu.
+- `Representative CLI Setup` saves
+  `representative_structure_cli_run.json` in the project folder so
+  the `representativefinder` source module can execute the same representative
+  selection without the plotting and viewer UI.
+
+!!! warning "Debye-Waller status"
+The linked **Compute Debye-Waller Factors (beta)** workflow is currently
+in testing and has a known bug. Keep that in mind when documenting or
+using the Project Setup integration path.
 
 ## Supporting application references
 
@@ -165,7 +221,7 @@ density, attenuation, and fluorescence calculators.
 ### Structure Analysis
 
 - [Bond Analysis](bond-analysis.md)
-- [Debye-Waller Analysis](debye-waller-analysis.md)
+- [Representative Structure CLI](representative-structure-cli.md)
 
 ### Cluster Dynamics
 
@@ -175,6 +231,7 @@ density, attenuation, and fluorescence calculators.
 ### PDF
 
 - [PDF Calculation](pdf-calculation.md)
+- [fullrmc Packmol Docker Link](fullrmc-packmol-docker.md)
 
 ### Visualization
 
@@ -183,16 +240,28 @@ density, attenuation, and fluorescence calculators.
 ### SAXS Calculation Preview
 
 - [SAXS Contrast Mode](saxs-contrast-mode.md)
-- [Electron Density Mapping](electron-density-mapping.md)
+- [1D Born Approximation (Average)](electron-density-mapping.md)
+- [3D FFT Born Approximation](fft-born-approximation.md)
 
 ### X-ray Toolkit
 
 - [X-ray Toolkit](xray-toolkit.md)
 
-## TODO
+### (beta)
 
-TODO: add screenshots once the docs site has a stable asset pipeline and the
-UI labels settle after the current SAXS workflow changes.
+- [Debye-Waller Analysis](debye-waller-analysis.md)
+
+## External software summary
+
+The conda environment provides the Python dependencies, but these optional
+applications need external software:
+
+| External software | Required by                                           | Install / docs                                                                                                                                                           |
+| ----------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Debyer            | `pdfsetup` PDF and partial-PDF calculations           | [Debyer docs](https://debyer.readthedocs.io/en/latest/) and [Debyer GitHub](https://github.com/wojdyr/debyer)                                                            |
+| Blender           | `blenderxyz` structure rendering                      | [Blender download](https://www.blender.org/download/) and [Blender installation manual](https://docs.blender.org/manual/en/latest/getting_started/installing/index.html) |
+| Packmol           | `fullrmc` Packmol setup and solvent packing workflows | [Packmol GitHub](https://github.com/m3g/packmol) and [Packmol user guide](https://m3g.github.io/packmol/)                                                                |
+| Docker            | `fullrmc` Packmol Docker link workflow                | [Get Docker](https://docs.docker.com/get-started/get-docker/)                                                                                                            |
 
 ??? note "Artwork Attribution"
 The SAXSShell application icon used across the UI, documentation site, and

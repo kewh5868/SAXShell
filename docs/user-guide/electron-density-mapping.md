@@ -1,6 +1,6 @@
-# Electron Density Mapping
+# 1D Born Approximation (Average)
 
-The **Electron Density Mapping** tool is SAXSShell's supporting application for
+The **1D Born Approximation (Average)** tool is SAXSShell's supporting application for
 building radial electron-density profiles from XYZ or PDB inputs and, when
 needed, turning those profiles into q-space scattering estimates. The current
 UI supports three working styles:
@@ -11,7 +11,11 @@ UI supports three working styles:
   stoichiometry gets its own density, solvent, Fourier, and saved-output state.
 
 In Project Setup, this is the linked component-build workspace for
-**Born Approximation (Average)**.
+**1D Born Approximation (Average)**.
+
+This page documents the legacy radial-profile workflow. For the separate
+Cartesian FFT workflow, see
+[3D FFT Born Approximation](fft-born-approximation.md).
 
 In the main SAXS workflow the tool can run either in **Preview Mode** or in
 **Computed Distribution Mode**. Preview mode is for exploratory work. Computed
@@ -29,12 +33,12 @@ PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshel
 
 ### From the main SAXS UI
 
-- **Tools > SAXS Calculation Preview > Open Electron Density Mapping** opens
+- **Tools > SAXS Calculation Preview > Open 1D Born Approximation** opens
   the tool in **Preview Mode**. The window title shows
-  `Electron Density Mapping (Preview)`, and the banner explains that pushed
+  `1D Born Approximation (Preview)`, and the banner explains that pushed
   model components are disabled in this mode.
 - **Build SAXS Components** with the
-  **Born Approximation (Average)** build mode opens the tool in
+  **1D Born Approximation (Average)** build mode opens the tool in
   **Computed Distribution Mode**. The tool inherits the active project q-range,
   the active computed distribution, the preferred input folder, and the
   distribution output directory.
@@ -187,10 +191,11 @@ The **Fourier Transform** section converts the active density profile into a
 Born-approximation scattering estimate. The preview panel always shows the
 resampled and windowed real-space data that will be used.
 
-The default transform domain is **mirrored mode**, which reflects the profile
-about `r = 0` and evaluates the windowed transform over `-rmax` to `rmax`.
-The UI also keeps a **legacy r min to r max transform** toggle for historical
-behavior.
+The validated default transform domain in the current UI is the historical
+one-sided transform from `r = 0` to `r = rmax` with no window. The
+**Legacy r min to r max transform** checkbox remains checked by default to
+match the backend Born-versus-Debye comparison tests. Clearing that checkbox
+switches to the mirrored-domain transform over `-rmax` to `rmax`.
 
 The evaluated transform is:
 
@@ -208,7 +213,7 @@ with `I(q) = |F(q)|^2`.
 | Field                                            | Description                                                                                                                                                                                |
 | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **r min / r max**                                | Real-space bounds used for the transform.                                                                                                                                                  |
-| **Legacy r min to r max transform**              | Switches from the default mirrored-domain transform back to the historical one-sided `r min` to `r max` behavior. In mirrored mode, the left bound is shown as `-r max`.                   |
+| **Legacy r min to r max transform**              | Keeps the current default one-sided `r min` to `r max` behavior. Clear it to switch to the mirrored-domain transform, where the left bound is shown as `-r max`.                           |
 | **q min / q max / q step**                       | Requested q grid for the output scattering profile.                                                                                                                                        |
 | **Window**                                       | Real-space apodization window. Options are `None`, `Lorch`, `Cosine`, `Hanning`, `Parzen`, `Welch`, `Gaussian`, `Sine`, and `Kaiser-Bessel`.                                               |
 | **Resample pts**                                 | Number of resampled real-space points used by the transform.                                                                                                                               |
@@ -350,7 +355,7 @@ The structure viewer is an interactive **3D** Matplotlib viewer, not a static
 
 ### Standalone preview
 
-1. Launch **Open Electron Density Mapping** from the main UI or start the tool
+1. Launch **Open 1D Born Approximation** from the main UI or start the tool
    from the terminal.
 2. Load a single structure file or a folder of structures.
 3. Review the structure summary and set the mesh.
@@ -363,7 +368,7 @@ The structure viewer is an interactive **3D** Matplotlib viewer, not a static
 ### Computed distribution / Born approximation
 
 1. Open the tool from **Build SAXS Components** with the
-   **Born Approximation (Average)** workflow.
+   **1D Born Approximation (Average)** workflow.
 2. Confirm that the inherited cluster folder, output directory, and q-range are
    correct.
 3. Review the stoichiometry table and choose whether to run the full batch or

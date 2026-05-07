@@ -17,6 +17,10 @@ from saxshell.saxs._model_templates import (
     load_template_module,
     load_template_spec,
 )
+from saxshell.saxs.contrast.settings import (
+    COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT,
+    normalize_component_build_mode,
+)
 from saxshell.saxs.prefit.cluster_geometry import (
     DEFAULT_IONIC_RADIUS_TYPE,
     DEFAULT_RADIUS_TYPE,
@@ -34,8 +38,8 @@ from saxshell.saxs.project_manager import (
     ProjectSettings,
     SAXSProjectManager,
     build_project_paths,
+    component_source_mode_label,
     distribution_id_for_settings,
-    effective_q_range_for_settings,
     load_built_component_q_range,
     project_artifact_paths,
 )
@@ -114,6 +118,29 @@ def normalize_requested_q_range_to_supported(
     if abs(normalized_max - supported_max) <= tolerance:
         normalized_max = float(supported_max)
     return normalized_min, normalized_max
+
+
+def component_q_range_boundary_tolerance(
+    component_build_mode: object,
+    q_values: np.ndarray,
+    supported_min: float,
+    supported_max: float,
+) -> float:
+    tolerance = q_range_boundary_tolerance(supported_min, supported_max)
+    if (
+        normalize_component_build_mode(component_build_mode)
+        != COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
+    ):
+        return tolerance
+    q_grid = np.asarray(q_values, dtype=float)
+    finite_q = np.unique(q_grid[np.isfinite(q_grid)])
+    if finite_q.size < 2:
+        return tolerance
+    positive_diffs = np.diff(np.sort(finite_q))
+    positive_diffs = positive_diffs[positive_diffs > 0.0]
+    if positive_diffs.size == 0:
+        return tolerance
+    return max(tolerance, float(np.median(positive_diffs)) * 1.01)
 
 
 @dataclass(slots=True)
@@ -899,6 +926,57 @@ class SAXSPrefitWorkflow:
             included_components=predicted_components,
         )
 
+    def _representative_structure_cluster_bins_for_active_components(
+        self,
+    ) -> list:
+        if not self.settings.use_representative_structures:
+            return []
+        active_components = {
+            (
+                str(component.structure).strip(),
+                str(component.motif).strip() or "no_motif",
+            )
+            for component in self.components
+            if not str(component.motif).strip().startswith("predicted_rank")
+        }
+        if not active_components:
+            return []
+        try:
+            inventory = self.project_manager._representative_cluster_inventory(
+                self.settings
+            )
+        except Exception as exc:
+            if self.settings.resolved_clusters_dir is not None:
+                return []
+            raise ValueError(
+                "Use Representative Structures is enabled, but SAXS Prefit "
+                "could not load the saved representative structure sources. "
+                "Reopen Project Setup, verify the representative selection, "
+                "and push or rebuild the SAXS components again."
+            ) from exc
+        return [
+            cluster_bin
+            for cluster_bin in inventory.cluster_bins
+            if (
+                str(cluster_bin.structure).strip(),
+                str(cluster_bin.motif).strip() or "no_motif",
+            )
+            in active_components
+        ]
+
+    @staticmethod
+    def _cluster_geometry_source_dir_for_bins(
+        cluster_bins: list,
+    ) -> Path | None:
+        source_dirs = [
+            Path(cluster_bin.source_dir).expanduser().resolve()
+            for cluster_bin in cluster_bins
+            if getattr(cluster_bin, "source_dir", None) is not None
+        ]
+        if not source_dirs:
+            return None
+        return source_dirs[0]
+
     def run_fit(
         self,
         parameter_entries: list[PrefitParameterEntry] | None = None,
@@ -1518,16 +1596,28 @@ class SAXSPrefitWorkflow:
             if evaluation.solvent_contribution is not None
             else np.zeros_like(evaluation.model_intensities, dtype=float)
         )
-        target = np.asarray(
-            evaluation.experimental_intensities
-            - offset_value
-            - solvent_contribution,
-            dtype=float,
-        )
-        model = np.asarray(
-            evaluation.model_intensities - offset_value - solvent_contribution,
-            dtype=float,
-        )
+        if self.solvent_contribution_is_scaled_by_global_scale():
+            target = np.asarray(
+                evaluation.experimental_intensities - offset_value,
+                dtype=float,
+            )
+            model = np.asarray(
+                evaluation.model_intensities - offset_value,
+                dtype=float,
+            )
+        else:
+            target = np.asarray(
+                evaluation.experimental_intensities
+                - offset_value
+                - solvent_contribution,
+                dtype=float,
+            )
+            model = np.asarray(
+                evaluation.model_intensities
+                - offset_value
+                - solvent_contribution,
+                dtype=float,
+            )
         mask = np.isfinite(target) & np.isfinite(model)
         if not np.any(mask):
             raise ValueError(
@@ -1609,12 +1699,20 @@ class SAXSPrefitWorkflow:
             if current_scale > 0.0
             else float("nan")
         )
+        adaptive_bounds = (
+            self.template_spec.prefit_support.autoscale_bounds_mode
+            == "adaptive"
+        )
         recommended_minimum = max(recommended_scale / span_factor, 1e-12)
         recommended_maximum = max(
             recommended_scale * span_factor,
             recommended_scale * 1.5,
-            float(scale_entry.maximum),
         )
+        if not adaptive_bounds:
+            recommended_maximum = max(
+                recommended_maximum,
+                float(scale_entry.maximum),
+            )
         recommended_offset_minimum: float | None = None
         recommended_offset_maximum: float | None = None
         if offset_entry is not None and recommended_offset is not None:
@@ -1626,14 +1724,22 @@ class SAXSPrefitWorkflow:
                 abs(float(recommended_offset)) / span_factor,
                 1e-12,
             )
-            recommended_offset_minimum = min(
-                float(offset_entry.minimum),
-                float(recommended_offset) - offset_padding,
-            )
-            recommended_offset_maximum = max(
-                float(offset_entry.maximum),
-                float(recommended_offset) + offset_padding,
-            )
+            if adaptive_bounds:
+                recommended_offset_minimum = (
+                    float(recommended_offset) - offset_padding
+                )
+                recommended_offset_maximum = (
+                    float(recommended_offset) + offset_padding
+                )
+            else:
+                recommended_offset_minimum = min(
+                    float(offset_entry.minimum),
+                    float(recommended_offset) - offset_padding,
+                )
+                recommended_offset_maximum = max(
+                    float(offset_entry.maximum),
+                    float(recommended_offset) + offset_padding,
+                )
         return PrefitScaleRecommendation(
             current_scale=raw_current_scale,
             recommended_scale=recommended_scale,
@@ -1647,7 +1753,84 @@ class SAXSPrefitWorkflow:
             points_used=int(np.count_nonzero(mask)),
         )
 
+    def apply_scale_recommendation_to_entries(
+        self,
+        parameter_entries: list[PrefitParameterEntry] | None = None,
+        *,
+        recommendation: PrefitScaleRecommendation | None = None,
+    ) -> list[PrefitParameterEntry]:
+        entries = self._copy_entries(
+            parameter_entries or self.parameter_entries
+        )
+        resolved_recommendation = (
+            recommendation or self.recommend_scale_settings(entries)
+        )
+        for entry in entries:
+            if entry.name == "scale":
+                entry.value = resolved_recommendation.recommended_scale
+                entry.minimum = resolved_recommendation.recommended_minimum
+                entry.maximum = resolved_recommendation.recommended_maximum
+                entry.vary = True
+            elif (
+                entry.name == "offset"
+                and resolved_recommendation.recommended_offset is not None
+            ):
+                entry.value = resolved_recommendation.recommended_offset
+                if (
+                    resolved_recommendation.recommended_offset_minimum
+                    is not None
+                ):
+                    entry.minimum = (
+                        resolved_recommendation.recommended_offset_minimum
+                    )
+                if (
+                    resolved_recommendation.recommended_offset_maximum
+                    is not None
+                ):
+                    entry.maximum = (
+                        resolved_recommendation.recommended_offset_maximum
+                    )
+        return entries
+
+    def current_prefit_state_exists(self) -> bool:
+        return (self.prefit_dir / "prefit_state.json").is_file()
+
+    def should_auto_apply_autoscale_on_load(self) -> bool:
+        return (
+            self.template_spec.prefit_support.auto_apply_autoscale_on_load
+            and self.can_run_prefit()
+            and not self.has_best_prefit_entries()
+            and not self.current_prefit_state_exists()
+        )
+
+    def auto_apply_autoscale_on_load(
+        self,
+    ) -> PrefitScaleRecommendation | None:
+        if not self.should_auto_apply_autoscale_on_load():
+            return None
+        recommendation = self.recommend_scale_settings(self.parameter_entries)
+        self.parameter_entries = self.apply_scale_recommendation_to_entries(
+            self.parameter_entries,
+            recommendation=recommendation,
+        )
+        return recommendation
+
     def volume_fraction_estimator_target(self) -> tuple[str, str] | None:
+        target = self.solution_scattering_volume_fraction_target()
+        if target is not None:
+            return target[:2]
+        return None
+
+    def solution_scattering_volume_fraction_target(
+        self,
+    ) -> tuple[str, str, str] | None:
+        support = self.template_spec.solution_scattering_support
+        if support.volume_fraction_parameter is not None:
+            return (
+                support.volume_fraction_parameter,
+                support.volume_fraction_kind,
+                support.volume_fraction_source,
+            )
         parameter_names = {
             str(parameter.name).strip()
             for parameter in self.template_spec.parameters
@@ -1655,10 +1838,10 @@ class SAXSPrefitWorkflow:
         }
         for candidate in SOLUTE_VOLUME_FRACTION_PARAMETER_NAMES:
             if candidate in parameter_names:
-                return candidate, "solute"
+                return candidate, "solute", "saxs_effective"
         for candidate in SOLVENT_VOLUME_FRACTION_PARAMETER_NAMES:
             if candidate in parameter_names:
-                return candidate, "solvent"
+                return candidate, "solvent", "saxs_effective"
         return None
 
     def supports_volume_fraction_estimator(self) -> bool:
@@ -1674,6 +1857,12 @@ class SAXSPrefitWorkflow:
             if candidate in parameter_names:
                 return candidate
         return None
+
+    def solvent_contribution_is_scaled_by_global_scale(self) -> bool:
+        return (
+            self.template_spec.solution_scattering_support.solvent_contribution_scale_mode
+            == "global_scale"
+        )
 
     def supports_cluster_geometry_metadata(self) -> bool:
         return bool(self.template_spec.cluster_geometry_support.supported)
@@ -1782,7 +1971,16 @@ class SAXSPrefitWorkflow:
         *,
         progress_callback=None,
     ) -> ClusterGeometryMetadataTable:
-        clusters_dir = self.settings.resolved_clusters_dir
+        representative_cluster_bins = (
+            self._representative_structure_cluster_bins_for_active_components()
+        )
+        clusters_dir = (
+            self._cluster_geometry_source_dir_for_bins(
+                representative_cluster_bins
+            )
+            if representative_cluster_bins
+            else self.settings.resolved_clusters_dir
+        )
         if clusters_dir is None:
             raise ValueError(
                 "Select a clusters directory in Project Setup before "
@@ -1790,6 +1988,7 @@ class SAXSPrefitWorkflow:
             )
         table = compute_cluster_geometry_metadata(
             clusters_dir,
+            cluster_bins=representative_cluster_bins or None,
             extra_cluster_bins=(
                 self._predicted_structure_cluster_bins_for_active_components()
             ),
@@ -2225,7 +2424,36 @@ class SAXSPrefitWorkflow:
             (entry.structure, entry.motif, entry.name) for entry in entries
         ]
 
+    @staticmethod
+    def _load_numeric_table(path: Path, *, min_columns: int = 2) -> np.ndarray:
+        raw_data = np.asarray(np.loadtxt(path, comments="#"), dtype=float)
+        if raw_data.ndim == 1:
+            raw_data = raw_data.reshape(1, -1)
+        if raw_data.ndim != 2 or raw_data.shape[1] < min_columns:
+            raise ValueError(
+                f"Expected at least {min_columns} numeric columns in {path}."
+            )
+        return raw_data
+
     def _load_components(self) -> list[PrefitComponent]:
+        if not self.project_manager.component_artifacts_match_settings(
+            self.settings,
+            artifact_paths=self.artifact_paths,
+        ):
+            saved_mode = self.project_manager.built_component_source_mode(
+                self.settings,
+                artifact_paths=self.artifact_paths,
+            )
+            if saved_mode is not None:
+                raise FileNotFoundError(
+                    "The saved SAXS components for this computed "
+                    "distribution were built from "
+                    f"{component_source_mode_label(saved_mode)}, but the "
+                    "current Project Setup selection expects "
+                    f"{component_source_mode_label('representative' if self.settings.use_representative_structures else 'average')}. "
+                    "Rebuild SAXS components in Project Setup before "
+                    "running Prefit."
+                )
         if not self.component_map_path.is_file():
             if self.settings.use_predicted_structure_weights:
                 predicted_state = (
@@ -2291,7 +2519,7 @@ class SAXSPrefitWorkflow:
             for motif in sorted(motif_map, key=_natural_sort_key):
                 profile_file = str(motif_map[motif])
                 profile_path = self.component_dir / profile_file
-                raw_data = np.loadtxt(profile_path, comments="#")
+                raw_data = self._load_numeric_table(profile_path)
                 q_values = np.asarray(raw_data[:, 0], dtype=float)
                 intensities = np.asarray(raw_data[:, 1], dtype=float)
                 components.append(
@@ -2345,7 +2573,7 @@ class SAXSPrefitWorkflow:
             self.paths.experimental_data_dir.glob("solv_*")
         ):
             if candidate.is_file():
-                raw_data = np.loadtxt(candidate, comments="#")
+                raw_data = self._load_numeric_table(candidate)
                 return np.interp(
                     q_values,
                     np.asarray(raw_data[:, 0], dtype=float),
@@ -2400,7 +2628,19 @@ class SAXSPrefitWorkflow:
         )
         if q_values.size == 0:
             raise ValueError("No SAXS component q-values are available.")
-        return effective_q_range_for_settings(self.settings, q_values)
+        requested_min = (
+            float(self.settings.q_min)
+            if self.settings.q_min is not None
+            else float(np.min(q_values))
+        )
+        requested_max = (
+            float(self.settings.q_max)
+            if self.settings.q_max is not None
+            else float(np.max(q_values))
+        )
+        if requested_min > requested_max:
+            raise ValueError("q min must be less than or equal to q max.")
+        return requested_min, requested_max
 
     def _ensure_requested_q_range_supported(
         self,
@@ -2409,18 +2649,15 @@ class SAXSPrefitWorkflow:
         q_values = np.asarray(source_q_values, dtype=float)
         requested_min, requested_max = self._requested_q_bounds(q_values)
         supported_min, supported_max = self._supported_component_q_range()
-        requested_min, requested_max = (
-            normalize_requested_q_range_to_supported(
-                requested_min,
-                requested_max,
-                supported_min,
-                supported_max,
-            )
-        )
-        tolerance = q_range_boundary_tolerance(
+        tolerance = self._component_q_range_boundary_tolerance(
+            q_values,
             supported_min,
             supported_max,
         )
+        if abs(requested_min - supported_min) <= tolerance:
+            requested_min = float(supported_min)
+        if abs(requested_max - supported_max) <= tolerance:
+            requested_max = float(supported_max)
         if requested_min < (supported_min - tolerance) or requested_max > (
             supported_max + tolerance
         ):
@@ -2433,6 +2670,19 @@ class SAXSPrefitWorkflow:
                 "q-range to be applied."
             )
         return requested_min, requested_max
+
+    def _component_q_range_boundary_tolerance(
+        self,
+        q_values: np.ndarray,
+        supported_min: float,
+        supported_max: float,
+    ) -> float:
+        return component_q_range_boundary_tolerance(
+            self.settings.component_build_mode,
+            q_values,
+            supported_min,
+            supported_max,
+        )
 
     def _component_q_values_from_candidates(
         self,
@@ -2454,7 +2704,7 @@ class SAXSPrefitWorkflow:
                         "SAXS components in Project Setup before previewing the model."
                     )
             else:
-                raw_data = np.loadtxt(component_files[0], comments="#")
+                raw_data = self._load_numeric_table(component_files[0])
                 source_q_values = np.asarray(raw_data[:, 0], dtype=float)
 
         requested_min, requested_max = (
@@ -2550,7 +2800,7 @@ class SAXSPrefitWorkflow:
         )
         for candidate in component_files:
             if candidate.is_file():
-                raw_data = np.loadtxt(candidate, comments="#")
+                raw_data = self._load_numeric_table(candidate)
                 return np.interp(
                     np.asarray(q_values, dtype=float),
                     np.asarray(raw_data[:, 0], dtype=float),

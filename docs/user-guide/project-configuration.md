@@ -44,7 +44,8 @@ distribution identity:
 When experimental-grid mode is active, the experimental data source also feeds
 into that saved identity. This is why two distributions can coexist in one
 project even when they differ only by build mode, for example
-`No Contrast (Debye)` versus `Born Approximation (Average)`.
+`No Contrast (Debye)` versus `1D Born Approximation (Average)` or
+`3D FFT Born Approximation`.
 
 ## Why this matters
 

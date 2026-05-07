@@ -11,11 +11,16 @@ from saxshell.saxs.project_manager import (
     ProjectSettings,
     SAXSProjectManager,
     build_project_paths,
+    project_artifact_paths,
 )
 
 from .constraint_generation import (
     ConstraintGenerationMetadata,
     load_constraint_generation_metadata,
+)
+from .packmol_docker import (
+    PackmolDockerLink,
+    load_packmol_docker_link_metadata,
 )
 from .packmol_planning import (
     PackmolPlanningMetadata,
@@ -64,6 +69,7 @@ class RMCDreamProjectSource:
     solution_properties: SolutionPropertiesMetadata
     representative_selection: RepresentativeSelectionMetadata | None
     solvent_handling: SolventHandlingMetadata | None
+    packmol_docker_link: PackmolDockerLink | None
     packmol_planning: PackmolPlanningMetadata | None
     packmol_setup: PackmolSetupMetadata | None
     constraint_generation: ConstraintGenerationMetadata | None
@@ -91,12 +97,16 @@ def load_rmc_project_source(
     manager = SAXSProjectManager()
     settings = manager.load_project(project_dir)
     paths = build_project_paths(settings.project_dir)
+    artifact_paths = project_artifact_paths(settings)
     rmcsetup_paths = ensure_rmcsetup_structure(paths)
     return RMCDreamProjectSource(
         settings=settings,
         paths=paths,
         rmcsetup_paths=rmcsetup_paths,
-        valid_runs=discover_valid_dream_runs(paths),
+        valid_runs=_discover_project_valid_dream_runs(
+            paths,
+            artifact_paths.dream_dir,
+        ),
         cluster_validation=validate_cluster_source(
             settings,
             project_paths=paths,
@@ -109,6 +119,9 @@ def load_rmc_project_source(
         ),
         solvent_handling=load_solvent_handling_metadata(
             rmcsetup_paths.solvent_handling_path
+        ),
+        packmol_docker_link=load_packmol_docker_link_metadata(
+            rmcsetup_paths.packmol_docker_link_path
         ),
         packmol_planning=load_packmol_planning_metadata(
             rmcsetup_paths.packmol_plan_path
@@ -131,9 +144,42 @@ def discover_valid_dream_runs(
         paths = paths_or_dir
     else:
         paths = build_project_paths(paths_or_dir)
+    return _discover_runs_in_dir(
+        paths.dream_dir,
+        project_dir=paths.project_dir,
+    )
+
+
+def _discover_project_valid_dream_runs(
+    paths: ProjectPaths,
+    active_dream_dir: Path,
+) -> list[RMCDreamRunRecord]:
+    active_records = _discover_runs_in_dir(
+        active_dream_dir,
+        project_dir=paths.project_dir,
+    )
+    if active_records:
+        return active_records
+    if active_dream_dir.resolve() == paths.dream_dir.resolve():
+        return active_records
+    # Prefer the active artifact root used by the SAXS UI, but keep
+    # legacy project-root DREAM runs available when no scoped runs exist.
+    return _discover_runs_in_dir(
+        paths.dream_dir,
+        project_dir=paths.project_dir,
+    )
+
+
+def _discover_runs_in_dir(
+    dream_dir: Path,
+    *,
+    project_dir: Path,
+) -> list[RMCDreamRunRecord]:
+    if not dream_dir.is_dir():
+        return []
     records: list[RMCDreamRunRecord] = []
     for metadata_path in sorted(
-        paths.dream_dir.rglob("dream_runtime_metadata.json")
+        dream_dir.rglob("dream_runtime_metadata.json")
     ):
         run_dir = metadata_path.parent
         if not _is_valid_run_dir(run_dir):
@@ -146,7 +192,7 @@ def discover_valid_dream_runs(
             settings = DreamRunSettings.from_dict(
                 dict(metadata.get("settings", {}))
             )
-        relative_path = str(run_dir.relative_to(paths.project_dir))
+        relative_path = str(run_dir.relative_to(project_dir))
         template_name = _optional_text(metadata.get("template_name"))
         records.append(
             RMCDreamRunRecord(

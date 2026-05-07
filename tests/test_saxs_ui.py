@@ -41,11 +41,25 @@ from PySide6.QtWidgets import (
 from scipy import stats
 
 import saxshell.saxs.project_manager.project as project_module
+import saxshell.saxs.ui.main_window as saxs_ui_main_window_module
 import saxshell.saxs.ui.prefit_tab as prefit_tab_module
 from saxshell.clusterdynamicsml.workflow import (
     ClusterDynamicsMLTrainingObservation,
     PredictedClusterCandidate,
 )
+from saxshell.fullrmc import (
+    PackmolDockerLink,
+    load_packmol_docker_link_metadata,
+)
+from saxshell.fullrmc.project_model import build_rmcsetup_paths
+from saxshell.fullrmc.representatives import (
+    DistributionSelectionMetadata,
+    RepresentativeSelectionEntry,
+    RepresentativeSelectionIssue,
+    RepresentativeSelectionMetadata,
+    RepresentativeSelectionSettings,
+)
+from saxshell.plotting import Q_A_INVERSE_LABEL, load_pickled_plot_figure
 from saxshell.saxs._model_templates import (
     list_template_specs,
     load_template_module,
@@ -64,11 +78,24 @@ from saxshell.saxs.contrast.representatives import (
 )
 from saxshell.saxs.contrast.settings import (
     COMPONENT_BUILD_MODE_BORN_APPROXIMATION,
+    COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT,
     COMPONENT_BUILD_MODE_CONTRAST,
     COMPONENT_BUILD_MODE_NO_CONTRAST,
     ContrastRepresentativeSamplerSettings,
 )
 from saxshell.saxs.contrast.ui.main_window import ContrastModeMainWindow
+from saxshell.saxs.contrast_fft import (
+    ContrastFFTResult,
+    ContrastFFTSettings,
+    ContrastFFTTiming,
+)
+from saxshell.saxs.contrast_fft.ui.main_window import (
+    FFTBornApproximationMainWindow,
+    _FFTComputationPayload,
+    _FFTComputationWorker,
+    _FFTProfileComputationResult,
+    _FFTProfileTarget,
+)
 from saxshell.saxs.debye.profiles import AveragedComponent, ClusterBin
 from saxshell.saxs.dream import (
     DreamParameterEntry,
@@ -76,6 +103,9 @@ from saxshell.saxs.dream import (
     SAXSDreamResultsLoader,
     SAXSDreamWorkflow,
     load_dream_settings,
+)
+from saxshell.saxs.electron_density_mapping.workflow import (
+    load_electron_density_structure,
 )
 from saxshell.saxs.model_report import export_dream_model_report_pptx
 from saxshell.saxs.prefit import (
@@ -87,6 +117,7 @@ from saxshell.saxs.prefit import (
 from saxshell.saxs.prefit.workflow import PrefitFitResult
 from saxshell.saxs.project_manager import (
     ClusterImportResult,
+    DreamBestFitSelection,
     ExperimentalDataSummary,
     PowerPointExportSettings,
     ProjectSettings,
@@ -112,6 +143,7 @@ from saxshell.saxs.ui.experimental_data_loader import (
 )
 from saxshell.saxs.ui.main_window import (
     AUTO_SNAP_PANES_KEY,
+    PACKMOL_DOCKER_PRESETS_KEY,
     PROJECT_LOAD_TOTAL_STEPS,
     InstallModelDialog,
     RuntimeBundleOpener,
@@ -131,6 +163,9 @@ from saxshell.version import __version__
 
 POLY_LMA_HS_TEMPLATE = "template_pydream_poly_lma_hs"
 POLY_LMA_HS_MIX_TEMPLATE = "template_pydream_poly_lma_hs_mix_approx"
+SCALED_SOLVENT_MONOSQ_TEMPLATE = (
+    "template_pydream_monosq_normalized_scaled_solvent"
+)
 
 
 def _table_column_index(table, label: str) -> int:
@@ -339,6 +374,22 @@ def _build_minimal_saxs_project(
         settings.pdb_frames_dir = str(pdb_frames_dir)
     manager.save_project(settings)
     return project_dir, paths
+
+
+def _write_representative_selection_metadata(
+    project_dir: Path,
+    metadata: RepresentativeSelectionMetadata,
+) -> Path:
+    rmcsetup_paths = build_rmcsetup_paths(project_dir)
+    rmcsetup_paths.representative_selection_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    rmcsetup_paths.representative_selection_path.write_text(
+        json.dumps(metadata.to_dict(), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return rmcsetup_paths.representative_selection_path
 
 
 def _write_predicted_structure_artifacts(
@@ -1468,6 +1519,79 @@ def test_prefit_single_solvent_weight_uses_combined_saxs_effective_multiplier(
         rel=1e-3,
     )
     assert "Applied solv_w =" in widget.output_box.toPlainText()
+    window.close()
+
+
+def test_prefit_scaled_solvent_monosq_applies_physical_vol_frac_target(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.selected_model_template = SCALED_SOLVENT_MONOSQ_TEMPLATE
+    manager.save_project(settings)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    window.prefit_tab.solute_volume_fraction_collapse_button.click()
+    widget = window.prefit_tab.solute_volume_fraction_widget
+    widget.solution_density_spin.setValue(1.0)
+    widget.solute_stoich_edit.setText("Cs1Pb1I3")
+    widget.solvent_stoich_edit.setText("H2O")
+    widget.molar_mass_solute_spin.setValue(620.0)
+    widget.molar_mass_solvent_spin.setValue(18.015)
+    widget.mass_solute_spin.setValue(1.0)
+    widget.mass_solvent_spin.setValue(9.0)
+    widget.solute_density_spin.setValue(2.0)
+    widget.solvent_density_spin.setValue(1.0)
+
+    expected_settings = widget.current_estimator_settings()
+    expected_estimate = calculate_solution_scattering_estimate(
+        SolutionScatteringEstimatorSettings(
+            solution=expected_settings.solution,
+            solute_density_g_per_ml=expected_settings.solute_density_g_per_ml,
+            solvent_density_g_per_ml=expected_settings.solvent_density_g_per_ml,
+            calculate_number_density=expected_settings.calculate_number_density,
+            calculate_solute_volume_fraction=(
+                expected_settings.calculate_solute_volume_fraction
+            ),
+            calculate_solvent_scattering_contribution=(
+                expected_settings.calculate_solvent_scattering_contribution
+            ),
+            calculate_sample_fluorescence_yield=(
+                expected_settings.calculate_sample_fluorescence_yield
+            ),
+            beam=expected_settings.beam,
+        )
+    )
+
+    widget.calculate_button.click()
+
+    vol_frac_row = window.prefit_tab.find_parameter_row("vol_frac")
+    assert vol_frac_row >= 0
+    assert float(
+        window.prefit_tab.parameter_table.item(vol_frac_row, 3).text()
+    ) == pytest.approx(
+        expected_estimate.volume_fraction_estimate.solute_volume_fraction,
+        rel=1e-3,
+    )
+    assert float(
+        window.prefit_tab.parameter_table.item(vol_frac_row, 6).text()
+    ) == pytest.approx(0.5)
+    solvent_row = window.prefit_tab.find_parameter_row("solv_w")
+    assert solvent_row >= 0
+    assert float(
+        window.prefit_tab.parameter_table.item(solvent_row, 3).text()
+    ) == pytest.approx(
+        expected_estimate.attenuation_estimate.solvent_scattering_scale_factor
+        * expected_estimate.interaction_contrast_estimate.saxs_effective_solvent_background_ratio,
+        rel=1e-3,
+    )
+    output_text = widget.output_box.toPlainText()
+    assert "Applied vol_frac =" in output_text
+    assert "physical bulk volume fraction" in output_text
+    assert "Applied solv_w =" in output_text
     window.close()
 
 
@@ -2740,6 +2864,10 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert window.save_project_action.text() == "Save Project"
     assert window.save_project_action.shortcuts()
     assert window.save_project_as_action.text() == "Save Project As..."
+    assert window.link_packmol_docker_action.text() == (
+        "Link Packmol Docker Container..."
+    )
+    assert window.link_packmol_docker_action.isEnabled() is True
     assert all(
         button.text() != "Save Project State"
         for button in window.project_setup_tab.project_group.findChildren(
@@ -2751,6 +2879,8 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert window.md_extraction_menu.title() == "MD Extraction"
     assert window.structure_analysis_menu.title() == "Structure Analysis"
     assert window.visualization_menu.title() == "Visualization"
+    assert window.cli_setup_menu.title() == "CLI Setup"
+    assert window.beta_menu.title() == "(beta)"
     assert window.mdtrajectory_action.text() == "Open MD Trajectory Extraction"
     assert window.xyz2pdb_action.text() == "Open XYZ -> PDB Conversion"
     assert window.cluster_action.text() == "Open Cluster Extraction"
@@ -2758,6 +2888,10 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert (
         window.debye_waller_analysis_action.text()
         == "Open Debye-Waller Analysis"
+    )
+    assert (
+        window.project_setup_tab.debye_waller_button.text()
+        == "Compute Debye-Waller Factors (beta)"
     )
     assert [action.text() for action in window.tools_menu.actions()] == [
         "MD Extraction",
@@ -2767,6 +2901,8 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
         "Visualization",
         "SAXS Calculation Preview",
         "X-ray Toolkit",
+        "CLI Setup",
+        "(beta)",
     ]
     assert [
         action.text() for action in window.md_extraction_menu.actions()
@@ -2779,7 +2915,25 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
         action.text() for action in window.structure_analysis_menu.actions()
     ] == [
         "Open Bond Analysis",
-        "Open Debye-Waller Analysis",
+        "Open Representative Structures",
+    ]
+    window._build_menu_bar()
+    assert [action.text() for action in window.tools_menu.actions()] == [
+        "MD Extraction",
+        "Structure Analysis",
+        "Cluster Dynamics",
+        "PDF",
+        "Visualization",
+        "SAXS Calculation Preview",
+        "X-ray Toolkit",
+        "CLI Setup",
+        "(beta)",
+    ]
+    assert [
+        action.text() for action in window.structure_analysis_menu.actions()
+    ] == [
+        "Open Bond Analysis",
+        "Open Representative Structures",
     ]
     assert (
         window.clusterdynamics_action.text() == "Open Cluster Dynamics (only)"
@@ -2787,16 +2941,30 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert (
         window.clusterdynamicsml_action.text() == "Open Cluster Dynamics (ML)"
     )
-    assert window.fullrmc_action.text() == "Open fullrmc Setup"
+    assert [
+        action.text() for action in window.cluster_dynamics_menu.actions()
+    ] == ["Open Cluster Dynamics (ML)"]
+    assert window.fullrmc_action.text() == "Open RMC Setup (fullrmc)"
     assert window.structure_viewer_action.text() == "Structure Viewer"
     assert window.blenderxyz_action.text() == "Open Blender XYZ Renderer"
+    assert (
+        window.representative_finder_action.text()
+        == "Open Representative Structures"
+    )
     assert window.component_calculation_preview_menu.title() == (
         "SAXS Calculation Preview"
     )
-    assert window.contrast_mode_action.text() == "Open SAXS Contrast Mode"
+    assert (
+        window.contrast_mode_action.text()
+        == "Open Debye Scattering (Contrast Mode)"
+    )
     assert (
         window.electron_density_mapping_action.text()
-        == "Open Electron Density Mapping"
+        == "Open 1D Born Approximation"
+    )
+    assert (
+        window.fft_born_approximation_action.text()
+        == "Open 3D FFT Born Approximation"
     )
     assert window.xray_toolkit_menu.title() == "X-ray Toolkit"
     assert (
@@ -2805,6 +2973,22 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert (
         window.number_density_action.text() == "Open Number Density Estimate"
     )
+    assert (
+        window.solvent_shell_builder_action.text()
+        == "Open Solvent Shell Builder (Beta)"
+    )
+    assert (
+        window.representative_cli_setup_action.text()
+        == "Open Representative CLI Setup (Beta)"
+    )
+    assert [action.text() for action in window.cli_setup_menu.actions()] == [
+        "Open Representative CLI Setup (Beta)",
+    ]
+    assert [action.text() for action in window.beta_menu.actions()] == [
+        "Open Cluster Dynamics (only)",
+        "Open Debye-Waller Analysis",
+        "Open Solvent Shell Builder (Beta)",
+    ]
 
     assert window.settings_menu.title() == "Settings"
     assert (
@@ -2823,6 +3007,75 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert "15-inch / 16-inch Laptop" in preset_labels
     assert "External Display (1080p)" in preset_labels
     assert "External Display (1440p / QHD)" in preset_labels
+
+
+def test_file_menu_can_link_packmol_docker_before_opening_fullrmc(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+
+    class _FakeSettings:
+        def __init__(self):
+            self.values: dict[str, object] = {}
+
+        def value(self, key, default=None):
+            return self.values.get(key, default)
+
+        def setValue(self, key, value):
+            self.values[key] = value
+
+    settings_store = _FakeSettings()
+    linked = PackmolDockerLink(
+        display_name="Main UI Packmol",
+        container_name="packmol-main-ui",
+        container_project_root="/packmol_input_files/project_alpha",
+        packmol_command="packmol",
+        shell_command="sh",
+        packmol_version="Packmol version 20.14.4",
+        last_verified_at="2026-04-17T13:00:00",
+        container_id="sha256:mainui",
+        image_name="packmol:test-image",
+        packmol_command_path="/usr/local/bin/packmol",
+    )
+
+    class _FakeDialog:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def exec(self):
+            return 1
+
+        def selected_link(self):
+            return PackmolDockerLink.from_dict(linked.to_dict())
+
+    monkeypatch.setattr(
+        SAXSMainWindow,
+        "_packmol_docker_settings",
+        lambda self: settings_store,
+    )
+    monkeypatch.setattr(
+        saxs_ui_main_window_module,
+        "PackmolDockerLinkDialog",
+        _FakeDialog,
+    )
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    window._open_packmol_docker_link_dialog()
+
+    metadata_path = project_dir / "rmcsetup" / "packmol_docker_link.json"
+    saved = load_packmol_docker_link_metadata(metadata_path)
+    assert saved is not None
+    assert saved.container_name == "packmol-main-ui"
+    assert saved.packmol_version == "Packmol version 20.14.4"
+    assert window.statusBar().currentMessage() == (
+        "Linked Packmol Docker container packmol-main-ui"
+    )
+    raw_presets = settings_store.value(PACKMOL_DOCKER_PRESETS_KEY, "[]")
+    preset_payload = json.loads(raw_presets)
+    assert preset_payload[0]["container_name"] == "packmol-main-ui"
 
 
 def test_project_setup_shows_prep_help_tooltips(qapp):
@@ -4712,6 +4965,294 @@ def test_electron_density_mapping_tool_uses_active_structure_folder(
     window.close()
 
 
+def test_3d_fft_born_tool_uses_active_structure_folder(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    pdb_frames_dir = tmp_path / "pdb_frames"
+    pdb_frames_dir.mkdir()
+    xyz_frames_dir = tmp_path / "xyz_frames"
+    xyz_frames_dir.mkdir()
+    window.current_settings.pdb_frames_dir = str(pdb_frames_dir.resolve())
+    window.current_settings.frames_dir = str(xyz_frames_dir.resolve())
+    window.current_settings.use_representative_structures = True
+    window.project_manager.save_project(window.current_settings)
+    launched: dict[str, object] = {}
+
+    class FakeFFTBornWindow(QWidget):
+        def __init__(self):
+            super().__init__()
+            launched["instance"] = self
+
+    def fake_launch_3d_fft_born_approximation_ui(**kwargs):
+        launched.update(kwargs)
+        return FakeFFTBornWindow()
+
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast_fft.ui.main_window.launch_3d_fft_born_approximation_ui",
+        fake_launch_3d_fft_born_approximation_ui,
+    )
+
+    window._open_3d_fft_born_approximation_tool()
+
+    assert launched["initial_project_dir"] == Path(project_dir).resolve()
+    assert launched["initial_input_path"] == pdb_frames_dir.resolve()
+    assert launched["initial_use_representative_structures"] is True
+    assert launched["preview_mode"] is True
+    assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
+def test_fft_project_representative_targets_preserve_fullsolv_source_mode(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    structure_path = tmp_path / "representative_fullsolv.xyz"
+    structure_path.write_text(
+        "\n".join(
+            [
+                "7",
+                "full solvent representative",
+                "Pb 0.0 0.0 0.0",
+                "O 3.0 0.0 0.0",
+                "H 3.6 0.7 0.0",
+                "H 2.4 0.7 0.0",
+                "O 6.0 0.0 0.0",
+                "H 6.6 0.7 0.0",
+                "H 5.4 0.7 0.0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    selection = DreamBestFitSelection(
+        run_name="Representative Structure Finder",
+        run_relative_path="rmcsetup/representative_structures",
+        label="Representative Structure Finder",
+        selection_source="representativefinder",
+        selected_at="2026-05-06T12:00:00",
+    )
+    metadata = RepresentativeSelectionMetadata(
+        selection_mode="representative_finder",
+        selection=selection,
+        distribution_selection=DistributionSelectionMetadata(
+            selection_mode="representative_finder",
+            selection=selection,
+            run_dir="rmcsetup/representative_structures",
+            updated_at="2026-05-06T12:00:00",
+            entries=[],
+        ),
+        settings=RepresentativeSelectionSettings(),
+        updated_at="2026-05-06T12:00:00",
+        representative_entries=[
+            RepresentativeSelectionEntry(
+                structure="Pb",
+                motif="no_motif",
+                param="Pb",
+                selected_weight=1.0,
+                cluster_count=1,
+                source_dir=str(structure_path.parent),
+                source_file=str(structure_path),
+                source_file_name=structure_path.name,
+                atom_count=7,
+                element_counts={"Pb": 1, "O": 2, "H": 4},
+                source_solvent_mode="fullsolv",
+            )
+        ],
+        missing_bins=[],
+        invalid_bins=[],
+    )
+    project_source = SimpleNamespace(
+        representative_selection=metadata,
+        solvent_handling=None,
+    )
+    window = FFTBornApproximationMainWindow(
+        preview_mode=True,
+        initial_project_dir=tmp_path,
+    )
+    monkeypatch.setattr(window, "_project_source", lambda: project_source)
+
+    targets = window._representative_targets_from_project_source()
+
+    assert set(targets) == {("representative", "full")}
+    assert len(targets[("representative", "full")]) == 1
+    target = targets[("representative", "full")][0]
+    assert target.solvent_mode == "full"
+    assert target.reference_file == structure_path.resolve()
+    window.close()
+
+
+def test_fft_average_cluster_targets_use_every_structure_in_cluster_folder(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    clusters_dir = tmp_path / "clusters"
+    structure_dir = clusters_dir / "PbI"
+    structure_dir.mkdir(parents=True)
+    frame_paths = []
+    for index in range(2):
+        frame_path = structure_dir / f"frame_{index + 1:04d}.xyz"
+        frame_path.write_text(
+            "\n".join(
+                [
+                    "2",
+                    frame_path.stem,
+                    "Pb 0.0 0.0 0.0",
+                    f"I {2.8 + index:.1f} 0.0 0.0",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        frame_paths.append(frame_path.resolve())
+
+    window = FFTBornApproximationMainWindow(preview_mode=True)
+    window._load_input_path(clusters_dir)
+
+    target = window._active_profile_target()
+    assert target is not None
+    assert target.source_mode == "average"
+    assert target.file_count == 2
+    assert target.source_files == tuple(frame_paths)
+    window.close()
+
+
+def test_fft_representative_root_loads_singular_metadata_sources(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    representative_root = tmp_path / "rmcsetup" / "representative_structures"
+    source_dir = representative_root / "partialsolv" / "PbI"
+    source_dir.mkdir(parents=True)
+    representative_path = source_dir / "selected_rep.xyz"
+    stale_path = source_dir / "stale_extra.xyz"
+    representative_text = (
+        "\n".join(
+            [
+                "2",
+                "selected representative",
+                "Pb 0.0 0.0 0.0",
+                "I 2.8 0.0 0.0",
+            ]
+        )
+        + "\n"
+    )
+    representative_path.write_text(representative_text, encoding="utf-8")
+    stale_path.write_text(representative_text, encoding="utf-8")
+    selection = DreamBestFitSelection(
+        run_name="Representative Structure Finder",
+        run_relative_path="rmcsetup/representative_structures",
+        label="Representative Structure Finder",
+        selection_source="representativefinder",
+        selected_at="2026-05-06T12:00:00",
+    )
+    metadata = RepresentativeSelectionMetadata(
+        selection_mode="representative_finder",
+        selection=selection,
+        distribution_selection=DistributionSelectionMetadata(
+            selection_mode="representative_finder",
+            selection=selection,
+            run_dir="rmcsetup/representative_structures",
+            updated_at="2026-05-06T12:00:00",
+            entries=[],
+        ),
+        settings=RepresentativeSelectionSettings(),
+        updated_at="2026-05-06T12:00:00",
+        representative_entries=[
+            RepresentativeSelectionEntry(
+                structure="PbI",
+                motif="no_motif",
+                param="PbI",
+                selected_weight=1.0,
+                cluster_count=5,
+                source_dir=str(source_dir),
+                source_file=str(representative_path),
+                source_file_name=representative_path.name,
+                atom_count=2,
+                element_counts={"Pb": 1, "I": 1},
+                source_solvent_mode="partialsolv",
+            )
+        ],
+        missing_bins=[],
+        invalid_bins=[],
+    )
+    project_source = SimpleNamespace(
+        representative_selection=metadata,
+        solvent_handling=None,
+    )
+    window = FFTBornApproximationMainWindow(
+        preview_mode=True,
+        initial_project_dir=tmp_path,
+        initial_use_representative_structures=True,
+    )
+    monkeypatch.setattr(window, "_project_source", lambda: project_source)
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_show_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    window._load_input_path(representative_root)
+
+    assert errors == []
+    assert window.structure_source_combo.currentData() == "representative"
+    target = window._active_profile_target()
+    assert target is not None
+    assert target.file_count == 1
+    assert target.source_files == (representative_path.resolve(),)
+    assert stale_path.resolve() not in target.source_files
+    window.close()
+
+
+def test_solvent_shell_builder_tool_uses_active_structure_folder(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    pdb_frames_dir = tmp_path / "pdb_frames"
+    pdb_frames_dir.mkdir()
+    xyz_frames_dir = tmp_path / "xyz_frames"
+    xyz_frames_dir.mkdir()
+    window.current_settings.pdb_frames_dir = str(pdb_frames_dir.resolve())
+    window.current_settings.frames_dir = str(xyz_frames_dir.resolve())
+    window.project_manager.save_project(window.current_settings)
+    launched: dict[str, object] = {}
+
+    class FakeSolventShellBuilderWindow(QWidget):
+        def __init__(self):
+            super().__init__()
+            launched["instance"] = self
+
+    def fake_launch_solvent_shell_builder_ui(**kwargs):
+        launched.update(kwargs)
+        return FakeSolventShellBuilderWindow()
+
+    monkeypatch.setattr(
+        "saxshell.fullrmc.ui.solvent_shell_builder_window.launch_solvent_shell_builder_ui",
+        fake_launch_solvent_shell_builder_ui,
+    )
+
+    window._open_solvent_shell_builder_tool()
+
+    assert launched["initial_project_dir"] == Path(project_dir).resolve()
+    assert launched["initial_input_path"] == pdb_frames_dir.resolve()
+    assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
 def test_open_contrast_mode_tool_does_not_auto_start_build(
     qapp,
     tmp_path,
@@ -4814,6 +5355,220 @@ def test_main_window_loads_contrast_distribution_after_tool_build_signal(
 
     assert loaded_distribution_ids == [artifact_paths.distribution_id]
     assert "built and loaded" in window.statusBar().currentMessage().lower()
+    window.close()
+
+
+def test_born_push_bootstraps_distribution_so_prefit_and_dream_can_load(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    from saxshell.saxs.electron_density_mapping.ui.main_window import (
+        ElectronDensityMappingMainWindow,
+        _ClusterDensityGroupState,
+    )
+    from saxshell.saxs.electron_density_mapping.workflow import (
+        ElectronDensityFourierTransformPreview,
+        ElectronDensityFourierTransformSettings,
+        ElectronDensityInputInspection,
+        ElectronDensityScatteringTransformResult,
+        ElectronDensityStructure,
+    )
+
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "born_push_project"
+    settings = manager.create_project(project_dir)
+    paths = build_project_paths(project_dir)
+
+    q_values = np.linspace(0.05, 0.3, 8)
+    component = np.linspace(10.0, 17.0, 8)
+    template_name = "template_pd_likelihood_monosq_decoupled"
+    template_module = load_template_module(template_name)
+    experimental = template_module.lmfit_model_profile(
+        q_values,
+        np.zeros_like(q_values),
+        [component],
+        w0=0.6,
+        solv_w=0.0,
+        offset=0.05,
+        eff_r=9.0,
+        vol_frac=0.0,
+        scale=5e-4,
+    )
+
+    experimental_path = paths.experimental_data_dir / "exp_demo.txt"
+    np.savetxt(experimental_path, np.column_stack([q_values, experimental]))
+
+    cluster_dir = paths.project_dir / "clusters" / "A"
+    cluster_dir.mkdir(parents=True, exist_ok=True)
+    frame_path = cluster_dir / "frame_0001.xyz"
+    frame_path.write_text(
+        "\n".join(
+            [
+                "3",
+                "frame_0001",
+                "Pb 0.0 0.0 0.0",
+                "I 2.8 0.0 0.0",
+                "I 0.0 2.8 0.0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    settings.clusters_dir = str(paths.project_dir / "clusters")
+    settings.experimental_data_path = str(experimental_path)
+    settings.copied_experimental_data_file = str(experimental_path)
+    settings.selected_model_template = template_name
+    settings.component_build_mode = COMPONENT_BUILD_MODE_BORN_APPROXIMATION
+    settings.use_experimental_grid = False
+    settings.q_min = float(q_values.min())
+    settings.q_max = float(q_values.max())
+    settings.q_points = int(q_values.size)
+    manager.save_project(settings)
+
+    artifact_paths = project_artifact_paths(
+        settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+    assert not artifact_paths.distribution_metadata_file.is_file()
+    assert not artifact_paths.prior_weights_file.is_file()
+
+    window = ElectronDensityMappingMainWindow(
+        initial_project_dir=project_dir.resolve(),
+        initial_distribution_id=artifact_paths.distribution_id,
+        initial_distribution_root_dir=artifact_paths.root_dir,
+        preview_mode=False,
+    )
+
+    inspection = ElectronDensityInputInspection(
+        selection_path=cluster_dir,
+        input_mode="folder",
+        structure_files=(frame_path,),
+        reference_file=frame_path,
+        format_counts={"xyz": 1},
+    )
+    reference_structure = ElectronDensityStructure(
+        file_path=frame_path,
+        display_label="frame_0001.xyz",
+        structure_comment="frame_0001",
+        coordinates=np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [2.8, 0.0, 0.0],
+                [0.0, 2.8, 0.0],
+            ],
+            dtype=float,
+        ),
+        centered_coordinates=np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [2.8, 0.0, 0.0],
+                [0.0, 2.8, 0.0],
+            ],
+            dtype=float,
+        ),
+        elements=("Pb", "I", "I"),
+        element_counts={"Pb": 1, "I": 2},
+        atomic_numbers=np.asarray([82.0, 53.0, 53.0], dtype=float),
+        atomic_masses=np.asarray([207.2, 126.9, 126.9], dtype=float),
+        center_of_mass=np.asarray([0.0, 0.0, 0.0], dtype=float),
+        geometric_center=np.asarray([0.0, 0.0, 0.0], dtype=float),
+        reference_element="Pb",
+        reference_element_geometric_center=np.asarray(
+            [0.0, 0.0, 0.0], dtype=float
+        ),
+        reference_element_offset_from_geometric_center=0.0,
+        active_center=np.asarray([0.0, 0.0, 0.0], dtype=float),
+        center_mode="center_of_mass",
+        nearest_atom_index=0,
+        nearest_atom_distance=0.0,
+        bonds=((0, 1), (0, 2)),
+        rmax=2.8,
+    )
+    fourier_settings = ElectronDensityFourierTransformSettings(
+        r_min=0.0,
+        r_max=5.0,
+        domain_mode="mirrored",
+        window_function="hanning",
+        resampling_points=2048,
+        q_min=float(q_values.min()),
+        q_max=float(q_values.max()),
+        q_step=float(q_values[1] - q_values[0]),
+    )
+    preview = ElectronDensityFourierTransformPreview(
+        settings=fourier_settings,
+        source_profile_label="A",
+        source_radial_values=np.asarray([0.0, 1.0], dtype=float),
+        source_density_values=np.asarray([1.0, 0.5], dtype=float),
+        resampled_r_values=np.asarray([0.0, 1.0], dtype=float),
+        resampled_density_values=np.asarray([1.0, 0.5], dtype=float),
+        window_values=np.asarray([1.0, 1.0], dtype=float),
+        windowed_density_values=np.asarray([1.0, 0.5], dtype=float),
+        available_r_min=0.0,
+        available_r_max=1.0,
+        resampling_step_a=0.5,
+        nyquist_q_max_a_inverse=1.0,
+        independent_q_step_a_inverse=float(q_values[1] - q_values[0]),
+        q_grid_is_oversampled=False,
+        q_max_was_clamped=False,
+        notes=(),
+        source_mode="density_fourier",
+    )
+    transform_result = ElectronDensityScatteringTransformResult(
+        preview=preview,
+        q_values=np.asarray(q_values, dtype=float),
+        scattering_amplitude=np.sqrt(component),
+        intensity=np.asarray(component, dtype=float),
+    )
+    window._cluster_group_states = [
+        _ClusterDensityGroupState(
+            key="A",
+            display_name="A",
+            structure_name="A",
+            motif_name="no_motif",
+            source_dir=cluster_dir,
+            inspection=inspection,
+            reference_structure=reference_structure,
+            average_atom_count=3.0,
+            single_atom_only=False,
+            trace_color="#2563eb",
+            transform_result=transform_result,
+        )
+    ]
+    window._selected_cluster_group_key = "A"
+
+    window._push_components_to_model()
+
+    assert artifact_paths.distribution_metadata_file.is_file()
+    assert artifact_paths.prior_weights_file.is_file()
+    assert artifact_paths.component_map_file.is_file()
+    assert any(artifact_paths.component_dir.glob("*.txt"))
+
+    saved_record = manager.load_saved_distribution(
+        project_dir,
+        artifact_paths.distribution_id,
+    )
+    assert saved_record.component_artifacts_ready
+    assert saved_record.prior_artifacts_ready
+
+    prefit_workflow = SAXSPrefitWorkflow(project_dir)
+    assert [
+        (component.structure, component.motif)
+        for component in prefit_workflow.components
+    ] == [("A", "no_motif")]
+    assert np.allclose(prefit_workflow.evaluate().q_values, q_values)
+
+    dream_workflow = SAXSDreamWorkflow(project_dir)
+    assert [
+        (component.structure, component.motif)
+        for component in dream_workflow.prefit_workflow.components
+    ] == [("A", "no_motif")]
+    assert np.allclose(
+        dream_workflow.prefit_workflow.evaluate().q_values,
+        q_values,
+    )
     window.close()
 
 
@@ -5612,7 +6367,7 @@ def test_contrast_mode_workspace_reloads_saved_distribution_artifacts(
         experimental_axis.get_title()
         == "Experimental Data and Contrast Traces"
     )
-    assert experimental_axis.get_xlabel() == "q (Å⁻¹)"
+    assert experimental_axis.get_xlabel() == Q_A_INVERSE_LABEL
     assert (
         experimental_axis.get_ylabel() == "Experimental Intensity (arb. units)"
     )
@@ -7654,7 +8409,18 @@ def test_project_setup_component_build_mode_defaults_and_round_trips(qapp):
     )
     assert (
         tab.component_build_mode_combo.currentText()
-        == "Born Approximation (Average)"
+        == "1D Born Approximation (Average)"
+    )
+    tab.set_component_build_mode(
+        COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
+    )
+    assert (
+        tab.component_build_mode()
+        == COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
+    )
+    assert (
+        tab.component_build_mode_combo.currentText()
+        == "3D FFT Born Approximation"
     )
 
     tab.set_project_settings(settings, [])
@@ -8804,7 +9570,7 @@ def test_dream_model_plot_includes_residual_subplot(qapp, tmp_path):
     residual_axis = window.dream_tab.model_figure.axes[1]
     assert top_axis.get_title().startswith("DREAM refinement:")
     assert residual_axis.get_ylabel() == "Residual"
-    assert residual_axis.get_xlabel() == "q (Å⁻¹)"
+    assert residual_axis.get_xlabel() == Q_A_INVERSE_LABEL
     assert residual_axis.get_xscale() == top_axis.get_xscale()
 
     residual_line = residual_axis.get_lines()[-1]
@@ -10670,6 +11436,57 @@ def test_prefit_recommended_scale_button_updates_scale_bounds(qapp, tmp_path):
     )
 
 
+def test_scaled_solvent_monosq_auto_autoscales_on_project_load(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    q_values = np.linspace(0.05, 0.3, 8)
+    component = np.linspace(10.0, 17.0, 8)
+    experimental_scale = 2e-7
+    experimental_offset = 0.01
+    template_module = load_template_module(SCALED_SOLVENT_MONOSQ_TEMPLATE)
+    experimental = template_module.lmfit_model_profile(
+        q_values,
+        np.zeros_like(q_values),
+        [component],
+        w0=0.6,
+        solv_w=0.0,
+        offset=experimental_offset,
+        eff_r=3.0,
+        vol_frac=0.0,
+        scale=experimental_scale,
+    )
+    experimental_path = paths.experimental_data_dir / "adaptive_exp_demo.txt"
+    np.savetxt(experimental_path, np.column_stack([q_values, experimental]))
+
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.selected_model_template = SCALED_SOLVENT_MONOSQ_TEMPLATE
+    settings.experimental_data_path = str(experimental_path)
+    settings.copied_experimental_data_file = str(experimental_path)
+    manager.save_project(settings)
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    entries = {
+        entry.name: entry for entry in window.prefit_tab.parameter_entries()
+    }
+
+    assert entries["eff_r"].value == pytest.approx(3.0)
+    assert entries["scale"].value == pytest.approx(experimental_scale)
+    assert entries["scale"].minimum == pytest.approx(experimental_scale / 10.0)
+    assert entries["scale"].maximum == pytest.approx(experimental_scale * 10.0)
+    assert entries["scale"].vary
+    assert entries["offset"].value == pytest.approx(experimental_offset)
+    assert entries["offset"].minimum == pytest.approx(0.009)
+    assert entries["offset"].maximum == pytest.approx(0.011)
+    assert "Applied initial autoscale settings" in (
+        window.prefit_tab.output_box.toPlainText()
+    )
+    window.close()
+
+
 def test_prefit_tab_reorders_controls_and_parameter_actions(qapp):
     del qapp
     tab = PrefitTab()
@@ -11879,6 +12696,285 @@ def test_solvent_sort_prior_histogram_does_not_auto_match_component_colors(
     assert prior_window.structure_motif_colors is None
 
 
+def test_project_setup_prior_histogram_plot_editor_applies_settings(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    json_path = tmp_path / "md_prior_weights.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "origin": "clusters",
+                "total_files": 5,
+                "structures": {
+                    "PbI2": {
+                        "motif_A": {
+                            "count": 2,
+                            "weight": 0.4,
+                            "profile_file": "PbI2_motif_A.txt",
+                        }
+                    },
+                    "Pb2I4": {
+                        "motif_B": {
+                            "count": 3,
+                            "weight": 0.6,
+                            "profile_file": "Pb2I4_motif_B.txt",
+                        }
+                    },
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    tab = ProjectSetupTab()
+    tab.set_project_selected(True)
+    tab.show()
+    tab.draw_prior_plot(json_path)
+    QApplication.processEvents()
+
+    assert tab.open_prior_plot_editor_button.isEnabled()
+
+    tab.open_prior_plot_editor_button.click()
+    QApplication.processEvents()
+
+    assert tab._prior_plot_editor_window is not None
+    assert tab._prior_plot_editor_controls is not None
+
+    controls = tab._prior_plot_editor_controls
+    controls.title_edit.setText("Edited Prior Histogram")
+    controls.x_label_edit.setText("Cluster Bin")
+    controls.y_label_edit.setText("Population (%)")
+    controls.legend_title_edit.setText("Segment Class")
+    controls.colormap_combo.setCurrentIndex(
+        controls.colormap_combo.findData("viridis")
+    )
+    controls.show_total_annotations_checkbox.setChecked(False)
+    controls.legend_location_combo.setCurrentIndex(
+        controls.legend_location_combo.findData("upper_left")
+    )
+    controls.x_tick_rotation_spin.setValue(12)
+    controls.label_table.setCurrentCell(1, 1)
+    controls._move_label_up()
+    controls.label_table.item(0, 1).setText(r"\f01Pb$_{2}$I$_{4}$")
+    QApplication.processEvents()
+
+    axis = tab.prior_figure.axes[0]
+    tick_texts = [
+        tick.get_text()
+        for tick in axis.get_xticklabels()
+        if tick.get_text().strip()
+    ]
+    legend = axis.get_legend()
+    assert axis.get_title() == "Edited Prior Histogram"
+    assert axis.get_xlabel() == "Cluster Bin"
+    assert axis.get_ylabel() == "Population (%)"
+    assert legend is not None
+    assert legend.get_title().get_text() == "Segment Class"
+    assert legend._loc == 2
+    assert tab.prior_color_combo.currentText() == "viridis"
+    assert tab.prior_x_axis_order_combo.currentData() == "custom"
+    assert tab.prior_histogram_x_axis_order()[0][0] == "Pb2I4"
+    assert r"\mathbf{Pb}" in tick_texts[0]
+    assert not any(text.get_text().endswith("%") for text in axis.texts)
+    assert axis.patches
+    assert to_hex(axis.patches[0].get_facecolor()) == to_hex(
+        colormaps["viridis"](0.1)
+    )
+
+    tab._prior_plot_editor_window.close()
+    tab.close()
+
+
+def test_project_setup_prior_histogram_restored_axes_keep_auto_labels(
+    qapp,
+    tmp_path,
+):
+    json_path = tmp_path / "md_prior_weights.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "origin": "clusters",
+                "total_files": 5,
+                "structures": {
+                    "PbI2": {
+                        "motif_A": {
+                            "count": 2,
+                            "weight": 0.4,
+                            "profile_file": "PbI2_motif_A.txt",
+                        }
+                    },
+                    "Pb2I4": {
+                        "motif_B": {
+                            "count": 3,
+                            "weight": 0.6,
+                            "profile_file": "Pb2I4_motif_B.txt",
+                        }
+                    },
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    tab = ProjectSetupTab()
+    tab.set_project_selected(True)
+    tab.draw_prior_plot(json_path)
+    qapp.processEvents()
+
+    tab.set_prior_plot_state(
+        {
+            "axes": [
+                {
+                    "xscale": "linear",
+                    "yscale": "linear",
+                    "xlim": [-0.25, 1.25],
+                    "ylim": [0.0, 120.0],
+                }
+            ]
+        }
+    )
+    qapp.processEvents()
+
+    axis = tab.prior_figure.axes[0]
+    tick_texts = [
+        tick.get_text()
+        for tick in axis.get_xticklabels()
+        if tick.get_text().strip()
+    ]
+
+    assert tick_texts == ["PbI$_{2}$", "Pb$_{2}$I$_{4}$"]
+    assert axis.get_xlim() == pytest.approx((-0.25, 1.25))
+    assert axis.get_ylim() == pytest.approx((0.0, 120.0))
+    tab.close()
+
+
+def test_project_setup_prior_histogram_plot_editor_can_save_and_load_pickled_state(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    json_path = tmp_path / "md_prior_weights.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "origin": "clusters",
+                "total_files": 5,
+                "structures": {
+                    "A": {
+                        "motif_A": {
+                            "count": 3,
+                            "weight": 0.6,
+                            "profile_file": "A_motif_A.txt",
+                        }
+                    },
+                    "A2": {
+                        "motif_B": {
+                            "count": 2,
+                            "weight": 0.4,
+                            "profile_file": "A2_motif_B.txt",
+                        }
+                    },
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    tab = ProjectSetupTab()
+    tab.set_project_selected(True)
+    tab.show()
+    tab.draw_prior_plot(json_path)
+    QApplication.processEvents()
+    tab.open_prior_plot_editor_button.click()
+    QApplication.processEvents()
+
+    assert tab._prior_plot_editor_window is not None
+    assert tab._prior_plot_editor_controls is not None
+
+    editor = tab._prior_plot_editor_window
+    controls = tab._prior_plot_editor_controls
+    pickle_path = tmp_path / "saved_prior_histogram.pkl"
+
+    monkeypatch.setattr(
+        "saxshell.plotting.plot_editor.QFileDialog.getSaveFileName",
+        lambda *args, **kwargs: (
+            str(pickle_path),
+            "Pickled Plot Files (*.pkl)",
+        ),
+    )
+    monkeypatch.setattr(
+        "saxshell.plotting.plot_editor.QFileDialog.getOpenFileName",
+        lambda *args, **kwargs: (
+            str(pickle_path),
+            "Pickled Plot Files (*.pkl)",
+        ),
+    )
+
+    controls.title_edit.setText("Pickled Prior Histogram")
+    controls.legend_title_edit.setText("Saved Legend")
+    controls.colormap_combo.setCurrentIndex(
+        controls.colormap_combo.findData("magma")
+    )
+    controls.label_table.item(0, 1).setText("Alpha")
+    QApplication.processEvents()
+
+    assert editor.save_pickled_plot_as() == pickle_path
+    assert pickle_path.is_file()
+
+    pickled_figure = load_pickled_plot_figure(pickle_path)
+    assert pickled_figure.axes[0].get_title() == "Pickled Prior Histogram"
+    assert pickled_figure.axes[0].get_legend() is not None
+    assert (
+        pickled_figure.axes[0].get_legend().get_title().get_text()
+        == "Saved Legend"
+    )
+
+    controls.title_edit.setText("Live Prior Histogram")
+    controls.legend_title_edit.setText("Live Legend")
+    controls.colormap_combo.setCurrentIndex(
+        controls.colormap_combo.findData("summer")
+    )
+    controls.label_table.item(0, 1).setText("Live Alpha")
+    QApplication.processEvents()
+    assert tab.prior_figure.axes[0].get_title() == "Live Prior Histogram"
+    assert tab.prior_color_combo.currentText() == "summer"
+
+    assert editor.load_pickled_plot_as() == pickle_path
+    QApplication.processEvents()
+
+    assert not editor.is_showing_pickled_plot()
+    assert controls.title_edit.text() == "Pickled Prior Histogram"
+    assert controls.legend_title_edit.text() == "Saved Legend"
+    assert controls.colormap_combo.currentData() == "magma"
+    assert tab.prior_color_combo.currentText() == "magma"
+    assert tab.prior_x_axis_order_combo.currentData() == "custom"
+    assert (
+        tab.prior_figure.axes[0].get_xticklabels()[0].get_text().strip()
+        == "Alpha"
+    )
+    assert (
+        tab.prior_figure.axes[0].get_legend().get_title().get_text()
+        == "Saved Legend"
+    )
+
+    controls.title_edit.setText("Editable After Load")
+    QApplication.processEvents()
+    assert tab.prior_figure.axes[0].get_title() == "Editable After Load"
+    assert editor.figure.axes[0].get_title() == "Editable After Load"
+
+    tab._prior_plot_editor_window.close()
+    tab.close()
+
+
 def test_create_project_warns_before_overwriting_existing_folder(
     qapp, tmp_path, monkeypatch
 ):
@@ -12222,7 +13318,7 @@ def test_project_setup_preview_updates_with_experimental_q_range(
     assert tab.component_log_x_checkbox.isChecked()
     assert tab.component_log_y_checkbox.isChecked()
     assert preview_axis.get_title() == "Experimental Data Preview"
-    assert preview_axis.get_xlabel() == "q (Å⁻¹)"
+    assert preview_axis.get_xlabel() == Q_A_INVERSE_LABEL
     assert preview_axis.get_ylabel() == "Intensity (arb. units)"
     assert preview_axis.get_xscale() == "log"
     assert preview_axis.get_yscale() == "log"
@@ -12505,6 +13601,9 @@ def test_build_components_auto_refreshes_component_plot_for_built_distribution(
     QApplication.processEvents()
 
     assert window.project_setup_tab.computed_distribution_combo.count() == 1
+    assert "DREAM fits: 0" in (
+        window.project_setup_tab.computed_distribution_combo.itemText(0)
+    )
     assert (
         window.project_setup_tab.selected_distribution_id()
         == expected_distribution_id
@@ -12624,10 +13723,1808 @@ def test_build_components_in_born_approximation_launches_electron_density_workfl
         == COMPONENT_BUILD_MODE_BORN_APPROXIMATION
     )
     assert (
-        "Born Approximation (Average)"
+        "1D Born Approximation (Average)"
         in window.project_setup_tab.summary_box.toPlainText()
     )
     window.close()
+
+
+def test_build_project_components_opens_3d_fft_born_window(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    start_calls: list[str] = []
+    launched: list[dict[str, object]] = []
+    clusters_dir = project_dir / "clusters"
+    clusters_dir.mkdir()
+    stoich_dir = clusters_dir / "PbI2"
+    stoich_dir.mkdir()
+    (stoich_dir / "frame_0001.xyz").write_text(
+        "\n".join(
+            [
+                "3",
+                "frame_0001",
+                "Pb 0.0 0.0 0.0",
+                "I 2.8 0.0 0.0",
+                "I 0.0 2.8 0.0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    window.project_setup_tab.project_dir_edit.setText(
+        str(project_dir.resolve())
+    )
+    window.project_setup_tab.clusters_dir_edit.setText(
+        str(clusters_dir.resolve())
+    )
+    window.project_setup_tab.set_component_build_mode(
+        COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
+    )
+    monkeypatch.setattr(
+        window,
+        "_confirm_default_q_range_for_component_build",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        window,
+        "_start_project_task",
+        lambda task_name, *args, **kwargs: start_calls.append(task_name),
+    )
+    monkeypatch.setattr(
+        window,
+        "_open_3d_fft_born_approximation_tool",
+        lambda **kwargs: launched.append(kwargs),
+    )
+
+    window.build_project_components()
+
+    assert not start_calls
+    assert launched == [{"preview_mode": False}]
+    assert window.current_settings is not None
+    assert (
+        window.current_settings.component_build_mode
+        == COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
+    )
+    assert (
+        "3D FFT Born Approximation"
+        in window.project_setup_tab.summary_box.toPlainText()
+    )
+    window.close()
+
+
+def test_create_fft_distribution_resets_pushed_component_indicator(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    clusters_dir = project_dir / "clusters"
+    structure_dir = clusters_dir / "A"
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    (structure_dir / "frame_0001.xyz").write_text(
+        "1\nframe 1\nA 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    settings.clusters_dir = str(clusters_dir)
+    settings.component_build_mode = (
+        COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
+    )
+    manager.save_project(settings)
+
+    artifact_paths = project_artifact_paths(
+        settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+    manager.ensure_artifact_dirs(artifact_paths)
+    shutil.copytree(
+        paths.scattering_components_dir,
+        artifact_paths.component_dir,
+        dirs_exist_ok=True,
+    )
+    shutil.copy2(
+        paths.project_dir / "md_saxs_map.json",
+        artifact_paths.component_map_file,
+    )
+    manager._write_distribution_metadata(
+        settings,
+        artifact_paths=artifact_paths,
+        built_component_source_mode="average",
+    )
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert "#16a34a" in (
+        window.project_setup_tab.components_built_indicator.styleSheet()
+    )
+
+    def run_task_sync(
+        task_name,
+        task_fn,
+        *,
+        start_message,
+        settings=None,
+    ):
+        del start_message, settings
+        result = task_fn(lambda *_args, **_kwargs: None)
+        window._on_task_finished(task_name, result)
+
+    monkeypatch.setattr(window, "_start_project_task", run_task_sync)
+
+    window.build_prior_weights()
+    QApplication.processEvents()
+
+    metadata_payload = json.loads(
+        artifact_paths.distribution_metadata_file.read_text(encoding="utf-8")
+    )
+    component_files = (
+        list(artifact_paths.component_dir.glob("*.txt"))
+        if artifact_paths.component_dir.is_dir()
+        else []
+    )
+
+    assert "#6b7280" in (
+        window.project_setup_tab.components_built_indicator.styleSheet()
+    )
+    assert not artifact_paths.component_map_file.exists()
+    assert component_files == []
+    assert metadata_payload["component_artifacts_ready"] is False
+    assert metadata_payload["prior_artifacts_ready"] is True
+    window.close()
+
+
+def test_fft_born_main_window_uses_split_scrollable_layout(qapp):
+    del qapp
+    window = FFTBornApproximationMainWindow(preview_mode=True)
+    assert window.windowTitle() == "3D FFT Born Approximation (Preview)"
+    assert isinstance(window._pane_splitter, QSplitter)
+    assert isinstance(window._left_scroll_area, QScrollArea)
+    assert isinstance(window._right_scroll_area, QScrollArea)
+    assert "Preview Mode" in window.preview_mode_banner.text()
+    assert window.log_q_checkbox.isChecked()
+    assert window.log_intensity_checkbox.isChecked()
+    assert window.contrast_section.is_expanded
+    assert window.fft_settings_section.is_expanded
+    assert window.legacy_1d_settings_section.is_expanded is False
+    assert window.toggle_curve_legend_button.text() == "Hide Legend"
+    assert window.export_curve_csv_button.text() == "Export Plot CSV"
+    assert window.structure_viewer.show_mesh_checkbox.isChecked()
+    assert len(window.fft_box_visualizer.figure.axes) == 1
+    assert window.fft_box_visualizer.figure.axes[0].name == "3d"
+    for widget in (
+        window.q_min_spin,
+        window.q_max_spin,
+        window.q_step_spin,
+        window.spacing_spin,
+        window.sigma_spin,
+        window.min_box_length_spin,
+        window.padding_spin,
+    ):
+        assert widget.toolTip().strip()
+    assert "project q-range" in window.q_min_spin.toolTip()
+    assert "Nyquist limit" in window.spacing_spin.toolTip()
+    window.close()
+
+
+def test_tools_menu_3d_fft_action_triggers_preview_launch(qapp, monkeypatch):
+    del qapp
+    window = SAXSMainWindow()
+    launched: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        window,
+        "_open_3d_fft_born_approximation_tool",
+        lambda **kwargs: launched.append(kwargs),
+    )
+
+    window.fft_born_approximation_action.trigger()
+    QApplication.processEvents()
+
+    assert launched == [{"preview_mode": True}]
+    window.close()
+
+
+def test_fft_born_main_window_loads_mesh_preview_and_exports_curve_csv(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    structure_path = tmp_path / "preview.xyz"
+    structure_path.write_text(
+        "\n".join(
+            [
+                "3",
+                "preview",
+                "Pb 0.0 0.0 0.0",
+                "I 2.8 0.0 0.0",
+                "I 0.0 2.8 0.0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    window = FFTBornApproximationMainWindow(preview_mode=True)
+    window._load_input_path(structure_path)
+
+    assert window.structure_viewer.current_structure is not None
+    assert window.structure_viewer.current_mesh_geometry is not None
+    assert window.structure_viewer.show_mesh_checkbox.isChecked()
+    preview_axes = window.fft_box_visualizer.figure.axes
+    assert len(preview_axes) == 1
+    assert preview_axes[0].name == "3d"
+
+    q_values = np.asarray([0.01, 0.02, 0.03], dtype=float)
+    fft_settings = ContrastFFTSettings(
+        spacing_a=2.5,
+        gaussian_sigma_a=0.75,
+        minimum_box_length_a=640.0,
+        padding_a=24.0,
+    ).normalized()
+    fft_result = ContrastFFTResult(
+        settings=fft_settings,
+        q_values=q_values,
+        raw_intensity=np.asarray([1.0, 0.8, 0.6], dtype=float),
+        kernel_corrected_intensity=np.asarray([1.0, 0.85, 0.7], dtype=float),
+        q_shell_counts=np.asarray([8, 12, 16], dtype=int),
+        density_integral=180.0,
+        expected_weight=180.0,
+        contrast_density_integral=180.0,
+        expected_contrast_weight=180.0,
+        solvent_exclusion_volume_a3=0.0,
+        grid_shape=(257, 257, 257),
+        box_lengths_a=(642.5, 642.5, 642.5),
+        voxel_spacing_a=(2.5, 2.5, 2.5),
+        q_nyquist_a_inverse=float(np.pi / 2.5),
+        q_frequency_step_a_inverse=(
+            float(2.0 * np.pi / 642.5),
+            float(2.0 * np.pi / 642.5),
+            float(2.0 * np.pi / 642.5),
+        ),
+        q_convention="q = 2πf",
+        uses_two_pi_frequency_conversion=True,
+        density_subtraction_active=False,
+        first_nonempty_q_a_inverse=0.01,
+        solvent_density_e_per_a3=0.0,
+        contrast_mode="bare_atomic_density_only",
+        kernel_correction_supported=True,
+        kernel_correction_applied=True,
+        kernel_correction_model="Gaussian deposition intensity factor exp(-sigma^2 q^2)",
+        timing=ContrastFFTTiming(
+            atomic_density_seconds=0.1,
+            contrast_density_seconds=0.0,
+            fft_seconds=0.2,
+            shell_average_seconds=0.3,
+            total_seconds=0.6,
+        ),
+    )
+    payload = _FFTComputationPayload(
+        q_values=q_values,
+        profile_results=(
+            _FFTProfileComputationResult(
+                target=window._active_profile_target(),
+                q_values=q_values,
+                fft_result=fft_result,
+                legacy_q_values=None,
+                legacy_intensity=None,
+                exact_debye_intensity=None,
+                legacy_elapsed_seconds=None,
+                debye_elapsed_seconds=None,
+            ),
+        ),
+    )
+    window._on_worker_finished(payload)
+    assert "3D FFT Nyquist limit:" in window.status_log_box.toPlainText()
+    result_axes = window.fft_box_visualizer.figure.axes
+    assert len(result_axes) == 2
+    assert all(axis.name == "3d" for axis in result_axes)
+
+    export_path = tmp_path / "fft_curves.csv"
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (str(export_path), "CSV files (*.csv)"),
+    )
+    window._export_q_space_curves_csv()
+
+    exported_text = export_path.read_text(encoding="utf-8")
+    assert "3d_fft_born_approximation_q_a_inverse" in exported_text
+    assert "3d_fft_born_approximation_intensity" in exported_text
+    window.close()
+
+
+def test_fft_worker_applies_active_contrast_to_legacy_overlay(
+    tmp_path,
+    monkeypatch,
+):
+    structure_path = tmp_path / "contrast_overlay.xyz"
+    structure_path.write_text(
+        "\n".join(
+            [
+                "3",
+                "contrast_overlay",
+                "Pb 0.0 0.0 0.0",
+                "I 2.8 0.0 0.0",
+                "I 0.0 2.8 0.0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    load_electron_density_structure(structure_path)
+    q_values = np.asarray([0.01, 0.02, 0.03], dtype=float)
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast_fft.ui.main_window.build_shared_q_grid",
+        lambda q_min, q_max, q_step: q_values,
+    )
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast_fft.ui.main_window.compute_contrast_fft_intensity",
+        lambda *args, **kwargs: ContrastFFTResult(
+            settings=ContrastFFTSettings(
+                spacing_a=2.5,
+                gaussian_sigma_a=0.75,
+                minimum_box_length_a=640.0,
+                padding_a=24.0,
+            ).normalized(),
+            q_values=q_values,
+            raw_intensity=np.asarray([1.0, 0.8, 0.6], dtype=float),
+            kernel_corrected_intensity=np.asarray(
+                [1.0, 0.8, 0.6], dtype=float
+            ),
+            q_shell_counts=np.asarray([8, 12, 16], dtype=int),
+            density_integral=180.0,
+            expected_weight=180.0,
+            contrast_density_integral=180.0,
+            expected_contrast_weight=180.0,
+            solvent_exclusion_volume_a3=0.0,
+            grid_shape=(257, 257, 257),
+            box_lengths_a=(642.5, 642.5, 642.5),
+            voxel_spacing_a=(2.5, 2.5, 2.5),
+            q_nyquist_a_inverse=float(np.pi / 2.5),
+            q_frequency_step_a_inverse=(
+                float(2.0 * np.pi / 642.5),
+                float(2.0 * np.pi / 642.5),
+                float(2.0 * np.pi / 642.5),
+            ),
+            q_convention="q = 2πf",
+            uses_two_pi_frequency_conversion=True,
+            density_subtraction_active=True,
+            first_nonempty_q_a_inverse=0.01,
+            solvent_density_e_per_a3=0.334,
+            contrast_mode="constant_solvent_density_inside_union_of_atomic_spheres",
+            kernel_correction_supported=False,
+            kernel_correction_applied=False,
+            kernel_correction_model=None,
+            timing=ContrastFFTTiming(
+                atomic_density_seconds=0.1,
+                contrast_density_seconds=0.1,
+                fft_seconds=0.1,
+                shell_average_seconds=0.1,
+                total_seconds=0.4,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast_fft.ui.main_window.compute_electron_density_profile",
+        lambda *args, **kwargs: SimpleNamespace(
+            radial_centers=np.asarray([0.0, 1.0, 2.0], dtype=float),
+            shell_volumes=np.asarray([1.0, 1.0, 1.0], dtype=float),
+            solvent_contrast=None,
+        ),
+    )
+
+    def _fake_apply_contrast(profile, settings, *, solvent_name=None):
+        captured["contrast_settings"] = settings
+        captured["contrast_name"] = solvent_name
+        return SimpleNamespace(
+            radial_centers=np.asarray([0.0, 1.0, 2.0], dtype=float),
+            shell_volumes=np.asarray([1.0, 1.0, 1.0], dtype=float),
+            solvent_contrast=SimpleNamespace(
+                solvent_density_e_per_a3=0.334,
+                solvent_subtracted_smeared_density=np.asarray(
+                    [2.0, 1.5, 1.0], dtype=float
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast_fft.ui.main_window.apply_solvent_contrast_to_profile_result",
+        _fake_apply_contrast,
+    )
+
+    def _fake_scattering(profile, settings):
+        captured["use_solvent_subtracted_profile"] = (
+            settings.use_solvent_subtracted_profile
+        )
+        return SimpleNamespace(
+            q_values=q_values,
+            intensity=np.asarray([1.0, 0.85, 0.7], dtype=float),
+        )
+
+    monkeypatch.setattr(
+        "saxshell.saxs.contrast_fft.ui.main_window.compute_electron_density_scattering_profile",
+        _fake_scattering,
+    )
+
+    worker = _FFTComputationWorker(
+        targets=(
+            _FFTProfileTarget(
+                key="average|input|contrast_overlay|no_motif",
+                display_name="contrast_overlay",
+                structure_name="contrast_overlay",
+                motif_name="no_motif",
+                file_count=1,
+                reference_file=structure_path,
+                source_files=(structure_path,),
+                representative=structure_path.name,
+                source_mode="average",
+                solvent_mode="input",
+            ),
+        ),
+        fft_settings=ContrastFFTSettings(
+            spacing_a=2.5,
+            gaussian_sigma_a=0.75,
+            minimum_box_length_a=640.0,
+            padding_a=24.0,
+            solvent_density_e_per_a3=0.334,
+        ).normalized(),
+        legacy_mesh_settings=None,
+        legacy_smearing_settings=None,
+        legacy_fourier_settings=None,
+        active_contrast_settings=ContrastSolventDensitySettings.from_values(
+            method=CONTRAST_SOLVENT_METHOD_DIRECT,
+            direct_electron_density_e_per_a3=0.334,
+        ),
+        active_contrast_name="Direct solvent",
+        q_min=0.01,
+        q_max=1.20,
+        q_step=0.01,
+        compare_legacy_1d=True,
+        compare_exact_debye=False,
+    )
+    payloads: list[object] = []
+    worker.finished.connect(payloads.append)
+
+    worker.run()
+
+    assert len(payloads) == 1
+    assert isinstance(payloads[0], _FFTComputationPayload)
+    assert captured["contrast_name"] == "Direct solvent"
+    assert captured["use_solvent_subtracted_profile"] is True
+
+
+def test_fft_born_workspace_state_restores_representative_profile_results(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    structure_path = tmp_path / "representative.xyz"
+    structure_path.write_text(
+        "\n".join(
+            [
+                "3",
+                "representative",
+                "Pb 0.0 0.0 0.0",
+                "I 2.8 0.0 0.0",
+                "I 0.0 2.8 0.0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    q_values = np.asarray([0.01, 0.02, 0.03], dtype=float)
+    fft_result = ContrastFFTResult(
+        settings=ContrastFFTSettings(
+            spacing_a=2.5,
+            gaussian_sigma_a=0.75,
+            minimum_box_length_a=640.0,
+            padding_a=24.0,
+        ).normalized(),
+        q_values=q_values,
+        raw_intensity=np.asarray([1.0, 0.9, 0.75], dtype=float),
+        kernel_corrected_intensity=np.asarray([1.0, 0.94, 0.81], dtype=float),
+        q_shell_counts=np.asarray([8, 12, 16], dtype=int),
+        density_integral=180.0,
+        expected_weight=180.0,
+        contrast_density_integral=180.0,
+        expected_contrast_weight=180.0,
+        solvent_exclusion_volume_a3=0.0,
+        grid_shape=(257, 257, 257),
+        box_lengths_a=(642.5, 642.5, 642.5),
+        voxel_spacing_a=(2.5, 2.5, 2.5),
+        q_nyquist_a_inverse=float(np.pi / 2.5),
+        q_frequency_step_a_inverse=(
+            float(2.0 * np.pi / 642.5),
+            float(2.0 * np.pi / 642.5),
+            float(2.0 * np.pi / 642.5),
+        ),
+        q_convention="q = 2πf",
+        uses_two_pi_frequency_conversion=True,
+        density_subtraction_active=False,
+        first_nonempty_q_a_inverse=0.01,
+        solvent_density_e_per_a3=0.0,
+        contrast_mode="bare_atomic_density_only",
+        kernel_correction_supported=True,
+        kernel_correction_applied=True,
+        kernel_correction_model="Gaussian deposition intensity factor exp(-sigma^2 q^2)",
+        timing=ContrastFFTTiming(
+            atomic_density_seconds=0.1,
+            contrast_density_seconds=0.0,
+            fft_seconds=0.2,
+            shell_average_seconds=0.3,
+            total_seconds=0.6,
+        ),
+    )
+    average_target = _FFTProfileTarget(
+        key="average|input|representative|no_motif",
+        display_name="representative",
+        structure_name="representative",
+        motif_name="no_motif",
+        file_count=1,
+        reference_file=structure_path,
+        source_files=(structure_path,),
+        representative=structure_path.name,
+        source_mode="average",
+        solvent_mode="input",
+    )
+    representative_target = _FFTProfileTarget(
+        key="representative|partial|representative|no_motif",
+        display_name="representative",
+        structure_name="representative",
+        motif_name="no_motif",
+        file_count=1,
+        reference_file=structure_path,
+        source_files=(structure_path,),
+        representative=structure_path.name,
+        source_mode="representative",
+        solvent_mode="partial",
+    )
+
+    def _mock_targets(_self, _path):
+        return {
+            ("average", "input"): (average_target,),
+            ("representative", "partial"): (representative_target,),
+        }
+
+    monkeypatch.setattr(
+        FFTBornApproximationMainWindow,
+        "_resolve_available_profile_targets",
+        _mock_targets,
+    )
+
+    output_dir = tmp_path / "fft_state"
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    window = FFTBornApproximationMainWindow(
+        preview_mode=False,
+        initial_project_dir=project_dir,
+        initial_output_dir=output_dir,
+    )
+    window._load_input_path(structure_path)
+    rep_index = window.structure_source_combo.findData("representative")
+    window.structure_source_combo.setCurrentIndex(rep_index)
+    window.direct_density_spin.setValue(0.334)
+    direct_index = window.solvent_method_combo.findData(
+        CONTRAST_SOLVENT_METHOD_DIRECT
+    )
+    window.solvent_method_combo.setCurrentIndex(direct_index)
+    window._apply_contrast_settings()
+    window._on_worker_finished(
+        _FFTComputationPayload(
+            q_values=q_values,
+            profile_results=(
+                _FFTProfileComputationResult(
+                    target=representative_target,
+                    q_values=q_values,
+                    fft_result=fft_result,
+                    legacy_q_values=None,
+                    legacy_intensity=None,
+                    exact_debye_intensity=None,
+                    legacy_elapsed_seconds=None,
+                    debye_elapsed_seconds=None,
+                ),
+            ),
+        )
+    )
+    state_path = output_dir / "workspace_state.json"
+    assert state_path.is_file()
+    window.close()
+
+    restored_window = FFTBornApproximationMainWindow(
+        preview_mode=False,
+        initial_project_dir=project_dir,
+        initial_output_dir=output_dir,
+    )
+    restored_window._load_input_path(structure_path)
+
+    assert (
+        restored_window.structure_source_combo.currentData()
+        == "representative"
+    )
+    assert (
+        restored_window.representative_solvent_mode_combo.currentData()
+        == "partial"
+    )
+    assert restored_window._active_profile_key == representative_target.key
+    assert (
+        representative_target.key in restored_window._computed_profile_results
+    )
+    assert restored_window._active_contrast_name == "Direct solvent"
+    assert restored_window._current_payload is not None
+    assert state_path.is_file()
+    restored_window.close()
+
+
+def test_fft_born_representative_input_can_switch_to_project_average_clusters(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    clusters_dir = project_dir / "clusters"
+    structure_dir = clusters_dir / "A"
+    structure_dir.mkdir(parents=True)
+    frame_paths = []
+    for index in range(2):
+        frame_path = structure_dir / f"frame_{index + 1:04d}.xyz"
+        frame_path.write_text(
+            "3\nframe\nPb 0.0 0.0 0.0\nI 2.8 0.0 0.0\nI 0.0 2.8 0.0\n",
+            encoding="utf-8",
+        )
+        frame_paths.append(frame_path.resolve())
+    settings.clusters_dir = str(clusters_dir)
+    settings.use_representative_structures = True
+    manager.save_project(settings)
+
+    rmcsetup_paths = build_rmcsetup_paths(project_dir)
+    representative_dir = (
+        rmcsetup_paths.representative_partial_solvent_dir / "A"
+    )
+    representative_dir.mkdir(parents=True)
+    representative_path = representative_dir / "selected_rep.xyz"
+    representative_path.write_text(
+        frame_paths[0].read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    selection = DreamBestFitSelection(
+        run_name="Representative Structure Finder",
+        run_relative_path="rmcsetup/representative_structures",
+        label="Representative Structure Finder",
+        selection_source="representativefinder",
+        selected_at="2026-05-06T12:00:00",
+    )
+    metadata = RepresentativeSelectionMetadata(
+        selection_mode="representative_finder",
+        selection=selection,
+        distribution_selection=DistributionSelectionMetadata(
+            selection_mode="representative_finder",
+            selection=selection,
+            run_dir="rmcsetup/representative_structures",
+            updated_at="2026-05-06T12:00:00",
+            entries=[],
+        ),
+        settings=RepresentativeSelectionSettings(),
+        updated_at="2026-05-06T12:00:00",
+        representative_entries=[
+            RepresentativeSelectionEntry(
+                structure="A",
+                motif="no_motif",
+                param="w0",
+                selected_weight=1.0,
+                cluster_count=2,
+                source_dir=str(representative_dir),
+                source_file=str(representative_path),
+                source_file_name=representative_path.name,
+                atom_count=3,
+                element_counts={"Pb": 1, "I": 2},
+                source_solvent_mode="partialsolv",
+            )
+        ],
+        missing_bins=[],
+        invalid_bins=[],
+    )
+    _write_representative_selection_metadata(project_dir, metadata)
+    project_source = SimpleNamespace(
+        representative_selection=metadata,
+        solvent_handling=None,
+    )
+
+    window = FFTBornApproximationMainWindow(
+        preview_mode=False,
+        initial_project_dir=project_dir,
+        initial_use_representative_structures=True,
+    )
+    monkeypatch.setattr(window, "_project_source", lambda: project_source)
+    window._load_input_path(rmcsetup_paths.representative_clusters_dir)
+
+    assert window.structure_source_combo.currentData() == "representative"
+    assert ("average", "input") in window._available_profile_targets
+    average_index = window.structure_source_combo.findData("average")
+    window.structure_source_combo.setCurrentIndex(average_index)
+    target = window._active_profile_target()
+
+    assert target is not None
+    assert target.source_mode == "average"
+    assert target.file_count == 2
+    assert target.source_files == tuple(frame_paths)
+    window.close()
+
+
+def _make_fft_result_for_test(
+    q_values: np.ndarray,
+    raw_intensity: np.ndarray,
+) -> ContrastFFTResult:
+    fft_settings = ContrastFFTSettings(
+        spacing_a=2.5,
+        gaussian_sigma_a=0.75,
+        minimum_box_length_a=640.0,
+        padding_a=24.0,
+    ).normalized()
+    return ContrastFFTResult(
+        settings=fft_settings,
+        q_values=np.asarray(q_values, dtype=float),
+        raw_intensity=np.asarray(raw_intensity, dtype=float),
+        kernel_corrected_intensity=np.asarray(raw_intensity, dtype=float),
+        q_shell_counts=np.ones_like(q_values, dtype=int),
+        density_integral=10.0,
+        expected_weight=10.0,
+        contrast_density_integral=10.0,
+        expected_contrast_weight=10.0,
+        solvent_exclusion_volume_a3=0.0,
+        grid_shape=(257, 257, 257),
+        box_lengths_a=(642.5, 642.5, 642.5),
+        voxel_spacing_a=(2.5, 2.5, 2.5),
+        q_nyquist_a_inverse=float(np.pi / 2.5),
+        q_frequency_step_a_inverse=(
+            float(2.0 * np.pi / 642.5),
+            float(2.0 * np.pi / 642.5),
+            float(2.0 * np.pi / 642.5),
+        ),
+        q_convention="q = 2πf",
+        uses_two_pi_frequency_conversion=True,
+        density_subtraction_active=False,
+        first_nonempty_q_a_inverse=float(q_values[0]),
+        solvent_density_e_per_a3=0.0,
+        contrast_mode="bare_atomic_density_only",
+        kernel_correction_supported=True,
+        kernel_correction_applied=True,
+        kernel_correction_model=(
+            "Gaussian deposition intensity factor exp(-sigma^2 q^2)"
+        ),
+        timing=ContrastFFTTiming(
+            atomic_density_seconds=0.1,
+            contrast_density_seconds=0.0,
+            fft_seconds=0.2,
+            shell_average_seconds=0.3,
+            total_seconds=0.6,
+        ),
+    )
+
+
+def test_fft_restored_traces_require_recompute_after_source_or_contrast_change(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.component_build_mode = (
+        COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
+    )
+    settings.use_representative_structures = True
+    manager.save_project(settings)
+    artifact_paths = project_artifact_paths(
+        settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+    manager.ensure_artifact_dirs(artifact_paths)
+
+    q_values = 0.05 + 0.05 * np.arange(6, dtype=float)
+    average_path = tmp_path / "average.xyz"
+    representative_path = tmp_path / "representative.xyz"
+    structure_text = (
+        "3\ncomponent\nPb 0.0 0.0 0.0\nI 2.8 0.0 0.0\nI 0.0 2.8 0.0\n"
+    )
+    average_path.write_text(structure_text, encoding="utf-8")
+    representative_path.write_text(structure_text, encoding="utf-8")
+    average_target = _FFTProfileTarget(
+        key="average|input|A|no_motif",
+        display_name="A",
+        structure_name="A",
+        motif_name="no_motif",
+        file_count=1,
+        reference_file=average_path,
+        source_files=(average_path,),
+        representative=average_path.name,
+        source_mode="average",
+        solvent_mode="input",
+    )
+    representative_target = _FFTProfileTarget(
+        key="representative|partial|A|no_motif",
+        display_name="A",
+        structure_name="A",
+        motif_name="no_motif",
+        file_count=1,
+        reference_file=representative_path,
+        source_files=(representative_path,),
+        representative=representative_path.name,
+        source_mode="representative",
+        solvent_mode="partial",
+    )
+    window = FFTBornApproximationMainWindow(
+        preview_mode=False,
+        initial_project_dir=project_dir,
+        initial_distribution_id=artifact_paths.distribution_id,
+        initial_distribution_root_dir=artifact_paths.root_dir,
+        initial_use_representative_structures=True,
+    )
+    window._loaded_input_path = project_dir
+    window._available_profile_targets = {
+        ("average", "input"): (average_target,),
+        ("representative", "partial"): (representative_target,),
+    }
+    representative_index = window.structure_source_combo.findData(
+        "representative"
+    )
+    window.structure_source_combo.setCurrentIndex(representative_index)
+    window.q_min_spin.setValue(float(q_values[0]))
+    window.q_max_spin.setValue(float(q_values[-1]))
+    window.q_step_spin.setValue(0.05)
+    window._computed_profile_results = {
+        representative_target.key: _FFTProfileComputationResult(
+            target=representative_target,
+            q_values=q_values,
+            fft_result=_make_fft_result_for_test(
+                q_values,
+                np.linspace(11.0, 18.0, q_values.size),
+            ),
+            legacy_q_values=None,
+            legacy_intensity=None,
+            exact_debye_intensity=None,
+            legacy_elapsed_seconds=None,
+            debye_elapsed_seconds=None,
+        )
+    }
+    window._computed_profile_run_signature = (
+        window._current_trace_configuration_signature()
+    )
+    window._update_push_to_model_state()
+    assert window.push_to_model_button.isEnabled()
+
+    average_index = window.structure_source_combo.findData("average")
+    window.structure_source_combo.setCurrentIndex(average_index)
+    assert not window.push_to_model_button.isEnabled()
+
+    window._on_worker_finished(
+        _FFTComputationPayload(
+            q_values=q_values,
+            profile_results=(
+                _FFTProfileComputationResult(
+                    target=average_target,
+                    q_values=q_values,
+                    fft_result=_make_fft_result_for_test(
+                        q_values,
+                        np.linspace(21.0, 28.0, q_values.size),
+                    ),
+                    legacy_q_values=None,
+                    legacy_intensity=None,
+                    exact_debye_intensity=None,
+                    legacy_elapsed_seconds=None,
+                    debye_elapsed_seconds=None,
+                ),
+            ),
+        )
+    )
+    assert window.push_to_model_button.isEnabled()
+
+    direct_index = window.solvent_method_combo.findData(
+        CONTRAST_SOLVENT_METHOD_DIRECT
+    )
+    window.solvent_method_combo.setCurrentIndex(direct_index)
+    window.direct_density_spin.setValue(0.334)
+
+    assert not window.push_to_model_button.isEnabled()
+    window.close()
+
+
+def test_fft_push_to_model_records_representative_component_source(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.component_build_mode = (
+        COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
+    )
+    settings.use_representative_structures = True
+    manager.save_project(settings)
+    artifact_paths = project_artifact_paths(
+        settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+    manager.ensure_artifact_dirs(artifact_paths)
+    q_values = np.asarray([0.01, 0.02, 0.03], dtype=float)
+    fft_result = ContrastFFTResult(
+        settings=ContrastFFTSettings(
+            spacing_a=2.5,
+            gaussian_sigma_a=0.75,
+            minimum_box_length_a=640.0,
+            padding_a=24.0,
+        ).normalized(),
+        q_values=q_values,
+        raw_intensity=np.asarray([1.0, 0.9, 0.8], dtype=float),
+        kernel_corrected_intensity=np.asarray([1.0, 0.9, 0.8], dtype=float),
+        q_shell_counts=np.asarray([8, 12, 16], dtype=int),
+        density_integral=10.0,
+        expected_weight=10.0,
+        contrast_density_integral=10.0,
+        expected_contrast_weight=10.0,
+        solvent_exclusion_volume_a3=0.0,
+        grid_shape=(257, 257, 257),
+        box_lengths_a=(642.5, 642.5, 642.5),
+        voxel_spacing_a=(2.5, 2.5, 2.5),
+        q_nyquist_a_inverse=float(np.pi / 2.5),
+        q_frequency_step_a_inverse=(
+            float(2.0 * np.pi / 642.5),
+            float(2.0 * np.pi / 642.5),
+            float(2.0 * np.pi / 642.5),
+        ),
+        q_convention="q = 2πf",
+        uses_two_pi_frequency_conversion=True,
+        density_subtraction_active=False,
+        first_nonempty_q_a_inverse=0.01,
+        solvent_density_e_per_a3=0.0,
+        contrast_mode="bare_atomic_density_only",
+        kernel_correction_supported=True,
+        kernel_correction_applied=True,
+        kernel_correction_model="Gaussian deposition intensity factor exp(-sigma^2 q^2)",
+        timing=ContrastFFTTiming(
+            atomic_density_seconds=0.1,
+            contrast_density_seconds=0.0,
+            fft_seconds=0.2,
+            shell_average_seconds=0.3,
+            total_seconds=0.6,
+        ),
+    )
+    target = _FFTProfileTarget(
+        key="representative|partial|A|no_motif",
+        display_name="A",
+        structure_name="A",
+        motif_name="no_motif",
+        file_count=1,
+        reference_file=tmp_path / "representative.xyz",
+        source_files=(tmp_path / "representative.xyz",),
+        representative="representative.xyz",
+        source_mode="representative",
+        solvent_mode="partial",
+    )
+    window = FFTBornApproximationMainWindow(
+        preview_mode=False,
+        initial_project_dir=project_dir,
+        initial_distribution_id=artifact_paths.distribution_id,
+        initial_distribution_root_dir=artifact_paths.root_dir,
+        initial_use_representative_structures=True,
+    )
+    window._loaded_input_path = project_dir
+    window._available_profile_targets = {
+        ("representative", "partial"): (target,)
+    }
+    window._current_profile_targets = (target,)
+    window._active_profile_key = target.key
+    window._computed_profile_results = {
+        target.key: _FFTProfileComputationResult(
+            target=target,
+            q_values=q_values,
+            fft_result=fft_result,
+            legacy_q_values=None,
+            legacy_intensity=None,
+            exact_debye_intensity=None,
+            legacy_elapsed_seconds=None,
+            debye_elapsed_seconds=None,
+        )
+    }
+    representative_index = window.structure_source_combo.findData(
+        "representative"
+    )
+    window.structure_source_combo.setCurrentIndex(representative_index)
+    monkeypatch.setattr(
+        FFTBornApproximationMainWindow,
+        "_ensure_linked_distribution_ready_for_push",
+        lambda self: None,
+    )
+
+    window._push_components_to_model()
+
+    payload = json.loads(
+        artifact_paths.distribution_metadata_file.read_text(encoding="utf-8")
+    )
+    assert payload["built_component_source_mode"] == "representative"
+    assert payload["use_representative_structures"] is True
+    assert artifact_paths.component_map_file.is_file()
+    window.close()
+
+
+def test_fft_restored_trace_requires_recompute_when_endpoint_is_missing(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings, artifact_paths = _seed_saved_distribution_from_root(
+        project_dir,
+        component_build_mode=COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT,
+    )
+    manager.save_project(settings)
+    q_values = 0.0101 + 0.01 * np.arange(119, dtype=float)
+    target = _FFTProfileTarget(
+        key="average|input|A|no_motif",
+        display_name="A",
+        structure_name="A",
+        motif_name="no_motif",
+        file_count=1,
+        reference_file=tmp_path / "frame_0001.xyz",
+        source_files=(tmp_path / "frame_0001.xyz",),
+        representative="frame_0001.xyz",
+        source_mode="average",
+        solvent_mode="input",
+    )
+    window = FFTBornApproximationMainWindow(
+        preview_mode=False,
+        initial_project_dir=project_dir,
+        initial_distribution_id=artifact_paths.distribution_id,
+        initial_distribution_root_dir=artifact_paths.root_dir,
+        initial_use_representative_structures=False,
+    )
+    window._loaded_input_path = project_dir
+    window.q_min_spin.setValue(0.0101)
+    window.q_max_spin.setValue(1.1976)
+    window.q_step_spin.setValue(0.01)
+    window._computed_profile_results = {
+        target.key: _FFTProfileComputationResult(
+            target=target,
+            q_values=q_values,
+            fft_result=_make_fft_result_for_test(
+                q_values,
+                np.linspace(21.0, 28.0, q_values.size),
+            ),
+            legacy_q_values=None,
+            legacy_intensity=None,
+            exact_debye_intensity=None,
+            legacy_elapsed_seconds=None,
+            debye_elapsed_seconds=None,
+        )
+    }
+    window._computed_profile_run_signature = (
+        window._current_trace_configuration_signature()
+    )
+    window._update_push_to_model_state()
+
+    assert not window._results_match_current_configuration()
+    assert not window.push_to_model_button.isEnabled()
+    window.close()
+
+
+def test_fft_push_to_model_registers_components_with_prefit_and_dream(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings, artifact_paths = _seed_saved_distribution_from_root(
+        project_dir,
+        component_build_mode=COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT,
+    )
+    settings.component_build_mode = (
+        COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
+    )
+    settings.use_representative_structures = False
+    manager.save_project(settings)
+
+    q_values = np.linspace(0.05, 0.3, 8)
+    pushed_intensity = np.linspace(21.0, 28.0, 8)
+    structure_path = tmp_path / "frame_0001.xyz"
+    structure_path.write_text(
+        "3\nframe_0001\nPb 0.0 0.0 0.0\nI 2.8 0.0 0.0\nI 0.0 2.8 0.0\n",
+        encoding="utf-8",
+    )
+    target = _FFTProfileTarget(
+        key="average|input|A|no_motif",
+        display_name="A",
+        structure_name="A",
+        motif_name="no_motif",
+        file_count=1,
+        reference_file=structure_path,
+        source_files=(structure_path,),
+        representative=structure_path.name,
+        source_mode="average",
+        solvent_mode="input",
+    )
+    window = FFTBornApproximationMainWindow(
+        preview_mode=False,
+        initial_project_dir=project_dir,
+        initial_distribution_id=artifact_paths.distribution_id,
+        initial_distribution_root_dir=artifact_paths.root_dir,
+        initial_use_representative_structures=False,
+    )
+    main_window = SAXSMainWindow(initial_project_dir=project_dir)
+    window.born_components_built.connect(main_window._on_born_components_built)
+    window._loaded_input_path = project_dir
+    window._computed_profile_results = {
+        target.key: _FFTProfileComputationResult(
+            target=target,
+            q_values=q_values,
+            fft_result=_make_fft_result_for_test(q_values, pushed_intensity),
+            legacy_q_values=None,
+            legacy_intensity=None,
+            exact_debye_intensity=None,
+            legacy_elapsed_seconds=None,
+            debye_elapsed_seconds=None,
+        )
+    }
+
+    window._push_components_to_model()
+    QApplication.processEvents()
+
+    saved_settings = manager.load_project(project_dir)
+    assert (
+        saved_settings.component_build_mode
+        == COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
+    )
+    assert saved_settings.use_representative_structures is False
+    assert main_window.prefit_workflow is not None
+    assert [
+        (component.structure, component.motif)
+        for component in main_window.prefit_workflow.components
+    ] == [("A", "no_motif")]
+    assert np.allclose(
+        main_window.prefit_workflow.components[0].intensities,
+        pushed_intensity,
+    )
+    assert main_window.dream_workflow is not None
+    assert [
+        (component.structure, component.motif)
+        for component in main_window.dream_workflow.prefit_workflow.components
+    ] == [("A", "no_motif")]
+    assert np.allclose(
+        main_window.dream_workflow.prefit_workflow.components[0].intensities,
+        pushed_intensity,
+    )
+
+    prefit_workflow = SAXSPrefitWorkflow(project_dir)
+    assert [
+        (component.structure, component.motif)
+        for component in prefit_workflow.components
+    ] == [("A", "no_motif")]
+    assert np.allclose(
+        prefit_workflow.components[0].intensities,
+        pushed_intensity,
+    )
+    assert np.allclose(prefit_workflow.evaluate().q_values, q_values)
+
+    dream_workflow = SAXSDreamWorkflow(project_dir)
+    assert [
+        (component.structure, component.motif)
+        for component in dream_workflow.prefit_workflow.components
+    ] == [("A", "no_motif")]
+    assert np.allclose(
+        dream_workflow.prefit_workflow.components[0].intensities,
+        pushed_intensity,
+    )
+    assert np.allclose(
+        dream_workflow.prefit_workflow.evaluate().q_values,
+        q_values,
+    )
+    main_window.close()
+    window.close()
+
+
+def test_saved_distribution_roundtrips_representative_structure_preference(
+    tmp_path,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.use_representative_structures = True
+    settings.component_build_mode = (
+        COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
+    )
+    manager.save_project(settings)
+    artifact_paths = project_artifact_paths(
+        settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+    manager.ensure_artifact_dirs(artifact_paths)
+    artifact_paths.component_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_paths.component_dir / "A_no_motif.txt").write_text(
+        "0.01 1.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    artifact_paths.component_map_file.write_text(
+        json.dumps({"saxs_map": {"A": {"no_motif": "A_no_motif.txt"}}}) + "\n",
+        encoding="utf-8",
+    )
+    artifact_paths.prior_weights_file.write_text(
+        json.dumps({"A_no_motif.txt": 1.0}) + "\n",
+        encoding="utf-8",
+    )
+    manager._write_distribution_metadata(
+        settings, artifact_paths=artifact_paths
+    )
+
+    loaded_settings = manager.settings_for_saved_distribution(
+        project_dir,
+        artifact_paths.distribution_id,
+    )
+
+    assert loaded_settings.use_representative_structures is True
+
+
+def test_load_saved_distribution_checks_representative_toggle_for_representative_components(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.use_representative_structures = False
+    manager.save_project(settings)
+    _settings, artifact_paths = _seed_saved_distribution_from_root(project_dir)
+
+    representative_dir = build_rmcsetup_paths(
+        project_dir
+    ).representative_partial_solvent_dir
+    representative_dir.mkdir(parents=True, exist_ok=True)
+    representative_path = representative_dir / "selected_rep.xyz"
+    representative_path.write_text(
+        "\n".join(
+            [
+                "4",
+                "selected representative",
+                "Pb 0.0 0.0 0.0",
+                "I 2.8 0.0 0.0",
+                "I 0.0 2.8 0.0",
+                "I 0.0 0.0 2.8",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    selection = DreamBestFitSelection(
+        run_name="Representative Structure Finder",
+        run_relative_path="rmcsetup/representative_structures",
+        label="Representative Structure Finder",
+        selection_source="representativefinder",
+        selected_at="2026-05-06T12:00:00",
+    )
+    _write_representative_selection_metadata(
+        project_dir,
+        RepresentativeSelectionMetadata(
+            selection_mode="representative_finder",
+            selection=selection,
+            distribution_selection=DistributionSelectionMetadata(
+                selection_mode="representative_finder",
+                selection=selection,
+                run_dir="rmcsetup/representative_structures",
+                updated_at="2026-05-06T12:00:00",
+                entries=[],
+            ),
+            settings=RepresentativeSelectionSettings(),
+            updated_at="2026-05-06T12:00:00",
+            representative_entries=[
+                RepresentativeSelectionEntry(
+                    structure="A",
+                    motif="no_motif",
+                    param="w0",
+                    selected_weight=0.6,
+                    cluster_count=1,
+                    source_dir=str(representative_dir),
+                    source_file=str(representative_path),
+                    source_file_name=representative_path.name,
+                    atom_count=4,
+                    element_counts={"Pb": 1, "I": 3},
+                    source_solvent_mode="partialsolv",
+                )
+            ],
+            missing_bins=[],
+            invalid_bins=[],
+        ),
+    )
+
+    metadata_path = artifact_paths.distribution_metadata_file
+    assert metadata_path is not None
+    metadata_payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata_payload["use_representative_structures"] = False
+    metadata_payload["built_component_source_mode"] = "representative"
+    metadata_path.write_text(
+        json.dumps(metadata_payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    assert not window.project_setup_tab.use_representative_structures()
+
+    window.project_setup_tab.load_distribution_button.click()
+    QApplication.processEvents()
+
+    assert window.current_settings is not None
+    assert window.current_settings.use_representative_structures is True
+    assert window.project_setup_tab.use_representative_structures()
+    assert "Representative Structures mode is on." in (
+        window.project_setup_tab.representative_structure_status_label.text()
+    )
+    window.close()
+
+
+def test_generate_prior_weights_keeps_full_distribution_when_representatives_selected(
+    tmp_path,
+):
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+
+    clusters_dir = project_dir / "clusters"
+    structure_dir = clusters_dir / "A"
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    frame_a = structure_dir / "frame_0001.xyz"
+    frame_b = structure_dir / "frame_0002.xyz"
+    for frame_path in (frame_a, frame_b):
+        frame_path.write_text(
+            "\n".join(
+                [
+                    "4",
+                    frame_path.stem,
+                    "Pb 0.0 0.0 0.0",
+                    "I 2.8 0.0 0.0",
+                    "I 0.0 2.8 0.0",
+                    "I 0.0 0.0 2.8",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    representative_dir = build_rmcsetup_paths(
+        project_dir
+    ).representative_partial_solvent_dir
+    representative_dir.mkdir(parents=True, exist_ok=True)
+    representative_path = representative_dir / "selected_rep.xyz"
+    representative_path.write_text(
+        frame_a.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    selection = DreamBestFitSelection(
+        run_name="Representative Structure Finder",
+        run_relative_path="rmcsetup/representative_structures",
+        label="Representative Structure Finder",
+        selection_source="representativefinder",
+        selected_at="2026-05-06T12:00:00",
+    )
+    _write_representative_selection_metadata(
+        project_dir,
+        RepresentativeSelectionMetadata(
+            selection_mode="representative_finder",
+            selection=selection,
+            distribution_selection=DistributionSelectionMetadata(
+                selection_mode="representative_finder",
+                selection=selection,
+                run_dir="rmcsetup/representative_structures",
+                updated_at="2026-05-06T12:00:00",
+                entries=[],
+            ),
+            settings=RepresentativeSelectionSettings(),
+            updated_at="2026-05-06T12:00:00",
+            representative_entries=[
+                RepresentativeSelectionEntry(
+                    structure="A",
+                    motif="no_motif",
+                    param="w0",
+                    selected_weight=1.0,
+                    cluster_count=2,
+                    source_dir=str(representative_dir),
+                    source_file=str(representative_path),
+                    source_file_name=representative_path.name,
+                    atom_count=4,
+                    element_counts={"Pb": 1, "I": 3},
+                    source_solvent_mode="partialsolv",
+                )
+            ],
+            missing_bins=[],
+            invalid_bins=[],
+        ),
+    )
+
+    settings.clusters_dir = str(clusters_dir)
+    settings.use_representative_structures = True
+    result = manager.generate_prior_weights(settings)
+    prior_payload = json.loads(
+        result.md_prior_weights_path.read_text(encoding="utf-8")
+    )
+    prior_entry = prior_payload["structures"]["A"]["no_motif"]
+
+    assert prior_payload["origin"] == clusters_dir.name
+    assert prior_entry["source_kind"] == "cluster_dir"
+    assert Path(prior_entry["source_dir"]).resolve() == structure_dir.resolve()
+    assert Path(prior_entry["source_file"]).resolve() == frame_a.resolve()
+
+
+def test_representative_checkbox_stays_disabled_until_all_bins_are_computed(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.use_representative_structures = True
+    manager.save_project(settings)
+    (paths.project_dir / "md_prior_weights.json").write_text(
+        json.dumps(
+            {
+                "origin": "clusters",
+                "total_files": 2,
+                "structures": {
+                    "A": {
+                        "no_motif": {
+                            "count": 1,
+                            "weight": 0.6,
+                            "representative": "frame_0001.xyz",
+                            "profile_file": "A_no_motif.txt",
+                        }
+                    },
+                    "B": {
+                        "no_motif": {
+                            "count": 1,
+                            "weight": 0.4,
+                            "representative": "frame_0001.xyz",
+                            "profile_file": "B_no_motif.txt",
+                        }
+                    },
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    representative_dir = build_rmcsetup_paths(
+        project_dir
+    ).representative_partial_solvent_dir
+    representative_dir.mkdir(parents=True, exist_ok=True)
+    representative_path = representative_dir / "partial_rep.xyz"
+    representative_path.write_text(
+        "\n".join(
+            [
+                "4",
+                "partial representative",
+                "Pb 0.0 0.0 0.0",
+                "I 2.8 0.0 0.0",
+                "I 0.0 2.8 0.0",
+                "I 0.0 0.0 2.8",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    selection = DreamBestFitSelection(
+        run_name="Representative Structure Finder",
+        run_relative_path="rmcsetup/representative_structures",
+        label="Representative Structure Finder",
+        selection_source="representativefinder",
+        selected_at="2026-05-06T12:00:00",
+    )
+    _write_representative_selection_metadata(
+        project_dir,
+        RepresentativeSelectionMetadata(
+            selection_mode="representative_finder",
+            selection=selection,
+            distribution_selection=DistributionSelectionMetadata(
+                selection_mode="representative_finder",
+                selection=selection,
+                run_dir="rmcsetup/representative_structures",
+                updated_at="2026-05-06T12:00:00",
+                entries=[],
+            ),
+            settings=RepresentativeSelectionSettings(),
+            updated_at="2026-05-06T12:00:00",
+            representative_entries=[
+                RepresentativeSelectionEntry(
+                    structure="A",
+                    motif="no_motif",
+                    param="w0",
+                    selected_weight=0.6,
+                    cluster_count=1,
+                    source_dir=str(representative_dir),
+                    source_file=str(representative_path),
+                    source_file_name=representative_path.name,
+                    atom_count=4,
+                    element_counts={"Pb": 1, "I": 3},
+                    source_solvent_mode="partialsolv",
+                )
+            ],
+            missing_bins=[
+                RepresentativeSelectionIssue(
+                    structure="B",
+                    motif="no_motif",
+                    param="w1",
+                    message="Representative structure has not been computed yet.",
+                )
+            ],
+            invalid_bins=[],
+        ),
+    )
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert not window.project_setup_tab.use_representative_structures()
+    assert (
+        not window.project_setup_tab.use_representative_structures_checkbox.isEnabled()
+    )
+    assert "Saved 1 of 2 required representative structures." in (
+        window.project_setup_tab.representative_structure_status_label.text()
+    )
+    window.close()
+
+
+def test_representative_checkbox_uses_prior_histogram_bins_for_readiness(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.use_representative_structures = True
+    manager.save_project(settings)
+
+    representative_dir = build_rmcsetup_paths(
+        project_dir
+    ).representative_partial_solvent_dir
+    representative_dir.mkdir(parents=True, exist_ok=True)
+    representative_path = representative_dir / "partial_rep.xyz"
+    representative_path.write_text(
+        "\n".join(
+            [
+                "4",
+                "partial representative",
+                "Pb 0.0 0.0 0.0",
+                "I 2.8 0.0 0.0",
+                "I 0.0 2.8 0.0",
+                "I 0.0 0.0 2.8",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    selection = DreamBestFitSelection(
+        run_name="Representative Structure Finder",
+        run_relative_path="rmcsetup/representative_structures",
+        label="Representative Structure Finder",
+        selection_source="representativefinder",
+        selected_at="2026-05-06T12:00:00",
+    )
+    _write_representative_selection_metadata(
+        project_dir,
+        RepresentativeSelectionMetadata(
+            selection_mode="representative_finder",
+            selection=selection,
+            distribution_selection=DistributionSelectionMetadata(
+                selection_mode="representative_finder",
+                selection=selection,
+                run_dir="rmcsetup/representative_structures",
+                updated_at="2026-05-06T12:00:00",
+                entries=[],
+            ),
+            settings=RepresentativeSelectionSettings(),
+            updated_at="2026-05-06T12:00:00",
+            representative_entries=[
+                RepresentativeSelectionEntry(
+                    structure="A",
+                    motif="no_motif",
+                    param="w0",
+                    selected_weight=1.0,
+                    cluster_count=1,
+                    source_dir=str(representative_dir),
+                    source_file=str(representative_path),
+                    source_file_name=representative_path.name,
+                    atom_count=4,
+                    element_counts={"Pb": 1, "I": 3},
+                    source_solvent_mode="partialsolv",
+                )
+            ],
+            missing_bins=[
+                RepresentativeSelectionIssue(
+                    structure="B",
+                    motif="no_motif",
+                    param="w1",
+                    message="Stale missing bin from a previous distribution.",
+                )
+            ],
+            invalid_bins=[],
+        ),
+    )
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert window.project_setup_tab.use_representative_structures()
+    assert (
+        window.project_setup_tab.use_representative_structures_checkbox.isEnabled()
+    )
+    assert "Representative Structures mode is on." in (
+        window.project_setup_tab.representative_structure_status_label.text()
+    )
+    window.close()
+
+
+def test_representative_toggle_keeps_prior_histogram_and_hides_stale_average_components(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    _settings, artifact_paths = _seed_saved_distribution_from_root(project_dir)
+
+    representative_dir = build_rmcsetup_paths(
+        project_dir
+    ).representative_partial_solvent_dir
+    representative_dir.mkdir(parents=True, exist_ok=True)
+    representative_path = representative_dir / "selected_rep.xyz"
+    representative_path.write_text(
+        "\n".join(
+            [
+                "4",
+                "selected representative",
+                "Pb 0.0 0.0 0.0",
+                "I 2.8 0.0 0.0",
+                "I 0.0 2.8 0.0",
+                "I 0.0 0.0 2.8",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    selection = DreamBestFitSelection(
+        run_name="Representative Structure Finder",
+        run_relative_path="rmcsetup/representative_structures",
+        label="Representative Structure Finder",
+        selection_source="representativefinder",
+        selected_at="2026-05-06T12:00:00",
+    )
+    _write_representative_selection_metadata(
+        project_dir,
+        RepresentativeSelectionMetadata(
+            selection_mode="representative_finder",
+            selection=selection,
+            distribution_selection=DistributionSelectionMetadata(
+                selection_mode="representative_finder",
+                selection=selection,
+                run_dir="rmcsetup/representative_structures",
+                updated_at="2026-05-06T12:00:00",
+                entries=[],
+            ),
+            settings=RepresentativeSelectionSettings(),
+            updated_at="2026-05-06T12:00:00",
+            representative_entries=[
+                RepresentativeSelectionEntry(
+                    structure="A",
+                    motif="no_motif",
+                    param="w0",
+                    selected_weight=1.0,
+                    cluster_count=1,
+                    source_dir=str(representative_dir),
+                    source_file=str(representative_path),
+                    source_file_name=representative_path.name,
+                    atom_count=4,
+                    element_counts={"Pb": 1, "I": 3},
+                    source_solvent_mode="partialsolv",
+                )
+            ],
+            missing_bins=[],
+            invalid_bins=[],
+        ),
+    )
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert window.project_setup_tab._component_paths is not None
+    assert len(window.project_setup_tab._component_paths) == 1
+    assert (
+        window.project_setup_tab.current_prior_json_path()
+        == artifact_paths.prior_weights_file.resolve()
+    )
+
+    window.project_setup_tab.use_representative_structures_checkbox.setChecked(
+        True
+    )
+
+    assert window.project_setup_tab.use_representative_structures()
+    assert window.project_setup_tab._component_paths is None
+    assert (
+        window.project_setup_tab.current_prior_json_path()
+        == artifact_paths.prior_weights_file.resolve()
+    )
+    assert all(
+        str(row.get("source_kind", "")) == "cluster_dir"
+        for row in window.project_setup_tab.recognized_cluster_rows()
+    )
+    window.close()
+
+
+def test_saved_distribution_details_show_component_source_preference(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.use_representative_structures = True
+    manager.save_project(settings)
+    _settings, artifact_paths = _seed_saved_distribution_from_root(project_dir)
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    details = window.project_setup_tab._distribution_details[
+        artifact_paths.distribution_id
+    ]
+
+    assert "Component source preference: Representative Structures" in details
+    assert "built from Representative Structures" in details
+    window.close()
+
+
+def test_fft_born_close_cancels_running_calculation_without_blocking(qapp):
+    del qapp
+    window = FFTBornApproximationMainWindow(preview_mode=True)
+    calls: list[object] = []
+
+    class DummyWorker:
+        def cancel(self):
+            calls.append("cancel")
+
+    class DummyThread:
+        def __init__(self):
+            self.running = True
+
+        def isRunning(self):
+            return self.running
+
+        def quit(self):
+            calls.append("quit")
+            self.running = False
+
+        def wait(self, timeout_ms):
+            calls.append(("wait", timeout_ms))
+            return True
+
+    window._compute_worker = DummyWorker()
+    window._compute_thread = DummyThread()
+
+    assert window.close() is True
+    assert calls == ["cancel", "quit", ("wait", 1000)]
 
 
 def test_saved_distributions_can_coexist_and_load_by_component_build_mode(
@@ -12753,6 +15650,52 @@ def test_save_project_state_ignores_tiny_q_range_edge_mismatch(
         window.prefit_workflow.evaluate().q_values,
         np.linspace(0.05, 0.3, 8),
     )
+    window.close()
+
+
+def test_save_project_state_allows_legacy_3d_fft_one_step_endpoint_gap(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    q_values = 0.0101 + 0.01 * np.arange(118, dtype=float)
+    _write_component_file(
+        paths.scattering_components_dir / "A_no_motif.txt",
+        q_values,
+        np.linspace(10.0, 17.0, q_values.size),
+    )
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.component_build_mode = (
+        COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
+    )
+    settings.model_only_mode = True
+    settings.q_min = 0.0101
+    settings.q_max = 1.19
+    manager.save_project(settings)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr(
+        window,
+        "_show_error",
+        lambda title, message: captured.update(
+            {
+                "title": title,
+                "message": message,
+            }
+        ),
+    )
+
+    window.project_setup_tab.qmin_edit.setText("0.0101")
+    window.project_setup_tab.qmax_edit.setText("1.19")
+    window.save_project_state()
+
+    assert captured == {}
+    assert window.prefit_workflow is not None
+    evaluation_q_values = window.prefit_workflow.evaluate().q_values
+    assert evaluation_q_values[0] == pytest.approx(q_values[0])
+    assert evaluation_q_values[-1] == pytest.approx(q_values[-1])
     window.close()
 
 
@@ -12884,7 +15827,7 @@ def test_project_setup_component_overlay_uses_secondary_y_axis(qapp, tmp_path):
         experimental_axis.get_title()
         == "Experimental Data and SAXS Components"
     )
-    assert experimental_axis.get_xlabel() == "q (Å⁻¹)"
+    assert experimental_axis.get_xlabel() == Q_A_INVERSE_LABEL
     assert (
         experimental_axis.get_ylabel() == "Experimental Intensity (arb. units)"
     )
@@ -12893,6 +15836,89 @@ def test_project_setup_component_overlay_uses_secondary_y_axis(qapp, tmp_path):
     assert (
         component_axis.get_ylim()[1] - component_axis.get_ylim()[0] > 4.8 - 4.2
     )
+
+
+def test_project_setup_component_plot_editor_updates_dual_axis_plot(
+    qapp, tmp_path
+):
+    q_values = np.asarray([0.05, 0.08, 0.12, 0.18], dtype=float)
+    data_path = tmp_path / "exp_overlay_editor.txt"
+    np.savetxt(
+        data_path,
+        np.column_stack(
+            [
+                q_values,
+                np.asarray([100.0, 80.0, 55.0, 30.0], dtype=float),
+            ]
+        ),
+    )
+    component_path = tmp_path / "A_no_motif.txt"
+    _write_component_file(
+        component_path,
+        q_values,
+        np.asarray([4.8, 4.6, 4.4, 4.2], dtype=float),
+    )
+
+    summary = load_experimental_data_file(data_path)
+    tab = ProjectSetupTab()
+    tab.set_project_selected(True)
+    tab._apply_experimental_file(data_path, summary)
+    tab.draw_component_plot([component_path])
+
+    tab.open_component_plot_editor()
+    qapp.processEvents()
+
+    controls = tab._component_plot_editor_controls
+    assert controls is not None
+    assert not controls.secondary_y_label_edit.isHidden()
+    assert not controls.primary_axis_label_font_spin.isHidden()
+    assert not controls.primary_tick_label_font_spin.isHidden()
+    assert not controls.secondary_axis_label_font_spin.isHidden()
+    assert not controls.secondary_tick_label_font_spin.isHidden()
+    assert controls.residual_y_label_edit.isHidden()
+
+    controls.title_edit.setText("Custom SAXS Overlay")
+    controls.primary_axis_label_font_spin.setValue(18.5)
+    controls.primary_tick_label_font_spin.setValue(14.5)
+    qapp.processEvents()
+
+    experimental_axis, component_axis = tab.component_figure.axes
+    assert controls.secondary_axis_label_font_spin.value() == pytest.approx(
+        11.0
+    )
+    assert controls.secondary_tick_label_font_spin.value() == pytest.approx(
+        9.0
+    )
+    assert experimental_axis.yaxis.label.get_fontsize() == pytest.approx(18.5)
+    experimental_ticklabels = experimental_axis.get_yticklabels()
+    assert experimental_ticklabels
+    assert experimental_ticklabels[0].get_fontsize() == pytest.approx(14.5)
+    component_ticklabels = component_axis.get_yticklabels()
+    assert component_ticklabels
+    assert component_ticklabels[0].get_fontsize() == pytest.approx(9.0)
+
+    controls.secondary_axis_label_font_spin.setValue(17.5)
+    controls.secondary_tick_label_font_spin.setValue(13.5)
+    qapp.processEvents()
+
+    label_item = controls.label_table.item(1, 2)
+    assert label_item is not None
+    label_item.setText("Component Average")
+    qapp.processEvents()
+
+    experimental_axis, component_axis = tab.component_figure.axes
+    legend = experimental_axis.get_legend()
+    assert legend is not None
+    legend_labels = [text.get_text() for text in legend.get_texts()]
+
+    assert experimental_axis.get_title() == "Custom SAXS Overlay"
+    assert "Component Average" in legend_labels
+    assert experimental_axis.yaxis.label.get_fontsize() == pytest.approx(18.5)
+    assert component_axis.get_ylabel() == "Model Intensity (arb. units)"
+    assert component_axis.yaxis.label.get_fontsize() == pytest.approx(17.5)
+    component_ticklabels = component_axis.get_yticklabels()
+    assert component_ticklabels
+    assert component_ticklabels[0].get_fontsize() == pytest.approx(13.5)
 
 
 def test_component_legend_toggle_hides_and_shows_legend(qapp, tmp_path):
@@ -13162,6 +16188,71 @@ def test_component_trace_color_scheme_persists_with_project_state(
     )
 
 
+def test_project_setup_plot_view_state_persists_with_project_state(
+    qapp, tmp_path
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    window.project_setup_tab.component_log_x_checkbox.setChecked(False)
+    window.project_setup_tab.component_log_y_checkbox.setChecked(False)
+    window.project_setup_tab.component_legend_toggle_button.setChecked(False)
+    component_axes = window.project_setup_tab.component_figure.axes
+    assert len(component_axes) == 2
+    component_axes[0].set_xlim(0.08, 0.18)
+    component_axes[0].set_ylim(0.045, 0.06)
+    component_axes[1].set_ylim(9.0, 15.0)
+
+    prior_axes = window.project_setup_tab.prior_figure.axes
+    assert len(prior_axes) == 1
+    prior_axes[0].set_xlim(-0.05, 0.75)
+    prior_axes[0].set_ylim(0.0, 120.0)
+
+    window.save_project_state()
+
+    saved_settings = manager.load_project(project_dir)
+    assert saved_settings.component_plot_state["axes"][0]["xlim"] == (
+        pytest.approx([0.08, 0.18])
+    )
+    assert saved_settings.component_plot_state["axes"][1]["ylim"] == (
+        pytest.approx([9.0, 15.0])
+    )
+    assert saved_settings.prior_plot_state["axes"][0]["xlim"] == (
+        pytest.approx([-0.05, 0.75])
+    )
+
+    reloaded_window = SAXSMainWindow(initial_project_dir=project_dir)
+    reloaded_component_axes = (
+        reloaded_window.project_setup_tab.component_figure.axes
+    )
+    reloaded_prior_axes = reloaded_window.project_setup_tab.prior_figure.axes
+
+    assert (
+        not reloaded_window.project_setup_tab.component_log_x_checkbox.isChecked()
+    )
+    assert (
+        not reloaded_window.project_setup_tab.component_log_y_checkbox.isChecked()
+    )
+    assert (
+        reloaded_window.project_setup_tab.component_legend_toggle_button.isChecked()
+        is False
+    )
+    assert reloaded_component_axes[0].get_xscale() == "linear"
+    assert reloaded_component_axes[0].get_yscale() == "linear"
+    assert reloaded_component_axes[0].get_xlim() == pytest.approx((0.08, 0.18))
+    assert reloaded_component_axes[0].get_ylim() == pytest.approx(
+        (0.045, 0.06)
+    )
+    assert reloaded_component_axes[1].get_ylim() == pytest.approx((9.0, 15.0))
+    assert reloaded_prior_axes[0].get_xlim() == pytest.approx((-0.05, 0.75))
+    assert reloaded_prior_axes[0].get_ylim() == pytest.approx((0.0, 120.0))
+
+    window.close()
+    reloaded_window.close()
+
+
 def test_prefit_plot_shows_solvent_contribution_and_legend_pick_toggles_model(
     qapp, tmp_path
 ):
@@ -13382,6 +16473,76 @@ def test_prefit_plot_trace_toggles_control_visible_series(qapp, tmp_path):
     top_axis = window.prefit_tab.figure.axes[0]
     line_labels = [line.get_label() for line in top_axis.get_lines()]
     assert "Experimental" not in line_labels
+
+
+def test_prefit_plot_editor_updates_residual_plot_fields(qapp):
+    q_values = np.asarray([0.05, 0.08, 0.12, 0.18], dtype=float)
+    experimental = np.asarray([10.0, 8.0, 6.0, 4.0], dtype=float)
+    model = np.asarray([9.5, 7.9, 6.2, 4.3], dtype=float)
+    residuals = model - experimental
+    structure_factor = np.asarray([1.1, 1.0, 0.95, 0.9], dtype=float)
+
+    tab = PrefitTab()
+    tab.show_structure_factor_trace_checkbox.setChecked(True)
+    evaluation = PrefitEvaluation(
+        q_values=q_values,
+        experimental_intensities=experimental,
+        model_intensities=model,
+        residuals=residuals,
+        structure_factor_trace=structure_factor,
+    )
+    tab.plot_evaluation(evaluation)
+    tab.open_plot_editor()
+    qapp.processEvents()
+
+    controls = tab._plot_editor_controls
+    assert controls is not None
+    assert not controls.secondary_y_label_edit.isHidden()
+    assert not controls.primary_axis_label_font_spin.isHidden()
+    assert not controls.primary_tick_label_font_spin.isHidden()
+    assert not controls.secondary_axis_label_font_spin.isHidden()
+    assert not controls.secondary_tick_label_font_spin.isHidden()
+    assert not controls.residual_y_label_edit.isHidden()
+    assert not controls.show_annotation_checkbox.isHidden()
+
+    controls.residual_y_label_edit.setText("Model - Data")
+    controls.primary_axis_label_font_spin.setValue(15.0)
+    controls.primary_tick_label_font_spin.setValue(11.0)
+    qapp.processEvents()
+
+    top_axis, bottom_axis, structure_axis = tab.figure.axes
+    assert controls.secondary_axis_label_font_spin.value() == pytest.approx(
+        11.0
+    )
+    assert controls.secondary_tick_label_font_spin.value() == pytest.approx(
+        9.0
+    )
+    assert top_axis.yaxis.label.get_fontsize() == pytest.approx(15.0)
+    top_ticklabels = top_axis.get_yticklabels()
+    assert top_ticklabels
+    assert top_ticklabels[0].get_fontsize() == pytest.approx(11.0)
+    bottom_ticklabels = bottom_axis.get_yticklabels()
+    assert bottom_ticklabels
+    assert bottom_ticklabels[0].get_fontsize() == pytest.approx(11.0)
+    structure_ticklabels = structure_axis.get_yticklabels()
+    assert structure_ticklabels
+    assert structure_ticklabels[0].get_fontsize() == pytest.approx(9.0)
+
+    controls.secondary_axis_label_font_spin.setValue(16.0)
+    controls.secondary_tick_label_font_spin.setValue(12.0)
+    controls.show_annotation_checkbox.setChecked(False)
+    qapp.processEvents()
+
+    top_axis, bottom_axis, structure_axis = tab.figure.axes
+
+    assert bottom_axis.get_ylabel() == "Model - Data"
+    assert top_axis.yaxis.label.get_fontsize() == pytest.approx(15.0)
+    assert structure_axis.get_ylabel() == "S(q)"
+    assert structure_axis.yaxis.label.get_fontsize() == pytest.approx(16.0)
+    structure_ticklabels = structure_axis.get_yticklabels()
+    assert structure_ticklabels
+    assert structure_ticklabels[0].get_fontsize() == pytest.approx(12.0)
+    assert not top_axis.texts
 
 
 def test_prefit_field_interaction_warns_before_components_are_built(
@@ -14656,8 +17817,20 @@ def test_project_setup_can_load_saved_distribution_and_scope_prefit_and_dream(
 
     manager.save_project(observed_settings)
     window = SAXSMainWindow(initial_project_dir=project_dir)
+    observed_label = project_module.distribution_label_for_settings(
+        observed_settings
+    )
+    excluded_label = project_module.distribution_label_for_settings(
+        excluded_settings
+    )
 
     assert window.project_setup_tab.computed_distribution_combo.count() == 2
+    assert "DREAM fits: 1" in (
+        window.project_setup_tab.computed_distribution_combo.currentText()
+    )
+    assert window.project_setup_tab.active_distribution_text() == (
+        observed_label
+    )
     assert window.project_setup_tab.current_prior_json_path() == (
         observed_artifacts.prior_weights_file
     )
@@ -14675,12 +17848,23 @@ def test_project_setup_can_load_saved_distribution_and_scope_prefit_and_dream(
         )
     )
     assert target_index >= 0
+    assert "DREAM fits: 1" in (
+        window.project_setup_tab.computed_distribution_combo.itemText(
+            target_index
+        )
+    )
     window.project_setup_tab.computed_distribution_combo.setCurrentIndex(
         target_index
+    )
+    assert window.project_setup_tab.active_distribution_text() == (
+        observed_label
     )
     window.project_setup_tab.load_distribution_button.click()
     QApplication.processEvents()
 
+    assert window.project_setup_tab.active_distribution_text() == (
+        excluded_label
+    )
     assert window.project_setup_tab.exclude_elements() == ["H"]
     assert window.project_setup_tab.current_prior_json_path() == (
         excluded_artifacts.prior_weights_file
@@ -14820,6 +18004,78 @@ def test_no_contrast_distribution_paths_preserve_legacy_loading_without_build_mo
     assert loaded_settings.selected_model_template == (
         contrast_settings.selected_model_template
     )
+
+
+def test_project_setup_saved_distribution_dropdown_shows_build_mode_for_legacy_metadata(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    legacy_distribution_id = project_module._distribution_id_for_settings(
+        settings,
+        include_template=True,
+        include_build_mode=False,
+    )
+    distribution_dir = (
+        build_project_paths(project_dir).saved_distributions_dir
+        / legacy_distribution_id
+    )
+    component_dir = distribution_dir / "scattering_components"
+    component_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(
+        paths.scattering_components_dir,
+        component_dir,
+        dirs_exist_ok=True,
+    )
+    shutil.copy2(
+        paths.project_dir / "md_saxs_map.json",
+        distribution_dir / "md_saxs_map.json",
+    )
+    shutil.copy2(
+        paths.project_dir / "md_prior_weights.json",
+        distribution_dir / "md_prior_weights.json",
+    )
+    (distribution_dir / "distribution.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "distribution_id": legacy_distribution_id,
+                "label": (
+                    "Observed Only | Template: "
+                    f"{settings.selected_model_template} | Excluded: None | "
+                    "q-range: default | Grid: experimental grid"
+                ),
+                "template_name": settings.selected_model_template,
+                "use_predicted_structure_weights": False,
+                "exclude_elements": [],
+                "clusters_dir": None,
+                "q_min": None,
+                "q_max": None,
+                "use_experimental_grid": True,
+                "q_points": None,
+                "component_artifacts_ready": True,
+                "prior_artifacts_ready": True,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert window.project_setup_tab.computed_distribution_combo.count() == 1
+    assert "Build: No Contrast (Debye)" in (
+        window.project_setup_tab.computed_distribution_combo.itemText(0)
+    )
+    assert "Build: No Contrast (Debye)" in (
+        window.project_setup_tab.active_distribution_text()
+    )
+
+    window.close()
 
 
 def test_project_setup_loads_saved_distribution_with_cropped_q_range(

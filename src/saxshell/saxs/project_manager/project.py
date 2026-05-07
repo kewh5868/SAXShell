@@ -27,6 +27,8 @@ from saxshell.saxs.contrast.representatives import (
     analyze_contrast_representatives,
 )
 from saxshell.saxs.contrast.settings import (
+    COMPONENT_BUILD_MODE_BORN_APPROXIMATION,
+    COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT,
     COMPONENT_BUILD_MODE_CONTRAST,
     COMPONENT_BUILD_MODE_NO_CONTRAST,
     component_build_mode_label,
@@ -44,6 +46,40 @@ from saxshell.saxs.debye import (
 from .prior_plot import export_prior_plot_data
 
 ProgressCallback = Callable[[int, int, str], None]
+COMPONENT_SOURCE_MODE_AVERAGE = "average"
+COMPONENT_SOURCE_MODE_REPRESENTATIVE = "representative"
+_EXTERNAL_COMPONENT_BUILD_MODES = {
+    COMPONENT_BUILD_MODE_BORN_APPROXIMATION,
+    COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT,
+    COMPONENT_BUILD_MODE_CONTRAST,
+}
+
+
+def normalize_component_source_mode(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if text in {
+        COMPONENT_SOURCE_MODE_REPRESENTATIVE,
+        "representative_structure",
+        "representative_structures",
+        "representative structures",
+    }:
+        return COMPONENT_SOURCE_MODE_REPRESENTATIVE
+    return COMPONENT_SOURCE_MODE_AVERAGE
+
+
+def component_source_mode_for_settings(settings: "ProjectSettings") -> str:
+    return (
+        COMPONENT_SOURCE_MODE_REPRESENTATIVE
+        if settings.use_representative_structures
+        else COMPONENT_SOURCE_MODE_AVERAGE
+    )
+
+
+def component_source_mode_label(value: object) -> str:
+    normalized = normalize_component_source_mode(value)
+    if normalized == COMPONENT_SOURCE_MODE_REPRESENTATIVE:
+        return "Representative Structures"
+    return "Average (default)"
 
 
 @dataclass(slots=True)
@@ -223,6 +259,117 @@ class PredictedStructuresProjectState:
 
 
 @dataclass(slots=True, frozen=True)
+class RepresentativeStructuresProjectState:
+    representative_selection_file: Path | None
+    representative_count: int
+    partialsolv_dir: Path | None
+    nosolv_dir: Path | None
+    fullsolv_dir: Path | None
+    source_files_ready: bool = False
+    available_modes: tuple[str, ...] = ()
+    expected_representative_count: int = 0
+    missing_representative_count: int = 0
+    invalid_representative_count: int = 0
+    selection_ready: bool = False
+    updated_at: str | None = None
+
+
+def _representative_bin_key(
+    structure: object,
+    motif: object,
+) -> tuple[str, str] | None:
+    structure_text = str(structure or "").strip()
+    if not structure_text:
+        return None
+    return (
+        structure_text,
+        _normalized_nonempty_text(motif, default="no_motif"),
+    )
+
+
+def _representative_issue_key(
+    issue: object,
+) -> tuple[str, str] | None:
+    return _representative_bin_key(
+        getattr(issue, "structure", ""),
+        getattr(issue, "motif", "no_motif"),
+    )
+
+
+def _representative_weight_value(value: object) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _representative_expected_bins_from_prior_weights(
+    prior_weights_path: str | Path | None,
+) -> tuple[tuple[str, str], ...] | None:
+    if prior_weights_path is None:
+        return None
+    path = Path(prior_weights_path).expanduser().resolve()
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    raw_structures = payload.get("structures", {})
+    if not isinstance(raw_structures, dict):
+        return None
+
+    value_kind = str(payload.get("value_kind", "count")).strip().lower()
+    expected_bins: set[tuple[str, str]] = set()
+    for structure, raw_motifs in raw_structures.items():
+        if not isinstance(raw_motifs, dict):
+            continue
+        for motif, raw_motif_payload in raw_motifs.items():
+            if not isinstance(raw_motif_payload, dict):
+                continue
+            source_kind = (
+                str(raw_motif_payload.get("source_kind", "cluster_dir"))
+                .strip()
+                .lower()
+            )
+            if source_kind == "predicted_structure":
+                continue
+            if value_kind == "normalized_weight":
+                weight_value = _representative_weight_value(
+                    raw_motif_payload.get(
+                        "normalized_weight",
+                        raw_motif_payload.get("weight", 0.0),
+                    )
+                    or 0.0
+                )
+            else:
+                weight_value = _representative_weight_value(
+                    raw_motif_payload.get(
+                        "count",
+                        raw_motif_payload.get("weight", 0.0),
+                    )
+                    or 0.0
+                )
+            if weight_value <= 0.0:
+                continue
+            key = _representative_bin_key(structure, motif)
+            if key is not None:
+                expected_bins.add(key)
+
+    return tuple(
+        sorted(
+            expected_bins,
+            key=lambda item: (
+                _natural_sort_key(item[0]),
+                _natural_sort_key(item[1]),
+            ),
+        )
+    )
+
+
+@dataclass(slots=True, frozen=True)
 class SavedDistributionRecord:
     distribution_id: str
     label: str
@@ -233,6 +380,7 @@ class SavedDistributionRecord:
     template_name: str | None = None
     component_build_mode: str = COMPONENT_BUILD_MODE_NO_CONTRAST
     use_predicted_structure_weights: bool = False
+    use_representative_structures: bool = False
     exclude_elements: tuple[str, ...] = ()
     clusters_dir: str | None = None
     q_min: float | None = None
@@ -241,6 +389,7 @@ class SavedDistributionRecord:
     q_points: int | None = None
     component_artifacts_ready: bool = False
     prior_artifacts_ready: bool = False
+    built_component_source_mode: str | None = None
 
 
 @dataclass(slots=True)
@@ -505,6 +654,7 @@ class ProjectSettings:
     project_dir: str
     model_only_mode: bool = False
     use_predicted_structure_weights: bool = False
+    use_representative_structures: bool = False
     frames_dir: str | None = None
     pdb_frames_dir: str | None = None
     clusters_dir: str | None = None
@@ -541,10 +691,12 @@ class ProjectSettings:
     exclude_elements: list[str] = field(default_factory=list)
     component_trace_colors: dict[str, str] = field(default_factory=dict)
     component_trace_color_scheme: str = "default"
+    component_plot_state: dict[str, object] = field(default_factory=dict)
     experimental_trace_visible: bool = True
     experimental_trace_color: str = "#000000"
     solvent_trace_visible: bool = True
     solvent_trace_color: str = "#008000"
+    prior_plot_state: dict[str, object] = field(default_factory=dict)
     runtime_bundle_opener: str | None = None
     template_reset_template: str | None = None
     template_reset_parameter_entries: list[dict[str, object]] = field(
@@ -645,6 +797,9 @@ class ProjectSettings:
         payload["component_trace_color_scheme"] = (
             str(self.component_trace_color_scheme).strip() or "default"
         )
+        payload["component_plot_state"] = _normalized_json_object(
+            self.component_plot_state
+        )
         payload["experimental_trace_visible"] = bool(
             self.experimental_trace_visible
         )
@@ -653,6 +808,9 @@ class ProjectSettings:
         )
         payload["solvent_trace_visible"] = bool(self.solvent_trace_visible)
         payload["solvent_trace_color"] = str(self.solvent_trace_color)
+        payload["prior_plot_state"] = _normalized_json_object(
+            self.prior_plot_state
+        )
         payload["runtime_bundle_opener"] = _optional_str(
             self.runtime_bundle_opener
         )
@@ -716,6 +874,9 @@ class ProjectSettings:
             model_only_mode=bool(payload.get("model_only_mode", False)),
             use_predicted_structure_weights=bool(
                 payload.get("use_predicted_structure_weights", False)
+            ),
+            use_representative_structures=bool(
+                payload.get("use_representative_structures", False)
             ),
             frames_dir=_optional_str(payload.get("frames_dir")),
             pdb_frames_dir=_optional_str(payload.get("pdb_frames_dir")),
@@ -803,6 +964,9 @@ class ProjectSettings:
                 payload.get("component_trace_color_scheme", "default")
             ).strip()
             or "default",
+            component_plot_state=_normalized_json_object(
+                payload.get("component_plot_state", {})
+            ),
             experimental_trace_visible=bool(
                 payload.get("experimental_trace_visible", True)
             ),
@@ -817,6 +981,9 @@ class ProjectSettings:
                 payload.get("solvent_trace_color", "#008000")
             ).strip()
             or "#008000",
+            prior_plot_state=_normalized_json_object(
+                payload.get("prior_plot_state", {})
+            ),
             runtime_bundle_opener=_optional_str(
                 payload.get("runtime_bundle_opener")
             ),
@@ -867,6 +1034,16 @@ def _normalized_prior_x_axis_order(raw: object) -> list[list[str]]:
     return result
 
 
+def _normalized_json_object(raw: object) -> dict[str, object]:
+    if not isinstance(raw, dict):
+        return {}
+    try:
+        normalized = json.loads(json.dumps(raw))
+    except (TypeError, ValueError):
+        return {}
+    return normalized if isinstance(normalized, dict) else {}
+
+
 def _distribution_id_for_settings(
     settings: ProjectSettings,
     *,
@@ -905,28 +1082,78 @@ def distribution_id_for_settings(settings: ProjectSettings) -> str:
 
 
 def distribution_label_for_settings(settings: ProjectSettings) -> str:
+    return _distribution_label(
+        use_predicted_structure_weights=(
+            settings.use_predicted_structure_weights
+        ),
+        component_build_mode=settings.component_build_mode,
+        template_name=settings.selected_model_template,
+        exclude_elements=settings.exclude_elements,
+        q_min=settings.q_min,
+        q_max=settings.q_max,
+        use_experimental_grid=settings.use_experimental_grid,
+        q_points=settings.q_points,
+    )
+
+
+def _distribution_label(
+    *,
+    use_predicted_structure_weights: bool,
+    component_build_mode: object,
+    template_name: str | None,
+    exclude_elements: object,
+    q_min: float | None,
+    q_max: float | None,
+    use_experimental_grid: bool,
+    q_points: int | None,
+) -> str:
     mode = (
         "Observed + Predicted Structures"
-        if settings.use_predicted_structure_weights
+        if use_predicted_structure_weights
         else "Observed Only"
     )
-    build_mode = component_build_mode_label(settings.component_build_mode)
-    template_name = (
-        str(settings.selected_model_template or "").strip() or "Unspecified"
-    )
-    excluded = ", ".join(sorted(set(settings.exclude_elements))) or "None"
-    if settings.q_min is None or settings.q_max is None:
+    build_mode = component_build_mode_label(component_build_mode)
+    resolved_template_name = str(template_name or "").strip() or "Unspecified"
+    excluded = ", ".join(sorted(set(_normalized_elements(exclude_elements))))
+    excluded = excluded or "None"
+    if q_min is None or q_max is None:
         q_range = "default"
     else:
-        q_range = f"{float(settings.q_min):.6g} to {float(settings.q_max):.6g}"
+        q_range = f"{float(q_min):.6g} to {float(q_max):.6g}"
     grid = (
         "experimental grid"
-        if settings.use_experimental_grid
-        else f"resample {int(settings.q_points or 0)}"
+        if use_experimental_grid
+        else f"resample {int(q_points or 0)}"
     )
     return (
-        f"{mode} | Build: {build_mode} | Template: {template_name} | "
+        f"{mode} | Build: {build_mode} | Template: {resolved_template_name} | "
         f"Excluded: {excluded} | q-range: {q_range} | Grid: {grid}"
+    )
+
+
+def _distribution_label_from_metadata_payload(
+    payload: dict[str, object],
+) -> str:
+    stored_label = str(payload.get("label", "")).strip()
+    template_name = _optional_str(payload.get("template_name"))
+    if template_name is None:
+        for part in stored_label.split(" | "):
+            if part.startswith("Template: "):
+                template_name = (
+                    str(part.removeprefix("Template: ")).strip() or None
+                )
+                break
+    return _distribution_label(
+        use_predicted_structure_weights=bool(
+            payload.get("use_predicted_structure_weights", False)
+        ),
+        component_build_mode=payload.get("component_build_mode"),
+        template_name=template_name,
+        exclude_elements=payload.get("exclude_elements", []),
+        q_min=_optional_float(payload.get("q_min")),
+        q_max=_optional_float(payload.get("q_max")),
+        use_experimental_grid=bool(payload.get("use_experimental_grid", True)),
+        q_points=_optional_int(payload.get("q_points")),
     )
 
 
@@ -1177,21 +1404,43 @@ def _project_has_saved_distributions(project_dir: str | Path) -> bool:
     return any(path.is_dir() for path in saved_dir.iterdir())
 
 
+def _distribution_built_component_source_mode_from_payload(
+    payload: dict[str, object],
+) -> str | None:
+    explicit_mode = _optional_str(payload.get("built_component_source_mode"))
+    if explicit_mode is not None:
+        return normalize_component_source_mode(explicit_mode)
+    if bool(payload.get("component_artifacts_ready", False)):
+        return normalize_component_source_mode(
+            COMPONENT_SOURCE_MODE_REPRESENTATIVE
+            if bool(payload.get("use_representative_structures", False))
+            else COMPONENT_SOURCE_MODE_AVERAGE
+        )
+    return None
+
+
 def _distribution_metadata_from_payload(
     distribution_dir: Path,
     metadata_path: Path,
     payload: dict[str, object],
 ) -> SavedDistributionRecord | None:
     distribution_id = str(payload.get("distribution_id", "")).strip()
-    label = str(payload.get("label", "")).strip()
-    if not distribution_id or not label:
+    if not distribution_id:
         return None
     exclude_elements = tuple(
         _normalized_elements(payload.get("exclude_elements", []))
     )
+    built_component_source_mode = (
+        _distribution_built_component_source_mode_from_payload(payload)
+    )
+    use_representative_structures = bool(
+        payload.get("use_representative_structures", False)
+    )
+    if built_component_source_mode == COMPONENT_SOURCE_MODE_REPRESENTATIVE:
+        use_representative_structures = True
     return SavedDistributionRecord(
         distribution_id=distribution_id,
-        label=label,
+        label=_distribution_label_from_metadata_payload(payload),
         distribution_dir=distribution_dir,
         metadata_path=metadata_path,
         created_at=_optional_str(payload.get("created_at")),
@@ -1203,6 +1452,7 @@ def _distribution_metadata_from_payload(
         use_predicted_structure_weights=bool(
             payload.get("use_predicted_structure_weights", False)
         ),
+        use_representative_structures=use_representative_structures,
         exclude_elements=exclude_elements,
         clusters_dir=_optional_str(payload.get("clusters_dir")),
         q_min=_optional_float(payload.get("q_min")),
@@ -1215,6 +1465,7 @@ def _distribution_metadata_from_payload(
         prior_artifacts_ready=bool(
             payload.get("prior_artifacts_ready", False)
         ),
+        built_component_source_mode=built_component_source_mode,
     )
 
 
@@ -1841,6 +2092,305 @@ class SAXSProjectManager:
             prior_artifacts_ready=prior_artifacts_ready,
         )
 
+    def inspect_representative_structures(
+        self,
+        project_dir: str | Path,
+        *,
+        prior_weights_path: str | Path | None = None,
+    ) -> RepresentativeStructuresProjectState:
+        from saxshell.fullrmc.project_model import ensure_rmcsetup_structure
+        from saxshell.fullrmc.representatives import (
+            load_representative_selection_metadata,
+            normalize_representative_source_solvent_mode,
+            representative_structure_variant_path,
+        )
+        from saxshell.fullrmc.solvent_handling import (
+            load_solvent_handling_metadata,
+        )
+
+        paths = ensure_rmcsetup_structure(project_dir)
+        metadata = load_representative_selection_metadata(
+            paths.representative_selection_path
+        )
+        solvent_metadata = load_solvent_handling_metadata(
+            paths.solvent_handling_path
+        )
+        representative_entries = (
+            list(metadata.representative_entries)
+            if metadata is not None
+            else []
+        )
+        representative_count = len(representative_entries)
+        representative_bin_keys = [
+            key
+            for entry in representative_entries
+            if (key := _representative_bin_key(entry.structure, entry.motif))
+            is not None
+        ]
+        representative_bin_key_set = set(representative_bin_keys)
+        expected_bin_keys = _representative_expected_bins_from_prior_weights(
+            prior_weights_path
+        )
+        expected_bin_key_set = (
+            None if expected_bin_keys is None else set(expected_bin_keys)
+        )
+        expected_representative_count = 0
+        missing_representative_count = 0
+        invalid_representative_count = 0
+        if metadata is not None:
+            metadata_expected_bin_keys = [
+                key
+                for entry in metadata.distribution_selection.active_entries(
+                    metadata.settings.minimum_cluster_count_for_analysis
+                )
+                if (
+                    key := _representative_bin_key(
+                        entry.structure, entry.motif
+                    )
+                )
+                is not None
+            ]
+            if expected_bin_key_set is None:
+                expected_bin_key_set = set(metadata_expected_bin_keys)
+                expected_representative_count = len(expected_bin_key_set)
+                missing_representative_count = len(metadata.missing_bins)
+                invalid_representative_count = len(metadata.invalid_bins)
+                if expected_representative_count <= 0:
+                    expected_representative_count = (
+                        representative_count
+                        + missing_representative_count
+                        + invalid_representative_count
+                    )
+            else:
+                invalid_issue_keys = {
+                    key
+                    for issue in metadata.invalid_bins
+                    if (key := _representative_issue_key(issue))
+                    in expected_bin_key_set
+                }
+                unresolved_expected_keys = (
+                    expected_bin_key_set - representative_bin_key_set
+                )
+                missing_representative_count = len(
+                    unresolved_expected_keys - invalid_issue_keys
+                )
+                invalid_representative_count = len(invalid_issue_keys)
+                invalid_representative_count += len(
+                    representative_bin_key_set - expected_bin_key_set
+                )
+                invalid_representative_count += max(
+                    representative_count - len(representative_bin_key_set),
+                    0,
+                )
+                expected_representative_count = len(expected_bin_key_set)
+        elif expected_bin_key_set is not None:
+            expected_representative_count = len(expected_bin_key_set)
+            missing_representative_count = len(
+                expected_bin_key_set - representative_bin_key_set
+            )
+            invalid_representative_count = len(
+                representative_bin_key_set - expected_bin_key_set
+            )
+            invalid_representative_count += max(
+                representative_count - len(representative_bin_key_set),
+                0,
+            )
+        available_modes: list[str] = []
+        source_files_ready = False
+        if representative_count > 0:
+            source_paths = [
+                Path(entry.source_file).expanduser().resolve()
+                for entry in representative_entries
+            ]
+            source_files_ready = bool(source_paths) and all(
+                path.is_file() for path in source_paths
+            )
+            if source_files_ready:
+                for mode in ("nosolv", "partialsolv", "fullsolv"):
+                    if (
+                        all(
+                            representative_structure_variant_path(
+                                entry.source_file,
+                                mode,
+                            )
+                            is not None
+                            or normalize_representative_source_solvent_mode(
+                                entry.source_solvent_mode
+                            )
+                            == mode
+                            for entry in representative_entries
+                        )
+                        and mode not in available_modes
+                    ):
+                        available_modes.append(mode)
+        if solvent_metadata is not None and solvent_metadata.entries:
+            no_solvent_paths = [
+                Path(entry.no_solvent_pdb).expanduser().resolve()
+                for entry in solvent_metadata.entries
+            ]
+            full_solvent_paths = [
+                Path(entry.completed_pdb).expanduser().resolve()
+                for entry in solvent_metadata.entries
+            ]
+            if (
+                no_solvent_paths
+                and all(path.is_file() for path in no_solvent_paths)
+                and "nosolv" not in available_modes
+            ):
+                available_modes.append("nosolv")
+            if (
+                full_solvent_paths
+                and all(path.is_file() for path in full_solvent_paths)
+                and "fullsolv" not in available_modes
+            ):
+                available_modes.append("fullsolv")
+        selection_count_matches = (
+            representative_count == expected_representative_count
+            if expected_bin_key_set is not None
+            else representative_count >= expected_representative_count
+        )
+        selection_bins_match = (
+            representative_bin_key_set == expected_bin_key_set
+            if expected_bin_key_set is not None
+            else True
+        )
+        selection_ready = bool(
+            representative_count > 0
+            and source_files_ready
+            and missing_representative_count == 0
+            and invalid_representative_count == 0
+            and selection_count_matches
+            and selection_bins_match
+        )
+        return RepresentativeStructuresProjectState(
+            representative_selection_file=(
+                paths.representative_selection_path
+                if paths.representative_selection_path.is_file()
+                else None
+            ),
+            representative_count=int(representative_count),
+            partialsolv_dir=(
+                paths.representative_partial_solvent_dir
+                if paths.representative_partial_solvent_dir.is_dir()
+                else None
+            ),
+            nosolv_dir=(
+                paths.pdb_no_solvent_dir
+                if paths.pdb_no_solvent_dir.is_dir()
+                else None
+            ),
+            fullsolv_dir=(
+                paths.pdb_with_solvent_dir
+                if paths.pdb_with_solvent_dir.is_dir()
+                else None
+            ),
+            source_files_ready=bool(source_files_ready),
+            available_modes=tuple(available_modes),
+            expected_representative_count=max(
+                int(expected_representative_count),
+                0,
+            ),
+            missing_representative_count=max(
+                int(missing_representative_count),
+                0,
+            ),
+            invalid_representative_count=max(
+                int(invalid_representative_count),
+                0,
+            ),
+            selection_ready=selection_ready,
+            updated_at=(
+                None
+                if metadata is None
+                else _optional_str(metadata.updated_at)
+            ),
+        )
+
+    def component_artifacts_ready(
+        self,
+        settings: ProjectSettings,
+        *,
+        artifact_paths: ProjectArtifactPaths | None = None,
+    ) -> bool:
+        active_artifact_paths = artifact_paths or project_artifact_paths(
+            settings
+        )
+        return bool(
+            active_artifact_paths.component_dir.is_dir()
+            and any(active_artifact_paths.component_dir.glob("*.txt"))
+            and active_artifact_paths.component_map_file.is_file()
+        )
+
+    def built_component_source_mode(
+        self,
+        settings: ProjectSettings,
+        *,
+        artifact_paths: ProjectArtifactPaths | None = None,
+    ) -> str | None:
+        active_artifact_paths = artifact_paths or project_artifact_paths(
+            settings
+        )
+        metadata_path = active_artifact_paths.distribution_metadata_file
+        if metadata_path is None or not metadata_path.is_file():
+            return None
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return _distribution_built_component_source_mode_from_payload(payload)
+
+    def component_artifacts_match_settings(
+        self,
+        settings: ProjectSettings,
+        *,
+        artifact_paths: ProjectArtifactPaths | None = None,
+    ) -> bool:
+        normalized_build_mode = normalize_component_build_mode(
+            settings.component_build_mode
+        )
+        if normalized_build_mode in {
+            COMPONENT_BUILD_MODE_CONTRAST,
+            COMPONENT_BUILD_MODE_BORN_APPROXIMATION,
+            COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT,
+        }:
+            return self.component_artifacts_ready(
+                settings,
+                artifact_paths=artifact_paths,
+            )
+        active_artifact_paths = artifact_paths or project_artifact_paths(
+            settings
+        )
+        if not self.component_artifacts_ready(
+            settings,
+            artifact_paths=active_artifact_paths,
+        ):
+            return False
+        saved_mode = self.built_component_source_mode(
+            settings,
+            artifact_paths=active_artifact_paths,
+        )
+        if saved_mode is None:
+            return True
+        return saved_mode == component_source_mode_for_settings(settings)
+
+    def _full_observed_cluster_inventory(
+        self,
+        settings: ProjectSettings,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> _ClusterInventory:
+        clusters_dir = settings.resolved_clusters_dir
+        if clusters_dir is None:
+            raise ValueError(
+                "Select a clusters directory before building models."
+            )
+        return self._collect_cluster_inventory(
+            clusters_dir,
+            progress_callback=progress_callback,
+        )
+
     def list_saved_distributions(
         self,
         project_dir: str | Path,
@@ -1920,6 +2470,9 @@ class SAXSProjectManager:
         )
         working_settings.use_predicted_structure_weights = bool(
             record.use_predicted_structure_weights
+        )
+        working_settings.use_representative_structures = bool(
+            record.use_representative_structures
         )
         working_settings.exclude_elements = list(record.exclude_elements)
         working_settings.clusters_dir = record.clusters_dir
@@ -2210,13 +2763,9 @@ class SAXSProjectManager:
             storage_mode="distribution",
         )
         self.ensure_artifact_dirs(artifact_paths)
-        clusters_dir = settings.resolved_clusters_dir
-        if clusters_dir is None:
-            raise ValueError(
-                "Select a clusters directory before building models."
-            )
         predicted_dataset_file: Path | None = None
         predicted_component_count = 0
+        built_component_source_mode: str | None = None
         if (
             normalize_component_build_mode(settings.component_build_mode)
             == COMPONENT_BUILD_MODE_CONTRAST
@@ -2239,16 +2788,27 @@ class SAXSProjectManager:
                 cluster_inventory=cluster_inventory,
                 progress_callback=progress_callback,
             )
+            built_component_source_mode = component_source_mode_for_settings(
+                settings
+            )
         else:
-            cluster_inventory = self._collect_cluster_inventory(
-                clusters_dir,
+            full_cluster_inventory = self._full_observed_cluster_inventory(
+                settings,
                 progress_callback=progress_callback,
             )
-            settings.available_elements = cluster_inventory.available_elements
-            settings.cluster_inventory_rows = cluster_inventory.cluster_rows
-            cluster_rows = list(cluster_inventory.cluster_rows)
-            component_entries = self._component_entries_from_cluster_bins(
-                cluster_inventory.cluster_bins
+            cluster_inventory = self._active_observed_cluster_inventory(
+                settings,
+                progress_callback=progress_callback,
+            )
+            settings.available_elements = (
+                full_cluster_inventory.available_elements
+            )
+            settings.cluster_inventory_rows = (
+                full_cluster_inventory.cluster_rows
+            )
+            cluster_rows = list(full_cluster_inventory.cluster_rows)
+            component_entries = self._component_entries_from_cluster_inventory(
+                cluster_inventory
             )
             reused_observed_components = (
                 settings.use_predicted_structure_weights
@@ -2270,17 +2830,15 @@ class SAXSProjectManager:
                     progress_callback=progress_callback,
                     progress_total=max(cluster_inventory.total_files, 1),
                 )
-                component_entries = [
-                    ProjectComponentEntry(
-                        structure=component.structure,
-                        motif=component.motif,
-                        file_count=component.file_count,
-                        representative=component.representative,
-                        profile_file=component.output_path.name,
-                        source_dir=str(component.source_dir),
+                component_entries = (
+                    self._component_entries_from_averaged_components(
+                        averaged_components,
+                        cluster_inventory=cluster_inventory,
                     )
-                    for component in averaged_components
-                ]
+                )
+            built_component_source_mode = component_source_mode_for_settings(
+                settings
+            )
         if (
             normalize_component_build_mode(settings.component_build_mode)
             != COMPONENT_BUILD_MODE_CONTRAST
@@ -2297,11 +2855,11 @@ class SAXSProjectManager:
                 artifact_paths=artifact_paths,
                 q_values=q_values,
                 component_entries=component_entries,
-                cluster_inventory=cluster_inventory,
+                cluster_inventory=full_cluster_inventory,
             )
             settings.available_elements = sorted(
                 {
-                    *settings.available_elements,
+                    *full_cluster_inventory.available_elements,
                     *predicted_available_elements,
                 },
                 key=_natural_sort_key,
@@ -2313,6 +2871,7 @@ class SAXSProjectManager:
         self._write_distribution_metadata(
             settings,
             artifact_paths=artifact_paths,
+            built_component_source_mode=built_component_source_mode,
         )
         self.save_project(
             settings,
@@ -2572,13 +3131,8 @@ class SAXSProjectManager:
             storage_mode="distribution",
         )
         self.ensure_artifact_dirs(artifact_paths)
-        clusters_dir = settings.resolved_clusters_dir
-        if clusters_dir is None:
-            raise ValueError(
-                "Select a clusters directory before generating prior weights."
-            )
-        cluster_inventory = self._collect_cluster_inventory(
-            clusters_dir,
+        cluster_inventory = self._full_observed_cluster_inventory(
+            settings,
             progress_callback=progress_callback,
         )
         settings.available_elements = cluster_inventory.available_elements
@@ -2586,13 +3140,23 @@ class SAXSProjectManager:
         component_entries = self._component_entries_for_prior_weights(
             settings,
             artifact_paths=artifact_paths,
-            cluster_bins=cluster_inventory.cluster_bins,
+            cluster_inventory=cluster_inventory,
         )
         md_prior_weights_path = artifact_paths.prior_weights_file
         prior_plot_data_path = artifact_paths.prior_plot_data_file
         cluster_rows = list(cluster_inventory.cluster_rows)
         predicted_dataset_file: Path | None = None
         predicted_component_count = 0
+        prior_origin_dir = (
+            cluster_inventory.cluster_bins[0].source_dir.parent
+            if settings.use_representative_structures
+            and cluster_inventory.cluster_bins
+            else settings.resolved_clusters_dir
+        )
+        if prior_origin_dir is None:
+            raise ValueError(
+                "Select a clusters directory before generating prior weights."
+            )
         if progress_callback is not None:
             progress_callback(
                 0,
@@ -2617,7 +3181,7 @@ class SAXSProjectManager:
                 predicted_component_count,
             ) = self._write_md_prior_weights_with_predicted_structures(
                 md_prior_weights_path=md_prior_weights_path,
-                clusters_dir=clusters_dir,
+                clusters_dir=prior_origin_dir,
                 component_entries=component_entries,
                 cluster_bins=cluster_inventory.cluster_bins,
                 available_elements=cluster_inventory.available_elements,
@@ -2635,13 +3199,18 @@ class SAXSProjectManager:
         else:
             self._write_md_prior_weights(
                 md_prior_weights_path=md_prior_weights_path,
-                clusters_dir=clusters_dir,
+                clusters_dir=prior_origin_dir,
                 component_entries=component_entries,
                 cluster_bins=cluster_inventory.cluster_bins,
                 available_elements=cluster_inventory.available_elements,
                 q_values=q_values,
             )
         export_prior_plot_data(md_prior_weights_path, prior_plot_data_path)
+        if (
+            normalize_component_build_mode(settings.component_build_mode)
+            in _EXTERNAL_COMPONENT_BUILD_MODES
+        ):
+            self._reset_distribution_component_artifacts(artifact_paths)
         self._write_distribution_metadata(
             settings,
             artifact_paths=artifact_paths,
@@ -2670,17 +3239,30 @@ class SAXSProjectManager:
             predicted_component_count=predicted_component_count,
         )
 
+    def _reset_distribution_component_artifacts(
+        self,
+        artifact_paths: ProjectArtifactPaths,
+    ) -> None:
+        if artifact_paths.component_dir.is_dir():
+            shutil.rmtree(artifact_paths.component_dir)
+        elif artifact_paths.component_dir.exists():
+            artifact_paths.component_dir.unlink()
+        if artifact_paths.component_map_file.is_file():
+            artifact_paths.component_map_file.unlink()
+
     def _write_distribution_metadata(
         self,
         settings: ProjectSettings,
         *,
         artifact_paths: ProjectArtifactPaths,
+        built_component_source_mode: str | None = None,
     ) -> None:
         metadata_path = artifact_paths.distribution_metadata_file
         if metadata_path is None:
             return
         now = datetime.now().isoformat(timespec="seconds")
         created_at = now
+        existing: dict[str, object] = {}
         if metadata_path.is_file():
             try:
                 existing = json.loads(
@@ -2689,14 +3271,27 @@ class SAXSProjectManager:
             except Exception:
                 existing = {}
             created_at = str(existing.get("created_at", now)).strip() or now
-        component_ready = bool(
-            artifact_paths.component_dir.is_dir()
-            and any(artifact_paths.component_dir.glob("*.txt"))
-            and artifact_paths.component_map_file.is_file()
+        component_ready = self.component_artifacts_ready(
+            settings,
+            artifact_paths=artifact_paths,
         )
         prior_ready = bool(artifact_paths.prior_weights_file.is_file())
+        resolved_component_source_mode: str | None = None
+        if component_ready:
+            if built_component_source_mode is not None:
+                resolved_component_source_mode = (
+                    normalize_component_source_mode(
+                        built_component_source_mode
+                    )
+                )
+            else:
+                resolved_component_source_mode = (
+                    _distribution_built_component_source_mode_from_payload(
+                        existing
+                    )
+                )
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "distribution_id": artifact_paths.distribution_id,
             "label": distribution_label_for_settings(settings),
             "created_at": created_at,
@@ -2707,6 +3302,9 @@ class SAXSProjectManager:
             ),
             "use_predicted_structure_weights": bool(
                 settings.use_predicted_structure_weights
+            ),
+            "use_representative_structures": bool(
+                settings.use_representative_structures
             ),
             "exclude_elements": sorted(set(settings.exclude_elements)),
             "clusters_dir": (
@@ -2724,6 +3322,7 @@ class SAXSProjectManager:
             ),
             "component_artifacts_ready": component_ready,
             "prior_artifacts_ready": prior_ready,
+            "built_component_source_mode": resolved_component_source_mode,
         }
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         metadata_path.write_text(
@@ -2970,22 +3569,86 @@ class SAXSProjectManager:
             discover_cluster_bins(clusters_dir)
         )
 
+    def _component_entries_from_cluster_inventory(
+        self,
+        cluster_inventory: _ClusterInventory,
+    ) -> list[ProjectComponentEntry]:
+        count_lookup = {
+            (
+                str(row.get("structure", "")).strip(),
+                _normalized_nonempty_text(
+                    row.get("motif"),
+                    default="no_motif",
+                ),
+            ): max(int(row.get("count", 0) or 0), 1)
+            for row in cluster_inventory.cluster_rows
+        }
+        entries = self._component_entries_from_cluster_bins(
+            cluster_inventory.cluster_bins
+        )
+        return [
+            replace(
+                entry,
+                file_count=count_lookup.get(
+                    (entry.structure, entry.motif),
+                    max(int(entry.file_count), 1),
+                ),
+            )
+            for entry in entries
+        ]
+
     def _component_entries_for_prior_weights(
         self,
         settings: ProjectSettings,
         *,
         artifact_paths: ProjectArtifactPaths,
-        cluster_bins: list[ClusterBin],
+        cluster_inventory: _ClusterInventory,
     ) -> list[ProjectComponentEntry]:
         if (
             normalize_component_build_mode(settings.component_build_mode)
             != COMPONENT_BUILD_MODE_CONTRAST
         ):
-            return self._component_entries_from_cluster_bins(cluster_bins)
+            return self._component_entries_from_cluster_inventory(
+                cluster_inventory
+            )
         return self._contrast_component_entries_from_distribution_artifacts(
             artifact_paths=artifact_paths,
-            cluster_bins=cluster_bins,
+            cluster_bins=cluster_inventory.cluster_bins,
         )
+
+    def _component_entries_from_averaged_components(
+        self,
+        averaged_components: list[object],
+        *,
+        cluster_inventory: _ClusterInventory,
+    ) -> list[ProjectComponentEntry]:
+        count_lookup = {
+            (
+                str(row.get("structure", "")).strip(),
+                _normalized_nonempty_text(
+                    row.get("motif"),
+                    default="no_motif",
+                ),
+            ): max(int(row.get("count", 0) or 0), 1)
+            for row in cluster_inventory.cluster_rows
+        }
+        entries: list[ProjectComponentEntry] = []
+        for component in averaged_components:
+            key = (component.structure, component.motif)
+            entries.append(
+                ProjectComponentEntry(
+                    structure=component.structure,
+                    motif=component.motif,
+                    file_count=count_lookup.get(
+                        key,
+                        max(int(component.file_count), 1),
+                    ),
+                    representative=component.representative,
+                    profile_file=component.output_path.name,
+                    source_dir=str(component.source_dir),
+                )
+            )
+        return entries
 
     def _component_entries_from_cluster_bins(
         self,
@@ -3135,6 +3798,180 @@ class SAXSProjectManager:
         if distribution_snapshot_path.is_file():
             return distribution_snapshot_path
         return distribution_snapshot_path
+
+    def _active_observed_cluster_inventory(
+        self,
+        settings: ProjectSettings,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> _ClusterInventory:
+        if not settings.use_representative_structures:
+            return self._full_observed_cluster_inventory(
+                settings,
+                progress_callback=progress_callback,
+            )
+        return self._representative_cluster_inventory(
+            settings,
+            progress_callback=progress_callback,
+        )
+
+    def _representative_cluster_inventory(
+        self,
+        settings: ProjectSettings,
+        *,
+        progress_callback: ProgressCallback | None = None,
+        force_refresh: bool = False,
+    ) -> _ClusterInventory:
+        from saxshell.fullrmc.project_model import ensure_rmcsetup_structure
+        from saxshell.fullrmc.representatives import (
+            load_representative_selection_metadata,
+        )
+
+        rmcsetup_paths = ensure_rmcsetup_structure(settings.project_dir)
+        cache_key = rmcsetup_paths.representative_selection_path.resolve()
+        if not force_refresh:
+            cached = self._cluster_inventory_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        metadata = load_representative_selection_metadata(
+            rmcsetup_paths.representative_selection_path
+        )
+        representative_entries = (
+            [] if metadata is None else list(metadata.representative_entries)
+        )
+        if not representative_entries:
+            raise ValueError(
+                "Use Representative Structures is enabled, but this project "
+                "does not have any saved representative structures yet."
+            )
+
+        total_files = len(representative_entries)
+        if progress_callback is not None:
+            progress_callback(
+                0,
+                max(total_files, 1),
+                "Importing representative structures...",
+            )
+
+        cluster_bins: list[ClusterBin] = []
+        cluster_rows: list[dict[str, object]] = []
+        available_elements: set[str] = set()
+        processed_files = 0
+        selected_weight_total = sum(
+            max(float(entry.selected_weight), 0.0)
+            for entry in representative_entries
+        )
+        row_weight_seed: list[tuple[str, str, int, float]] = []
+        for entry in representative_entries:
+            source_file = Path(entry.source_file).expanduser().resolve()
+            if not source_file.is_file():
+                raise FileNotFoundError(
+                    "Representative structure file was not found: "
+                    f"{source_file}"
+                )
+            representative_name = (
+                _optional_str(entry.source_file_name) or source_file.name
+            )
+            motif = _normalized_nonempty_text(entry.motif, default="no_motif")
+            cluster_bins.append(
+                ClusterBin(
+                    structure=entry.structure,
+                    motif=motif,
+                    source_dir=source_file.parent,
+                    files=(source_file,),
+                    representative=representative_name,
+                )
+            )
+            available_elements.update(scan_structure_elements(source_file))
+            row_weight_seed.append(
+                (
+                    entry.structure,
+                    motif,
+                    max(int(entry.cluster_count), 1),
+                    max(float(entry.selected_weight), 0.0),
+                )
+            )
+            processed_files += 1
+            if progress_callback is not None:
+                progress_callback(
+                    processed_files,
+                    max(total_files, 1),
+                    (
+                        "Importing representative structures: "
+                        f"{entry.structure}/{motif}"
+                    ),
+                )
+
+        fallback_weight_total = sum(
+            cluster_count
+            for _structure, _motif, cluster_count, _weight in row_weight_seed
+        )
+        atom_weight_total = 0.0
+        row_weights: dict[tuple[str, str], float] = {}
+        for (
+            structure,
+            motif,
+            cluster_count,
+            selected_weight,
+        ) in row_weight_seed:
+            weight = (
+                selected_weight / selected_weight_total
+                if selected_weight_total > 0.0
+                else cluster_count / max(fallback_weight_total, 1)
+            )
+            row_weights[(structure, motif)] = float(weight)
+            atom_weight_total += float(weight) * _structure_atom_weight(
+                structure
+            )
+
+        for entry, cluster_bin in zip(
+            representative_entries,
+            cluster_bins,
+            strict=True,
+        ):
+            source_file = cluster_bin.files[0]
+            key = (cluster_bin.structure, cluster_bin.motif)
+            structure_weight = row_weights.get(key, 0.0)
+            cluster_rows.append(
+                {
+                    "structure": cluster_bin.structure,
+                    "motif": cluster_bin.motif,
+                    "count": max(int(entry.cluster_count), 1),
+                    "weight": float(structure_weight),
+                    "source_kind": "representative_structure",
+                    "source_dir": str(cluster_bin.source_dir),
+                    "source_file": str(source_file),
+                    "source_file_name": cluster_bin.representative or "",
+                    "representative": cluster_bin.representative or "",
+                    "structure_fraction_percent": float(structure_weight)
+                    * 100.0,
+                    "atom_fraction_percent": (
+                        float(structure_weight)
+                        * _structure_atom_weight(cluster_bin.structure)
+                        / atom_weight_total
+                        * 100.0
+                        if atom_weight_total > 0.0
+                        else 0.0
+                    ),
+                }
+            )
+        cluster_rows.sort(
+            key=lambda row: (
+                _natural_sort_key(str(row["structure"])),
+                _natural_sort_key(str(row["motif"])),
+            )
+        )
+        inventory = _ClusterInventory(
+            cluster_bins=cluster_bins,
+            available_elements=sorted(
+                available_elements, key=_natural_sort_key
+            ),
+            cluster_rows=cluster_rows,
+            total_files=max(total_files, 1),
+        )
+        self._cluster_inventory_cache[cache_key] = inventory
+        return inventory
 
     def _collect_cluster_inventory(
         self,
@@ -3390,6 +4227,15 @@ class SAXSProjectManager:
         )
         if observed_artifact_paths is None:
             return False
+        observed_only_settings = replace(
+            settings,
+            use_predicted_structure_weights=False,
+        )
+        if not self.component_artifacts_match_settings(
+            observed_only_settings,
+            artifact_paths=observed_artifact_paths,
+        ):
+            return False
         if not observed_artifact_paths.component_map_file.is_file():
             return False
         try:
@@ -3637,33 +4483,66 @@ class SAXSProjectManager:
         observed_motif_weights: dict[tuple[str, str], float],
         predicted_payloads: list[dict[str, object]],
     ) -> list[dict[str, object]]:
+        base_row_lookup = {
+            (
+                str(row.get("structure", "")).strip(),
+                _normalized_nonempty_text(
+                    row.get("motif"),
+                    default="no_motif",
+                ),
+            ): dict(row)
+            for row in cluster_inventory.cluster_rows
+        }
         rows: list[dict[str, object]] = []
         for cluster_bin in cluster_inventory.cluster_bins:
-            source_file = (
-                str(
+            base_row = base_row_lookup.get(
+                (cluster_bin.structure, cluster_bin.motif),
+                {},
+            )
+            source_file = str(
+                base_row.get(
+                    "source_file",
                     (
-                        cluster_bin.source_dir / cluster_bin.representative
-                    ).resolve()
+                        (
+                            cluster_bin.source_dir / cluster_bin.representative
+                        ).resolve()
+                        if cluster_bin.representative
+                        else ""
+                    ),
                 )
-                if cluster_bin.representative
-                else ""
             )
             rows.append(
                 {
                     "structure": cluster_bin.structure,
                     "motif": cluster_bin.motif,
-                    "count": int(len(cluster_bin.files)),
+                    "count": int(
+                        base_row.get("count", len(cluster_bin.files)) or 0
+                    ),
                     "weight": float(
                         observed_motif_weights.get(
                             (cluster_bin.structure, cluster_bin.motif),
                             0.0,
                         )
                     ),
-                    "source_kind": "cluster_dir",
-                    "source_dir": str(cluster_bin.source_dir),
+                    "source_kind": str(
+                        base_row.get("source_kind", "cluster_dir")
+                    ),
+                    "source_dir": str(
+                        base_row.get("source_dir", cluster_bin.source_dir)
+                    ),
                     "source_file": source_file,
-                    "source_file_name": cluster_bin.representative or "",
-                    "representative": cluster_bin.representative or "",
+                    "source_file_name": str(
+                        base_row.get(
+                            "source_file_name",
+                            cluster_bin.representative or "",
+                        )
+                    ),
+                    "representative": str(
+                        base_row.get(
+                            "representative",
+                            cluster_bin.representative or "",
+                        )
+                    ),
                 }
             )
         for payload in predicted_payloads:

@@ -55,6 +55,19 @@ def _mean(values: list[float] | tuple[float, ...]) -> float:
     return float(np.mean(np.asarray(values, dtype=float)))
 
 
+def _element_index_lookup(
+    elements: tuple[str, ...],
+) -> dict[str, np.ndarray]:
+    grouped: defaultdict[str, list[int]] = defaultdict(list)
+    for atom_index, element in enumerate(elements):
+        grouped[str(element)].append(int(atom_index))
+    return {
+        element: np.asarray(indices, dtype=int)
+        for element, indices in sorted(grouped.items())
+        if indices
+    }
+
+
 def _angle_between_vectors(
     vector_a: np.ndarray,
     vector_b: np.ndarray,
@@ -211,23 +224,41 @@ def estimate_pair_contact_distance_medians(
     pair_distances: defaultdict[str, list[float]] = defaultdict(list)
     for parsed in parsed_structures:
         coordinates = np.asarray(parsed.coordinates, dtype=float)
-        elements = list(parsed.elements)
-        for atom_index, element in enumerate(elements):
-            nearest_by_pair: dict[str, float] = {}
-            for other_index, other_element in enumerate(elements):
-                if atom_index == other_index:
+        elements = parsed.elements
+        if len(elements) < 2:
+            continue
+        element_indices = _element_index_lookup(elements)
+        ordered_elements = tuple(element_indices.keys())
+        for index, element_a in enumerate(ordered_elements):
+            indices_a = element_indices[element_a]
+            coords_a = coordinates[indices_a]
+            for element_b in ordered_elements[index:]:
+                indices_b = element_indices[element_b]
+                if element_a == element_b and len(indices_a) < 2:
                     continue
-                pair_key = _pair_key(element, other_element)
-                distance = float(
-                    np.linalg.norm(
-                        coordinates[atom_index] - coordinates[other_index]
-                    )
+                coords_b = coordinates[indices_b]
+                pair_key = _pair_key(element_a, element_b)
+                distances = np.linalg.norm(
+                    coords_a[:, np.newaxis, :] - coords_b[np.newaxis, :, :],
+                    axis=2,
                 )
-                previous = nearest_by_pair.get(pair_key)
-                if previous is None or distance < previous:
-                    nearest_by_pair[pair_key] = distance
-            for pair_key, distance in nearest_by_pair.items():
-                pair_distances[pair_key].append(float(distance))
+                if element_a == element_b:
+                    np.fill_diagonal(distances, np.inf)
+                    nearest = distances.min(axis=1)
+                    finite = nearest[np.isfinite(nearest)]
+                    if finite.size > 0:
+                        pair_distances[pair_key].extend(
+                            finite.astype(float).tolist()
+                        )
+                    continue
+                nearest_a = distances.min(axis=1)
+                nearest_b = distances.min(axis=0)
+                pair_distances[pair_key].extend(
+                    nearest_a.astype(float).tolist()
+                )
+                pair_distances[pair_key].extend(
+                    nearest_b.astype(float).tolist()
+                )
     return {
         pair_key: _median(values)
         for pair_key, values in sorted(pair_distances.items())
@@ -242,18 +273,39 @@ def _build_contact_neighbors(
 ) -> tuple[list[set[int]], set[tuple[int, int]]]:
     neighbors = [set() for _ in range(len(elements))]
     contact_pairs: set[tuple[int, int]] = set()
-    for index_a, index_b in combinations(range(len(elements)), 2):
-        pair_key = _pair_key(elements[index_a], elements[index_b])
-        cutoff = float(pair_contact_distance_medians.get(pair_key, 0.0))
-        if cutoff <= 0.0:
-            continue
-        distance = float(
-            np.linalg.norm(coordinates[index_a] - coordinates[index_b])
+    if len(elements) < 2:
+        return neighbors, contact_pairs
+
+    coordinate_array = np.asarray(coordinates, dtype=float)
+    distance_matrix = np.linalg.norm(
+        coordinate_array[:, np.newaxis, :]
+        - coordinate_array[np.newaxis, :, :],
+        axis=2,
+    )
+    thresholds = {
+        key: float(value) * _CONTACT_DISTANCE_SCALE
+        for key, value in pair_contact_distance_medians.items()
+        if float(value) > 0.0
+    }
+    if not thresholds:
+        return neighbors, contact_pairs
+
+    row_indices, column_indices = np.triu_indices(len(elements), k=1)
+    for atom_index, neighbor_index, distance in zip(
+        row_indices.tolist(),
+        column_indices.tolist(),
+        distance_matrix[row_indices, column_indices].tolist(),
+        strict=False,
+    ):
+        threshold = thresholds.get(
+            _pair_key(elements[atom_index], elements[neighbor_index]),
+            0.0,
         )
-        if distance <= cutoff * _CONTACT_DISTANCE_SCALE:
-            neighbors[index_a].add(index_b)
-            neighbors[index_b].add(index_a)
-            contact_pairs.add((index_a, index_b))
+        if threshold <= 0.0 or float(distance) > threshold:
+            continue
+        neighbors[atom_index].add(neighbor_index)
+        neighbors[neighbor_index].add(atom_index)
+        contact_pairs.add((atom_index, neighbor_index))
     return neighbors, contact_pairs
 
 
@@ -329,6 +381,7 @@ def describe_parsed_contrast_structure(
     *,
     expected_core_counts: dict[str, int],
     pair_contact_distance_medians: dict[str, float],
+    include_geometry_metrics: bool = True,
 ) -> ContrastStructureDescriptor:
     coordinates = np.asarray(parsed_structure.coordinates, dtype=float)
     elements = parsed_structure.elements
@@ -349,52 +402,54 @@ def describe_parsed_contrast_structure(
     solvent_set = set(solvent_indices)
 
     bond_lengths: defaultdict[str, list[float]] = defaultdict(list)
-    for atom_index in range(len(elements)):
-        for neighbor_index in neighbors[atom_index]:
-            if neighbor_index <= atom_index:
-                continue
-            bond_lengths[
-                _pair_key(elements[atom_index], elements[neighbor_index])
-            ].append(
-                float(
-                    np.linalg.norm(
-                        coordinates[atom_index] - coordinates[neighbor_index]
+    angle_values: defaultdict[str, list[float]] = defaultdict(list)
+    coordination_values: defaultdict[str, list[int]] = defaultdict(list)
+    if include_geometry_metrics:
+        for atom_index in range(len(elements)):
+            for neighbor_index in neighbors[atom_index]:
+                if neighbor_index <= atom_index:
+                    continue
+                bond_lengths[
+                    _pair_key(elements[atom_index], elements[neighbor_index])
+                ].append(
+                    float(
+                        np.linalg.norm(
+                            coordinates[atom_index]
+                            - coordinates[neighbor_index]
+                        )
                     )
                 )
-            )
 
-    angle_values: defaultdict[str, list[float]] = defaultdict(list)
-    for center_index, center_neighbors in enumerate(neighbors):
-        if len(center_neighbors) < 2:
-            continue
-        for neighbor_a, neighbor_b in combinations(
-            sorted(center_neighbors), 2
-        ):
-            angle = _angle_between_vectors(
-                coordinates[neighbor_a] - coordinates[center_index],
-                coordinates[neighbor_b] - coordinates[center_index],
-            )
-            if angle is None:
+        for center_index, center_neighbors in enumerate(neighbors):
+            if len(center_neighbors) < 2:
                 continue
-            angle_values[
-                _triplet_key(
-                    elements[neighbor_a],
-                    elements[center_index],
-                    elements[neighbor_b],
+            for neighbor_a, neighbor_b in combinations(
+                sorted(center_neighbors), 2
+            ):
+                angle = _angle_between_vectors(
+                    coordinates[neighbor_a] - coordinates[center_index],
+                    coordinates[neighbor_b] - coordinates[center_index],
                 )
-            ].append(float(angle))
+                if angle is None:
+                    continue
+                angle_values[
+                    _triplet_key(
+                        elements[neighbor_a],
+                        elements[center_index],
+                        elements[neighbor_b],
+                    )
+                ].append(float(angle))
 
-    present_elements = tuple(sorted(set(elements)))
-    coordination_values: defaultdict[str, list[int]] = defaultdict(list)
-    for center_index, center_element in enumerate(elements):
-        neighbor_counts = Counter(
-            elements[neighbor_index]
-            for neighbor_index in neighbors[center_index]
-        )
-        for neighbor_element in present_elements:
-            coordination_values[
-                _coordination_key(center_element, neighbor_element)
-            ].append(int(neighbor_counts.get(neighbor_element, 0)))
+        present_elements = tuple(sorted(set(elements)))
+        for center_index, center_element in enumerate(elements):
+            neighbor_counts = Counter(
+                elements[neighbor_index]
+                for neighbor_index in neighbors[center_index]
+            )
+            for neighbor_element in present_elements:
+                coordination_values[
+                    _coordination_key(center_element, neighbor_element)
+                ].append(int(neighbor_counts.get(neighbor_element, 0)))
 
     direct_solvent_indices: set[int] = set()
     for atom_index in solvent_set:

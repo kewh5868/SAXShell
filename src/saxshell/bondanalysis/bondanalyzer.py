@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -185,87 +186,152 @@ class BondAnalyzer:
         dict[BondPairDefinition, list[float]],
         dict[AngleTripletDefinition, list[float]],
     ]:
+        if not atoms:
+            return (
+                {definition: [] for definition in self.bond_pairs},
+                {definition: [] for definition in self.angle_triplets},
+            )
+        coords = np.asarray(
+            [[atom.x, atom.y, atom.z] for atom in atoms], dtype=float
+        )
+        elements = [atom.element for atom in atoms]
+        return self.measure_structure_data(coords, elements)
+
+    def measure_structure_data(
+        self,
+        coordinates: np.ndarray,
+        elements: Iterable[str],
+    ) -> tuple[
+        dict[BondPairDefinition, list[float]],
+        dict[AngleTripletDefinition, list[float]],
+    ]:
         bond_values = {definition: [] for definition in self.bond_pairs}
         angle_values = {definition: [] for definition in self.angle_triplets}
-        if not atoms:
+
+        coords = np.asarray(coordinates, dtype=float)
+        normalized_elements = tuple(
+            _normalized_element_symbol(element) for element in elements
+        )
+        if coords.size == 0 or not normalized_elements:
             return bond_values, angle_values
-
-        coords = np.array([[atom.x, atom.y, atom.z] for atom in atoms])
-        elements = [atom.element for atom in atoms]
-        tree = cKDTree(coords)
-
-        for definition in self.bond_pairs:
-            expected = definition.normalized_pair
-            for index1, index2 in tree.query_pairs(definition.cutoff_angstrom):
-                actual = tuple(sorted((elements[index1], elements[index2])))
-                if actual != expected:
-                    continue
-                distance = float(
-                    np.linalg.norm(coords[index1] - coords[index2])
-                )
-                bond_values[definition].append(distance)
-
-        for definition in self.angle_triplets:
-            max_cutoff = max(
-                definition.cutoff1_angstrom,
-                definition.cutoff2_angstrom,
+        if coords.ndim != 2 or coords.shape[0] != len(normalized_elements):
+            raise ValueError(
+                "Coordinates and element symbols must describe the same atoms."
             )
-            for center_index, element in enumerate(elements):
-                if element != definition.vertex:
-                    continue
-                neighbor_indices = [
-                    index
-                    for index in tree.query_ball_point(
-                        coords[center_index],
-                        r=max_cutoff,
+
+        tree = cKDTree(coords)
+        element_array = np.asarray(normalized_elements, dtype=object)
+
+        bond_groups: defaultdict[float, list[BondPairDefinition]] = (
+            defaultdict(list)
+        )
+        for definition in self.bond_pairs:
+            bond_groups[float(definition.cutoff_angstrom)].append(definition)
+        for cutoff, definitions in bond_groups.items():
+            raw_pairs = tree.query_pairs(cutoff)
+            if not raw_pairs:
+                continue
+            pair_indices = np.asarray(list(raw_pairs), dtype=int)
+            if pair_indices.size == 0:
+                continue
+            pair_indices = pair_indices.reshape(-1, 2)
+            left_elements = element_array[pair_indices[:, 0]]
+            right_elements = element_array[pair_indices[:, 1]]
+            distances = np.linalg.norm(
+                coords[pair_indices[:, 0]] - coords[pair_indices[:, 1]],
+                axis=1,
+            )
+            for definition in definitions:
+                pair_a, pair_b = definition.normalized_pair
+                if pair_a == pair_b:
+                    mask = (left_elements == pair_a) & (
+                        right_elements == pair_b
                     )
-                    if index != center_index
-                ]
-                arm1_candidates = [
-                    index
-                    for index in neighbor_indices
-                    if elements[index] == definition.arm1
-                    and self._distance(coords, center_index, index)
-                    <= definition.cutoff1_angstrom
-                ]
-                arm2_candidates = [
-                    index
-                    for index in neighbor_indices
-                    if elements[index] == definition.arm2
-                    and self._distance(coords, center_index, index)
-                    <= definition.cutoff2_angstrom
-                ]
-                if not arm1_candidates or not arm2_candidates:
-                    continue
+                else:
+                    mask = (
+                        (left_elements == pair_a) & (right_elements == pair_b)
+                    ) | (
+                        (left_elements == pair_b) & (right_elements == pair_a)
+                    )
+                if np.any(mask):
+                    bond_values[definition].extend(
+                        distances[mask].astype(float).tolist()
+                    )
 
-                if definition.arm1 == definition.arm2:
-                    seen_pairs: set[tuple[int, int]] = set()
-                    for arm1_index in arm1_candidates:
-                        for arm2_index in arm2_candidates:
-                            if arm1_index == arm2_index:
+        angle_groups: defaultdict[
+            tuple[str, float], list[AngleTripletDefinition]
+        ] = defaultdict(list)
+        for definition in self.angle_triplets:
+            angle_groups[
+                (
+                    definition.vertex,
+                    max(
+                        float(definition.cutoff1_angstrom),
+                        float(definition.cutoff2_angstrom),
+                    ),
+                )
+            ].append(definition)
+        for (vertex, max_cutoff), definitions in angle_groups.items():
+            center_indices = np.flatnonzero(element_array == vertex)
+            if center_indices.size == 0:
+                continue
+            for center_index in center_indices.tolist():
+                neighbor_indices = np.asarray(
+                    tree.query_ball_point(coords[center_index], r=max_cutoff),
+                    dtype=int,
+                )
+                if neighbor_indices.size == 0:
+                    continue
+                neighbor_indices = neighbor_indices[
+                    neighbor_indices != center_index
+                ]
+                if neighbor_indices.size == 0:
+                    continue
+                neighbor_vectors = (
+                    coords[neighbor_indices] - coords[center_index]
+                )
+                neighbor_distances = np.linalg.norm(neighbor_vectors, axis=1)
+                valid_mask = neighbor_distances > 0.0
+                if not np.any(valid_mask):
+                    continue
+                neighbor_elements = element_array[neighbor_indices]
+                unit_vectors = np.zeros_like(neighbor_vectors)
+                unit_vectors[valid_mask] = (
+                    neighbor_vectors[valid_mask]
+                    / neighbor_distances[valid_mask, np.newaxis]
+                )
+                for definition in definitions:
+                    arm1_positions = np.flatnonzero(
+                        (neighbor_elements == definition.arm1)
+                        & (neighbor_distances <= definition.cutoff1_angstrom)
+                        & valid_mask
+                    )
+                    arm2_positions = np.flatnonzero(
+                        (neighbor_elements == definition.arm2)
+                        & (neighbor_distances <= definition.cutoff2_angstrom)
+                        & valid_mask
+                    )
+                    if arm1_positions.size == 0 or arm2_positions.size == 0:
+                        continue
+                    if definition.arm1 == definition.arm2:
+                        for offset, arm1_position in enumerate(
+                            arm1_positions[:-1]
+                        ):
+                            other_positions = arm1_positions[offset + 1 :]
+                            if other_positions.size == 0:
                                 continue
-                            pair = tuple(sorted((arm1_index, arm2_index)))
-                            if pair in seen_pairs:
-                                continue
-                            seen_pairs.add(pair)
-                            angle = self._angle_between(
-                                coords[arm1_index] - coords[center_index],
-                                coords[arm2_index] - coords[center_index],
+                            angles = self._angles_from_unit_vectors(
+                                unit_vectors[arm1_position],
+                                unit_vectors[other_positions],
                             )
-                            if angle is not None:
-                                angle_values[definition].append(angle)
-                    continue
-
-                for arm1_index in arm1_candidates:
-                    for arm2_index in arm2_candidates:
-                        if arm1_index == arm2_index:
-                            continue
-                        angle = self._angle_between(
-                            coords[arm1_index] - coords[center_index],
-                            coords[arm2_index] - coords[center_index],
+                            angle_values[definition].extend(angles)
+                        continue
+                    for arm1_position in arm1_positions.tolist():
+                        angles = self._angles_from_unit_vectors(
+                            unit_vectors[arm1_position],
+                            unit_vectors[arm2_positions],
                         )
-                        if angle is not None:
-                            angle_values[definition].append(angle)
+                        angle_values[definition].extend(angles)
 
         return bond_values, angle_values
 
@@ -336,6 +402,18 @@ class BondAnalyzer:
             return None
         cosine = float(np.dot(vector1, vector2) / (norm1 * norm2))
         return float(math.degrees(math.acos(np.clip(cosine, -1.0, 1.0))))
+
+    @staticmethod
+    def _angles_from_unit_vectors(
+        vector: np.ndarray,
+        other_vectors: np.ndarray,
+    ) -> list[float]:
+        vectors = np.asarray(other_vectors, dtype=float)
+        if vectors.size == 0:
+            return []
+        dots = np.clip(vectors @ np.asarray(vector, dtype=float), -1.0, 1.0)
+        angles = np.degrees(np.arccos(dots))
+        return np.asarray(angles, dtype=float).tolist()
 
     @staticmethod
     def _dedupe_bond_pairs(

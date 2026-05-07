@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from saxshell.plotting import Q_A_INVERSE_LABEL
 from saxshell.saxs.contrast.descriptors import ContrastStructureDescriptor
 from saxshell.saxs.contrast.electron_density import (
     CONTRAST_SOLVENT_METHOD_DIRECT,
@@ -3121,7 +3122,7 @@ class ContrastModeMainWindow(QMainWindow):
         self, axis, *, is_generated_axis: bool
     ) -> None:
         if not is_generated_axis or self._experimental_summary is None:
-            axis.set_xlabel("q (Å⁻¹)")
+            axis.set_xlabel(Q_A_INVERSE_LABEL)
         if not is_generated_axis:
             axis.set_ylabel("Intensity (arb. units)")
         axis.grid(True, alpha=0.25)

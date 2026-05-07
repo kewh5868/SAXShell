@@ -141,6 +141,18 @@ def main(argv: list[str] | None = None) -> int:
         nargs=argparse.REMAINDER,
         help="Arguments passed through to the fullrmc command.",
     )
+    representativefinder_parser = subparsers.add_parser(
+        "representativefinder",
+        help=(
+            "Build or run project-backed representative-structure analysis "
+            "run files."
+        ),
+    )
+    representativefinder_parser.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="Arguments passed through to the representativefinder command.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -225,6 +237,16 @@ def main(argv: list[str] | None = None) -> int:
         if forwarded_args[:1] == ["--"]:
             forwarded_args = forwarded_args[1:]
         return fullrmc_main(forwarded_args)
+
+    if args.command == "representativefinder":
+        from saxshell.representativefinder.cli import (
+            main as representativefinder_main,
+        )
+
+        forwarded_args = list(args.args)
+        if forwarded_args[:1] == ["--"]:
+            forwarded_args = forwarded_args[1:]
+        return representativefinder_main(forwarded_args)
 
     parser.print_help()
     return 0

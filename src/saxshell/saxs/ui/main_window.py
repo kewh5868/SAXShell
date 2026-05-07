@@ -70,12 +70,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from saxshell.fullrmc.packmol_docker import (
+    PackmolDockerLink,
+    load_packmol_docker_link_metadata,
+    save_packmol_docker_link_metadata,
+)
+from saxshell.fullrmc.project_model import build_rmcsetup_paths
+from saxshell.fullrmc.ui.packmol_docker_dialog import PackmolDockerLinkDialog
 from saxshell.saxs._model_templates import (
     list_template_specs,
     load_template_spec,
 )
 from saxshell.saxs.contrast.settings import (
     COMPONENT_BUILD_MODE_BORN_APPROXIMATION,
+    COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT,
     COMPONENT_BUILD_MODE_CONTRAST,
     component_build_mode_label,
     normalize_component_build_mode,
@@ -108,8 +116,8 @@ from saxshell.saxs.prefit.workflow import (
     SOLUTE_VOLUME_FRACTION_PARAMETER_NAMES,
     SOLVENT_VOLUME_FRACTION_PARAMETER_NAMES,
     SOLVENT_WEIGHT_PARAMETER_NAMES,
+    component_q_range_boundary_tolerance,
     normalize_requested_q_range_to_supported,
-    q_range_boundary_tolerance,
 )
 from saxshell.saxs.project_manager import (
     ClusterImportResult,
@@ -118,6 +126,7 @@ from saxshell.saxs.project_manager import (
     ProjectSettings,
     SAXSProjectManager,
     build_project_paths,
+    component_source_mode_label,
     effective_q_range_for_settings,
     export_prior_histogram_npy,
     export_prior_histogram_table,
@@ -167,6 +176,7 @@ CONTACT_EMAIL = "keith.white@colorado.edu"
 RECENT_PROJECTS_KEY = "recent_project_dirs"
 CONSOLE_AUTOSCROLL_KEY = "console_autoscroll_enabled"
 AUTO_SNAP_PANES_KEY = "auto_snap_panes_enabled"
+PACKMOL_DOCKER_PRESETS_KEY = "packmol_docker_presets"
 MAX_RECENT_PROJECTS = 10
 PROJECT_LOAD_PREP_STEPS = 4
 PROJECT_LOAD_TOTAL_STEPS = 12
@@ -272,6 +282,7 @@ class ProjectLoadPrefitPayload:
     workflow: SAXSPrefitWorkflow | None
     evaluation: PrefitEvaluation | None
     scale_recommendation: PrefitScaleRecommendation | None = None
+    autoscale_applied_on_load: bool = False
     workflow_error: str | None = None
     preview_error: str | None = None
 
@@ -1216,6 +1227,9 @@ class SAXSMainWindow(QMainWindow):
         self.project_setup_tab.open_clusterdynamicsml_requested.connect(
             self._open_clusterdynamicsml_tool
         )
+        self.project_setup_tab.open_representative_finder_requested.connect(
+            self._open_representative_finder_tool
+        )
         self.project_setup_tab.open_debye_waller_requested.connect(
             self._open_debye_waller_analysis_tool
         )
@@ -1224,6 +1238,9 @@ class SAXSMainWindow(QMainWindow):
         )
         self.project_setup_tab.predicted_structure_weights_changed.connect(
             self._on_predicted_structure_weights_changed
+        )
+        self.project_setup_tab.representative_structures_changed.connect(
+            self._on_representative_structures_changed
         )
         self.project_setup_tab.load_distribution_requested.connect(
             self._load_saved_distribution
@@ -1389,6 +1406,7 @@ class SAXSMainWindow(QMainWindow):
 
     def _build_menu_bar(self) -> None:
         menu_bar = self.menuBar()
+        menu_bar.clear()
 
         self.file_menu = menu_bar.addMenu("File")
         self.create_project_action = QAction("Create Project", self)
@@ -1417,6 +1435,15 @@ class SAXSMainWindow(QMainWindow):
         self.save_project_as_action = QAction("Save Project As...", self)
         self.save_project_as_action.triggered.connect(self.save_project_as)
         self.file_menu.addAction(self.save_project_as_action)
+
+        self.link_packmol_docker_action = QAction(
+            "Link Packmol Docker Container...",
+            self,
+        )
+        self.link_packmol_docker_action.triggered.connect(
+            self._open_packmol_docker_link_dialog
+        )
+        self.file_menu.addAction(self.link_packmol_docker_action)
 
         self.tools_menu = menu_bar.addMenu("Tools")
         self.md_extraction_menu = self.tools_menu.addMenu("MD Extraction")
@@ -1452,9 +1479,6 @@ class SAXSMainWindow(QMainWindow):
         self.debye_waller_analysis_action.triggered.connect(
             self._open_debye_waller_analysis_tool
         )
-        self.structure_analysis_menu.addAction(
-            self.debye_waller_analysis_action
-        )
 
         self.cluster_dynamics_menu = self.tools_menu.addMenu(
             "Cluster Dynamics"
@@ -1466,7 +1490,6 @@ class SAXSMainWindow(QMainWindow):
         self.clusterdynamics_action.triggered.connect(
             self._open_clusterdynamics_tool
         )
-        self.cluster_dynamics_menu.addAction(self.clusterdynamics_action)
 
         self.clusterdynamicsml_action = QAction(
             "Open Cluster Dynamics (ML)",
@@ -1482,7 +1505,7 @@ class SAXSMainWindow(QMainWindow):
         self.pdfsetup_action.triggered.connect(self._open_pdfsetup_tool)
         self.pdf_menu.addAction(self.pdfsetup_action)
 
-        self.fullrmc_action = QAction("Open fullrmc Setup", self)
+        self.fullrmc_action = QAction("Open RMC Setup (fullrmc)", self)
         self.fullrmc_action.triggered.connect(self._open_fullrmc_tool)
         self.pdf_menu.addAction(self.fullrmc_action)
 
@@ -1507,7 +1530,7 @@ class SAXSMainWindow(QMainWindow):
             "SAXS Calculation Preview"
         )
         self.contrast_mode_action = QAction(
-            "Open SAXS Contrast Mode",
+            "Open Debye Scattering (Contrast Mode)",
             self,
         )
         self.contrast_mode_action.triggered.connect(
@@ -1520,7 +1543,7 @@ class SAXSMainWindow(QMainWindow):
         )
 
         self.electron_density_mapping_action = QAction(
-            "Open Electron Density Mapping",
+            "Open 1D Born Approximation",
             self,
         )
         self.electron_density_mapping_action.triggered.connect(
@@ -1530,6 +1553,29 @@ class SAXSMainWindow(QMainWindow):
         )
         self.component_calculation_preview_menu.addAction(
             self.electron_density_mapping_action
+        )
+        self.fft_born_approximation_action = QAction(
+            "Open 3D FFT Born Approximation",
+            self,
+        )
+        self.fft_born_approximation_action.triggered.connect(
+            lambda _checked=False: self._open_3d_fft_born_approximation_tool(
+                preview_mode=True
+            )
+        )
+        self.component_calculation_preview_menu.addAction(
+            self.fft_born_approximation_action
+        )
+
+        self.representative_finder_action = QAction(
+            "Open Representative Structures",
+            self,
+        )
+        self.representative_finder_action.triggered.connect(
+            self._open_representative_finder_tool
+        )
+        self.structure_analysis_menu.addAction(
+            self.representative_finder_action
         )
 
         self.xray_toolkit_menu = self.tools_menu.addMenu("X-ray Toolkit")
@@ -1564,6 +1610,26 @@ class SAXSMainWindow(QMainWindow):
             self._open_fluorescence_tool
         )
         self.xray_toolkit_menu.addAction(self.fluorescence_estimate_action)
+        self.cli_setup_menu = self.tools_menu.addMenu("CLI Setup")
+        self.representative_cli_setup_action = QAction(
+            "Open Representative CLI Setup (Beta)",
+            self,
+        )
+        self.representative_cli_setup_action.triggered.connect(
+            self._open_representative_cli_setup_tool
+        )
+        self.cli_setup_menu.addAction(self.representative_cli_setup_action)
+        self.beta_menu = self.tools_menu.addMenu("(beta)")
+        self.beta_menu.addAction(self.clusterdynamics_action)
+        self.beta_menu.addAction(self.debye_waller_analysis_action)
+        self.solvent_shell_builder_action = QAction(
+            "Open Solvent Shell Builder (Beta)",
+            self,
+        )
+        self.solvent_shell_builder_action.triggered.connect(
+            self._open_solvent_shell_builder_tool
+        )
+        self.beta_menu.addAction(self.solvent_shell_builder_action)
         self.settings_menu = menu_bar.addMenu("Settings")
         self.console_autoscroll_action = QAction(
             "Autoscroll Console Output",
@@ -1924,6 +1990,12 @@ class SAXSMainWindow(QMainWindow):
                 prefit_payload=payload.prefit,
                 dream_payload=payload.dream,
             )
+            self.project_setup_tab.set_component_plot_state(
+                payload.settings.component_plot_state
+            )
+            self.project_setup_tab.set_prior_plot_state(
+                payload.settings.prior_plot_state
+            )
             self._append_project_load_output(
                 f"Recording recent project: {payload.settings.project_dir}"
             )
@@ -2090,19 +2162,27 @@ class SAXSMainWindow(QMainWindow):
         evaluation: PrefitEvaluation | None = None
         preview_error: str | None = None
         scale_recommendation: PrefitScaleRecommendation | None = None
+        autoscale_applied_on_load = False
+        try:
+            scale_recommendation = workflow.auto_apply_autoscale_on_load()
+            autoscale_applied_on_load = scale_recommendation is not None
+        except Exception:
+            scale_recommendation = None
         try:
             evaluation = workflow.evaluate()
         except Exception as exc:
             preview_error = str(exc)
         else:
-            try:
-                scale_recommendation = workflow.recommend_scale_settings()
-            except Exception:
-                scale_recommendation = None
+            if not autoscale_applied_on_load:
+                try:
+                    scale_recommendation = workflow.recommend_scale_settings()
+                except Exception:
+                    scale_recommendation = None
         return ProjectLoadPrefitPayload(
             workflow=workflow,
             evaluation=evaluation,
             scale_recommendation=scale_recommendation,
+            autoscale_applied_on_load=autoscale_applied_on_load,
             preview_error=preview_error,
         )
 
@@ -2249,9 +2329,9 @@ class SAXSMainWindow(QMainWindow):
                 )
                 self.current_settings = settings
                 self.project_setup_tab.append_summary(
-                    "Build SAXS Components requested in Born Approximation "
-                    "(Average).\n"
-                    "Launching the electron-density mapping workflow with the "
+                    "Build SAXS Components requested in 1D Born "
+                    "Approximation (Average).\n"
+                    "Launching the legacy 1D Born workflow with the "
                     "active computed-distribution context.\n"
                     "Use that workspace to calculate per-stoichiometry "
                     "electron-density profiles and Fourier-transformed Born "
@@ -2259,7 +2339,34 @@ class SAXSMainWindow(QMainWindow):
                 )
                 self._open_electron_density_mapping_tool(preview_mode=False)
                 self.statusBar().showMessage(
-                    "Opened electron-density Born Approximation workflow"
+                    "Opened 1D Born Approximation workflow"
+                )
+                return
+            if (
+                settings.component_build_mode
+                == COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
+            ):
+                self._save_settings(
+                    settings,
+                    status_message=(
+                        "Project auto-saved before launching the 3D FFT Born "
+                        "Approximation workflow"
+                    ),
+                )
+                self.current_settings = settings
+                self.project_setup_tab.append_summary(
+                    "Build SAXS Components requested in 3D FFT Born "
+                    "Approximation.\n"
+                    "Launching the separate 3D FFT Born workflow with the "
+                    "active computed-distribution context.\n"
+                    "Use that workspace to evaluate the Cartesian 3D FFT "
+                    "Born calculation, optional solvent-density contrast, "
+                    "and comparison overlays while the component-export "
+                    "integration is prepared."
+                )
+                self._open_3d_fft_born_approximation_tool(preview_mode=False)
+                self.statusBar().showMessage(
+                    "Opened 3D FFT Born Approximation workflow"
                 )
                 return
             self._save_settings(
@@ -2305,8 +2412,10 @@ class SAXSMainWindow(QMainWindow):
                 )
         if settings is None:
             return False
-        component_dir = project_artifact_paths(settings).component_dir
-        return component_dir.is_dir() and any(component_dir.glob("*.txt"))
+        return self.project_manager.component_artifacts_match_settings(
+            settings,
+            artifact_paths=project_artifact_paths(settings),
+        )
 
     def _on_prefit_field_interaction_requested(self) -> None:
         if self._current_project_has_built_components():
@@ -2622,12 +2731,15 @@ class SAXSMainWindow(QMainWindow):
     def save_project_state(self) -> None:
         try:
             settings = self._settings_from_project_tab()
+            rebuild_message = self._component_q_range_rebuild_message(settings)
             saved_path = self._save_settings(settings)
-            self._sync_live_project_settings_after_save(settings)
+            if rebuild_message is None:
+                self._sync_live_project_settings_after_save(settings)
+            else:
+                self.current_settings = settings
             self.project_setup_tab.append_summary(
                 f"Saved project state to {saved_path}"
             )
-            rebuild_message = self._component_q_range_rebuild_message(settings)
             if rebuild_message is not None:
                 self._show_error(
                     "Expanded q-range requires rebuilding SAXS components",
@@ -2759,6 +2871,26 @@ class SAXSMainWindow(QMainWindow):
         text = str(value or "").strip()
         return text or None
 
+    @staticmethod
+    def _component_q_values_for_q_range_tolerance(
+        component_dir: Path,
+    ) -> np.ndarray:
+        for component_path in sorted(component_dir.glob("*.txt")):
+            try:
+                raw_data = np.loadtxt(component_path, comments="#")
+            except Exception:
+                continue
+            if raw_data.size == 0:
+                continue
+            if raw_data.ndim == 1:
+                raw_data = raw_data.reshape(1, -1)
+            if raw_data.shape[1] < 1:
+                continue
+            q_values = np.asarray(raw_data[:, 0], dtype=float)
+            if q_values.size > 0:
+                return q_values
+        return np.asarray([], dtype=float)
+
     def _component_q_range_rebuild_message(
         self,
         settings: ProjectSettings,
@@ -2825,7 +2957,11 @@ class SAXSMainWindow(QMainWindow):
                 supported_max,
             )
         )
-        tolerance = q_range_boundary_tolerance(
+        tolerance = component_q_range_boundary_tolerance(
+            settings.component_build_mode,
+            self._component_q_values_for_q_range_tolerance(
+                artifact_paths.component_dir
+            ),
             supported_min,
             supported_max,
         )
@@ -3533,25 +3669,37 @@ class SAXSMainWindow(QMainWindow):
         )
 
     def _refresh_prefit_volume_fraction_section(self) -> None:
-        target = self._current_volume_fraction_target()
+        target = self._current_volume_fraction_target_details()
         solvent_weight_target = self._current_solvent_weight_target()
         visible = self.prefit_workflow is not None
         self.prefit_tab.set_solute_volume_fraction_visible(visible)
         parameter_name = None
         fraction_kind = None
+        fraction_source = "saxs_effective"
         if target is not None:
-            parameter_name, fraction_kind = target
+            parameter_name, fraction_kind, fraction_source = target
         self.prefit_tab.set_solute_volume_fraction_target(
             parameter_name,
             fraction_kind,
+            fraction_source,
             solvent_weight_target,
         )
         self._sync_solution_scattering_tool_targets()
 
     def _current_volume_fraction_target(self) -> tuple[str, str] | None:
+        target = self._current_volume_fraction_target_details()
+        if target is None:
+            return None
+        return target[:2]
+
+    def _current_volume_fraction_target_details(
+        self,
+    ) -> tuple[str, str, str] | None:
         if self.prefit_workflow is None:
             return None
-        return self.prefit_workflow.volume_fraction_estimator_target()
+        return (
+            self.prefit_workflow.solution_scattering_volume_fraction_target()
+        )
 
     def _current_solvent_weight_target(self) -> str | None:
         if self.prefit_workflow is None:
@@ -3559,12 +3707,13 @@ class SAXSMainWindow(QMainWindow):
         return self.prefit_workflow.solvent_weight_estimator_target()
 
     def _sync_solution_scattering_tool_targets(self) -> None:
-        target = self._current_volume_fraction_target()
+        target = self._current_volume_fraction_target_details()
         if target is None:
             parameter_name = None
             fraction_kind = None
+            fraction_source = "saxs_effective"
         else:
-            parameter_name, fraction_kind = target
+            parameter_name, fraction_kind, fraction_source = target
         solvent_weight_parameter = self._current_solvent_weight_target()
         for window in (
             self._solute_volume_fraction_tool_window,
@@ -3577,6 +3726,7 @@ class SAXSMainWindow(QMainWindow):
             window.estimator_widget.set_target_parameter(
                 parameter_name,
                 fraction_kind,
+                fraction_source,
                 solvent_weight_parameter,
             )
 
@@ -3600,7 +3750,6 @@ class SAXSMainWindow(QMainWindow):
             maximum = max(
                 float(current_entry.maximum),
                 parameter_value,
-                1.0,
             )
         self.prefit_tab.set_parameter_row(
             parameter_name,
@@ -3634,57 +3783,87 @@ class SAXSMainWindow(QMainWindow):
 
         preview_changed = False
         try:
-            volume_target = self._current_volume_fraction_target()
+            volume_target = self._current_volume_fraction_target_details()
             interaction_estimate = (
                 estimate_payload.interaction_contrast_estimate
             )
-            if interaction_estimate is not None and volume_target is not None:
-                parameter_name, fraction_kind = volume_target
-                parameter_value = (
-                    float(
-                        interaction_estimate.saxs_effective_solute_interaction_ratio
+            if volume_target is not None:
+                parameter_name, fraction_kind, fraction_source = volume_target
+                parameter_value: float | None = None
+                if fraction_source == "physical":
+                    volume_estimate = estimate_payload.volume_fraction_estimate
+                    if volume_estimate is not None:
+                        parameter_value = (
+                            float(volume_estimate.solute_volume_fraction)
+                            if fraction_kind == "solute"
+                            else float(volume_estimate.solvent_volume_fraction)
+                        )
+                elif interaction_estimate is not None:
+                    parameter_value = (
+                        float(
+                            interaction_estimate.saxs_effective_solute_interaction_ratio
+                        )
+                        if fraction_kind == "solute"
+                        else float(
+                            interaction_estimate.saxs_effective_solvent_background_ratio
+                        )
                     )
-                    if fraction_kind == "solute"
-                    else float(
-                        interaction_estimate.saxs_effective_solvent_background_ratio
+                if parameter_value is None:
+                    if hasattr(widget, "append_application_note"):
+                        cast(object, widget).append_application_note(
+                            "Calculated solution-scattering estimates, but the "
+                            f"{parameter_name} target could not be populated "
+                            f"from the requested {fraction_source} volume "
+                            "fraction source."
+                        )
+                else:
+                    self._apply_estimator_parameter_to_prefit(
+                        parameter_name,
+                        parameter_value,
                     )
-                )
-                self._apply_estimator_parameter_to_prefit(
-                    parameter_name,
-                    parameter_value,
-                )
-                applied_notes.append(
-                    f"Applied {parameter_name} = "
-                    f"{parameter_value:.{DISPLAY_FRACTION_DECIMALS}f} "
-                    "from the SAXS-effective interaction ratio."
-                )
-                log_lines.extend(
-                    [
-                        f"Volume-fraction target: {parameter_name}",
-                        f"Model fraction kind: {fraction_kind}",
-                        (
-                            "Physical solute-associated volume fraction: "
-                            f"{interaction_estimate.physical_solute_associated_volume_fraction:.{DISPLAY_FRACTION_DECIMALS}f}"
-                        ),
-                        (
-                            "Physical solvent-associated volume fraction: "
-                            f"{interaction_estimate.physical_solvent_associated_volume_fraction:.{DISPLAY_FRACTION_DECIMALS}f}"
-                        ),
-                        (
-                            "SAXS-effective solute interaction ratio: "
-                            f"{interaction_estimate.saxs_effective_solute_interaction_ratio:.{DISPLAY_FRACTION_DECIMALS}f}"
-                        ),
-                        (
-                            "SAXS-effective solvent background ratio: "
-                            f"{interaction_estimate.saxs_effective_solvent_background_ratio:.{DISPLAY_FRACTION_DECIMALS}f}"
-                        ),
-                        (
-                            "Contrast weight factor: "
-                            f"{interaction_estimate.contrast_weight_factor:.6g}"
-                        ),
-                    ]
-                )
-                preview_changed = True
+                    source_label = (
+                        "physical bulk volume fraction"
+                        if fraction_source == "physical"
+                        else "SAXS-effective interaction ratio"
+                    )
+                    applied_notes.append(
+                        f"Applied {parameter_name} = "
+                        f"{parameter_value:.{DISPLAY_FRACTION_DECIMALS}f} "
+                        f"from the {source_label}."
+                    )
+                    log_lines.extend(
+                        [
+                            f"Volume-fraction target: {parameter_name}",
+                            f"Model fraction kind: {fraction_kind}",
+                            f"Target fraction source: {fraction_source}",
+                        ]
+                    )
+                    if interaction_estimate is not None:
+                        log_lines.extend(
+                            [
+                                (
+                                    "Physical solute-associated volume fraction: "
+                                    f"{interaction_estimate.physical_solute_associated_volume_fraction:.{DISPLAY_FRACTION_DECIMALS}f}"
+                                ),
+                                (
+                                    "Physical solvent-associated volume fraction: "
+                                    f"{interaction_estimate.physical_solvent_associated_volume_fraction:.{DISPLAY_FRACTION_DECIMALS}f}"
+                                ),
+                                (
+                                    "SAXS-effective solute interaction ratio: "
+                                    f"{interaction_estimate.saxs_effective_solute_interaction_ratio:.{DISPLAY_FRACTION_DECIMALS}f}"
+                                ),
+                                (
+                                    "SAXS-effective solvent background ratio: "
+                                    f"{interaction_estimate.saxs_effective_solvent_background_ratio:.{DISPLAY_FRACTION_DECIMALS}f}"
+                                ),
+                                (
+                                    "Contrast weight factor: "
+                                    f"{interaction_estimate.contrast_weight_factor:.6g}"
+                                ),
+                            ]
+                        )
+                    preview_changed = True
             elif (
                 estimate_payload.volume_fraction_estimate is not None
                 and hasattr(widget, "append_application_note")
@@ -3704,7 +3883,10 @@ class SAXSMainWindow(QMainWindow):
                 attenuation_scale = float(
                     estimate_payload.attenuation_estimate.solvent_scattering_scale_factor
                 )
-                uses_split_fraction_parameter = volume_target is not None
+                uses_split_fraction_parameter = (
+                    volume_target is not None
+                    and volume_target[2] == "saxs_effective"
+                )
                 solvent_scale = attenuation_scale
                 if (
                     not uses_split_fraction_parameter
@@ -7753,6 +7935,15 @@ class SAXSMainWindow(QMainWindow):
                     f"{'' if len(available_elements) == 1 else 's'}."
                 )
             start_load_step(
+                "Loading representative structure status...",
+                log_message="Checking Representative Structures readiness.",
+            )
+            representative_status = (
+                self._refresh_representative_structure_status(settings)
+            )
+            if log_callback is not None:
+                log_callback(representative_status)
+            start_load_step(
                 "Loading predicted structure status...",
                 log_message="Checking Predicted Structures readiness.",
             )
@@ -7902,10 +8093,6 @@ class SAXSMainWindow(QMainWindow):
                 self._format_prefit_summary(payload.evaluation)
             )
             self._update_prefit_stoichiometry_status()
-            if payload.scale_recommendation is not None:
-                self._append_scale_recommendation_log(
-                    payload.scale_recommendation
-                )
         self.prefit_tab.set_log_text(
             self._format_prefit_console_intro(
                 evaluation=payload.evaluation,
@@ -7916,6 +8103,13 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_tab.append_log(
                 "Loaded the Best Prefit preset from the project file."
             )
+        elif (
+            payload.autoscale_applied_on_load
+            and payload.scale_recommendation is not None
+        ):
+            self._append_initial_autoscale_log(payload.scale_recommendation)
+        elif payload.scale_recommendation is not None:
+            self._append_scale_recommendation_log(payload.scale_recommendation)
         self._refresh_saved_prefit_states()
 
     def _apply_loaded_dream_payload(
@@ -7966,16 +8160,25 @@ class SAXSMainWindow(QMainWindow):
         active_settings = settings or self.current_settings
         if active_settings is None:
             self.project_setup_tab.set_available_distributions([])
+            self.project_setup_tab.set_active_distribution(None)
             self.project_setup_tab.set_current_distribution_details(None)
             self._update_active_contrast_distribution_view_state(None)
             return 0
+        artifact_paths = project_artifact_paths(active_settings)
+        active_distribution_id = (
+            str(artifact_paths.distribution_id or "").strip() or None
+        )
         records = self.project_manager.list_saved_distributions(
             active_settings.project_dir
         )
         labels = []
+        active_distribution_labels: dict[str, str] = {}
         tooltips: dict[str, str] = {}
         details: dict[str, str] = {}
         for record in records:
+            dream_count = self._distribution_dream_run_count(
+                record.distribution_dir
+            )
             readiness = []
             if record.component_artifacts_ready:
                 readiness.append("components")
@@ -7988,10 +8191,12 @@ class SAXSMainWindow(QMainWindow):
             )
             labels.append(
                 (
-                    f"{record.label}{readiness_text}",
+                    f"{record.label}{readiness_text} | "
+                    f"{self._distribution_dream_fit_text(dream_count)}",
                     record.distribution_id,
                 )
             )
+            active_distribution_labels[record.distribution_id] = record.label
             tooltips[record.distribution_id] = (
                 self._distribution_tooltip_for_record(record)
             )
@@ -8000,14 +8205,24 @@ class SAXSMainWindow(QMainWindow):
             )
         selected_id = None
         if labels:
-            selected_id = project_artifact_paths(
-                active_settings
-            ).distribution_id
+            selected_id = active_distribution_id
         self.project_setup_tab.set_available_distributions(
             labels,
             selected_distribution_id=selected_id,
             distribution_tooltips=tooltips,
             distribution_details=details,
+        )
+        active_distribution_text, active_distribution_tooltip = (
+            self._active_distribution_field_state(
+                active_settings,
+                active_distribution_id=active_distribution_id,
+                active_distribution_labels=active_distribution_labels,
+                distribution_details=details,
+            )
+        )
+        self.project_setup_tab.set_active_distribution(
+            active_distribution_text,
+            tooltip=active_distribution_tooltip,
         )
         self.project_setup_tab.set_current_distribution_details(
             self._current_distribution_details_text(active_settings)
@@ -8038,6 +8253,18 @@ class SAXSMainWindow(QMainWindow):
     def _distribution_time_text(value: str | None) -> str:
         text = str(value or "").strip()
         return text or "Unavailable"
+
+    @staticmethod
+    def _distribution_dream_fit_text(dream_count: int) -> str:
+        return f"DREAM fits: {max(int(dream_count), 0)}"
+
+    @staticmethod
+    def _distribution_component_source_preference_text(
+        use_representative_structures: bool,
+    ) -> str:
+        return component_source_mode_label(
+            "representative" if use_representative_structures else "average"
+        )
 
     @staticmethod
     def _distribution_prefit_summary(
@@ -8095,12 +8322,19 @@ class SAXSMainWindow(QMainWindow):
         return 0
 
     def _distribution_tooltip_for_record(self, record) -> str:
+        dream_count = self._distribution_dream_run_count(
+            record.distribution_dir
+        )
         return "\n".join(
             [
                 record.label,
                 f"Distribution ID: {record.distribution_id}",
                 "Build mode: "
                 + component_build_mode_label(record.component_build_mode),
+                "Component source preference: "
+                + self._distribution_component_source_preference_text(
+                    record.use_representative_structures
+                ),
                 "Template: " + str(record.template_name or "Unspecified"),
                 "q-range: "
                 + self._distribution_q_range_text(
@@ -8112,6 +8346,7 @@ class SAXSMainWindow(QMainWindow):
                     use_experimental_grid=record.use_experimental_grid,
                     q_points=record.q_points,
                 ),
+                self._distribution_dream_fit_text(dream_count),
                 "Updated: " + self._distribution_time_text(record.updated_at),
             ]
         )
@@ -8133,6 +8368,10 @@ class SAXSMainWindow(QMainWindow):
                 "Template: " + str(record.template_name or "Unspecified"),
                 "Build mode: "
                 + component_build_mode_label(record.component_build_mode),
+                "Component source preference: "
+                + self._distribution_component_source_preference_text(
+                    record.use_representative_structures
+                ),
                 "Structure weighting: "
                 + (
                     "Observed + Predicted Structures"
@@ -8151,7 +8390,9 @@ class SAXSMainWindow(QMainWindow):
                 ),
                 "Saved components: "
                 + (
-                    f"ready ({component_count} traces)"
+                    "ready "
+                    f"({component_count} traces, built from "
+                    f"{component_source_mode_label(record.built_component_source_mode or 'average')})"
                     if record.component_artifacts_ready
                     else "not built yet"
                 ),
@@ -8163,7 +8404,7 @@ class SAXSMainWindow(QMainWindow):
                 ),
                 f"Saved prefits: {prefit_count}",
                 f"Best Prefit R^2: {best_prefit_r_squared}",
-                f"Saved DREAM runs: {dream_count}",
+                f"Saved {self._distribution_dream_fit_text(dream_count)}",
                 "Best DREAM R^2: Available after loading a DREAM run",
                 "Created: " + self._distribution_time_text(record.created_at),
                 "Updated: " + self._distribution_time_text(record.updated_at),
@@ -8194,6 +8435,10 @@ class SAXSMainWindow(QMainWindow):
                 + str(settings.selected_model_template or "Unspecified"),
                 "Build mode: "
                 + component_build_mode_label(settings.component_build_mode),
+                "Component source preference: "
+                + self._distribution_component_source_preference_text(
+                    settings.use_representative_structures
+                ),
                 "Structure weighting: "
                 + (
                     "Observed + Predicted Structures"
@@ -8220,6 +8465,33 @@ class SAXSMainWindow(QMainWindow):
                 "Model only mode: "
                 + ("on" if settings.model_only_mode else "off"),
             ]
+        )
+
+    def _active_distribution_field_state(
+        self,
+        settings: ProjectSettings,
+        *,
+        active_distribution_id: str | None,
+        active_distribution_labels: dict[str, str],
+        distribution_details: dict[str, str],
+    ) -> tuple[str, str]:
+        if active_distribution_id:
+            active_label = active_distribution_labels.get(
+                active_distribution_id
+            )
+            active_details = distribution_details.get(active_distribution_id)
+            if active_label:
+                return active_label, (
+                    active_details
+                    or self._current_distribution_details_text(settings)
+                )
+            return (
+                f"Pending: {active_distribution_id}",
+                self._current_distribution_details_text(settings),
+            )
+        return (
+            "No active computed distribution loaded.",
+            self._current_distribution_details_text(settings),
         )
 
     def _set_dream_tab_enabled(self, enabled: bool) -> None:
@@ -8296,6 +8568,51 @@ class SAXSMainWindow(QMainWindow):
                 str(exc),
             )
 
+    @Slot(bool)
+    def _on_representative_structures_changed(self, enabled: bool) -> None:
+        if self.current_settings is None:
+            return
+        try:
+            settings = self._settings_from_project_tab()
+            settings.use_representative_structures = bool(enabled)
+            self._save_settings(settings)
+            self.current_settings = settings
+            self._apply_project_settings(settings)
+            self.statusBar().showMessage(
+                "Use Representative Structures enabled"
+                if enabled
+                else "Use Representative Structures disabled"
+            )
+        except Exception as exc:
+            self._show_error(
+                "Update Representative Structures mode failed",
+                str(exc),
+            )
+
+    @Slot(str)
+    def _handle_representative_structure_results_changed(
+        self,
+        project_dir: str,
+    ) -> None:
+        if self.current_settings is None:
+            return
+        active_project_dir = Path(self.current_settings.project_dir).resolve()
+        if active_project_dir != Path(project_dir).expanduser().resolve():
+            return
+        try:
+            status_text = self._refresh_representative_structure_status(
+                self.current_settings
+            )
+            self.project_setup_tab.append_summary(status_text)
+            self.statusBar().showMessage(
+                "Representative structures updated for the active project"
+            )
+        except Exception as exc:
+            self.project_setup_tab.append_summary(
+                "Representative structures changed, but the main UI "
+                f"could not refresh their status automatically:\n{exc}"
+            )
+
     @Slot(str)
     def _load_saved_distribution(self, distribution_id: str) -> None:
         if self.current_settings is None:
@@ -8339,6 +8656,9 @@ class SAXSMainWindow(QMainWindow):
         base.model_only_mode = self.project_setup_tab.model_only_mode()
         base.use_predicted_structure_weights = (
             self.project_setup_tab.use_predicted_structure_weights()
+        )
+        base.use_representative_structures = (
+            self.project_setup_tab.use_representative_structures()
         )
         base.frames_dir = (
             str(self.project_setup_tab.frames_dir())
@@ -8405,6 +8725,9 @@ class SAXSMainWindow(QMainWindow):
         base.component_trace_color_scheme = (
             self.project_setup_tab.component_trace_color_scheme()
         )
+        base.component_plot_state = (
+            self.project_setup_tab.component_plot_state()
+        )
         base.experimental_trace_visible = (
             self.project_setup_tab.experimental_trace_visible()
         )
@@ -8425,6 +8748,7 @@ class SAXSMainWindow(QMainWindow):
         base.prior_histogram_x_axis_order = (
             self.project_setup_tab.prior_histogram_x_axis_order()
         )
+        base.prior_plot_state = self.project_setup_tab.prior_plot_state()
         return base
 
     def _load_prefit_workflow(self) -> SAXSPrefitWorkflow:
@@ -8434,6 +8758,13 @@ class SAXSMainWindow(QMainWindow):
             self.current_settings.project_dir,
             template_name=self.current_settings.selected_model_template,
         )
+        initial_autoscale_recommendation = None
+        try:
+            initial_autoscale_recommendation = (
+                self.prefit_workflow.auto_apply_autoscale_on_load()
+            )
+        except Exception:
+            initial_autoscale_recommendation = None
         self.current_settings = self.prefit_workflow.settings
         self._sync_active_template_controls(
             self.prefit_workflow.template_spec.name,
@@ -8467,6 +8798,10 @@ class SAXSMainWindow(QMainWindow):
         if self.prefit_workflow.has_best_prefit_entries():
             self.prefit_tab.append_log(
                 "Loaded the Best Prefit preset from the project file."
+            )
+        elif initial_autoscale_recommendation is not None:
+            self._append_initial_autoscale_log(
+                initial_autoscale_recommendation
             )
         self._refresh_saved_prefit_states()
         self._refresh_model_only_mode_state()
@@ -8514,6 +8849,7 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_tab.set_solute_volume_fraction_target(
                 None,
                 None,
+                "saxs_effective",
                 solvent_weight_target,
             )
         else:
@@ -8548,9 +8884,16 @@ class SAXSMainWindow(QMainWindow):
     @staticmethod
     def _volume_fraction_target_for_template_spec(
         template_spec,
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, str] | None:
         if template_spec is None:
             return None
+        support = template_spec.solution_scattering_support
+        if support.volume_fraction_parameter is not None:
+            return (
+                support.volume_fraction_parameter,
+                support.volume_fraction_kind,
+                support.volume_fraction_source,
+            )
         parameter_names = {
             str(parameter.name).strip()
             for parameter in template_spec.parameters
@@ -8558,10 +8901,10 @@ class SAXSMainWindow(QMainWindow):
         }
         for candidate in SOLUTE_VOLUME_FRACTION_PARAMETER_NAMES:
             if candidate in parameter_names:
-                return candidate, "solute"
+                return candidate, "solute", "saxs_effective"
         for candidate in SOLVENT_VOLUME_FRACTION_PARAMETER_NAMES:
             if candidate in parameter_names:
-                return candidate, "solvent"
+                return candidate, "solvent", "saxs_effective"
         return None
 
     @staticmethod
@@ -8720,6 +9063,12 @@ class SAXSMainWindow(QMainWindow):
             self.project_setup_tab.draw_component_plot(None)
             return []
         artifact_paths = project_artifact_paths(self.current_settings)
+        if not self.project_manager.component_artifacts_match_settings(
+            self.current_settings,
+            artifact_paths=artifact_paths,
+        ):
+            self.project_setup_tab.draw_component_plot(None)
+            return []
         component_paths = sorted(artifact_paths.component_dir.glob("*.txt"))
         self.project_setup_tab.draw_component_plot(component_paths or None)
         return component_paths
@@ -8904,10 +9253,11 @@ class SAXSMainWindow(QMainWindow):
             )
             return status_text
         artifact_paths = project_artifact_paths(active_settings)
-        component_artifacts_ready = bool(
-            artifact_paths.component_dir.is_dir()
-            and any(artifact_paths.component_dir.glob("*.txt"))
-            and artifact_paths.component_map_file.is_file()
+        component_artifacts_ready = (
+            self.project_manager.component_artifacts_match_settings(
+                active_settings,
+                artifact_paths=artifact_paths,
+            )
         )
         prior_artifacts_ready = bool(
             artifact_paths.prior_weights_file.is_file()
@@ -8952,6 +9302,155 @@ class SAXSMainWindow(QMainWindow):
             "and prior weights to bring them into Project Setup, Prefit, and DREAM."
         )
         self.project_setup_tab.set_predicted_structure_status_text(status_text)
+        return status_text
+
+    def _refresh_representative_structure_status(
+        self,
+        settings: ProjectSettings | None = None,
+    ) -> str:
+        active_settings = settings or self.current_settings
+        if active_settings is None:
+            self.project_setup_tab.set_representative_structure_availability(
+                False
+            )
+            status_text = (
+                self.project_setup_tab._default_representative_structure_status_text()
+            )
+            self.project_setup_tab.set_representative_structure_status_text(
+                status_text
+            )
+            return status_text
+        representative_state = (
+            self.project_manager.inspect_representative_structures(
+                active_settings.project_dir,
+                prior_weights_path=project_artifact_paths(
+                    active_settings
+                ).prior_weights_file,
+            )
+        )
+        representative_available = bool(representative_state.selection_ready)
+        mode_labels = {
+            "partialsolv": "partialsolv",
+            "nosolv": "nosolv",
+            "fullsolv": "fullsolv",
+        }
+        available_modes = tuple(
+            mode_labels.get(mode, mode)
+            for mode in representative_state.available_modes
+        )
+        if (
+            active_settings.use_representative_structures
+            and not representative_available
+            and self.current_settings is not None
+            and Path(self.current_settings.project_dir).resolve()
+            == Path(active_settings.project_dir).expanduser().resolve()
+        ):
+            corrected_settings = ProjectSettings.from_dict(
+                active_settings.to_dict()
+            )
+            corrected_settings.use_representative_structures = False
+            self.project_manager.save_project(
+                corrected_settings,
+                refresh_registered_paths=False,
+            )
+            self.current_settings = corrected_settings
+            active_settings = corrected_settings
+        effective_enabled = bool(
+            active_settings.use_representative_structures
+            and representative_available
+        )
+        self.project_setup_tab.set_representative_structure_availability(
+            representative_available,
+            representative_count=representative_state.representative_count,
+            available_modes=available_modes,
+        )
+        self.project_setup_tab.set_use_representative_structures(
+            effective_enabled
+        )
+        if not representative_available:
+            if representative_state.representative_count > 0:
+                status_text = (
+                    "Representative Structures mode is off.\n"
+                    f"Saved {representative_state.representative_count} of "
+                    f"{max(representative_state.expected_representative_count, 1)} "
+                    "required representative structure"
+                    f"{'' if max(representative_state.expected_representative_count, 1) == 1 else 's'}.\n"
+                    f"Missing bins: {representative_state.missing_representative_count}\n"
+                    f"Invalid bins: {representative_state.invalid_representative_count}\n"
+                    "Finish computing every representative structure in the "
+                    "selected distribution before enabling Use Representative "
+                    "Structures here."
+                )
+            else:
+                status_text = (
+                    "Representative Structures mode is off.\n"
+                    "No saved project representative structures were found yet.\n"
+                    "Open Tools > Structure Analysis > Open Representative "
+                    "Structures, compute the representative set, then enable "
+                    "Use Representative Structures here."
+                )
+            self.project_setup_tab.set_representative_structure_status_text(
+                status_text
+            )
+            return status_text
+        mode_text = (
+            ", ".join(available_modes) if available_modes else "partialsolv"
+        )
+        selection_file = representative_state.representative_selection_file
+        location_text = (
+            ""
+            if selection_file is None
+            else f"\nRepresentative metadata: {selection_file.name}"
+        )
+        if not effective_enabled:
+            status_text = (
+                "Representative Structures mode is off.\n"
+                f"Found {representative_state.representative_count} saved "
+                "representative structure"
+                f"{'' if representative_state.representative_count == 1 else 's'} "
+                f"for this project.\nAvailable saved sets: {mode_text}."
+                f"{location_text}\nEnable Use Representative Structures to "
+                "make compatible Debye, 1D Born, 3D FFT, and RMCSetup workflows "
+                "prefer the saved project representatives instead of average cluster folders."
+            )
+            self.project_setup_tab.set_representative_structure_status_text(
+                status_text
+            )
+            return status_text
+        artifact_paths = project_artifact_paths(active_settings)
+        component_artifacts_ready = (
+            self.project_manager.component_artifacts_ready(
+                active_settings,
+                artifact_paths=artifact_paths,
+            )
+        )
+        component_artifacts_match = (
+            self.project_manager.component_artifacts_match_settings(
+                active_settings,
+                artifact_paths=artifact_paths,
+            )
+        )
+        rebuild_note = ""
+        if component_artifacts_ready and not component_artifacts_match:
+            rebuild_note = (
+                "\nRebuild SAXS components to replace the saved average traces "
+                "with representative-structure traces for this computed "
+                "distribution. The saved prior weights still come from the full "
+                "stoichiometry distribution."
+            )
+        status_text = (
+            "Representative Structures mode is on.\n"
+            f"Using {representative_state.representative_count} saved project "
+            "representative structure"
+            f"{'' if representative_state.representative_count == 1 else 's'} "
+            f"with saved sets: {mode_text}.{location_text}\n"
+            "Compatible Debye, 1D Born, 3D FFT, and RMCSetup workflows will "
+            "prefer these project representatives over average cluster folders."
+            f"{rebuild_note}"
+        )
+        self.project_setup_tab.set_representative_structure_status_text(
+            status_text
+        )
         return status_text
 
     def _refresh_saved_prefit_states(
@@ -9517,6 +10016,98 @@ class SAXSMainWindow(QMainWindow):
     def _recent_projects_settings(self) -> QSettings:
         return QSettings("SAXShell", "SAXS")
 
+    def _packmol_docker_settings(self) -> QSettings:
+        return QSettings("SAXShell", "RMCSetup")
+
+    def _recent_packmol_docker_presets(self) -> list[PackmolDockerLink]:
+        raw_value = self._packmol_docker_settings().value(
+            PACKMOL_DOCKER_PRESETS_KEY,
+            "[]",
+        )
+        if isinstance(raw_value, str):
+            try:
+                payload = json.loads(raw_value)
+            except Exception:
+                payload = []
+        elif isinstance(raw_value, (list, tuple)):
+            payload = list(raw_value)
+        else:
+            payload = []
+        presets: list[PackmolDockerLink] = []
+        for entry in payload:
+            preset = PackmolDockerLink.from_dict(
+                dict(entry) if isinstance(entry, dict) else None
+            )
+            if preset is not None:
+                presets.append(preset)
+        return presets
+
+    def _remember_packmol_docker_preset(
+        self,
+        link: PackmolDockerLink,
+    ) -> None:
+        preset = PackmolDockerLink.from_dict(link.to_preset_dict())
+        if preset is None:
+            return
+        signature = (
+            preset.container_name,
+            preset.packmol_command,
+            preset.shell_command,
+            preset.container_project_root,
+        )
+        kept = [
+            existing
+            for existing in self._recent_packmol_docker_presets()
+            if (
+                existing.container_name,
+                existing.packmol_command,
+                existing.shell_command,
+                existing.container_project_root,
+            )
+            != signature
+        ]
+        payload = [preset.to_preset_dict()] + [
+            item.to_preset_dict() for item in kept[:7]
+        ]
+        self._packmol_docker_settings().setValue(
+            PACKMOL_DOCKER_PRESETS_KEY,
+            json.dumps(payload),
+        )
+
+    def _open_packmol_docker_link_dialog(self) -> None:
+        if self.current_settings is None:
+            QMessageBox.information(
+                self,
+                "No project loaded",
+                "Open or create a SAXS project before linking a Packmol "
+                "Docker container from the main UI.",
+            )
+            return
+        project_dir = Path(self.current_settings.project_dir).resolve()
+        rmcsetup_paths = build_rmcsetup_paths(project_dir)
+        current_link = load_packmol_docker_link_metadata(
+            rmcsetup_paths.packmol_docker_link_path
+        )
+        dialog = PackmolDockerLinkDialog(
+            current_link=current_link,
+            recent_presets=self._recent_packmol_docker_presets(),
+            parent=self,
+        )
+        if not dialog.exec():
+            return
+        link = dialog.selected_link()
+        if link is None:
+            return
+        link.linked_at = datetime.now().isoformat(timespec="seconds")
+        save_packmol_docker_link_metadata(
+            rmcsetup_paths.packmol_docker_link_path,
+            link,
+        )
+        self._remember_packmol_docker_preset(link)
+        self.statusBar().showMessage(
+            f"Linked Packmol Docker container {link.container_name}"
+        )
+
     def _recent_project_paths(self) -> list[str]:
         raw_value = self._recent_projects_settings().value(
             RECENT_PROJECTS_KEY,
@@ -9582,6 +10173,7 @@ class SAXSMainWindow(QMainWindow):
         has_project = self.current_settings is not None
         self.save_project_action.setEnabled(has_project)
         self.save_project_as_action.setEnabled(has_project)
+        self.link_packmol_docker_action.setEnabled(has_project)
 
     def _remap_copied_project_paths(
         self,
@@ -9657,6 +10249,55 @@ class SAXSMainWindow(QMainWindow):
             )
         except Exception:
             return self.current_settings
+
+    def _preferred_representative_input_path(
+        self,
+        settings: ProjectSettings | None,
+    ) -> Path | None:
+        if settings is None or not settings.use_representative_structures:
+            return None
+        try:
+            representative_state = (
+                self.project_manager.inspect_representative_structures(
+                    settings.project_dir,
+                    prior_weights_path=project_artifact_paths(
+                        settings
+                    ).prior_weights_file,
+                )
+            )
+        except Exception:
+            return None
+        if not representative_state.selection_ready:
+            return None
+        available_modes = set(representative_state.available_modes)
+        candidate_dirs = [
+            (
+                representative_state.partialsolv_dir
+                if "partialsolv" in available_modes
+                else None
+            ),
+            (
+                representative_state.nosolv_dir
+                if "nosolv" in available_modes
+                else None
+            ),
+            (
+                representative_state.fullsolv_dir
+                if "fullsolv" in available_modes
+                else None
+            ),
+        ]
+        existing_dirs = [
+            directory
+            for directory in candidate_dirs
+            if directory is not None and directory.is_dir()
+        ]
+        if len(existing_dirs) == 1:
+            return existing_dirs[0]
+        selection_file = representative_state.representative_selection_file
+        if selection_file is not None and selection_file.parent.is_dir():
+            return selection_file.parent
+        return existing_dirs[0] if existing_dirs else None
 
     def _active_contrast_distribution_artifact_context(
         self,
@@ -10192,6 +10833,84 @@ class SAXSMainWindow(QMainWindow):
         self._track_child_tool_window(window)
         self.statusBar().showMessage("Opened Structure Viewer")
 
+    def _open_solvent_shell_builder_tool(self) -> None:
+        from saxshell.fullrmc.ui.solvent_shell_builder_window import (
+            launch_solvent_shell_builder_ui,
+        )
+
+        project_dir = None
+        initial_input_path = None
+        if self.current_settings is not None:
+            project_dir = Path(self.current_settings.project_dir).resolve()
+            initial_input_path = (
+                self.current_settings.resolved_pdb_frames_dir
+                or self.current_settings.resolved_frames_dir
+            )
+        window = launch_solvent_shell_builder_ui(
+            initial_project_dir=project_dir,
+            initial_input_path=initial_input_path,
+        )
+        self._track_child_tool_window(window)
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                f"Opened solvent shell builder (beta) for {project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened solvent shell builder (beta)")
+
+    def _open_representative_finder_tool(self) -> None:
+        from saxshell.representativefinder.ui.main_window import (
+            launch_representativefinder_ui,
+        )
+
+        project_dir = None
+        initial_input_path = None
+        if self.current_settings is not None:
+            project_dir = Path(self.current_settings.project_dir).resolve()
+            initial_input_path = self.current_settings.resolved_clusters_dir
+        window = launch_representativefinder_ui(
+            initial_project_dir=project_dir,
+            initial_input_path=initial_input_path,
+        )
+        project_results_changed = getattr(
+            window, "project_results_changed", None
+        )
+        if project_results_changed is not None and hasattr(
+            project_results_changed, "connect"
+        ):
+            project_results_changed.connect(
+                self._handle_representative_structure_results_changed
+            )
+        self._track_child_tool_window(window)
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                "Opened representative structures for " f"{project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened representative structures")
+
+    def _open_representative_cli_setup_tool(self) -> None:
+        from saxshell.representativefinder.ui.run_file_window import (
+            launch_representativefinder_run_file_ui,
+        )
+
+        project_dir = None
+        initial_input_path = None
+        if self.current_settings is not None:
+            project_dir = Path(self.current_settings.project_dir).resolve()
+            initial_input_path = self.current_settings.resolved_clusters_dir
+        window = launch_representativefinder_run_file_ui(
+            initial_project_dir=project_dir,
+            initial_input_path=initial_input_path,
+        )
+        self._track_child_tool_window(window)
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                "Opened representative CLI setup for " f"{project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened representative CLI setup")
+
     def _open_contrast_mode_tool(
         self,
         *,
@@ -10333,6 +11052,7 @@ class SAXSMainWindow(QMainWindow):
         distribution_id = None
         distribution_root_dir = None
         use_predicted_structure_weights = False
+        preferred_representative_input = None
         if settings is not None:
             project_dir = Path(settings.project_dir).resolve()
             q_min = settings.q_min
@@ -10340,13 +11060,18 @@ class SAXSMainWindow(QMainWindow):
             use_predicted_structure_weights = bool(
                 settings.use_predicted_structure_weights
             )
+            preferred_representative_input = (
+                self._preferred_representative_input_path(settings)
+            )
             candidate_paths = (
                 (
+                    preferred_representative_input,
                     settings.resolved_pdb_frames_dir,
                     settings.resolved_frames_dir,
                 )
                 if preview_mode
                 else (
+                    preferred_representative_input,
                     settings.resolved_clusters_dir,
                     settings.resolved_pdb_frames_dir,
                     settings.resolved_frames_dir,
@@ -10385,27 +11110,143 @@ class SAXSMainWindow(QMainWindow):
         self._track_child_tool_window(window)
         if input_path is not None:
             self.statusBar().showMessage(
+                ("Opened 1D Born Approximation preview for " f"{input_path}")
+                if preview_mode
+                else f"Opened 1D Born Approximation for {input_path}"
+            )
+        elif project_dir is not None:
+            self.statusBar().showMessage(
+                ("Opened 1D Born Approximation preview for " f"{project_dir}")
+                if preview_mode
+                else f"Opened 1D Born Approximation for {project_dir}"
+            )
+        else:
+            self.statusBar().showMessage(
+                "Opened 1D Born Approximation preview"
+                if preview_mode
+                else "Opened 1D Born Approximation"
+            )
+
+    def _open_3d_fft_born_approximation_tool(
+        self,
+        *,
+        preview_mode: bool = True,
+    ) -> None:
+        try:
+            from saxshell.saxs.contrast_fft.ui.main_window import (
+                launch_3d_fft_born_approximation_ui,
+            )
+        except Exception as exc:
+            self._show_error(
+                "3D FFT Born Approximation Error",
+                "Could not load the 3D FFT Born Approximation window:\n"
+                f"{exc}",
+            )
+            return
+
+        try:
+            settings = self._active_project_launch_settings()
+            project_dir = None
+            input_path = None
+            output_dir = None
+            q_min = None
+            q_max = None
+            distribution_id = None
+            distribution_root_dir = None
+            use_predicted_structure_weights = False
+            use_representative_structures = False
+            preferred_representative_input = None
+            if settings is not None:
+                project_dir = Path(settings.project_dir).resolve()
+                q_min = settings.q_min
+                q_max = settings.q_max
+                use_predicted_structure_weights = bool(
+                    settings.use_predicted_structure_weights
+                )
+                use_representative_structures = bool(
+                    settings.use_representative_structures
+                )
+                preferred_representative_input = (
+                    self._preferred_representative_input_path(settings)
+                )
+                candidate_paths = (
+                    (
+                        preferred_representative_input,
+                        settings.resolved_pdb_frames_dir,
+                        settings.resolved_frames_dir,
+                    )
+                    if preview_mode
+                    else (
+                        preferred_representative_input,
+                        settings.resolved_clusters_dir,
+                        settings.resolved_pdb_frames_dir,
+                        settings.resolved_frames_dir,
+                    )
+                )
+                for candidate in candidate_paths:
+                    if candidate is not None and candidate.exists():
+                        input_path = candidate
+                        break
+                if not preview_mode:
+                    artifact_paths = project_artifact_paths(
+                        settings,
+                        storage_mode="distribution",
+                    )
+                    distribution_id = artifact_paths.distribution_id
+                    distribution_root_dir = artifact_paths.root_dir
+                    output_dir = (
+                        artifact_paths.root_dir / "born_approximation_3d_fft"
+                    )
+            window = launch_3d_fft_born_approximation_ui(
+                initial_project_dir=project_dir,
+                initial_input_path=input_path,
+                initial_output_dir=output_dir,
+                initial_project_q_min=q_min,
+                initial_project_q_max=q_max,
+                initial_distribution_id=distribution_id,
+                initial_distribution_root_dir=distribution_root_dir,
+                initial_use_predicted_structure_weights=(
+                    use_predicted_structure_weights
+                ),
+                initial_use_representative_structures=(
+                    use_representative_structures
+                ),
+                preview_mode=preview_mode,
+            )
+        except Exception as exc:
+            self._show_error(
+                "3D FFT Born Approximation Error",
+                "Could not open the 3D FFT Born Approximation window:\n"
+                f"{exc}",
+            )
+            return
+        if hasattr(window, "set_auto_snap_enabled"):
+            window.set_auto_snap_enabled(self._auto_snap_panes_enabled)
+        self._connect_born_approximation_updates(window)
+        self._track_child_tool_window(window)
+        if input_path is not None:
+            self.statusBar().showMessage(
                 (
-                    "Opened electron density mapping preview for "
+                    "Opened 3D FFT Born Approximation preview for "
                     f"{input_path}"
                 )
                 if preview_mode
-                else f"Opened electron density mapping for {input_path}"
+                else f"Opened 3D FFT Born Approximation for {input_path}"
             )
         elif project_dir is not None:
             self.statusBar().showMessage(
                 (
-                    "Opened electron density mapping preview for "
+                    "Opened 3D FFT Born Approximation preview for "
                     f"{project_dir}"
                 )
                 if preview_mode
-                else f"Opened electron density mapping for {project_dir}"
+                else f"Opened 3D FFT Born Approximation for {project_dir}"
             )
         else:
             self.statusBar().showMessage(
-                "Opened electron density mapping preview"
+                "Opened 3D FFT Born Approximation preview"
                 if preview_mode
-                else "Opened electron density mapping"
+                else "Opened 3D FFT Born Approximation"
             )
 
     @Slot(object)
@@ -11933,6 +12774,34 @@ class SAXSMainWindow(QMainWindow):
             + f"to {recommendation.recommended_maximum:.6g}\n"
             + offset_text
             + f"Adjustment factor: {recommendation.adjustment_factor:.6g}\n"
+            + f"Points used: {recommendation.points_used}"
+        )
+        self.prefit_tab.append_log(message)
+
+    def _append_initial_autoscale_log(
+        self,
+        recommendation: PrefitScaleRecommendation,
+    ) -> None:
+        offset_lines: list[str] = []
+        if recommendation.recommended_offset is not None:
+            offset_lines.append(
+                f"Offset: {recommendation.recommended_offset:.6g}"
+            )
+            if (
+                recommendation.recommended_offset_minimum is not None
+                and recommendation.recommended_offset_maximum is not None
+            ):
+                offset_lines.append(
+                    "Offset range: "
+                    f"{recommendation.recommended_offset_minimum:.6g} to "
+                    f"{recommendation.recommended_offset_maximum:.6g}"
+                )
+        message = (
+            "Applied initial autoscale settings for this template.\n"
+            + f"Scale: {recommendation.recommended_scale:.6g}\n"
+            + f"Scale range: {recommendation.recommended_minimum:.6g} "
+            + f"to {recommendation.recommended_maximum:.6g}\n"
+            + ("\n".join(offset_lines) + "\n" if offset_lines else "")
             + f"Points used: {recommendation.points_used}"
         )
         self.prefit_tab.append_log(message)

@@ -19,6 +19,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QScrollArea
 import saxshell.saxs.electron_density_mapping.workflow as density_workflow
 from saxshell.saxs.contrast.electron_density import (
     CONTRAST_SOLVENT_METHOD_DIRECT,
+    CONTRAST_SOLVENT_METHOD_NEAT,
     ContrastSolventDensitySettings,
 )
 from saxshell.saxs.debye import atomic_form_factor
@@ -68,6 +69,22 @@ def _accept_default_questions(monkeypatch):
         "saxshell.saxs.electron_density_mapping.ui.main_window.QMessageBox.question",
         lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
     )
+
+
+def test_fourier_transform_q_grid_preserves_partial_step_endpoint():
+    settings = ElectronDensityFourierTransformSettings(
+        r_min=0.0,
+        r_max=1.0,
+        q_min=0.0101,
+        q_max=1.1976,
+        q_step=0.01,
+    )
+
+    q_values = density_workflow._q_values_from_transform_settings(settings)
+
+    np.testing.assert_allclose(q_values[0], 0.0101)
+    np.testing.assert_allclose(q_values[-2], 1.1901)
+    np.testing.assert_allclose(q_values[-1], 1.1976)
 
 
 def _write_xyz(path: Path, lines: list[str]) -> Path:
@@ -453,6 +470,19 @@ def _assert_batch_progress_dialog_visible(
     assert dialog is not None
     assert dialog.isVisible()
     assert dialog.windowTitle() == title
+    assert dialog.progress_bar.maximum() == total
+    return dialog
+
+
+def _assert_debye_progress_dialog_visible(
+    window: ElectronDensityMappingMainWindow,
+    *,
+    total: int,
+):
+    dialog = window._debye_scattering_progress_dialog
+    assert dialog is not None
+    assert dialog.isVisible()
+    assert dialog.windowTitle() == "Computing Debye Scattering"
     assert dialog.progress_bar.maximum() == total
     return dialog
 
@@ -2500,6 +2530,109 @@ def test_main_window_output_history_restores_preview_entries_in_non_preview_mode
     restored_window.close()
 
 
+def test_main_window_saved_debye_output_can_be_compared_and_reloaded_later(
+    qapp,
+    tmp_path,
+):
+    structure_path = _write_xyz(
+        tmp_path / "history_debye_restore.xyz",
+        [
+            "4",
+            "history debye restore",
+            "N 0.0 0.0 0.1",
+            "H 0.94 0.0 -0.2",
+            "H -0.47 0.81 -0.2",
+            "H -0.47 -0.81 -0.2",
+        ],
+    )
+    window = ElectronDensityMappingMainWindow(
+        initial_input_path=structure_path
+    )
+
+    window.run_button.click()
+    _wait_for(
+        lambda: window._profile_result is not None
+        and window._calculation_thread is None,
+        qapp,
+    )
+    window.evaluate_fourier_button.click()
+    _wait_for(
+        lambda: window._fourier_result is not None
+        and window.calculate_debye_scattering_button.isEnabled(),
+        qapp,
+    )
+    window.calculate_debye_scattering_button.click()
+    _wait_for(
+        lambda: window._debye_scattering_result is not None
+        and window._debye_scattering_thread is None,
+        qapp,
+    )
+
+    assert window._debye_scattering_result is not None
+    assert window.output_history_table.rowCount() == 3
+    assert window.output_history_table.item(0, 1).text() == "Debye Scattering"
+    saved_debye_entry = window._saved_output_entries[-1]
+    assert saved_debye_entry.debye_scattering_result is not None
+    assert saved_debye_entry.transform_result is not None
+
+    window.fourier_qmax_spin.setValue(window.fourier_qmax_spin.value() + 0.1)
+    window.evaluate_fourier_button.click()
+    qapp.processEvents()
+
+    assert window._fourier_result is not None
+    assert window._debye_scattering_result is None
+    assert window.output_history_table.rowCount() == 4
+
+    debye_row = next(
+        row_index
+        for row_index in range(window.output_history_table.rowCount())
+        if (
+            window.output_history_table.item(row_index, 0).data(
+                Qt.ItemDataRole.UserRole
+            )
+            == saved_debye_entry.entry_id
+        )
+    )
+    selection_model = window.output_history_table.selectionModel()
+    selection_model.clearSelection()
+    selection_model.select(
+        window.output_history_table.model().index(debye_row, 0),
+        QItemSelectionModel.SelectionFlag.Select
+        | QItemSelectionModel.SelectionFlag.Rows,
+    )
+    qapp.processEvents()
+
+    window.compare_output_history_button.click()
+    qapp.processEvents()
+
+    saved_compare_dialog = window._output_history_compare_dialog
+    assert saved_compare_dialog is not None
+    assert len(saved_compare_dialog._scatter_plot.figure.axes) == 2
+    saved_born_axis, saved_debye_axis = (
+        saved_compare_dialog._scatter_plot.figure.axes
+    )
+    assert "Born Approximation" in saved_born_axis.get_ylabel()
+    assert "Debye Scattering" in saved_debye_axis.get_ylabel()
+    assert saved_debye_axis.get_lines()
+    saved_compare_dialog.close()
+
+    window.load_output_history_button.click()
+    qapp.processEvents()
+
+    assert window._fourier_result is not None
+    assert window._debye_scattering_result is not None
+    assert window.open_debye_scattering_compare_button.isEnabled()
+
+    window.open_debye_scattering_compare_button.click()
+    qapp.processEvents()
+
+    live_compare_dialog = window._debye_scattering_compare_dialog
+    assert live_compare_dialog is not None
+    assert len(live_compare_dialog._plot_widget.figure.axes) == 2
+    live_compare_dialog.close()
+    window.close()
+
+
 def test_main_window_push_controls_render_between_fourier_and_saved_outputs(
     qapp,
 ):
@@ -2627,7 +2760,7 @@ def test_main_window_runs_profile_and_writes_outputs(qapp, tmp_path):
     )
     assert (
         window._profile_result.smearing_settings.debye_waller_factor
-        == pytest.approx(0.006)
+        == pytest.approx(0.0)
     )
     assert window.run_button.isEnabled()
     assert "complete" in window.calculation_progress_message.text().lower()
@@ -3080,7 +3213,7 @@ def test_main_window_evaluates_fourier_transform_and_toggles_log_axes(
     assert window._fourier_result is not None
     assert window.scattering_plot.current_result is window._fourier_result
     scattering_axis = window.scattering_plot.figure.axes[0]
-    assert scattering_axis.get_xlabel() == "q (Å⁻¹)"
+    assert scattering_axis.get_xlabel() == "q (Å$^{-1}$)"
     assert scattering_axis.get_xscale() == "log"
     assert scattering_axis.get_yscale() == "log"
 
@@ -3097,10 +3230,10 @@ def test_main_window_uses_updated_fourier_defaults_and_inherited_q_range(
     qapp,
 ):
     window = ElectronDensityMappingMainWindow()
-    assert window.fourier_qmin_spin.value() == pytest.approx(0.02)
+    assert window.fourier_qmin_spin.value() == pytest.approx(0.01)
     assert window.fourier_qmax_spin.value() == pytest.approx(1.2)
     assert window.fourier_qstep_spin.value() == pytest.approx(0.01)
-    assert window.fourier_resampling_points_spin.value() == 2048
+    assert window.fourier_resampling_points_spin.value() == 4096
 
     inherited_window = ElectronDensityMappingMainWindow(
         initial_project_q_min=0.15,
@@ -3109,7 +3242,7 @@ def test_main_window_uses_updated_fourier_defaults_and_inherited_q_range(
     assert inherited_window.fourier_qmin_spin.value() == pytest.approx(0.15)
     assert inherited_window.fourier_qmax_spin.value() == pytest.approx(0.9)
     assert inherited_window.fourier_qstep_spin.value() == pytest.approx(0.01)
-    assert inherited_window.fourier_resampling_points_spin.value() == 2048
+    assert inherited_window.fourier_resampling_points_spin.value() == 4096
 
     window.close()
     inherited_window.close()
@@ -3142,26 +3275,27 @@ def test_main_window_keeps_fourier_controls_editable_without_cluster_groups(
     window.close()
 
 
-def test_main_window_defaults_to_mirrored_fourier_domain_and_can_toggle_legacy(
+def test_main_window_defaults_to_legacy_fourier_domain_and_can_toggle_mirrored(
     qapp,
 ):
     window = ElectronDensityMappingMainWindow()
     window.apply_fourier_to_all_button.setChecked(False)
     qapp.processEvents()
 
-    assert not window.fourier_legacy_mode_checkbox.isChecked()
-    assert window.fourier_rmin_label.text() == "-r max"
-    assert not window.fourier_rmin_spin.isEnabled()
-
-    window.fourier_rmax_spin.setValue(3.25)
-    qapp.processEvents()
-    assert window.fourier_rmin_spin.value() == pytest.approx(-3.25)
-
-    window.fourier_legacy_mode_checkbox.setChecked(True)
-    qapp.processEvents()
+    assert window.fourier_legacy_mode_checkbox.isChecked()
     assert window.fourier_rmin_label.text() == "r min"
     assert window.fourier_rmin_spin.isEnabled()
     assert window.fourier_rmin_spin.value() == pytest.approx(0.0)
+
+    window.fourier_rmax_spin.setValue(3.25)
+    qapp.processEvents()
+    assert window.fourier_rmin_spin.value() == pytest.approx(0.0)
+
+    window.fourier_legacy_mode_checkbox.setChecked(False)
+    qapp.processEvents()
+    assert window.fourier_rmin_label.text() == "-r max"
+    assert not window.fourier_rmin_spin.isEnabled()
+    assert window.fourier_rmin_spin.value() == pytest.approx(-3.25)
 
     window.close()
 
@@ -3176,7 +3310,7 @@ def test_main_window_exposes_centered_exafs_window_options(qapp):
 
     assert "kaiser_bessel" in window_names
     assert "hanning" in window_names
-    assert window.fourier_window_combo.currentData() == "hanning"
+    assert window.fourier_window_combo.currentData() == "none"
     window.close()
 
 
@@ -3747,7 +3881,15 @@ def test_main_window_debye_scattering_pane_builds_cluster_comparison_plot(
     assert window.calculate_debye_scattering_button.isEnabled()
     window.apply_debye_to_all_button.setChecked(True)
     window.calculate_debye_scattering_button.click()
-    qapp.processEvents()
+    _wait_for(
+        lambda: all(
+            state.debye_scattering_result is not None
+            for state in window._cluster_group_states
+            if not state.single_atom_only
+        )
+        and window._debye_scattering_thread is None,
+        qapp,
+    )
 
     assert all(
         state.debye_scattering_result is not None
@@ -3778,6 +3920,51 @@ def test_main_window_debye_scattering_pane_builds_cluster_comparison_plot(
     assert "Debye Scattering" in debye_axis.get_ylabel()
 
     dialog.close()
+    window.close()
+
+
+def test_cluster_folder_batch_debye_runs_create_saved_output_entries(
+    qapp,
+    tmp_path,
+):
+    window = _open_ready_cluster_folder_window(
+        qapp,
+        tmp_path,
+        folder_name="debye_saved_outputs_batch",
+    )
+
+    window.apply_fourier_to_all_button.setChecked(True)
+    window.evaluate_fourier_button.click()
+    qapp.processEvents()
+    window.apply_debye_to_all_button.setChecked(True)
+    window.calculate_debye_scattering_button.click()
+    _wait_for(
+        lambda: all(
+            state.debye_scattering_result is not None
+            for state in window._cluster_group_states
+            if not state.single_atom_only
+        )
+        and window._debye_scattering_thread is None,
+        qapp,
+    )
+
+    expected_debye_entries = sum(
+        1
+        for state in window._cluster_group_states
+        if not state.single_atom_only
+    )
+    debye_entries = [
+        entry
+        for entry in window._saved_output_entries
+        if entry.entry_kind == "debye_scattering"
+    ]
+
+    assert len(debye_entries) == expected_debye_entries
+    assert all(
+        entry.debye_scattering_result is not None for entry in debye_entries
+    )
+    assert all(entry.transform_result is not None for entry in debye_entries)
+    assert window.output_history_table.item(0, 1).text() == "Debye Scattering"
     window.close()
 
 
@@ -3813,21 +4000,15 @@ def test_main_window_debye_scattering_progress_bar_updates_for_single_run(
         qapp,
     )
 
-    progress_snapshots: list[tuple[bool, int, int, str]] = []
+    progress_messages: list[tuple[int, int, str]] = []
 
     def wrapped_compute(*args, progress_callback=None, **kwargs):
         assert progress_callback is not None
 
         def wrapped_progress(current, total, message):
+            progress_messages.append((int(current), int(total), str(message)))
             progress_callback(current, total, message)
-            progress_snapshots.append(
-                (
-                    not window.debye_scattering_progress_bar.isHidden(),
-                    window.debye_scattering_progress_bar.value(),
-                    window.debye_scattering_progress_bar.maximum(),
-                    window.debye_scattering_status_label.text(),
-                )
-            )
+            time.sleep(0.01)
 
         return compute_average_debye_scattering_profile_for_input(
             *args,
@@ -3842,16 +4023,51 @@ def test_main_window_debye_scattering_progress_bar_updates_for_single_run(
 
     window.calculate_debye_scattering_button.click()
 
-    assert progress_snapshots
+    _wait_for(
+        lambda: window._debye_scattering_progress_dialog is not None
+        and window._debye_scattering_progress_dialog.isVisible(),
+        qapp,
+    )
+    dialog = _assert_debye_progress_dialog_visible(window, total=4)
+
+    progress_snapshots: list[tuple[bool, int, int, str, str]] = []
+    _wait_for(lambda: bool(progress_messages), qapp)
+    while window._debye_scattering_thread is not None:
+        qapp.processEvents()
+        progress_snapshots.append(
+            (
+                not window.debye_scattering_progress_bar.isHidden(),
+                window.debye_scattering_progress_bar.value(),
+                window.debye_scattering_progress_bar.maximum(),
+                window.debye_scattering_status_label.text(),
+                dialog.message_label.text(),
+            )
+        )
+        time.sleep(0.01)
+    _wait_for(
+        lambda: window._debye_scattering_result is not None
+        and window._debye_scattering_thread is None,
+        qapp,
+    )
+
+    assert progress_messages
     assert any(visible for visible, *_rest in progress_snapshots)
     assert any(
-        maximum == 4 for _visible, _value, maximum, _text in progress_snapshots
+        maximum == 4
+        for _visible, _value, maximum, _text, _dialog_text in progress_snapshots
     )
     assert any(
         "Debye scattering average calculation" in text or "Debye trace" in text
-        for _visible, _value, _maximum, text in progress_snapshots
+        for _visible, _value, _maximum, text, _dialog_text in progress_snapshots
+    )
+    assert any(
+        "Debye scattering average calculation" in dialog_text
+        or "Debye trace" in dialog_text
+        for _visible, _value, _maximum, _text, dialog_text in progress_snapshots
     )
     assert window.debye_scattering_progress_bar.isHidden()
+    assert window._debye_scattering_progress_dialog is not None
+    assert not window._debye_scattering_progress_dialog.isVisible()
     assert window._debye_scattering_result is not None
     window.close()
 
@@ -3870,20 +4086,15 @@ def test_main_window_debye_scattering_progress_bar_updates_for_batch_run(
     window.evaluate_fourier_button.click()
     qapp.processEvents()
 
-    progress_snapshots: list[tuple[int, int, str]] = []
+    progress_messages: list[tuple[int, int, str]] = []
 
     def wrapped_compute(*args, progress_callback=None, **kwargs):
         assert progress_callback is not None
 
         def wrapped_progress(current, total, message):
+            progress_messages.append((int(current), int(total), str(message)))
             progress_callback(current, total, message)
-            progress_snapshots.append(
-                (
-                    window.debye_scattering_progress_bar.value(),
-                    window.debye_scattering_progress_bar.maximum(),
-                    window.debye_scattering_status_label.text(),
-                )
-            )
+            time.sleep(0.01)
 
         return compute_average_debye_scattering_profile_for_input(
             *args,
@@ -3899,15 +4110,56 @@ def test_main_window_debye_scattering_progress_bar_updates_for_batch_run(
     window.apply_debye_to_all_button.setChecked(True)
     window.calculate_debye_scattering_button.click()
 
-    assert progress_snapshots
-    assert any(maximum == 8 for _value, maximum, _text in progress_snapshots)
+    _wait_for(
+        lambda: window._debye_scattering_progress_dialog is not None
+        and window._debye_scattering_progress_dialog.isVisible(),
+        qapp,
+    )
+    dialog = _assert_debye_progress_dialog_visible(window, total=8)
+
+    progress_snapshots: list[tuple[int, int, str, str]] = []
+    _wait_for(lambda: bool(progress_messages), qapp)
+    while window._debye_scattering_thread is not None:
+        qapp.processEvents()
+        progress_snapshots.append(
+            (
+                window.debye_scattering_progress_bar.value(),
+                window.debye_scattering_progress_bar.maximum(),
+                window.debye_scattering_status_label.text(),
+                dialog.message_label.text(),
+            )
+        )
+        time.sleep(0.01)
+    _wait_for(
+        lambda: all(
+            state.debye_scattering_result is not None
+            for state in window._cluster_group_states
+            if not state.single_atom_only
+        )
+        and window._debye_scattering_thread is None,
+        qapp,
+    )
+
+    assert progress_messages
     assert any(
-        "Debye 1/2" in text for _value, _maximum, text in progress_snapshots
+        maximum == 8
+        for _value, maximum, _text, _dialog_text in progress_snapshots
     )
     assert any(
-        "Debye 2/2" in text for _value, _maximum, text in progress_snapshots
+        "Debye 1/2" in text
+        for _value, _maximum, text, _dialog_text in progress_snapshots
+    )
+    assert any(
+        "Debye 2/2" in text
+        for _value, _maximum, text, _dialog_text in progress_snapshots
+    )
+    assert any(
+        "Debye 1/2" in dialog_text or "Debye 2/2" in dialog_text
+        for _value, _maximum, _text, dialog_text in progress_snapshots
     )
     assert window.debye_scattering_progress_bar.isHidden()
+    assert window._debye_scattering_progress_dialog is not None
+    assert not window._debye_scattering_progress_dialog.isVisible()
     assert all(
         state.debye_scattering_result is not None
         for state in window._cluster_group_states
@@ -4276,6 +4528,77 @@ def test_main_window_computes_solvent_contrast_and_updates_fourier_source(
     window.close()
 
 
+def test_main_window_saved_solvent_none_clears_active_solvent_subtraction(
+    qapp,
+    tmp_path,
+):
+    structure_path = _write_xyz(
+        tmp_path / "solvent_none_clear.xyz",
+        [
+            "4",
+            "solvent none clear",
+            "N 0.0 0.0 0.1",
+            "H 0.94 0.0 -0.2",
+            "H -0.47 0.81 -0.2",
+            "H -0.47 -0.81 -0.2",
+        ],
+    )
+    window = ElectronDensityMappingMainWindow(
+        initial_input_path=structure_path
+    )
+
+    window.run_button.click()
+    _wait_for(
+        lambda: window._profile_result is not None
+        and window._calculation_thread is None,
+        qapp,
+    )
+
+    assert window._profile_result is not None
+    direct_density = float(
+        min(
+            np.max(
+                np.asarray(
+                    window._profile_result.smeared_orientation_average_density,
+                    dtype=float,
+                )
+            )
+            * 0.01,
+            50.0,
+        )
+    )
+    window.solvent_method_combo.setCurrentIndex(
+        window.solvent_method_combo.findData(CONTRAST_SOLVENT_METHOD_DIRECT)
+    )
+    window.direct_density_spin.setValue(direct_density)
+    window.compute_solvent_density_button.click()
+    qapp.processEvents()
+
+    assert window._profile_result.solvent_contrast is not None
+    assert window._fourier_preview is not None
+    assert window._fourier_preview.source_profile_label.startswith(
+        "Solvent-subtracted"
+    )
+
+    window.solvent_method_combo.setCurrentIndex(
+        window.solvent_method_combo.findData(CONTRAST_SOLVENT_METHOD_NEAT)
+    )
+    none_index = window.solvent_preset_combo.findText("None")
+    assert none_index >= 0
+    window.solvent_preset_combo.setCurrentIndex(none_index)
+    qapp.processEvents()
+    window.compute_solvent_density_button.click()
+    qapp.processEvents()
+
+    assert window._active_contrast_settings is None
+    assert window._profile_result is not None
+    assert window._profile_result.solvent_contrast is None
+    assert window.residual_profile_plot.current_contrast is None
+    assert window._fourier_preview is not None
+    assert window._fourier_preview.source_profile_label == "Smeared ρ(r)"
+    window.close()
+
+
 def test_fourier_preview_plot_renders_mirrored_profile_and_solvent_subtraction(
     qapp,
     tmp_path,
@@ -4442,9 +4765,9 @@ def test_main_window_defaults_rstep_and_rmax_from_structure(qapp, tmp_path):
         initial_input_path=structure_path
     )
 
-    assert window.rstep_spin.value() == pytest.approx(0.05)
+    assert window.rstep_spin.value() == pytest.approx(0.25)
     assert window.rmax_spin.value() == pytest.approx(
-        window._structure.rmax,
+        np.ceil(float(window._structure.rmax) + 2.0),
         abs=1.0e-4,
     )
     assert "geometric mass center" in (
@@ -5303,7 +5626,15 @@ def test_main_window_restores_debye_scattering_workspace_state(
     qapp.processEvents()
     window.apply_debye_to_all_button.setChecked(True)
     window.calculate_debye_scattering_button.click()
-    qapp.processEvents()
+    _wait_for(
+        lambda: all(
+            state.debye_scattering_result is not None
+            for state in window._cluster_group_states
+            if not state.single_atom_only
+        )
+        and window._debye_scattering_thread is None,
+        qapp,
+    )
 
     assert workspace_state_path.is_file()
     workspace_payload = json.loads(
@@ -6608,6 +6939,74 @@ def test_cluster_group_selection_syncs_fourier_rmax_to_solvent_cutoff(
             abs=1.0e-4,
         )
 
+    window.close()
+
+
+def test_cluster_folder_saved_solvent_none_clears_batch_solvent_subtraction(
+    qapp,
+    tmp_path,
+):
+    clusters_dir = _write_cluster_folder_input(
+        tmp_path / "clusters_none_clear"
+    )
+
+    window = ElectronDensityMappingMainWindow(initial_input_path=clusters_dir)
+
+    window.run_button.click()
+    _wait_for(
+        lambda: all(
+            state.profile_result is not None
+            for state in window._cluster_group_states
+        )
+        and window._calculation_thread is None,
+        qapp,
+    )
+
+    window.solvent_method_combo.setCurrentIndex(
+        window.solvent_method_combo.findData(CONTRAST_SOLVENT_METHOD_DIRECT)
+    )
+    window.direct_density_spin.setValue(0.2)
+    window.compute_solvent_density_button.click()
+    qapp.processEvents()
+
+    assert all(
+        state.profile_result is not None
+        and state.profile_result.solvent_contrast is not None
+        for state in window._cluster_group_states
+    )
+
+    window.evaluate_fourier_button.click()
+    qapp.processEvents()
+    assert all(
+        state.transform_result is not None
+        for state in window._cluster_group_states
+    )
+
+    window.solvent_method_combo.setCurrentIndex(
+        window.solvent_method_combo.findData(CONTRAST_SOLVENT_METHOD_NEAT)
+    )
+    none_index = window.solvent_preset_combo.findText("None")
+    assert none_index >= 0
+    window.solvent_preset_combo.setCurrentIndex(none_index)
+    qapp.processEvents()
+    window.compute_solvent_density_button.click()
+    qapp.processEvents()
+
+    assert window._active_contrast_settings is None
+    assert all(
+        state.profile_result is not None
+        and state.profile_result.solvent_contrast is None
+        for state in window._cluster_group_states
+    )
+    assert all(
+        state.solvent_density_e_per_a3 is None
+        and state.solvent_cutoff_radius_a is None
+        for state in window._cluster_group_states
+    )
+    assert all(
+        state.transform_result is None
+        for state in window._cluster_group_states
+    )
     window.close()
 
 

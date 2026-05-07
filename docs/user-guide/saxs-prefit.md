@@ -14,6 +14,23 @@ cluster-derived component set and an active template. The supporting
 applications prepare those upstream inputs before the main SAXS UI turns them
 into a model preview.
 
+In plain language, Prefit is the "does this model make sense before I run a
+heavier fit?" tab.
+
+!!! info "Image placeholder"
+Add a screenshot of the **SAXS Prefit** tab showing the main plot, the
+parameter table, and the controls a first-time user should inspect before
+moving to DREAM.
+
+## When to use Prefit first
+
+Use Prefit before DREAM when you need to:
+
+- confirm that the built SAXS components load cleanly
+- sanity-check the overall shape and scale of the model against the data
+- decide whether a template or q-range choice is obviously wrong
+- prepare geometry-aware metadata before a longer Bayesian run
+
 ## What you can do in Prefit
 
 From the current UI implementation, Prefit supports:
@@ -122,8 +139,11 @@ solution SAXS than the older additive-volume estimate
 $V_{\mathrm{solute}} / (V_{\mathrm{solute}} + V_{\mathrm{solvent}})$.
 
 SAXSShell still prints this physical estimate in the output console for
-reference, but it is no longer written directly into the model-facing
-`phi_solute` / `phi_solvent` defaults.
+reference. It is written to a Prefit parameter only when the active template
+explicitly declares a physical volume-fraction target, such as `vol_frac` in
+`pyDREAM MonoSQ Normalized (Scaled Solvent Weight)`. Older templates that expose
+`phi_solute` / `phi_solvent` keep using the SAXS-effective ratio described
+below.
 
 ### SAXS-effective interaction contrast ratio
 
@@ -221,21 +241,40 @@ factor that answers the practical SAXS question, "how much more scattering
 intensity does the neat solvent have than the solvent fraction inside the real
 sample?"
 
-If the active template includes both a model-facing fraction parameter
-(`phi_solute` / `phi_solvent`) and a solvent-weight parameter such as
-`solvent_scale`, Prefit writes the attenuation factor above into
-`solvent_scale` and uses `R_saxs(E)` for the fraction parameter. The solvent
-term therefore becomes
+Prefit writes these estimates into different model parameters depending on the
+active template's declared convention.
+
+For split-fraction templates such as the Poly LMA hard-sphere templates,
+Prefit writes the attenuation factor above into `solvent_scale` and writes
+`R_saxs(E)` or its solvent complement into the model-facing fraction parameter
+(`phi_solute` / `phi_solvent`). The solvent term therefore uses the attenuation
+scale together with the SAXS-effective solvent fraction:
 \(w*{\mathrm{solv}} (1 - R*{\mathrm{saxs}}) I\_{\mathrm{solv}}(q)\).
 
-If the template only exposes a single solvent-weight parameter such as
-`solv_w`, Prefit writes the combined solvent-background multiplier
+For the original `pyDREAM MonoSQ Normalized` template, Prefit preserves the
+historical single-parameter convention. There is no automatic `vol_frac` target,
+and `solv_w` receives the combined solvent-background multiplier
 
 $$
 w_{\mathrm{model}} = \left(1 - R_{\mathrm{saxs}}(E)\right) w_{\mathrm{solv}}
 $$
 
-into that parameter directly.
+directly. In that original MonoSQ model, the solvent branch is added after the
+global `scale`, so `solv_w` may also absorb any intensity-unit mismatch between
+the experimental solvent blank and the scaled MD-derived model.
+
+For `pyDREAM MonoSQ Normalized (Scaled Solvent Weight)`, Prefit uses the same
+combined solvent-background multiplier for `solv_w`, but the template places
+that weighted solvent trace inside the global scale. It also declares `vol_frac`
+as a calculator target, so Prefit writes the physical solute-associated volume
+fraction into `vol_frac` while keeping `solv_w` as the solvent-background
+multiplier.
+
+That scaled-solvent MonoSQ template also asks Prefit to autoscale on load. If
+experimental data are present and the project does not already have a saved Best
+Prefit or current Prefit state for that template, Prefit applies the autoscale
+estimate immediately and narrows the `scale` and `offset` limits around the
+computed values.
 
 ### Fluorescence background proxy
 
@@ -374,22 +413,6 @@ exists and is mapped correctly.
 - Treat manual geometry edits as part of the current Prefit state.
 - If a geometry-aware template refuses to update, check the mapping column and
   the active radii values before looking elsewhere.
-
-## TODO
-
-TODO: re-check the consistency between the attenuation estimator output
-(`solvent_scale` / `solv_w`) and the solvent contribution used by the model.
-At least some current workflows appear to produce model-facing solvent weights
-around `0.15` even when the imported solvent trace still looks about `100x`
-too large by eye at the same q-position maxima. Revisit whether this comes
-from a mismatch between:
-
-- the attenuation-only estimate and the actual model solvent term
-- split-fraction versus single-solvent-weight template conventions
-- solvent blank versus sample normalization, transmission, thickness, or exposure
-- partially pre-subtracted or otherwise inconsistently reduced solvent traces
-- the possible need for a separate empirical solvent-normalization factor in
-  addition to the attenuation scaling
 
 ## Related pages
 

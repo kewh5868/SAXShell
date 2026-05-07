@@ -9,6 +9,7 @@ from saxshell.saxs.project_manager import (
     ProjectPaths,
     ProjectSettings,
     build_project_paths,
+    project_artifact_paths,
 )
 
 _STRUCTURE_SUFFIXES = {".pdb", ".xyz"}
@@ -20,6 +21,7 @@ class RMCSetupPaths:
     rmcsetup_dir: Path
     representative_clusters_dir: Path
     representative_selection_path: Path
+    representative_partial_solvent_dir: Path
     pdb_no_solvent_dir: Path
     pdb_with_solvent_dir: Path
     packmol_inputs_dir: Path
@@ -28,6 +30,7 @@ class RMCSetupPaths:
     distribution_selection_path: Path
     solution_properties_path: Path
     solvent_handling_path: Path
+    packmol_docker_link_path: Path
     packmol_plan_path: Path
     packmol_setup_path: Path
     constraint_generation_path: Path
@@ -61,15 +64,17 @@ def build_rmcsetup_paths(
     else:
         project_dir = Path(project_dir_or_paths).expanduser().resolve()
     rmcsetup_dir = project_dir / "rmcsetup"
+    representative_root_dir = rmcsetup_dir / "representative_structures"
     return RMCSetupPaths(
         project_dir=project_dir,
         rmcsetup_dir=rmcsetup_dir,
-        representative_clusters_dir=rmcsetup_dir / "representative_clusters",
-        representative_selection_path=rmcsetup_dir
-        / "representative_clusters"
+        representative_clusters_dir=representative_root_dir,
+        representative_selection_path=representative_root_dir
         / "representative_selection.json",
-        pdb_no_solvent_dir=rmcsetup_dir / "pdb_no_solvent",
-        pdb_with_solvent_dir=rmcsetup_dir / "pdb_with_solvent",
+        representative_partial_solvent_dir=representative_root_dir
+        / "partialsolv",
+        pdb_no_solvent_dir=representative_root_dir / "nosolv",
+        pdb_with_solvent_dir=representative_root_dir / "fullsolv",
         packmol_inputs_dir=rmcsetup_dir / "packmol_inputs",
         constraints_dir=rmcsetup_dir / "constraints",
         reports_dir=rmcsetup_dir / "reports",
@@ -77,6 +82,7 @@ def build_rmcsetup_paths(
         / "distribution_selection.json",
         solution_properties_path=rmcsetup_dir / "solution_properties.json",
         solvent_handling_path=rmcsetup_dir / "solvent_handling.json",
+        packmol_docker_link_path=rmcsetup_dir / "packmol_docker_link.json",
         packmol_plan_path=rmcsetup_dir / "packmol_plan.json",
         packmol_setup_path=rmcsetup_dir / "packmol_setup.json",
         constraint_generation_path=rmcsetup_dir / "constraints.json",
@@ -114,6 +120,7 @@ def ensure_rmcsetup_structure(
     for directory in (
         paths.rmcsetup_dir,
         paths.representative_clusters_dir,
+        paths.representative_partial_solvent_dir,
         paths.pdb_no_solvent_dir,
         paths.pdb_with_solvent_dir,
         paths.packmol_inputs_dir,
@@ -125,6 +132,7 @@ def ensure_rmcsetup_structure(
     _ensure_json_file(paths.distribution_selection_path)
     _ensure_json_file(paths.solution_properties_path)
     _ensure_json_file(paths.solvent_handling_path)
+    _ensure_json_file(paths.packmol_docker_link_path)
     _ensure_json_file(paths.packmol_plan_path)
     _ensure_json_file(paths.packmol_setup_path)
     _ensure_json_file(paths.constraint_generation_path)
@@ -252,14 +260,39 @@ def expected_cluster_inventory_rows(
     *,
     project_paths: ProjectPaths | None = None,
 ) -> list[dict[str, object]]:
-    if settings.cluster_inventory_rows:
-        return [dict(row) for row in settings.cluster_inventory_rows]
     paths = (
         project_paths
         if project_paths is not None
         else build_project_paths(settings.project_dir)
     )
-    prior_weights_path = paths.project_dir / "md_prior_weights.json"
+    settings_rows = [dict(row) for row in settings.cluster_inventory_rows]
+    artifact_paths = project_artifact_paths(settings)
+    artifact_rows = _load_cluster_inventory_rows_from_prior_weights(
+        artifact_paths.prior_weights_file
+    )
+    if artifact_rows and (
+        artifact_paths.uses_distribution_storage
+        or settings.use_predicted_structure_weights
+    ):
+        return artifact_rows
+    if settings_rows:
+        return settings_rows
+    if artifact_rows:
+        return artifact_rows
+    legacy_prior_weights_path = paths.project_dir / "md_prior_weights.json"
+    if (
+        legacy_prior_weights_path.resolve()
+        == artifact_paths.prior_weights_file.resolve()
+    ):
+        return []
+    return _load_cluster_inventory_rows_from_prior_weights(
+        legacy_prior_weights_path
+    )
+
+
+def _load_cluster_inventory_rows_from_prior_weights(
+    prior_weights_path: Path,
+) -> list[dict[str, object]]:
     if not prior_weights_path.is_file():
         return []
     try:
@@ -362,7 +395,10 @@ def _count_structure_files_in_dir(directory: Path) -> int:
 
 def _row_uses_cluster_directory(row: dict[str, object]) -> bool:
     source_kind = _optional_text(row.get("source_kind"))
-    if source_kind == "single_structure_file":
+    if source_kind in {
+        "single_structure_file",
+        "predicted_structure",
+    }:
         return False
     source_dir = _optional_text(row.get("source_dir"))
     source_file = _optional_text(row.get("source_file"))

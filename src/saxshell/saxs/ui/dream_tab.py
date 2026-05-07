@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from saxshell.plotting import Q_A_INVERSE_LABEL
 from saxshell.saxs.dream import (
     DreamModelPlotData,
     DreamRunSettings,
@@ -2062,7 +2063,7 @@ class DreamTab(QWidget):
         bottom_axis.set_xscale(
             "log" if self.model_log_x_checkbox.isChecked() else "linear"
         )
-        bottom_axis.set_xlabel("q (Å⁻¹)")
+        bottom_axis.set_xlabel(Q_A_INVERSE_LABEL)
         bottom_axis.set_ylabel("Residual")
         if plotted_lines:
             self._build_interactive_model_legend(top_axis, plotted_lines)

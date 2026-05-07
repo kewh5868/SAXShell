@@ -45,6 +45,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from saxshell.plotting import (
+    Q_A_INVERSE_LABEL,
+    LinePlotDefaults,
+    LinePlotEditorControls,
+    LinePlotSeriesDefaults,
+    LinePlotSettings,
+    PlotEditorWindow,
+    StackedHistogramPlotDefaults,
+    StackedHistogramPlotEditorControls,
+    StackedHistogramPlotSettings,
+)
+from saxshell.plotting.stacked_histogram import (
+    render_stacked_histogram_export_payload,
+)
 from saxshell.saxs._model_templates import TemplateSpec
 from saxshell.saxs.contrast.settings import (
     COMPONENT_BUILD_MODE_NO_CONTRAST,
@@ -64,7 +78,9 @@ from saxshell.saxs.project_manager import (
     build_prior_histogram_export_payload,
     build_project_paths,
     load_experimental_data_file,
-    plot_md_prior_histogram,
+    prior_histogram_default_legend_title,
+    prior_histogram_default_title,
+    prior_histogram_default_y_label,
 )
 from saxshell.saxs.stoichiometry import parse_stoich_label
 from saxshell.saxs.ui._pane_snap import PaneSnapFilter
@@ -191,6 +207,7 @@ class ProjectSetupTab(QWidget):
     open_xyz2pdb_requested = Signal()
     open_cluster_requested = Signal()
     open_clusterdynamicsml_requested = Signal()
+    open_representative_finder_requested = Signal()
     open_debye_waller_requested = Signal()
     scan_clusters_requested = Signal()
     build_components_requested = Signal()
@@ -207,6 +224,7 @@ class ProjectSetupTab(QWidget):
     show_deprecated_templates_changed = Signal(bool)
     model_only_mode_changed = Signal(bool)
     predicted_structure_weights_changed = Signal(bool)
+    representative_structures_changed = Signal(bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -241,20 +259,42 @@ class ProjectSetupTab(QWidget):
         self._preview_update_suspend_depth = 0
         self._pending_saxs_preview_redraw = False
         self._pending_prior_preview_redraw = False
+        self._pending_component_plot_axes_state: (
+            list[dict[str, object]] | None
+        ) = None
+        self._pending_prior_plot_axes_state: list[dict[str, object]] | None = (
+            None
+        )
         self._active_template_name: str | None = None
         self._project_selected = False
         self._debye_waller_ready = False
         self._debye_waller_status_note: str | None = None
+        self._representative_structures_available = False
+        self._representative_structure_count = 0
+        self._representative_structure_modes: tuple[str, ...] = ()
         self._predicted_structures_available = False
         self._predicted_structure_count = 0
         self._distribution_tooltips: dict[str, str] = {}
         self._distribution_details: dict[str, str] = {}
+        self._active_distribution_text = (
+            "No active computed distribution loaded."
+        )
         self._current_distribution_details_text = (
             "Create or load a computed distribution to review its saved "
             "build attributes here."
         )
         self._suspend_template_selection_signal = False
+        self._component_plot_settings = LinePlotSettings()
+        self._component_plot_editor_window: PlotEditorWindow | None = None
+        self._component_plot_editor_controls: LinePlotEditorControls | None = (
+            None
+        )
         self._prior_x_axis_custom_order: list[tuple[str, str]] = []
+        self._prior_plot_settings = StackedHistogramPlotSettings()
+        self._prior_plot_editor_window: PlotEditorWindow | None = None
+        self._prior_plot_editor_controls: (
+            StackedHistogramPlotEditorControls | None
+        ) = None
         self._build_ui()
         self._update_data_trace_control_state()
         self._update_component_trace_control_state()
@@ -409,6 +449,17 @@ class ProjectSetupTab(QWidget):
         self.use_predicted_structure_weights_checkbox.toggled.connect(
             self._on_predicted_structure_weights_toggled
         )
+        layout.addRow("", self._representative_structure_controls_row())
+        self.representative_structure_status_label = QLabel(
+            self._default_representative_structure_status_text()
+        )
+        self.representative_structure_status_label.setWordWrap(True)
+        self.representative_structure_status_label.setMinimumHeight(58)
+        self.representative_structure_status_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.MinimumExpanding,
+        )
+        layout.addRow("", self.representative_structure_status_label)
         layout.addRow("", self._predicted_structure_controls_row())
 
         self.predicted_structure_status_label = QLabel(
@@ -481,6 +532,39 @@ class ProjectSetupTab(QWidget):
         layout.addWidget(self.predict_structures_button)
         return row
 
+    def _representative_structure_controls_row(self) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        self.use_representative_structures_checkbox = QCheckBox(
+            "Use Representative Structures"
+        )
+        self.use_representative_structures_checkbox.setChecked(False)
+        self.use_representative_structures_checkbox.toggled.connect(
+            self._on_representative_structures_toggled
+        )
+        layout.addWidget(
+            self.use_representative_structures_checkbox,
+            stretch=1,
+        )
+        self.representative_structure_ready_indicator = QLabel()
+        self.representative_structure_ready_indicator.setFixedSize(14, 14)
+        layout.addWidget(self.representative_structure_ready_indicator)
+        self.open_representative_finder_button = QPushButton(
+            "Representative Structures"
+        )
+        self.open_representative_finder_button.setToolTip(
+            "Open the representative-structures workflow for this project."
+        )
+        self.open_representative_finder_button.clicked.connect(
+            self.open_representative_finder_requested.emit
+        )
+        layout.addWidget(self.open_representative_finder_button)
+        self._refresh_representative_structure_indicator()
+        self._refresh_representative_structure_controls()
+        return row
+
     def _build_model_group(self) -> QGroupBox:
         group = QGroupBox("Model and Build")
         layout = QVBoxLayout(group)
@@ -542,7 +626,9 @@ class ProjectSetupTab(QWidget):
         self.build_prior_weights_button.clicked.connect(
             self.build_prior_weights_requested.emit
         )
-        self.debye_waller_button = QPushButton("Compute Debye-Waller Factors")
+        self.debye_waller_button = QPushButton(
+            "Compute Debye-Waller Factors (beta)"
+        )
         self.debye_waller_button.clicked.connect(
             self.open_debye_waller_requested.emit
         )
@@ -555,7 +641,8 @@ class ProjectSetupTab(QWidget):
         self.component_build_mode_combo.setToolTip(
             "Choose how this computed distribution will prepare SAXS "
             "components. Debye modes use the direct component builders, "
-            "while Born Approximation launches the electron-density mapping workflow."
+            "1D Born Approximation launches the legacy averaged-density workflow, "
+            "and 3D FFT Born Approximation launches the separate Cartesian FFT workflow."
         )
         for mode, label in component_build_mode_choices():
             self.component_build_mode_combo.addItem(label, userData=mode)
@@ -589,6 +676,13 @@ class ProjectSetupTab(QWidget):
         self.computed_distribution_combo.setEnabled(False)
         self.computed_distribution_combo.currentIndexChanged.connect(
             self._update_distribution_details_panel
+        )
+        self.active_distribution_edit = QLineEdit()
+        self.active_distribution_edit.setReadOnly(True)
+        self.active_distribution_edit.setMinimumWidth(420)
+        self.active_distribution_edit.setText(self._active_distribution_text)
+        self.active_distribution_edit.setToolTip(
+            self._active_distribution_text
         )
         self.load_distribution_button = QPushButton("Load Distribution")
         self.load_distribution_button.setEnabled(False)
@@ -852,6 +946,14 @@ class ProjectSetupTab(QWidget):
         top_layout.addWidget(self.load_distribution_button)
         layout.addWidget(top_row)
 
+        active_row = QWidget()
+        active_layout = QHBoxLayout(active_row)
+        active_layout.setContentsMargins(0, 0, 0, 0)
+        active_layout.setSpacing(6)
+        active_layout.addWidget(QLabel("Active"), stretch=0)
+        active_layout.addWidget(self.active_distribution_edit, stretch=1)
+        layout.addWidget(active_row)
+
         install_row = QWidget()
         install_layout = QHBoxLayout(install_row)
         install_layout.setContentsMargins(0, 0, 0, 0)
@@ -945,6 +1047,12 @@ class ProjectSetupTab(QWidget):
         self.save_component_plot_data_button.clicked.connect(
             self.save_component_plot_data_requested.emit
         )
+        self.open_component_plot_editor_button = QPushButton(
+            "Open Plot Editor"
+        )
+        self.open_component_plot_editor_button.clicked.connect(
+            self.open_component_plot_editor
+        )
         controls.addWidget(self.component_log_x_checkbox)
         controls.addWidget(self.component_log_y_checkbox)
         controls.addWidget(self.component_legend_toggle_button)
@@ -954,6 +1062,7 @@ class ProjectSetupTab(QWidget):
         controls.addWidget(self.component_predicted_traces_button)
         controls.addWidget(QLabel("Trace Colors"))
         controls.addWidget(self.component_trace_color_scheme_combo)
+        controls.addWidget(self.open_component_plot_editor_button)
         controls.addWidget(self.save_component_plot_data_button)
         controls.addStretch(1)
         layout.addLayout(controls)
@@ -1004,7 +1113,7 @@ class ProjectSetupTab(QWidget):
             userData="solvent_sort_atom_fraction",
         )
         self.prior_mode_combo.currentTextChanged.connect(
-            self._update_prior_control_state
+            self._on_prior_mode_changed
         )
         self.secondary_filter_label = QLabel("Secondary atom")
         self.secondary_filter_combo = QComboBox()
@@ -1045,11 +1154,16 @@ class ProjectSetupTab(QWidget):
         self.edit_prior_x_axis_button.clicked.connect(
             self._on_edit_prior_x_axis_order
         )
+        self.open_prior_plot_editor_button = QPushButton("Open Plot Editor")
+        self.open_prior_plot_editor_button.clicked.connect(
+            self.open_prior_plot_editor
+        )
         controls.addWidget(QLabel("Mode"))
         controls.addWidget(self.prior_mode_combo)
         controls.addWidget(QLabel("X-Axis Ordering"))
         controls.addWidget(self.prior_x_axis_order_combo)
         controls.addWidget(self.edit_prior_x_axis_button)
+        controls.addWidget(self.open_prior_plot_editor_button)
         controls.addWidget(self.secondary_filter_label)
         controls.addWidget(self.secondary_filter_combo)
         controls.addWidget(self.generate_prior_plot_button)
@@ -1214,6 +1328,8 @@ class ProjectSetupTab(QWidget):
             selected
             and self.prior_x_axis_order_combo.currentData() == "custom"
         )
+        self.open_component_plot_editor_button.setEnabled(selected)
+        self.open_prior_plot_editor_button.setEnabled(selected)
         self.generate_prior_plot_button.setEnabled(selected)
         self.save_prior_png_button.setEnabled(selected)
         self.save_component_plot_data_button.setEnabled(selected)
@@ -1223,7 +1339,9 @@ class ProjectSetupTab(QWidget):
         if not selected:
             self._experimental_summary = None
             self._solvent_summary = None
+            self.set_representative_structure_availability(False)
             self.set_predicted_structure_availability(False)
+            self.set_active_distribution(None)
         self._refresh_data_status_labels()
         self._apply_model_only_mode_state()
         self._refresh_debye_waller_controls()
@@ -1274,6 +1392,9 @@ class ProjectSetupTab(QWidget):
             self.clusters_dir_edit.setText(settings.clusters_dir or "")
             self.set_use_predicted_structure_weights(
                 settings.use_predicted_structure_weights
+            )
+            self.set_use_representative_structures(
+                settings.use_representative_structures
             )
             displayed_data_path = settings.experimental_data_path or (
                 settings.copied_experimental_data_file or ""
@@ -1345,6 +1466,8 @@ class ProjectSetupTab(QWidget):
             self.set_prior_histogram_x_axis_order(
                 settings.prior_histogram_x_axis_order
             )
+            self.set_component_plot_state(settings.component_plot_state)
+            self.set_prior_plot_state(settings.prior_plot_state)
 
             if settings.cluster_inventory_rows:
                 self._recognized_cluster_rows = list(
@@ -1603,6 +1726,25 @@ class ProjectSetupTab(QWidget):
         )
         self._update_distribution_details_panel()
 
+    def set_active_distribution(
+        self,
+        text: str | None,
+        *,
+        tooltip: str | None = None,
+    ) -> None:
+        active_text = (
+            str(text or "").strip()
+            or "No active computed distribution loaded."
+        )
+        self._active_distribution_text = active_text
+        self.active_distribution_edit.setText(active_text)
+        self.active_distribution_edit.setToolTip(
+            str(tooltip or active_text).strip() or active_text
+        )
+
+    def active_distribution_text(self) -> str:
+        return self.active_distribution_edit.text().strip()
+
     def set_active_contrast_distribution_view_available(
         self,
         available: bool,
@@ -1712,6 +1854,95 @@ class ProjectSetupTab(QWidget):
         self.use_predicted_structure_weights_checkbox.blockSignals(False)
         self._refresh_predicted_structure_controls()
         self._update_component_trace_control_state()
+
+    def use_representative_structures(self) -> bool:
+        return bool(self.use_representative_structures_checkbox.isChecked())
+
+    def set_use_representative_structures(self, enabled: bool) -> None:
+        self.use_representative_structures_checkbox.blockSignals(True)
+        self.use_representative_structures_checkbox.setChecked(bool(enabled))
+        self.use_representative_structures_checkbox.blockSignals(False)
+        self._refresh_representative_structure_controls()
+
+    def set_representative_structure_availability(
+        self,
+        available: bool,
+        *,
+        representative_count: int = 0,
+        available_modes: tuple[str, ...] | list[str] = (),
+    ) -> None:
+        self._representative_structures_available = bool(available)
+        self._representative_structure_count = max(
+            int(representative_count),
+            0,
+        )
+        self._representative_structure_modes = tuple(available_modes)
+        if not self._representative_structures_available:
+            self.set_use_representative_structures(False)
+        self._refresh_representative_structure_indicator()
+        self._refresh_representative_structure_controls()
+
+    def _default_representative_structure_status_text(self) -> str:
+        return (
+            "Representative Structures mode is off.\n"
+            "Run Representative Structures to compute one saved project "
+            "representative per stoichiometry before enabling this option."
+        )
+
+    def set_representative_structure_status_text(self, text: str) -> None:
+        normalized = str(text).strip()
+        self.representative_structure_status_label.setText(
+            normalized or self._default_representative_structure_status_text()
+        )
+
+    def _refresh_representative_structure_indicator(self) -> None:
+        if self._representative_structures_available:
+            self.representative_structure_ready_indicator.setStyleSheet(
+                "background-color: #16a34a; border-radius: 7px;"
+            )
+            mode_text = (
+                ", ".join(self._representative_structure_modes)
+                if self._representative_structure_modes
+                else "partialsolv"
+            )
+            self.representative_structure_ready_indicator.setToolTip(
+                f"{self._representative_structure_count} representative structure"
+                f"{'' if self._representative_structure_count == 1 else 's'} "
+                "are available in this project.\n"
+                f"Saved sets: {mode_text}"
+            )
+        else:
+            self.representative_structure_ready_indicator.setStyleSheet(
+                "background-color: #6b7280; border-radius: 7px;"
+            )
+            self.representative_structure_ready_indicator.setToolTip(
+                "Representative structures have not been saved for this project yet."
+            )
+
+    def _refresh_representative_structure_controls(self) -> None:
+        checkbox_enabled = bool(
+            self._project_selected
+            and (
+                self._representative_structures_available
+                or self.use_representative_structures()
+            )
+        )
+        self.use_representative_structures_checkbox.setEnabled(
+            checkbox_enabled
+        )
+        if self._representative_structures_available:
+            self.use_representative_structures_checkbox.setToolTip(
+                "Prefer the saved project representative structures in compatible "
+                "SAXS and RMCSetup workflows. When disabled, the project falls "
+                "back to average cluster folders."
+            )
+        else:
+            self.use_representative_structures_checkbox.setToolTip(
+                "Run Representative Structures for this project before enabling this option."
+            )
+        self.open_representative_finder_button.setEnabled(
+            self._project_selected
+        )
 
     def set_predicted_structure_availability(
         self,
@@ -1999,6 +2230,7 @@ class ProjectSetupTab(QWidget):
             self.prior_x_axis_order_combo.setCurrentIndex(idx)
             self.prior_x_axis_order_combo.blockSignals(False)
             self.edit_prior_x_axis_button.setEnabled(False)
+        self._refresh_prior_plot_editor_controls(force=True)
 
     def _active_prior_x_axis_order(self) -> list[tuple[str, str]] | None:
         if (
@@ -2011,6 +2243,7 @@ class ProjectSetupTab(QWidget):
     def _on_prior_x_axis_order_changed(self, _index: int) -> None:
         is_custom = self.prior_x_axis_order_combo.currentData() == "custom"
         self.edit_prior_x_axis_button.setEnabled(is_custom)
+        self._refresh_prior_plot_editor_controls(force=True)
         self._redraw_prior_preview_if_needed()
 
     def _on_edit_prior_x_axis_order(self) -> None:
@@ -2041,8 +2274,571 @@ class ProjectSetupTab(QWidget):
             self.autosave_project_requested.emit(
                 "updated prior histogram x-axis order"
             )
+            self._refresh_prior_plot_editor_controls(force=True)
             if self.prior_x_axis_order_combo.currentData() == "custom":
                 self._redraw_prior_preview_if_needed()
+
+    def open_component_plot_editor(self) -> None:
+        if self._component_plot_editor_window is not None:
+            self._component_plot_editor_window.show()
+            self._component_plot_editor_window.raise_()
+            self._component_plot_editor_window.activateWindow()
+            self._component_plot_editor_window.refresh_preview()
+            return
+
+        defaults = self._current_component_plot_defaults()
+        self._component_plot_settings.sync_series(defaults.series_defaults)
+        self._component_plot_editor_controls = LinePlotEditorControls(
+            settings=self._component_plot_settings,
+            defaults=defaults,
+            parent=self,
+        )
+        self._component_plot_editor_controls.label_settings_changed.connect(
+            self._redraw_saxs_preview
+        )
+        self._component_plot_editor_controls.settings_changed.connect(
+            self._redraw_saxs_preview
+        )
+        self._component_plot_editor_window = PlotEditorWindow(
+            window_title="SAXS Component Plot Editor",
+            controls_widget=self._component_plot_editor_controls,
+            render_preview=self._render_component_plot_editor_preview,
+            pickle_state_provider=self._component_plot_editor_pickle_state,
+            apply_loaded_pickle_state=self._apply_loaded_component_plot_editor_pickle_state,
+            parent=self,
+        )
+        self._component_plot_editor_window.closed.connect(
+            self._on_component_plot_editor_closed
+        )
+        self._component_plot_editor_window.refresh_preview()
+        self._component_plot_editor_window.show()
+        self._component_plot_editor_window.raise_()
+        self._component_plot_editor_window.activateWindow()
+
+    def _on_component_plot_editor_closed(self) -> None:
+        self._component_plot_editor_window = None
+        self._component_plot_editor_controls = None
+
+    def _current_component_plot_defaults(self) -> LinePlotDefaults:
+        show_data_preview = not self.model_only_mode()
+        has_data_preview = show_data_preview and (
+            self._experimental_summary is not None
+            or self._solvent_summary is not None
+        )
+        has_components = bool(self._component_paths)
+        has_secondary_axis = bool(has_data_preview and has_components)
+        series_defaults: list[LinePlotSeriesDefaults] = []
+
+        if (
+            self._experimental_summary is not None
+            and show_data_preview
+            and self.experimental_trace_visible()
+        ):
+            series_defaults.append(
+                LinePlotSeriesDefaults(
+                    key="experimental_data",
+                    label="Experimental data",
+                    axis_label="Data" if has_secondary_axis else "Main",
+                )
+            )
+            q_values = np.asarray(
+                self._experimental_summary.q_values, dtype=float
+            )
+            selected_mask = self._selected_q_mask(q_values)
+            if (
+                selected_mask is not None
+                and np.any(selected_mask)
+                and not np.all(selected_mask)
+            ):
+                series_defaults.append(
+                    LinePlotSeriesDefaults(
+                        key="selected_q_range",
+                        label="Selected q-range",
+                        axis_label="Data" if has_secondary_axis else "Main",
+                    )
+                )
+
+        if (
+            self._solvent_summary is not None
+            and show_data_preview
+            and self.solvent_trace_visible()
+        ):
+            series_defaults.append(
+                LinePlotSeriesDefaults(
+                    key="solvent_data",
+                    label="Solvent data",
+                    axis_label="Data" if has_secondary_axis else "Main",
+                )
+            )
+            solvent_q = np.asarray(self._solvent_summary.q_values, dtype=float)
+            solvent_mask = self._selected_q_mask(solvent_q)
+            if (
+                solvent_mask is not None
+                and np.any(solvent_mask)
+                and not np.all(solvent_mask)
+            ):
+                series_defaults.append(
+                    LinePlotSeriesDefaults(
+                        key="selected_solvent_q_range",
+                        label="Selected solvent q-range",
+                        axis_label="Data" if has_secondary_axis else "Main",
+                    )
+                )
+
+        for component_path in self._component_paths or []:
+            series_defaults.append(
+                LinePlotSeriesDefaults(
+                    key=f"component::{component_path.stem}",
+                    label=component_path.stem,
+                    axis_label="Model" if has_secondary_axis else "Main",
+                )
+            )
+
+        if has_components:
+            if self._experimental_summary is not None and has_data_preview:
+                title = "Experimental Data and SAXS Components"
+                primary_y_label = "Experimental Intensity (arb. units)"
+                secondary_y_label = "Model Intensity (arb. units)"
+            elif has_data_preview:
+                title = "Data and SAXS Components"
+                primary_y_label = "Intensity (arb. units)"
+                secondary_y_label = "Model Intensity (arb. units)"
+            else:
+                title = "SAXS Component Preview"
+                primary_y_label = "Model Intensity (arb. units)"
+                secondary_y_label = ""
+        elif has_data_preview:
+            title = (
+                "Experimental Data Preview"
+                if self._experimental_summary is not None
+                else "Data Preview"
+            )
+            primary_y_label = "Intensity (arb. units)"
+            secondary_y_label = ""
+        else:
+            title = ""
+            primary_y_label = "Intensity (arb. units)"
+            secondary_y_label = ""
+
+        return LinePlotDefaults(
+            title=title,
+            x_label=Q_A_INVERSE_LABEL,
+            primary_y_label=primary_y_label,
+            secondary_y_label=secondary_y_label,
+            has_secondary_y_axis=has_secondary_axis,
+            default_legend_location="upper right",
+            series_defaults=tuple(series_defaults),
+        )
+
+    def _refresh_component_plot_editor_controls(
+        self, *, force: bool = False
+    ) -> None:
+        if self._component_plot_editor_controls is None:
+            return
+        defaults = self._current_component_plot_defaults()
+        self._component_plot_settings.sync_series(defaults.series_defaults)
+        if force or self._component_plot_editor_controls.needs_default_sync(
+            defaults
+        ):
+            self._component_plot_editor_controls.sync_defaults(defaults)
+
+    def _component_plot_editor_pickle_state(self) -> dict[str, object]:
+        return {
+            "plot_editor_state": {
+                "kind": "line_plot_editor_state",
+                "version": 1,
+                "plot_context": "saxs_component_preview",
+                "line_plot_settings": self._component_plot_settings.to_dict(),
+                "panel_state": {
+                    "log_x": bool(self.component_log_x_checkbox.isChecked()),
+                    "log_y": bool(self.component_log_y_checkbox.isChecked()),
+                    "show_legend": bool(
+                        self.component_legend_toggle_button.isChecked()
+                    ),
+                    "autoscale_to_model_range": bool(
+                        self.component_model_range_button.isChecked()
+                    ),
+                },
+            }
+        }
+
+    def component_plot_state(self) -> dict[str, object]:
+        payload = self._component_plot_editor_pickle_state()
+        payload["axes"] = self._capture_figure_axes_state(
+            self.component_figure
+        )
+        return payload
+
+    def _apply_loaded_component_plot_editor_pickle_state(
+        self,
+        payload: dict[str, object],
+    ) -> bool:
+        editor_state = payload.get("plot_editor_state")
+        if not isinstance(editor_state, dict):
+            return False
+        if str(editor_state.get("kind")) != "line_plot_editor_state":
+            return False
+        if str(editor_state.get("plot_context")) != "saxs_component_preview":
+            return False
+
+        plot_settings = editor_state.get("line_plot_settings")
+        if isinstance(plot_settings, dict):
+            self._component_plot_settings.update_from_dict(plot_settings)
+        panel_state = editor_state.get("panel_state")
+        if isinstance(panel_state, dict):
+            self.component_log_x_checkbox.setChecked(
+                bool(panel_state.get("log_x", True))
+            )
+            self.component_log_y_checkbox.setChecked(
+                bool(panel_state.get("log_y", True))
+            )
+            self.component_legend_toggle_button.setChecked(
+                bool(panel_state.get("show_legend", True))
+            )
+            self.component_model_range_button.setChecked(
+                bool(panel_state.get("autoscale_to_model_range", False))
+            )
+
+        self._refresh_component_plot_editor_controls(force=True)
+        self._redraw_saxs_preview()
+        return True
+
+    def set_component_plot_state(
+        self,
+        payload: dict[str, object] | None,
+    ) -> None:
+        normalized = dict(payload or {})
+        self._pending_component_plot_axes_state = (
+            self._normalized_figure_axes_state(normalized.get("axes"))
+        )
+        applied = False
+        if normalized:
+            applied = self._apply_loaded_component_plot_editor_pickle_state(
+                normalized
+            )
+        if (
+            not applied
+            and self._pending_component_plot_axes_state is not None
+            and not self._preview_updates_suspended()
+        ):
+            self._redraw_saxs_preview()
+
+    def open_prior_plot_editor(self) -> None:
+        if self._prior_plot_editor_window is not None:
+            self._prior_plot_editor_window.show()
+            self._prior_plot_editor_window.raise_()
+            self._prior_plot_editor_window.activateWindow()
+            self._prior_plot_editor_window.refresh_preview()
+            return
+
+        defaults = self._current_prior_plot_defaults()
+        self._apply_prior_plot_label_state(defaults)
+        self._prior_plot_editor_controls = StackedHistogramPlotEditorControls(
+            settings=self._prior_plot_settings,
+            defaults=defaults,
+            parent=self,
+        )
+        self._prior_plot_editor_controls.label_settings_changed.connect(
+            self._on_prior_plot_editor_label_settings_changed
+        )
+        self._prior_plot_editor_controls.settings_changed.connect(
+            self._redraw_prior_preview_if_needed
+        )
+        self._prior_plot_editor_controls.colormap_changed.connect(
+            self._on_prior_plot_editor_colormap_changed
+        )
+        self._prior_plot_editor_window = PlotEditorWindow(
+            window_title="Prior Histogram Plot Editor",
+            controls_widget=self._prior_plot_editor_controls,
+            render_preview=self._render_prior_plot_figure,
+            pickle_state_provider=self._prior_plot_editor_pickle_state,
+            apply_loaded_pickle_state=self._apply_loaded_prior_plot_editor_pickle_state,
+            parent=self,
+        )
+        self._prior_plot_editor_window.closed.connect(
+            self._on_prior_plot_editor_closed
+        )
+        self._prior_plot_editor_window.refresh_preview()
+        self._prior_plot_editor_window.show()
+        self._prior_plot_editor_window.raise_()
+        self._prior_plot_editor_window.activateWindow()
+
+    def _on_prior_plot_editor_closed(self) -> None:
+        self._prior_plot_editor_window = None
+        self._prior_plot_editor_controls = None
+
+    def _on_prior_plot_editor_colormap_changed(
+        self, colormap_name: str
+    ) -> None:
+        index = self.prior_color_combo.findText(colormap_name)
+        if index < 0 or index == self.prior_color_combo.currentIndex():
+            return
+        self.prior_color_combo.setCurrentIndex(index)
+
+    def _on_prior_plot_editor_label_settings_changed(self) -> None:
+        defaults = self._current_prior_plot_defaults()
+        entries = self._prior_plot_settings.ordered_label_entries(defaults)
+        default_entries = list(defaults.default_label_entries)
+        if entries == default_entries:
+            self._prior_x_axis_custom_order = []
+            combo_index = self.prior_x_axis_order_combo.findData("auto")
+            self.prior_x_axis_order_combo.blockSignals(True)
+            self.prior_x_axis_order_combo.setCurrentIndex(max(combo_index, 0))
+            self.prior_x_axis_order_combo.blockSignals(False)
+            self.edit_prior_x_axis_button.setEnabled(False)
+        else:
+            self._prior_x_axis_custom_order = list(entries)
+            combo_index = self.prior_x_axis_order_combo.findData("custom")
+            self.prior_x_axis_order_combo.blockSignals(True)
+            self.prior_x_axis_order_combo.setCurrentIndex(max(combo_index, 0))
+            self.prior_x_axis_order_combo.blockSignals(False)
+            self.edit_prior_x_axis_button.setEnabled(True)
+        self.autosave_project_requested.emit(
+            "updated prior histogram x-axis order"
+        )
+
+    def _current_prior_plot_defaults(self) -> StackedHistogramPlotDefaults:
+        default_label_entries: tuple[tuple[str, str], ...] = ()
+        raw_labels: tuple[str, ...] = ()
+        if self._current_prior_json_path is not None:
+            try:
+                payload = build_prior_histogram_export_payload(
+                    self._current_prior_json_path,
+                    mode=self.prior_mode(),
+                    secondary_element=self.prior_secondary_element(),
+                )
+            except Exception:
+                payload = None
+            if payload is not None:
+                raw_labels = tuple(str(label) for label in payload["labels"])
+                default_label_entries = tuple(
+                    (
+                        str(raw_label),
+                        str(display_label),
+                    )
+                    for raw_label, display_label in zip(
+                        payload["labels"],
+                        payload["axis_labels"],
+                        strict=False,
+                    )
+                )
+
+        return StackedHistogramPlotDefaults(
+            title=prior_histogram_default_title(
+                self.prior_mode(),
+                self.prior_secondary_element(),
+            ),
+            x_label="Structure",
+            y_label=prior_histogram_default_y_label(self.prior_mode()),
+            legend_title=prior_histogram_default_legend_title(
+                self.prior_mode(),
+                self.prior_secondary_element(),
+            ),
+            default_colormap_name=self.prior_cmap(),
+            available_colormap_names=tuple(HISTOGRAM_COLORMAP_NAMES),
+            raw_category_labels=raw_labels,
+            default_label_entries=default_label_entries,
+        )
+
+    def _apply_prior_plot_label_state(
+        self,
+        defaults: StackedHistogramPlotDefaults,
+    ) -> None:
+        self._prior_plot_settings.sync_labels(
+            defaults.raw_category_labels,
+            default_label_entries=defaults.default_label_entries,
+        )
+        active_entries = self._active_prior_x_axis_order()
+        if active_entries is None:
+            self._prior_plot_settings.label_order = list(
+                defaults.raw_category_labels
+            )
+            default_map = dict(defaults.default_label_entries)
+            self._prior_plot_settings.label_map = {
+                raw_label: default_map.get(raw_label, raw_label)
+                for raw_label in defaults.raw_category_labels
+            }
+            return
+
+        ordered = [
+            raw_label
+            for raw_label, _display_label in active_entries
+            if raw_label in defaults.raw_category_labels
+        ]
+        ordered_set = set(ordered)
+        ordered.extend(
+            raw_label
+            for raw_label in defaults.raw_category_labels
+            if raw_label not in ordered_set
+        )
+        default_map = dict(defaults.default_label_entries)
+        custom_map = {
+            str(raw_label): str(display_label)
+            for raw_label, display_label in active_entries
+        }
+        self._prior_plot_settings.label_order = list(ordered)
+        self._prior_plot_settings.label_map = {
+            raw_label: custom_map.get(
+                raw_label,
+                default_map.get(raw_label, raw_label),
+            )
+            for raw_label in ordered
+        }
+
+    def _refresh_prior_plot_editor_controls(
+        self, *, force: bool = False
+    ) -> None:
+        if self._prior_plot_editor_controls is None:
+            return
+        defaults = self._current_prior_plot_defaults()
+        self._apply_prior_plot_label_state(defaults)
+        if force or self._prior_plot_editor_controls.needs_default_sync(
+            defaults
+        ):
+            self._prior_plot_editor_controls.sync_defaults(defaults)
+
+    def _prior_plot_editor_pickle_state(self) -> dict[str, object]:
+        return {
+            "plot_editor_state": {
+                "kind": "stacked_histogram_plot_editor_state",
+                "version": 1,
+                "stacked_histogram_settings": self._prior_plot_settings.to_dict(),
+                "panel_state": {
+                    "mode": self.prior_mode(),
+                    "secondary_element": self.selected_prior_secondary_element(),
+                    "colormap_name": self.prior_cmap(),
+                    "match_trace_colors": self.prior_match_trace_colors(),
+                    "x_axis_order_mode": str(
+                        self.prior_x_axis_order_combo.currentData() or "auto"
+                    ),
+                },
+            }
+        }
+
+    def prior_plot_state(self) -> dict[str, object]:
+        payload = self._prior_plot_editor_pickle_state()
+        payload["axes"] = self._capture_figure_axes_state(self.prior_figure)
+        return payload
+
+    def _apply_loaded_prior_plot_editor_pickle_state(
+        self,
+        payload: dict[str, object],
+    ) -> bool:
+        editor_state = payload.get("plot_editor_state")
+        if not isinstance(editor_state, dict):
+            return False
+        if (
+            str(editor_state.get("kind"))
+            != "stacked_histogram_plot_editor_state"
+        ):
+            return False
+
+        histogram_settings = editor_state.get("stacked_histogram_settings")
+        if isinstance(histogram_settings, dict):
+            self._prior_plot_settings.update_from_dict(histogram_settings)
+
+        panel_state = editor_state.get("panel_state")
+        if isinstance(panel_state, dict):
+            self._apply_prior_plot_panel_state_from_pickle(panel_state)
+
+        defaults = self._current_prior_plot_defaults()
+        requested_mode = (
+            str(panel_state.get("x_axis_order_mode") or "").strip()
+            if isinstance(panel_state, dict)
+            else ""
+        )
+        loaded_entries = self._prior_plot_settings.ordered_label_entries(
+            defaults
+        )
+        if requested_mode == "custom" or loaded_entries != list(
+            defaults.default_label_entries
+        ):
+            self._prior_x_axis_custom_order = list(loaded_entries)
+            combo_index = self.prior_x_axis_order_combo.findData("custom")
+            self.prior_x_axis_order_combo.blockSignals(True)
+            self.prior_x_axis_order_combo.setCurrentIndex(max(combo_index, 0))
+            self.prior_x_axis_order_combo.blockSignals(False)
+            self.edit_prior_x_axis_button.setEnabled(True)
+        else:
+            self._prior_x_axis_custom_order = []
+            combo_index = self.prior_x_axis_order_combo.findData("auto")
+            self.prior_x_axis_order_combo.blockSignals(True)
+            self.prior_x_axis_order_combo.setCurrentIndex(max(combo_index, 0))
+            self.prior_x_axis_order_combo.blockSignals(False)
+            self.edit_prior_x_axis_button.setEnabled(False)
+
+        self._refresh_prior_plot_editor_controls(force=True)
+        self.draw_prior_plot(self._current_prior_json_path)
+        return True
+
+    def set_prior_plot_state(
+        self,
+        payload: dict[str, object] | None,
+    ) -> None:
+        normalized = dict(payload or {})
+        self._pending_prior_plot_axes_state = (
+            self._normalized_figure_axes_state(normalized.get("axes"))
+        )
+        applied = False
+        if normalized:
+            applied = self._apply_loaded_prior_plot_editor_pickle_state(
+                normalized
+            )
+        if (
+            not applied
+            and self._pending_prior_plot_axes_state is not None
+            and not self._preview_updates_suspended()
+        ):
+            self.draw_prior_plot(self._current_prior_json_path)
+
+    def _apply_prior_plot_panel_state_from_pickle(
+        self,
+        panel_state: dict[str, object],
+    ) -> None:
+        self.prior_mode_combo.blockSignals(True)
+        self.secondary_filter_combo.blockSignals(True)
+        self.prior_color_combo.blockSignals(True)
+        self.prior_match_trace_colors_checkbox.blockSignals(True)
+        try:
+            self._set_combo_data_if_present(
+                self.prior_mode_combo,
+                panel_state.get("mode"),
+            )
+            secondary_element = panel_state.get("secondary_element")
+            if secondary_element is not None:
+                index = self.secondary_filter_combo.findText(
+                    str(secondary_element)
+                )
+                if index >= 0:
+                    self.secondary_filter_combo.setCurrentIndex(index)
+            self._set_combo_text_if_present(
+                self.prior_color_combo,
+                panel_state.get("colormap_name"),
+            )
+            if "match_trace_colors" in panel_state:
+                self.prior_match_trace_colors_checkbox.setChecked(
+                    bool(panel_state["match_trace_colors"])
+                )
+        finally:
+            self.prior_mode_combo.blockSignals(False)
+            self.secondary_filter_combo.blockSignals(False)
+            self.prior_color_combo.blockSignals(False)
+            self.prior_match_trace_colors_checkbox.blockSignals(False)
+        self._update_prior_control_state()
+
+    @staticmethod
+    def _set_combo_data_if_present(combo: QComboBox, value: object) -> None:
+        index = combo.findData(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    @staticmethod
+    def _set_combo_text_if_present(combo: QComboBox, value: object) -> None:
+        if value is None:
+            return
+        index = combo.findText(str(value))
+        if index >= 0:
+            combo.setCurrentIndex(index)
 
     def prior_mode(self) -> str:
         return str(self.prior_mode_combo.currentData() or "structure_fraction")
@@ -2449,23 +3245,31 @@ class ProjectSetupTab(QWidget):
         self.activity_progress_bar.setValue(0)
         self.activity_progress_bar.setFormat("%v / %m items")
 
-    def _redraw_saxs_preview(self) -> None:
-        if self._preview_updates_suspended():
-            self._pending_saxs_preview_redraw = True
-            return
-        for axis in list(self.component_figure.axes):
+    def _render_component_plot_editor_preview(self, figure: Figure) -> None:
+        self._render_component_plot_figure(figure, interactive=False)
+
+    def _render_component_plot_figure(
+        self,
+        figure: Figure,
+        *,
+        interactive: bool,
+    ) -> None:
+        if interactive:
+            self._legend_line_map.clear()
+            self._component_legend_lookup.clear()
+            self._component_line_lookup.clear()
+            self._component_color_lookup.clear()
+            self._observed_component_keys = []
+            self._predicted_component_keys = []
+        for axis in list(figure.axes):
             try:
                 axis.set_xscale("linear")
                 axis.set_yscale("linear")
             except Exception:
                 continue
-        self.component_figure.clear()
-        self._legend_line_map.clear()
-        self._component_legend_lookup.clear()
-        self._component_line_lookup.clear()
-        self._component_color_lookup.clear()
-        self._observed_component_keys = []
-        self._predicted_component_keys = []
+        figure.clear()
+        defaults = self._current_component_plot_defaults()
+        self._component_plot_settings.sync_series(defaults.series_defaults)
         show_data_preview = not self.model_only_mode()
         has_data_preview = show_data_preview and (
             self._experimental_summary is not None
@@ -2473,7 +3277,7 @@ class ProjectSetupTab(QWidget):
         )
         has_components = bool(self._component_paths)
         if not has_data_preview and not has_components:
-            axis = self.component_figure.add_subplot(111)
+            axis = figure.add_subplot(111)
             axis.text(
                 0.5,
                 0.5,
@@ -2494,13 +3298,14 @@ class ProjectSetupTab(QWidget):
                 wrap=True,
             )
             axis.set_axis_off()
-            self._update_component_table_visuals()
-            self._update_component_trace_control_state()
-            self.component_figure.tight_layout()
-            self.component_canvas.draw()
+            if interactive:
+                self._refresh_component_plot_editor_controls()
+                self._update_component_table_visuals()
+                self._update_component_trace_control_state()
+            figure.tight_layout()
             return
 
-        base_axis = self.component_figure.add_subplot(111)
+        base_axis = figure.add_subplot(111)
         experimental_axis = base_axis if has_data_preview else None
         component_axis = (
             base_axis if has_components and not has_data_preview else None
@@ -2523,42 +3328,97 @@ class ProjectSetupTab(QWidget):
                 self._draw_component_profiles(
                     component_axis,
                     self._component_paths or [],
+                    track_lines=interactive,
                 )
             )
             if (
                 self._experimental_summary is not None
                 and experimental_axis is not None
+                and component_axis is not experimental_axis
             ):
                 self._normalize_component_axis(
                     experimental_axis,
                     component_axis,
                 )
-                experimental_axis.set_ylabel(
-                    "Experimental Intensity (arb. units)"
+
+        x_label = self._component_plot_settings.resolve_x_label(defaults)
+        title = self._component_plot_settings.resolve_title(defaults)
+        title_x = self._component_plot_settings.resolve_title_position_x(
+            defaults
+        )
+        title_y = self._component_plot_settings.resolve_title_position_y(
+            defaults
+        )
+        title_font_size = self._component_plot_settings.title_font_size
+        x_axis_label_font_size = (
+            self._component_plot_settings.axis_label_font_size
+        )
+        x_tick_label_font_size = (
+            self._component_plot_settings.tick_label_font_size
+        )
+        primary_axis_label_font_size = (
+            self._component_plot_settings.resolve_primary_axis_label_font_size(
+                defaults
+            )
+        )
+        primary_tick_label_font_size = (
+            self._component_plot_settings.resolve_primary_tick_label_font_size(
+                defaults
+            )
+        )
+        secondary_axis_label_font_size = self._component_plot_settings.resolve_secondary_axis_label_font_size(
+            defaults
+        )
+        secondary_tick_label_font_size = self._component_plot_settings.resolve_secondary_tick_label_font_size(
+            defaults
+        )
+        font_family = self._component_plot_settings.font_family.strip()
+        primary_y_label = (
+            self._component_plot_settings.resolve_primary_y_label(defaults)
+        )
+
+        if experimental_axis is not None:
+            experimental_axis.set_xlabel(x_label)
+            experimental_axis.set_ylabel(primary_y_label)
+        elif component_axis is not None:
+            component_axis.set_xlabel(x_label)
+            component_axis.set_ylabel(primary_y_label)
+
+        if (
+            component_axis is not None
+            and experimental_axis is not None
+            and component_axis is not experimental_axis
+        ):
+            component_axis.set_ylabel(
+                self._component_plot_settings.resolve_secondary_y_label(
+                    defaults
                 )
-                component_axis.set_ylabel("Model Intensity (arb. units)")
-                base_axis.set_title("Experimental Data and SAXS Components")
-            elif has_data_preview and experimental_axis is not None:
-                experimental_axis.set_ylabel("Intensity (arb. units)")
-                component_axis.set_ylabel("Model Intensity (arb. units)")
-                base_axis.set_title("Data and SAXS Components")
-            else:
-                component_axis.set_ylabel("Model Intensity (arb. units)")
-                base_axis.set_title("SAXS Component Preview")
-        elif experimental_axis is not None:
-            experimental_axis.set_ylabel("Intensity (arb. units)")
-            if self._experimental_summary is not None:
-                base_axis.set_title("Experimental Data Preview")
-            else:
-                base_axis.set_title("Data Preview")
+            )
+
+        if title:
+            title_kwargs: dict[str, object] = {
+                "x": title_x,
+                "y": title_y,
+                "fontsize": title_font_size,
+            }
+            if font_family:
+                title_kwargs["fontfamily"] = font_family
+            base_axis.set_title(title, **title_kwargs)
+        else:
+            base_axis.set_title("")
 
         if (
             component_axis is not None
             and self.component_model_range_button.isChecked()
         ):
             self._autoscale_to_model_range(
-                experimental_axis,
+                (
+                    experimental_axis
+                    if component_axis is not experimental_axis
+                    else None
+                ),
                 component_axis,
+                list(component_axis.get_lines()),
             )
 
         anchor_axis = experimental_axis or component_axis
@@ -2566,13 +3426,116 @@ class ProjectSetupTab(QWidget):
             anchor_axis is not None
             and plotted_lines
             and self.component_legend_toggle_button.isChecked()
+            and self._component_plot_settings.resolve_show_legend(defaults)
         ):
-            self._build_interactive_legend(anchor_axis, plotted_lines)
+            legend_location = (
+                self._component_plot_settings.resolve_legend_location(defaults)
+            )
+            legend_font_size = self._component_plot_settings.legend_font_size
+            if interactive:
+                self._build_interactive_legend(
+                    anchor_axis,
+                    plotted_lines,
+                    location=legend_location,
+                    font_size=legend_font_size,
+                    font_family=font_family,
+                )
+            else:
+                preview_legend = anchor_axis.legend(
+                    plotted_lines,
+                    [line.get_label() for line in plotted_lines],
+                    loc=legend_location,
+                    fontsize=legend_font_size,
+                    framealpha=0.9,
+                )
+                if preview_legend is not None and font_family:
+                    for text in preview_legend.get_texts():
+                        text.set_fontfamily(font_family)
 
-        self._update_component_table_visuals()
-        self._update_component_trace_control_state()
-        self.component_figure.tight_layout()
+        for axis in figure.axes:
+            axis.xaxis.label.set_fontsize(x_axis_label_font_size)
+            axis.tick_params(
+                axis="x",
+                which="both",
+                labelsize=x_tick_label_font_size,
+            )
+            if font_family:
+                axis.xaxis.label.set_fontfamily(font_family)
+            for label in list(axis.get_xticklabels()) + list(
+                axis.get_xticklabels(minor=True)
+            ):
+                if font_family:
+                    label.set_fontfamily(font_family)
+
+        primary_y_axis = experimental_axis or component_axis
+        if primary_y_axis is not None:
+            primary_y_axis.yaxis.label.set_fontsize(
+                primary_axis_label_font_size
+            )
+            primary_y_axis.tick_params(
+                axis="y",
+                which="both",
+                labelsize=primary_tick_label_font_size,
+            )
+            primary_y_axis.yaxis.get_offset_text().set_fontsize(
+                primary_tick_label_font_size
+            )
+            if font_family:
+                primary_y_axis.yaxis.label.set_fontfamily(font_family)
+                primary_y_axis.yaxis.get_offset_text().set_fontfamily(
+                    font_family
+                )
+            for label in list(primary_y_axis.get_yticklabels()) + list(
+                primary_y_axis.get_yticklabels(minor=True)
+            ):
+                if font_family:
+                    label.set_fontfamily(font_family)
+
+        if (
+            component_axis is not None
+            and experimental_axis is not None
+            and component_axis is not experimental_axis
+        ):
+            component_axis.yaxis.label.set_fontsize(
+                secondary_axis_label_font_size
+            )
+            component_axis.tick_params(
+                axis="y",
+                which="both",
+                labelsize=secondary_tick_label_font_size,
+            )
+            component_axis.yaxis.get_offset_text().set_fontsize(
+                secondary_tick_label_font_size
+            )
+            if font_family:
+                component_axis.yaxis.label.set_fontfamily(font_family)
+                component_axis.yaxis.get_offset_text().set_fontfamily(
+                    font_family
+                )
+            for label in list(component_axis.get_yticklabels()) + list(
+                component_axis.get_yticklabels(minor=True)
+            ):
+                if font_family:
+                    label.set_fontfamily(font_family)
+
+        if interactive:
+            self._refresh_component_plot_editor_controls()
+            self._update_component_table_visuals()
+            self._update_component_trace_control_state()
+        figure.tight_layout()
+
+    def _redraw_saxs_preview(self) -> None:
+        if self._preview_updates_suspended():
+            self._pending_saxs_preview_redraw = True
+            return
+        self._render_component_plot_figure(
+            self.component_figure,
+            interactive=True,
+        )
+        self._apply_pending_component_plot_axes_state(self.component_figure)
         self.component_canvas.draw()
+        if self._component_plot_editor_window is not None:
+            self._component_plot_editor_window.refresh_preview()
 
     def draw_prior_plot(self, json_path: str | Path | None) -> None:
         self._current_prior_json_path = (
@@ -2583,9 +3546,19 @@ class ProjectSetupTab(QWidget):
         if self._preview_updates_suspended():
             self._pending_prior_preview_redraw = True
             return
-        self.prior_figure.clear()
-        if json_path is None:
-            axis = self.prior_figure.add_subplot(111)
+        self._render_prior_plot_figure(self.prior_figure)
+        self.prior_canvas.draw_idle()
+        if self._prior_plot_editor_window is not None:
+            self._prior_plot_editor_window.refresh_preview()
+
+    def _render_prior_plot_figure(self, figure: Figure) -> None:
+        defaults = self._current_prior_plot_defaults()
+        self._apply_prior_plot_label_state(defaults)
+        self._refresh_prior_plot_editor_controls()
+
+        figure.clear()
+        if self._current_prior_json_path is None:
+            axis = figure.add_subplot(111)
             axis.text(
                 0.5,
                 0.5,
@@ -2594,29 +3567,38 @@ class ProjectSetupTab(QWidget):
                 va="center",
             )
             axis.set_axis_off()
-        else:
-            axis = self.prior_figure.add_subplot(111)
-            try:
-                plot_md_prior_histogram(
-                    json_path,
-                    mode=self.prior_mode(),
-                    secondary_element=self.prior_secondary_element(),
-                    cmap=self.prior_cmap(),
-                    structure_motif_colors=self.prior_structure_motif_colors(),
-                    custom_label_order=self._active_prior_x_axis_order(),
-                    ax=axis,
-                )
-            except Exception as exc:
-                axis.text(
-                    0.5,
-                    0.5,
-                    str(exc),
-                    ha="center",
-                    va="center",
-                    wrap=True,
-                )
-                axis.set_axis_off()
-        self.prior_canvas.draw()
+            return
+
+        axis = figure.add_subplot(111)
+        try:
+            export_payload = build_prior_histogram_export_payload(
+                self._current_prior_json_path,
+                mode=self.prior_mode(),
+                secondary_element=self.prior_secondary_element(),
+                custom_label_order=self._active_prior_x_axis_order(),
+            )
+            render_stacked_histogram_export_payload(
+                export_payload,
+                ax=axis,
+                defaults=defaults,
+                settings=self._prior_plot_settings,
+                cmap=self.prior_cmap(),
+                structure_segment_colors=self.prior_structure_motif_colors(),
+                show_percent=True,
+            )
+        except Exception as exc:
+            axis.text(
+                0.5,
+                0.5,
+                str(exc),
+                ha="center",
+                va="center",
+                wrap=True,
+            )
+            axis.set_axis_off()
+            return
+
+        self._apply_pending_prior_plot_axes_state(figure)
 
     def refresh_available_elements(self) -> None:
         self.request_cluster_scan()
@@ -3404,6 +4386,15 @@ class ProjectSetupTab(QWidget):
             else "disabled Use Predicted Structure Weights"
         )
 
+    def _on_representative_structures_toggled(self, enabled: bool) -> None:
+        self._refresh_representative_structure_controls()
+        self.representative_structures_changed.emit(bool(enabled))
+        self.autosave_project_requested.emit(
+            "enabled Use Representative Structures"
+            if enabled
+            else "disabled Use Representative Structures"
+        )
+
     def _update_resample_grid_state(self) -> None:
         self.resample_points_spin.setEnabled(
             not self.use_experimental_grid_checkbox.isChecked()
@@ -3464,6 +4455,11 @@ class ProjectSetupTab(QWidget):
     def _prior_mode_uses_secondary_filter(self) -> bool:
         return self.prior_mode().startswith("solvent_sort")
 
+    def _on_prior_mode_changed(self, _text: str) -> None:
+        self._update_prior_control_state()
+        self._refresh_prior_plot_editor_controls(force=True)
+        self._redraw_prior_preview_if_needed()
+
     def _update_prior_control_state(self) -> None:
         uses_secondary = self._prior_mode_uses_secondary_filter()
         has_secondary_options = self.secondary_filter_combo.count() > 0
@@ -3490,8 +4486,6 @@ class ProjectSetupTab(QWidget):
             self.secondary_filter_combo.setToolTip("")
 
     def _redraw_prior_preview_if_needed(self) -> None:
-        if self._current_prior_json_path is None:
-            return
         if self._preview_updates_suspended():
             self._pending_prior_preview_redraw = True
             return
@@ -3500,6 +4494,116 @@ class ProjectSetupTab(QWidget):
     def _on_component_trace_color_scheme_changed(self) -> None:
         self._redraw_saxs_preview()
         self._redraw_prior_preview_if_needed()
+
+    @staticmethod
+    def _capture_figure_axes_state(
+        figure: Figure,
+    ) -> list[dict[str, object]]:
+        states: list[dict[str, object]] = []
+        for axis in figure.axes:
+            if not axis.has_data():
+                continue
+            x_limits = axis.get_xlim()
+            y_limits = axis.get_ylim()
+            states.append(
+                {
+                    "xscale": str(axis.get_xscale()),
+                    "yscale": str(axis.get_yscale()),
+                    "xlim": [float(x_limits[0]), float(x_limits[1])],
+                    "ylim": [float(y_limits[0]), float(y_limits[1])],
+                }
+            )
+        return states
+
+    @staticmethod
+    def _normalized_figure_axes_state(
+        raw: object,
+    ) -> list[dict[str, object]] | None:
+        if not isinstance(raw, list):
+            return None
+        states: list[dict[str, object]] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            state: dict[str, object] = {}
+            xscale = str(entry.get("xscale", "")).strip()
+            yscale = str(entry.get("yscale", "")).strip()
+            if xscale:
+                state["xscale"] = xscale
+            if yscale:
+                state["yscale"] = yscale
+            for key in ("xlim", "ylim"):
+                limits = entry.get(key)
+                if not isinstance(limits, (list, tuple)) or len(limits) != 2:
+                    continue
+                try:
+                    lower = float(limits[0])
+                    upper = float(limits[1])
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    np.isfinite(lower)
+                    and np.isfinite(upper)
+                    and lower != upper
+                ):
+                    state[key] = [lower, upper]
+            if state:
+                states.append(state)
+        return states or None
+
+    def _apply_figure_axes_state(
+        self,
+        figure: Figure,
+        axes_state: list[dict[str, object]] | None,
+    ) -> bool:
+        if not axes_state:
+            return True
+        data_axes = [axis for axis in figure.axes if axis.has_data()]
+        if not data_axes:
+            return False
+        applied = False
+        for axis, state in zip(data_axes, axes_state):
+            try:
+                xscale = str(state.get("xscale", "")).strip()
+                if xscale and axis.get_xscale() != xscale:
+                    axis.set_xscale(xscale)
+                yscale = str(state.get("yscale", "")).strip()
+                if yscale and axis.get_yscale() != yscale:
+                    axis.set_yscale(yscale)
+                x_limits = state.get("xlim")
+                if isinstance(x_limits, list) and len(x_limits) == 2:
+                    axis.set_xlim(float(x_limits[0]), float(x_limits[1]))
+                y_limits = state.get("ylim")
+                if isinstance(y_limits, list) and len(y_limits) == 2:
+                    axis.set_ylim(float(y_limits[0]), float(y_limits[1]))
+            except Exception:
+                continue
+            applied = True
+        return applied
+
+    def _apply_pending_component_plot_axes_state(
+        self,
+        figure: Figure,
+    ) -> None:
+        if self._pending_component_plot_axes_state is None:
+            return
+        if self._apply_figure_axes_state(
+            figure,
+            self._pending_component_plot_axes_state,
+        ):
+            self._pending_component_plot_axes_state = None
+
+    def _apply_pending_prior_plot_axes_state(
+        self,
+        figure: Figure,
+    ) -> None:
+        if self._pending_prior_plot_axes_state is None:
+            return
+        if self._apply_figure_axes_state(
+            figure,
+            self._pending_prior_plot_axes_state,
+        ):
+            self._pending_prior_plot_axes_state = None
 
     def _draw_experimental_preview(
         self,
@@ -3511,31 +4615,43 @@ class ProjectSetupTab(QWidget):
             q_values = np.asarray(summary.q_values, dtype=float)
             intensities = np.asarray(summary.intensities, dtype=float)
             exp_color = self.experimental_trace_color()
+            experimental_label = (
+                self._component_plot_settings.display_series_label(
+                    "experimental_data",
+                    "Experimental data",
+                )
+            )
             (full_line,) = axis.plot(
                 q_values,
                 intensities,
                 color=exp_color,
                 alpha=0.35,
                 linewidth=1.3,
-                label="Experimental data",
+                label=experimental_label,
             )
             lines.append(full_line)
 
             selected_mask = self._selected_q_mask(q_values)
             if selected_mask is not None and np.any(selected_mask):
                 if not np.all(selected_mask):
+                    selected_label = (
+                        self._component_plot_settings.display_series_label(
+                            "selected_q_range",
+                            "Selected q-range",
+                        )
+                    )
                     (selected_line,) = axis.plot(
                         q_values[selected_mask],
                         intensities[selected_mask],
                         color=exp_color,
                         linewidth=1.8,
-                        label="Selected q-range",
+                        label=selected_label,
                     )
                     lines.append(selected_line)
                 else:
                     full_line.set_alpha(1.0)
                     full_line.set_linewidth(1.8)
-                    full_line.set_label("Experimental data")
+                    full_line.set_label(experimental_label)
             else:
                 axis.text(
                     0.5,
@@ -3557,13 +4673,17 @@ class ProjectSetupTab(QWidget):
                 dtype=float,
             )
             solvent_color = self.solvent_trace_color()
+            solvent_label = self._component_plot_settings.display_series_label(
+                "solvent_data",
+                "Solvent data",
+            )
             (solvent_line,) = axis.plot(
                 solvent_q_values,
                 solvent_intensities,
                 color=solvent_color,
                 alpha=0.45,
                 linewidth=1.3,
-                label="Solvent data",
+                label=solvent_label,
             )
             lines.append(solvent_line)
 
@@ -3572,18 +4692,24 @@ class ProjectSetupTab(QWidget):
                 solvent_selected_mask
             ):
                 if not np.all(solvent_selected_mask):
+                    selected_solvent_label = (
+                        self._component_plot_settings.display_series_label(
+                            "selected_solvent_q_range",
+                            "Selected solvent q-range",
+                        )
+                    )
                     (selected_solvent_line,) = axis.plot(
                         solvent_q_values[solvent_selected_mask],
                         solvent_intensities[solvent_selected_mask],
                         color=solvent_color,
                         linewidth=1.8,
-                        label="Selected solvent q-range",
+                        label=selected_solvent_label,
                     )
                     lines.append(selected_solvent_line)
                 else:
                     solvent_line.set_alpha(1.0)
                     solvent_line.set_linewidth(1.8)
-                    solvent_line.set_label("Solvent data")
+                    solvent_line.set_label(solvent_label)
 
         self._apply_saxs_axis_style(axis, is_component_axis=False)
         return lines
@@ -3592,6 +4718,8 @@ class ProjectSetupTab(QWidget):
         self,
         axis,
         component_paths: list[Path],
+        *,
+        track_lines: bool = True,
     ) -> list[object]:
         if not component_paths:
             axis.text(
@@ -3615,22 +4743,29 @@ class ProjectSetupTab(QWidget):
             visible = self._component_visibility.get(component_key, True)
             color_override = self._component_color_overrides.get(component_key)
             line_color = color_override or scheme_colors.get(component_key)
+            display_label = self._component_plot_settings.display_series_label(
+                f"component::{component_key}",
+                component_path.stem,
+            )
             (line,) = axis.plot(
                 q_values,
                 intensities,
-                label=component_path.stem,
+                label=display_label,
                 linewidth=1.4,
                 visible=visible,
                 color=line_color,
             )
             line.set_gid(component_key)
-            self._component_visibility.setdefault(component_key, visible)
-            self._component_line_lookup[component_key] = line
-            self._component_color_lookup[component_key] = str(line.get_color())
-            if source_kind == "predicted_structure":
-                self._predicted_component_keys.append(component_key)
-            else:
-                self._observed_component_keys.append(component_key)
+            if track_lines:
+                self._component_visibility.setdefault(component_key, visible)
+                self._component_line_lookup[component_key] = line
+                self._component_color_lookup[component_key] = str(
+                    line.get_color()
+                )
+                if source_kind == "predicted_structure":
+                    self._predicted_component_keys.append(component_key)
+                else:
+                    self._observed_component_keys.append(component_key)
             lines.append(line)
         self._apply_saxs_axis_style(axis, is_component_axis=True)
         return lines
@@ -3673,7 +4808,7 @@ class ProjectSetupTab(QWidget):
             "log" if self.component_log_y_checkbox.isChecked() else "linear"
         )
         if not is_component_axis or self._experimental_summary is None:
-            axis.set_xlabel("q (Å⁻¹)")
+            axis.set_xlabel(Q_A_INVERSE_LABEL)
         if not is_component_axis:
             axis.set_ylabel("Intensity (arb. units)")
 
@@ -3731,22 +4866,37 @@ class ProjectSetupTab(QWidget):
         )
         component_axis.set_ylim(right_limits)
 
-    def _build_interactive_legend(self, axis, lines: list[object]) -> None:
+    def _build_interactive_legend(
+        self,
+        axis,
+        lines: list[object],
+        *,
+        location: str = "upper right",
+        font_size: float = 9.0,
+        font_family: str = "",
+    ) -> None:
         legend_columns = max(1, int(np.ceil(len(lines) / 5.0)))
+        legend_kwargs: dict[str, object] = {
+            "fontsize": font_size,
+            "loc": location,
+            "borderaxespad": 0.3,
+            "framealpha": 0.9,
+            "ncols": legend_columns,
+            "columnspacing": 0.9,
+            "handlelength": 1.5,
+        }
+        if location == "upper right":
+            legend_kwargs["bbox_to_anchor"] = (0.985, 0.985)
         legend = axis.legend(
             lines,
             [line.get_label() for line in lines],
-            fontsize="small",
-            loc="upper right",
-            bbox_to_anchor=(0.985, 0.985),
-            borderaxespad=0.3,
-            framealpha=0.9,
-            ncols=legend_columns,
-            columnspacing=0.9,
-            handlelength=1.5,
+            **legend_kwargs,
         )
         if legend is None:
             return
+        if font_family:
+            for text in legend.get_texts():
+                text.set_fontfamily(font_family)
         self._legend_line_map.clear()
         self._component_legend_lookup.clear()
         legend_handles = getattr(legend, "legend_handles", None)
@@ -4050,12 +5200,18 @@ class ProjectSetupTab(QWidget):
         self,
         experimental_axis,
         component_axis,
+        component_lines: list[object] | None = None,
     ) -> None:
-        component_lines = [
-            line
-            for line in self._component_line_lookup.values()
-            if line.get_visible()
-        ]
+        if component_lines is None:
+            component_lines = [
+                line
+                for line in self._component_line_lookup.values()
+                if line.get_visible()
+            ]
+        else:
+            component_lines = [
+                line for line in component_lines if line.get_visible()
+            ]
         if not component_lines:
             return
         model_q_values = np.concatenate(

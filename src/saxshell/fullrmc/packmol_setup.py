@@ -13,10 +13,16 @@ from saxshell.fullrmc.packmol_planning import PackmolPlanningMetadata
 from saxshell.fullrmc.representatives import (
     RepresentativeSelectionEntry,
     RepresentativeSelectionMetadata,
+    validate_representative_selection_covers_distribution,
 )
-from saxshell.fullrmc.solvent_handling import SolventHandlingMetadata
+from saxshell.fullrmc.solvent_handling import (
+    SolventHandlingMetadata,
+    representative_structure_mode_label,
+    resolved_representative_structure_mode,
+)
 from saxshell.saxs.debye import load_structure_file
 from saxshell.structure import PDBAtom, PDBStructure
+from saxshell.xyz2pdb import resolve_reference_path
 
 if False:  # pragma: no cover
     from .project_loader import RMCDreamProjectSource
@@ -29,6 +35,7 @@ class PackmolSetupSettings:
     packed_output_filename: str = "packed_combined.pdb"
     use_completed_representatives: bool = True
     include_free_solvent: bool = True
+    free_solvent_reference: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -60,6 +67,9 @@ class PackmolSetupSettings:
             ),
             include_free_solvent=bool(
                 source.get("include_free_solvent", True)
+            ),
+            free_solvent_reference=_optional_text(
+                source.get("free_solvent_reference")
             ),
         )
 
@@ -109,10 +119,15 @@ class PackmolSetupMetadata:
     updated_at: str
     planning_mode: str
     representative_selection_mode: str
+    representative_structure_mode: str
     box_side_length_a: float
     packmol_input_path: str
     packed_output_filename: str
     solvent_pdb_path: str | None
+    free_solvent_reference_name: str | None
+    free_solvent_reference_path: str | None
+    target_solvent_molecules: int
+    solvent_molecules_in_clusters: int
     free_solvent_molecules: int
     audit_report_path: str
     entries: list[PackmolSetupEntry]
@@ -126,10 +141,19 @@ class PackmolSetupMetadata:
             "representative_selection_mode": (
                 self.representative_selection_mode
             ),
+            "representative_structure_mode": (
+                self.representative_structure_mode
+            ),
             "box_side_length_a": self.box_side_length_a,
             "packmol_input_path": self.packmol_input_path,
             "packed_output_filename": self.packed_output_filename,
             "solvent_pdb_path": self.solvent_pdb_path,
+            "free_solvent_reference_name": self.free_solvent_reference_name,
+            "free_solvent_reference_path": self.free_solvent_reference_path,
+            "target_solvent_molecules": self.target_solvent_molecules,
+            "solvent_molecules_in_clusters": (
+                self.solvent_molecules_in_clusters
+            ),
             "free_solvent_molecules": self.free_solvent_molecules,
             "audit_report_path": self.audit_report_path,
             "entries": [entry.to_dict() for entry in self.entries],
@@ -153,6 +177,9 @@ class PackmolSetupMetadata:
             representative_selection_mode=str(
                 payload.get("representative_selection_mode", "")
             ).strip(),
+            representative_structure_mode=str(
+                payload.get("representative_structure_mode", "")
+            ).strip(),
             box_side_length_a=float(payload.get("box_side_length_a", 0.0)),
             packmol_input_path=str(
                 payload.get("packmol_input_path", "")
@@ -161,6 +188,18 @@ class PackmolSetupMetadata:
                 payload.get("packed_output_filename", "")
             ).strip(),
             solvent_pdb_path=_optional_text(payload.get("solvent_pdb_path")),
+            free_solvent_reference_name=_optional_text(
+                payload.get("free_solvent_reference_name")
+            ),
+            free_solvent_reference_path=_optional_text(
+                payload.get("free_solvent_reference_path")
+            ),
+            target_solvent_molecules=int(
+                payload.get("target_solvent_molecules", 0)
+            ),
+            solvent_molecules_in_clusters=int(
+                payload.get("solvent_molecules_in_clusters", 0)
+            ),
             free_solvent_molecules=int(
                 payload.get("free_solvent_molecules", 0)
             ),
@@ -178,12 +217,31 @@ class PackmolSetupMetadata:
         lines = [
             f"Planning mode: {self.planning_mode}",
             f"Representative mode: {self.representative_selection_mode}",
+            (
+                "Representative structure set: "
+                f"{representative_structure_mode_label(self.representative_structure_mode)}"
+            ),
             f"Saved at: {self.updated_at}",
             f"Box side: {self.box_side_length_a:.3f} A",
+            f"Packmol tolerance: {self.settings.tolerance_angstrom:.3f} A",
             f"Packmol input: {Path(self.packmol_input_path).name}",
             f"Representative PDBs copied: {len(self.entries)}",
-            f"Free solvent molecules: {self.free_solvent_molecules}",
         ]
+        if self.free_solvent_reference_name:
+            lines.append(
+                "Free solvent structure: "
+                f"{self.free_solvent_reference_name}"
+            )
+        lines.extend(
+            [
+                f"Total solvent molecules: {self.target_solvent_molecules}",
+                (
+                    "Cluster solvent molecules: "
+                    f"{self.solvent_molecules_in_clusters}"
+                ),
+                f"Free solvent molecules: {self.free_solvent_molecules}",
+            ]
+        )
         if self.entries:
             first = self.entries[0]
             lines.extend(
@@ -223,18 +281,27 @@ def build_packmol_setup(
         or not active_representatives.representative_entries
     ):
         raise ValueError(
-            "Compute representative clusters before building Packmol setup."
+            "Save representative structures before building Packmol setup."
         )
+    validate_representative_selection_covers_distribution(
+        active_representatives
+    )
 
     active_solvent = solvent_metadata or project_source.solvent_handling
+    free_solvent_reference_name: str | None = None
+    free_solvent_reference_path: str | None = None
     if active_settings.include_free_solvent:
-        if active_solvent is None:
+        (
+            free_solvent_reference_name,
+            free_solvent_reference_path,
+        ) = _resolve_free_solvent_reference(
+            active_settings,
+            active_plan,
+            active_solvent,
+        )
+        if free_solvent_reference_path is None:
             raise ValueError(
-                "Build representative solvent outputs before generating Packmol inputs."
-            )
-        if not active_solvent.reference_path:
-            raise ValueError(
-                "No solvent reference PDB is available for Packmol input generation."
+                "Choose a free-solvent structure before generating Packmol inputs."
             )
 
     representative_lookup = {
@@ -247,6 +314,10 @@ def build_packmol_setup(
             (entry.structure, entry.motif, entry.param): entry
             for entry in active_solvent.entries
         }
+    representative_structure_mode = resolved_representative_structure_mode(
+        active_representatives,
+        active_solvent,
+    )
 
     entries: list[PackmolSetupEntry] = []
     box_side_length_a = active_plan.settings.box_side_length_a
@@ -263,6 +334,7 @@ def build_packmol_setup(
         source_structure, source_pdb_path = _resolve_structure_for_packmol(
             representative_entry,
             solvent_lookup.get(key),
+            representative_structure_mode=representative_structure_mode,
             use_completed=active_settings.use_completed_representatives,
         )
         residue_name = _packmol_residue_code(index)
@@ -302,24 +374,32 @@ def build_packmol_setup(
         )
 
     solvent_pdb_path: str | None = None
-    free_solvent_molecules = 0
-    if active_settings.include_free_solvent and active_solvent is not None:
-        source_solvent = (
-            Path(active_solvent.reference_path).expanduser().resolve()
-        )
-        free_solvent_molecules = int(
-            round(
-                float(
-                    active_plan.target_box_composition.get(
-                        "solvent_molecules",
-                        0,
-                    )
-                )
+    solvent_allocation = active_plan.solvent_allocation
+    target_solvent_molecules = int(
+        round(
+            float(
+                active_plan.target_box_composition.get("solvent_molecules", 0)
             )
         )
-        solvent_copy_name = (
-            f"{_safe_name(active_solvent.reference_name)}_single.pdb"
+    )
+    solvent_molecules_in_clusters = 0
+    free_solvent_molecules = target_solvent_molecules
+    if solvent_allocation is not None:
+        target_solvent_molecules = int(
+            solvent_allocation.target_solvent_molecules
         )
+        solvent_molecules_in_clusters = int(
+            solvent_allocation.solvent_molecules_in_clusters
+        )
+        free_solvent_molecules = int(solvent_allocation.free_solvent_molecules)
+    if (
+        active_settings.include_free_solvent
+        and free_solvent_reference_path is not None
+    ):
+        source_solvent = (
+            Path(free_solvent_reference_path).expanduser().resolve()
+        )
+        solvent_copy_name = f"{_safe_name(free_solvent_reference_name or source_solvent.stem)}_single.pdb"
         destination = (
             project_source.rmcsetup_paths.packmol_inputs_dir
             / solvent_copy_name
@@ -341,6 +421,10 @@ def build_packmol_setup(
         entries,
         input_path=input_path,
         solvent_pdb_path=solvent_pdb_path,
+        free_solvent_reference_name=free_solvent_reference_name,
+        free_solvent_reference_path=free_solvent_reference_path,
+        target_solvent_molecules=target_solvent_molecules,
+        solvent_molecules_in_clusters=solvent_molecules_in_clusters,
         free_solvent_molecules=free_solvent_molecules,
     )
     metadata = PackmolSetupMetadata(
@@ -348,10 +432,15 @@ def build_packmol_setup(
         updated_at=datetime.now().isoformat(timespec="seconds"),
         planning_mode=active_plan.settings.planning_mode,
         representative_selection_mode=active_representatives.selection_mode,
+        representative_structure_mode=representative_structure_mode,
         box_side_length_a=box_side_length_a,
         packmol_input_path=str(input_path),
         packed_output_filename=active_settings.packed_output_filename,
         solvent_pdb_path=solvent_pdb_path,
+        free_solvent_reference_name=free_solvent_reference_name,
+        free_solvent_reference_path=free_solvent_reference_path,
+        target_solvent_molecules=target_solvent_molecules,
+        solvent_molecules_in_clusters=solvent_molecules_in_clusters,
         free_solvent_molecules=free_solvent_molecules,
         audit_report_path=str(audit_path),
         entries=entries,
@@ -393,38 +482,50 @@ def _resolve_structure_for_packmol(
     representative_entry: RepresentativeSelectionEntry,
     solvent_entry: object | None,
     *,
+    representative_structure_mode: str,
     use_completed: bool,
 ) -> tuple[PDBStructure, Path]:
-    candidate_path: Path | None = None
-    if solvent_entry is not None and use_completed:
-        candidate_path = Path(
+    candidate_paths: list[Path] = []
+    if solvent_entry is not None:
+        completed_path = Path(
             getattr(solvent_entry, "completed_pdb", "")
         ).expanduser()
-    if (
-        candidate_path is None
-        or not str(candidate_path)
-        or not candidate_path.is_file()
-    ) and solvent_entry is not None:
-        candidate_path = Path(
+        no_solvent_path = Path(
             getattr(solvent_entry, "no_solvent_pdb", "")
         ).expanduser()
-    if (
-        candidate_path is None
-        or not str(candidate_path)
-        or not candidate_path.is_file()
-    ):
-        source_path = (
-            Path(representative_entry.source_file).expanduser().resolve()
-        )
-        return (
-            _load_structure_as_pdb(
-                source_path,
-                structure_label=representative_entry.structure,
-            ),
+        if representative_structure_mode == "full_solvent":
+            candidate_paths.extend([completed_path, no_solvent_path])
+        elif representative_structure_mode == "no_solvent":
+            candidate_paths.extend([no_solvent_path, completed_path])
+        elif representative_structure_mode == "partial_solvent":
+            candidate_paths.extend(
+                [Path(representative_entry.source_file).expanduser()]
+            )
+        elif use_completed:
+            candidate_paths.extend([completed_path, no_solvent_path])
+        else:
+            candidate_paths.extend([no_solvent_path, completed_path])
+    candidate_paths.append(Path(representative_entry.source_file).expanduser())
+    source_path = Path(representative_entry.source_file).expanduser().resolve()
+    for candidate_path in candidate_paths:
+        if str(candidate_path).strip() and candidate_path.is_file():
+            resolved = candidate_path.resolve()
+            if resolved == source_path:
+                return (
+                    _load_structure_as_pdb(
+                        resolved,
+                        structure_label=representative_entry.structure,
+                    ),
+                    resolved,
+                )
+            return PDBStructure.from_file(resolved), resolved
+    return (
+        _load_structure_as_pdb(
             source_path,
-        )
-    resolved = candidate_path.resolve()
-    return PDBStructure.from_file(resolved), resolved
+            structure_label=representative_entry.structure,
+        ),
+        source_path,
+    )
 
 
 def _prepare_packmol_structure(
@@ -485,6 +586,10 @@ def _write_packmol_audit_report(
     *,
     input_path: Path,
     solvent_pdb_path: str | None,
+    free_solvent_reference_name: str | None,
+    free_solvent_reference_path: str | None,
+    target_solvent_molecules: int,
+    solvent_molecules_in_clusters: int,
     free_solvent_molecules: int,
 ) -> Path:
     lines = [
@@ -499,6 +604,16 @@ def _write_packmol_audit_report(
             "- Solvent input: "
             f"{solvent_pdb_path if solvent_pdb_path is not None else '(none)'}"
         ),
+        (
+            "- Free solvent structure: "
+            f"{free_solvent_reference_name or '(none)'}"
+        ),
+        (
+            "- Free solvent source path: "
+            f"{free_solvent_reference_path if free_solvent_reference_path is not None else '(none)'}"
+        ),
+        f"- Target solvent molecules: {target_solvent_molecules}",
+        ("- Cluster solvent molecules: " f"{solvent_molecules_in_clusters}"),
         f"- Free solvent molecules: {free_solvent_molecules}",
         "",
         "## Planned Clusters",
@@ -529,8 +644,8 @@ def _write_packmol_audit_report(
             "",
             "## Notes",
             "- Cluster PDBs were rewritten with unique residue names for Packmol use.",
-            "- Free solvent counts currently follow the target solvent molecules from the solution-properties box composition.",
-            "- Coordinated-solvent completion assumptions come from the saved solvent-handling step when available.",
+            "- Free solvent counts subtract solvent molecules already present in the cluster files from the bulk-solvent target.",
+            "- If solvent-handling outputs are available, the completed full-solvent representative PDBs define the embedded cluster solvent counts.",
         ]
     )
     audit_path = project_source.rmcsetup_paths.packmol_audit_report_path
@@ -606,6 +721,36 @@ def _safe_name(text: str) -> str:
 def _safe_filename(text: str) -> str:
     name = Path(text.strip() or "item").name
     return name or "item"
+
+
+def _resolve_free_solvent_reference(
+    settings: PackmolSetupSettings,
+    plan_metadata: PackmolPlanningMetadata,
+    solvent_metadata: SolventHandlingMetadata | None,
+) -> tuple[str | None, str | None]:
+    candidates = [
+        settings.free_solvent_reference,
+        plan_metadata.settings.free_solvent_reference,
+        (
+            None
+            if plan_metadata.solvent_allocation is None
+            else plan_metadata.solvent_allocation.reference_path
+        ),
+        (
+            None
+            if solvent_metadata is None
+            else solvent_metadata.reference_path
+        ),
+    ]
+    for candidate in candidates:
+        reference_identifier = _optional_text(candidate)
+        if reference_identifier is None:
+            continue
+        resolved_reference = resolve_reference_path(
+            reference_identifier
+        ).expanduser()
+        return resolved_reference.stem, str(resolved_reference.resolve())
+    return None, None
 
 
 __all__ = [

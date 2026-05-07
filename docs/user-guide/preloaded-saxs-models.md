@@ -9,15 +9,16 @@ single paper.
 
 ## Template Catalog
 
-| Template file                                | GUI name                                               | Status     | Model family                                 |
-| -------------------------------------------- | ------------------------------------------------------ | ---------- | -------------------------------------------- |
-| `template_pydream_monosq_normalized.py`      | `pyDREAM MonoSQ Normalized`                            | current    | MonoSQ hard-sphere                           |
-| `template_pydream_poly_lma_hs.py`            | `pyDREAM Poly LMA Hard-Sphere`                         | current    | sphere-only Poly LMA hard-sphere             |
-| `template_pydream_poly_lma_hs_mix_approx.py` | `pyDREAM Poly LMA Hard-Sphere/Ellipsoid Mix (Approx.)` | current    | mixed-shape approximate Poly LMA hard-sphere |
-| `template_likelihood_monosq.py`              | `MonoSQ Basic (archived)`                              | archived   | MonoSQ hard-sphere                           |
-| `template_pd_likelihood_monosq.py`           | `MonoSQ PD (archived)`                                 | archived   | MonoSQ hard-sphere                           |
-| `template_pd_likelihood_monosq_decoupled.py` | `MonoSQ Decoupled (archived)`                          | archived   | MonoSQ hard-sphere                           |
-| `template_pydream_poly_lma_hs_legacy.py`     | `pyDREAM Poly LMA Hard-Sphere (deprecated)`            | deprecated | mixed-shape approximate Poly LMA hard-sphere |
+| Template file                                          | GUI name                                               | Status     | Model family                                  |
+| ------------------------------------------------------ | ------------------------------------------------------ | ---------- | --------------------------------------------- |
+| `template_pydream_monosq_normalized.py`                | `pyDREAM MonoSQ Normalized`                            | current    | MonoSQ hard-sphere                            |
+| `template_pydream_monosq_normalized_scaled_solvent.py` | `pyDREAM MonoSQ Normalized (Scaled Solvent Weight)`    | current    | MonoSQ hard-sphere with scale-coupled solvent |
+| `template_pydream_poly_lma_hs.py`                      | `pyDREAM Poly LMA Hard-Sphere`                         | current    | sphere-only Poly LMA hard-sphere              |
+| `template_pydream_poly_lma_hs_mix_approx.py`           | `pyDREAM Poly LMA Hard-Sphere/Ellipsoid Mix (Approx.)` | current    | mixed-shape approximate Poly LMA hard-sphere  |
+| `template_likelihood_monosq.py`                        | `MonoSQ Basic (archived)`                              | archived   | MonoSQ hard-sphere                            |
+| `template_pd_likelihood_monosq.py`                     | `MonoSQ PD (archived)`                                 | archived   | MonoSQ hard-sphere                            |
+| `template_pd_likelihood_monosq_decoupled.py`           | `MonoSQ Decoupled (archived)`                          | archived   | MonoSQ hard-sphere                            |
+| `template_pydream_poly_lma_hs_legacy.py`               | `pyDREAM Poly LMA Hard-Sphere (deprecated)`            | deprecated | mixed-shape approximate Poly LMA hard-sphere  |
 
 ## Shared Notation
 
@@ -37,38 +38,102 @@ Across the bundled templates:
 Applies to:
 
 - `template_pydream_monosq_normalized.py`
+- `template_pydream_monosq_normalized_scaled_solvent.py`
 - `template_likelihood_monosq.py`
 - `template_pd_likelihood_monosq.py`
 - `template_pd_likelihood_monosq_decoupled.py`
 
 These templates treat the MD-derived component profiles as a weighted solute
 mixture modulated by a **single** monodisperse hard-sphere structure factor.
+They differ mainly in where the experimental solvent trace enters the scaled
+model expression.
 
-\[
-I*{\mathrm{mix}}(q) = \sum*{i=0}^{N-1} w_i I_i(q)
-\]
+All MonoSQ templates start from the same solute branch:
 
-\[
-\begin{aligned}
-I*{\mathrm{model}}(q) ={}&
-\mathrm{scale}\, I*{\mathrm{mix}}(q)\,
-S*{\mathrm{HS}}(q; R*{\mathrm{eff}}, \phi*{\mathrm{vol}}) \\
-&+ w*{\mathrm{solv}} I\_{\mathrm{solv}}(q)
+$$
+I_{\mathrm{mix}}(q) = \sum_{i=0}^{N-1} w_i I_i(q)
+$$
 
-- \mathrm{offset}
-  \end{aligned}
-  \]
+$$
+I_{\mathrm{solute}}(q) =
+I_{\mathrm{mix}}(q) S_{\mathrm{HS}}(q; R_{\mathrm{eff}}, \phi_{\mathrm{vol}})
+$$
+
+### Current normalized MonoSQ
+
+The original `pyDREAM MonoSQ Normalized` template keeps the historical
+unscaled-solvent convention:
+
+$$
+I_{\mathrm{model}}(q) =
+\mathrm{scale}\, I_{\mathrm{solute}}(q)
++ w_{\mathrm{solv}} I_{\mathrm{solv}}(q)
++ \mathrm{offset}.
+$$
+
+In this template, `scale` applies only to the MD-derived solute branch. The
+solvent trace is added after the global scale, so `solv_w` must carry both the
+physical solvent-background multiplier and any remaining intensity-unit
+mismatch between the imported solvent data and the scaled MD model. This
+preserves the behavior of existing projects, but it can make fitted `solv_w`
+values look much smaller than a physical solvent volume fraction when the
+experimental solvent trace is orders of magnitude larger than the model trace.
+
+The solution-scattering calculator can still seed `solv_w` for this template
+with the combined solvent-background multiplier. It does **not** seed `vol_frac`
+for the original MonoSQ template; `vol_frac` remains a fitted hard-sphere
+packing term.
+
+### Scaled Solvent Weight MonoSQ
+
+The `pyDREAM MonoSQ Normalized (Scaled Solvent Weight)` template keeps the same
+MonoSQ solute branch and point-normalized likelihood, but moves the solvent
+trace inside the global scale:
+
+$$
+I_{\mathrm{model}}(q) =
+\mathrm{scale}
+\left[
+I_{\mathrm{solute}}(q)
++ w_{\mathrm{solv}} I_{\mathrm{solv}}(q)
+\right]
++ \mathrm{offset}.
+$$
+
+Here `scale` applies to the combined solute-plus-solvent model. This makes
+`solv_w` a model-facing solvent-background multiplier rather than a parameter
+that also has to absorb the arbitrary MD-model intensity scale. In practice,
+this is the safer MonoSQ starting point when the solvent blank intensity is
+much larger than the unscaled MD component profiles.
+
+This template declares calculator targets in its metadata:
+
+- `vol_frac` receives the physical solute-associated volume fraction computed
+  from the solution composition.
+- `solv_w` receives the combined solvent-background multiplier from attenuation
+  and SAXS-effective solvent contrast.
+
+It also declares Prefit startup behavior. When experimental data are available
+and there is no saved Best Prefit or current Prefit state for this template,
+Prefit applies the autoscale recommendation as soon as the template loads. The
+new `scale` and `offset` limits are centered around the autoscale result rather
+than preserving the broad template-default ranges. The default `eff_r` starts at
+3 A, the lower bound of the effective-radius search range.
+
+Because the solvent branch is scale-coupled, Prefit's scale recommendation also
+treats the solvent term as part of the scaled model instead of subtracting it as
+an already-scaled background contribution.
 
 ### Variables
 
-| Symbol / parameter                    | Meaning in SAXSShell                                                |
-| ------------------------------------- | ------------------------------------------------------------------- |
-| \(w_i\)                               | generated component weight for cluster profile \(i\)                |
-| \(w\_{\mathrm{solv}}\) / `solv_w`     | bounded solvent contribution weight                                 |
-| \(R\_{\mathrm{eff}}\) / `eff_r`       | effective hard-sphere radius used in `calc_monodisperse_sq(...)`    |
-| \(\phi\_{\mathrm{vol}}\) / `vol_frac` | effective hard-sphere volume fraction inside the Percus-Yevick term |
-| `scale`                               | solute intensity scale factor                                       |
-| `offset`                              | constant additive background                                        |
+| Symbol / parameter                    | Meaning in SAXSShell                                                                                                       |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| \(w_i\)                               | generated component weight for cluster profile \(i\)                                                                       |
+| \(w\_{\mathrm{solv}}\) / `solv_w`     | bounded solvent contribution weight                                                                                        |
+| \(R\_{\mathrm{eff}}\) / `eff_r`       | effective hard-sphere radius used in `calc_monodisperse_sq(...)`; scaled-solvent MonoSQ defaults to 3 A                    |
+| \(\phi\_{\mathrm{vol}}\) / `vol_frac` | effective hard-sphere volume fraction inside the Percus-Yevick term                                                        |
+| `scale`                               | global intensity scale; original MonoSQ applies it only to solute, scaled-solvent MonoSQ applies it to solute plus solvent |
+| `offset`                              | constant additive background                                                                                               |
 
 ### Likelihood conventions
 

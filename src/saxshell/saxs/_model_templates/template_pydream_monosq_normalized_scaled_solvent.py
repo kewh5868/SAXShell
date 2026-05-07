@@ -1,0 +1,139 @@
+import numpy as np
+from scipy.stats import norm
+
+# ==============================================
+# model_lmfit: lmfit_model_profile
+# model_pydream: log_likelihood_monosq_scaled_solvent
+# inputs_lmfit: q, solvent_data, model_data, params
+# inputs_pydream: q, solvent_data, model_data, params
+# param_columns: Structure, Motif, Param, Value, Vary, Min, Max
+#
+# param: solv_w,1.0,False,0.0,1.0
+# param: offset,0,True,-20,30
+# param: eff_r,3.0,True,3,20
+# param: vol_frac,0.0,False,0.0,0.5
+# param: scale,5e-4,False,1e-8,5e-3
+#
+# MonoSQ normalized variant with scale-coupled solvent contribution:
+#   I(q) = scale * (I_solute(q) + solv_w * I_solvent(q)) + offset
+#
+# The original template_pydream_monosq_normalized.py is intentionally left
+# unchanged for existing projects that rely on the unscaled solvent branch.
+# ==============================================
+
+
+def calc_monodisperse_sq(r, vol_frac, q_values):
+    """Return the hard-sphere Percus-Yevick structure factor."""
+    sqs = []
+
+    alpha = (1 + 2 * vol_frac) ** 2 / (1 - vol_frac) ** 4
+    beta = -6 * vol_frac * (1 + vol_frac / 2) ** 2 / (1 - vol_frac) ** 4
+    gamma = 0.5 * vol_frac * (1 + 2 * vol_frac) ** 2 / (1 - vol_frac) ** 4
+
+    for q in q_values:
+        a = 2 * q * r
+        g1 = alpha / a**2 * (np.sin(a) - a * np.cos(a))
+        g2 = beta / a**3 * (2 * a * np.sin(a) + (2 - a**2) * np.cos(a) - 2)
+        g3 = (
+            gamma
+            / a**5
+            * (
+                -(a**4) * np.cos(a)
+                + 4
+                * ((3 * a**2 - 6) * np.cos(a) + (a**3 - 6 * a) * np.sin(a) + 6)
+            )
+        )
+        g = g1 + g2 + g3
+        sqs.append(1 / (1 + 24 * vol_frac * (g / a)))
+
+    return np.asarray(sqs)
+
+
+def _bounded_solvent_weight(value):
+    return float(np.clip(float(value), 0.0, 1.0))
+
+
+def structure_factor_profile(q, solvent_data, model_data, **params):
+    """Return the pure hard-sphere structure-factor trace S(q)."""
+    del solvent_data, model_data
+    return calc_monodisperse_sq(
+        params["eff_r"],
+        params["vol_frac"],
+        np.asarray(q, dtype=float),
+    )
+
+
+def lmfit_model_profile(q, solvent_data, model_data, **params):
+    """Evaluate the scale-coupled-solvent monodisperse SAXS model."""
+    weight_keys = sorted(
+        (key for key in params if key.startswith("w")),
+        key=lambda key: int(key.lstrip("w")),
+    )
+    weights = [params[key] for key in weight_keys]
+
+    solv_w = _bounded_solvent_weight(params["solv_w"])
+    offset = params["offset"]
+    eff_r = params["eff_r"]
+    vol_frac = params["vol_frac"]
+    scale = params["scale"]
+
+    mixture = np.zeros_like(q)
+    for weight, component in zip(weights, model_data):
+        mixture += weight * component
+
+    solute_intensity = mixture * calc_monodisperse_sq(eff_r, vol_frac, q)
+    solvent_contribution = solv_w * np.asarray(solvent_data, dtype=float)
+
+    return scale * (solute_intensity + solvent_contribution) + offset
+
+
+def model_monosq_scaled_solvent(params):
+    """Return the forward model intensity for pyDREAM."""
+    global q_values
+    global theoretical_intensities
+    global solvent_intensities
+
+    n_profiles = len(theoretical_intensities)
+
+    weights = params[:n_profiles]
+    solv_w = _bounded_solvent_weight(params[n_profiles])
+    offset = params[n_profiles + 1]
+    eff_r = params[n_profiles + 2]
+    vol_frac = params[n_profiles + 3]
+    scale = params[n_profiles + 4]
+
+    mixture = np.zeros_like(q_values)
+    for weight, component in zip(weights, theoretical_intensities):
+        mixture += weight * component
+
+    solute_intensity = mixture * calc_monodisperse_sq(
+        eff_r,
+        vol_frac,
+        q_values,
+    )
+    solvent_contribution = solv_w * np.asarray(
+        solvent_intensities, dtype=float
+    )
+
+    return scale * (solute_intensity + solvent_contribution) + offset
+
+
+def log_likelihood_monosq_scaled_solvent(params):
+    """Return the normalized Gaussian log-likelihood for pyDREAM."""
+    global experimental_intensities
+
+    model_intensity = model_monosq_scaled_solvent(params)
+    n_points = len(experimental_intensities)
+
+    log_likelihood = np.sum(
+        norm.logpdf(
+            experimental_intensities,
+            loc=model_intensity,
+            scale=1e-4,
+        )
+    )
+
+    if n_points == 0:
+        return log_likelihood
+
+    return log_likelihood / n_points

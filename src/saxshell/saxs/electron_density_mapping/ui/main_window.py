@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -104,6 +104,9 @@ from saxshell.saxs.electron_density_mapping.workflow import (
     compute_electron_density_scattering_profile,
     compute_single_atom_debye_scattering_profile_for_input,
     inspect_structure_input,
+    legacy_born_average_default_fourier_settings,
+    legacy_born_average_default_mesh_settings,
+    legacy_born_average_default_smearing_settings,
     load_electron_density_structure,
     prepare_electron_density_fourier_transform,
     prepare_single_atom_debye_scattering_preview,
@@ -120,6 +123,10 @@ from saxshell.saxs.ui.branding import (
 )
 from saxshell.saxs.ui.progress_dialog import SAXSProgressDialog
 
+# Use MathText for the inverse-Angstrom exponent so the active UI font does
+# not need to provide the superscript minus glyph.
+Q_A_INVERSE_LABEL = "q (Å$^{-1}$)"
+
 _OPEN_WINDOWS: list["ElectronDensityMappingMainWindow"] = []
 _CLUSTER_TRACE_COLORS = (
     "#b45309",
@@ -129,6 +136,7 @@ _CLUSTER_TRACE_COLORS = (
     "#dc2626",
     "#0891b2",
 )
+_SOLVENT_PRESET_NONE = "__none__"
 AUTO_SNAP_PANES_KEY = "auto_snap_panes_enabled"
 _FT_COLUMN_STOICHIOMETRY = 0
 _FT_COLUMN_STATUS = 1
@@ -220,6 +228,9 @@ class _SavedOutputEntry:
     profile_result: ElectronDensityProfileResult
     fourier_settings: ElectronDensityFourierTransformSettings
     transform_result: ElectronDensityScatteringTransformResult | None = None
+    debye_scattering_result: (
+        ElectronDensityDebyeScatteringAverageResult | None
+    ) = None
 
 
 @dataclass(slots=True)
@@ -238,6 +249,37 @@ class _DebyeComparisonEntry:
     born_result: ElectronDensityScatteringTransformResult
     debye_result: ElectronDensityDebyeScatteringAverageResult
     info_text: str
+
+
+@dataclass(slots=True, frozen=True)
+class _DebyeScatteringWorkItem:
+    group_key: str | None
+    label: str
+    inspection: ElectronDensityInputInspection
+    q_values: tuple[float, ...]
+    progress_total: int
+
+
+@dataclass(slots=True, frozen=True)
+class _DebyeScatteringCompletedItem:
+    group_key: str | None
+    label: str
+    result: ElectronDensityDebyeScatteringAverageResult
+
+
+@dataclass(slots=True, frozen=True)
+class _DebyeScatteringRunPayload:
+    results: tuple[_DebyeScatteringCompletedItem, ...] = ()
+    failures: tuple[str, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class _DebyeScatteringRunContext:
+    mode: str
+    scope_label: str = ""
+    selected_keys: tuple[str, ...] = ()
+    skipped_pending: int = 0
+    skipped_single_atom: int = 0
 
 
 def _build_cluster_group_states_for_path(
@@ -547,7 +589,9 @@ class _SavedOutputComparisonDialog(QDialog):
 
         self.status_label = QLabel(
             "All selected entries are overlaid on shared axes. "
-            "Use the trace table to show/hide or recolour individual traces."
+            "Use the trace table to show/hide or recolour individual traces. "
+            "Saved Debye traces, when available, use dashed lines on the "
+            "right axis in the q-space panel."
         )
         self.status_label.setWordWrap(True)
         self.status_label.setStyleSheet("color: #475569;")
@@ -929,8 +973,10 @@ class _SavedOutputComparisonDialog(QDialog):
         pairs = self._visible_entries()
         fig = self._scatter_plot.figure
         fig.clear()
-        ax = fig.add_subplot(111)
+        born_axis = fig.add_subplot(111)
+        debye_axis = None
         has_scatter = False
+        has_debye = False
         use_log_q = any(
             bool(e.fourier_settings.log_q_axis)
             for e, _ in pairs
@@ -941,12 +987,15 @@ class _SavedOutputComparisonDialog(QDialog):
             for e, _ in pairs
             if e.transform_result is not None
         )
+        born_positive_i = True
+        debye_positive_i = True
+        plotted_lines: list[object] = []
         for entry, color in pairs:
-            if entry.transform_result is None:
+            transform_result = entry.transform_result
+            if transform_result is None:
                 continue
-            result = entry.transform_result
-            q = np.asarray(result.q_values, dtype=float)
-            intensity = np.asarray(result.intensity, dtype=float)
+            q = np.asarray(transform_result.q_values, dtype=float)
+            intensity = np.asarray(transform_result.intensity, dtype=float)
             mask = np.ones_like(q, dtype=bool)
             if use_log_q:
                 mask &= q > 0.0
@@ -954,41 +1003,94 @@ class _SavedOutputComparisonDialog(QDialog):
                 mask &= intensity > 0.0
             if not mask.any():
                 continue
+            born_positive_i = born_positive_i and bool(np.all(intensity > 0.0))
             label = (
                 entry.group_label
                 or ElectronDensityMappingMainWindow._saved_output_context_label(
                     entry
                 )
             )
-            ax.plot(
+            born_label = (
+                f"{label} · Born"
+                if ElectronDensityMappingMainWindow._saved_output_entry_debye_result(
+                    entry
+                )
+                is not None
+                else label
+            )
+            (born_line,) = born_axis.plot(
                 q[mask],
                 intensity[mask],
                 color=color,
                 linewidth=1.8,
-                label=label,
+                label=born_label,
             )
+            plotted_lines.append(born_line)
             has_scatter = True
+            debye_result = ElectronDensityMappingMainWindow._saved_output_entry_debye_result(
+                entry
+            )
+            if debye_result is None:
+                continue
+            debye_q = np.asarray(debye_result.q_values, dtype=float)
+            debye_i = np.asarray(debye_result.mean_intensity, dtype=float)
+            debye_mask = np.ones_like(debye_q, dtype=bool)
+            if use_log_q:
+                debye_mask &= debye_q > 0.0
+            if use_log_i:
+                debye_mask &= debye_i > 0.0
+            if not debye_mask.any():
+                continue
+            if debye_axis is None:
+                debye_axis = born_axis.twinx()
+            debye_positive_i = debye_positive_i and bool(np.all(debye_i > 0.0))
+            (debye_line,) = debye_axis.plot(
+                debye_q[debye_mask],
+                debye_i[debye_mask],
+                color=color,
+                linewidth=1.8,
+                linestyle="--",
+                label=f"{label} · Debye",
+            )
+            plotted_lines.append(debye_line)
+            has_debye = True
         if not has_scatter:
-            ax.text(
+            born_axis.text(
                 0.5,
                 0.5,
                 "No Fourier transform results available for selected entries.",
                 ha="center",
                 va="center",
-                transform=ax.transAxes,
+                transform=born_axis.transAxes,
             )
-            ax.set_axis_off()
+            born_axis.set_axis_off()
             self._scatter_plot.canvas.draw_idle()
             return
         if use_log_q:
-            ax.set_xscale("log")
-        if use_log_i:
-            ax.set_yscale("log")
-        ax.set_xlabel("q (Å⁻¹)", labelpad=10.0)
-        ax.set_ylabel("Intensity (arb. units)")
-        ax.set_title("q-Space Scattering Profile")
-        ax.grid(True, which="both", alpha=0.28)
-        ax.legend(loc="upper right", frameon=True, fontsize=8)
+            born_axis.set_xscale("log")
+            if debye_axis is not None:
+                debye_axis.set_xscale("log")
+        if use_log_i and born_positive_i:
+            born_axis.set_yscale("log")
+        if debye_axis is not None and use_log_i and debye_positive_i:
+            debye_axis.set_yscale("log")
+        born_axis.set_xlabel(Q_A_INVERSE_LABEL, labelpad=10.0)
+        born_axis.set_ylabel(
+            "Born Approximation Intensity (arb. units)"
+            if has_debye
+            else "Intensity (arb. units)"
+        )
+        if debye_axis is not None:
+            debye_axis.set_ylabel("Debye Scattering Intensity (arb. units)")
+        born_axis.set_title("q-Space Scattering Profile")
+        born_axis.grid(True, which="both", alpha=0.28)
+        born_axis.legend(
+            plotted_lines,
+            [line.get_label() for line in plotted_lines],
+            loc="upper right",
+            frameon=True,
+            fontsize=8,
+        )
         fig.tight_layout()
         self._scatter_plot.canvas.draw_idle()
 
@@ -1069,6 +1171,11 @@ class _SavedOutputComparisonDialog(QDialog):
                     profile_result=entry.profile_result,
                     fourier_preview=preview,
                     transform_result=entry.transform_result,
+                    debye_scattering_result=(
+                        ElectronDensityMappingMainWindow._saved_output_entry_debye_result(
+                            entry
+                        )
+                    ),
                 )
                 written_count += 1
         except Exception as exc:
@@ -1355,7 +1462,7 @@ class _DebyeScatteringComparisonDialog(QDialog):
             if self.log_y_checkbox.isChecked() and debye_positive_i
             else "linear"
         )
-        born_axis.set_xlabel("q (Å⁻¹)")
+        born_axis.set_xlabel(Q_A_INVERSE_LABEL)
         born_axis.set_ylabel("Born Approximation Intensity (arb. units)")
         debye_axis.set_ylabel("Debye Scattering Intensity (arb. units)")
         born_axis.set_title("Born Approximation vs Debye Scattering")
@@ -1833,25 +1940,159 @@ class ElectronDensityCalculationWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class ElectronDensityDebyeScatteringWorker(QObject):
+    progress = Signal(int, int, str)
+    finished = Signal(object)
+    canceled = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        items: tuple[_DebyeScatteringWorkItem, ...],
+        scope_label: str | None = None,
+    ) -> None:
+        super().__init__()
+        self._items = tuple(items)
+        self._scope_label = str(scope_label).strip()
+        self._cancel_requested = False
+
+    @Slot()
+    def cancel(self) -> None:
+        self._cancel_requested = True
+
+    def _progress_prefix(
+        self,
+        item_index: int,
+        item_count: int,
+        item: _DebyeScatteringWorkItem,
+    ) -> str:
+        label = str(item.label).strip()
+        if item_count <= 1 and item.group_key is None:
+            return "Debye scattering"
+        prefix = (
+            f"Debye {item_index}/{item_count}"
+            if item_count > 1
+            else "Debye scattering"
+        )
+        if label:
+            prefix += f" [{label}]"
+        if item_count > 1 and self._scope_label:
+            prefix += f" in {self._scope_label}"
+        return prefix
+
+    @Slot()
+    def run(self) -> None:
+        if not self._items:
+            self.failed.emit(
+                "Debye scattering calculation started without any targets."
+            )
+            return
+        results: list[_DebyeScatteringCompletedItem] = []
+        failures: list[str] = []
+        overall_total = max(
+            sum(max(int(item.progress_total), 1) for item in self._items),
+            1,
+        )
+        progress_offset = 0
+        try:
+            for item_index, item in enumerate(self._items, start=1):
+                if self._cancel_requested:
+                    raise ElectronDensityCalculationCanceled(
+                        "Debye scattering calculation was stopped by the user."
+                    )
+                item_total = max(int(item.progress_total), 1)
+                prefix = self._progress_prefix(
+                    item_index,
+                    len(self._items),
+                    item,
+                )
+
+                def emit_item_progress(
+                    current: int,
+                    total: int,
+                    message: str,
+                    *,
+                    _offset: int = progress_offset,
+                    _overall_total: int = overall_total,
+                    _prefix: str = prefix,
+                ) -> None:
+                    bounded_total = max(int(total), 1)
+                    bounded_current = min(
+                        max(int(current), 0),
+                        bounded_total,
+                    )
+                    text = str(message).strip()
+                    self.progress.emit(
+                        _offset + bounded_current,
+                        _overall_total,
+                        (
+                            f"{_prefix}: {text}"
+                            if text
+                            else f"{_prefix}: running..."
+                        ),
+                    )
+
+                try:
+                    result = (
+                        compute_average_debye_scattering_profile_for_input(
+                            item.inspection,
+                            q_values=np.asarray(item.q_values, dtype=float),
+                            progress_callback=emit_item_progress,
+                            cancel_callback=lambda: self._cancel_requested,
+                        )
+                    )
+                except ElectronDensityCalculationCanceled:
+                    raise
+                except Exception as exc:
+                    failures.append(f"{item.label}: {exc}")
+                    progress_offset += item_total
+                    self.progress.emit(
+                        progress_offset,
+                        overall_total,
+                        f"{prefix} failed.",
+                    )
+                    continue
+                if self._cancel_requested:
+                    raise ElectronDensityCalculationCanceled(
+                        "Debye scattering calculation was stopped by the user."
+                    )
+                results.append(
+                    _DebyeScatteringCompletedItem(
+                        group_key=item.group_key,
+                        label=item.label,
+                        result=result,
+                    )
+                )
+                progress_offset += item_total
+            self.finished.emit(
+                _DebyeScatteringRunPayload(
+                    results=tuple(results),
+                    failures=tuple(failures),
+                )
+            )
+        except ElectronDensityCalculationCanceled:
+            self.canceled.emit(
+                _DebyeScatteringRunPayload(
+                    results=tuple(results),
+                    failures=tuple(failures),
+                )
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class ElectronDensityMappingMainWindow(QMainWindow):
     """Interactive supporting tool for radial electron-density
     inspection."""
 
     born_components_built = Signal(object)
     cancel_calculation_requested = Signal()
+    cancel_debye_scattering_requested = Signal()
 
     @staticmethod
     def _default_fourier_settings() -> ElectronDensityFourierTransformSettings:
-        return ElectronDensityFourierTransformSettings(
-            r_min=-1.0,
-            r_max=1.0,
-            domain_mode="mirrored",
-            window_function="hanning",
-            q_min=0.02,
-            q_max=1.2,
-            q_step=0.01,
-            resampling_points=2048,
-        )
+        return legacy_born_average_default_fourier_settings()
 
     def __init__(
         self,
@@ -1912,9 +2153,13 @@ class ElectronDensityMappingMainWindow(QMainWindow):
         )
         self._current_group_run_manual = False
         self._auto_snap_panes_enabled = self._load_auto_snap_panes_setting()
-        self._active_mesh_settings = ElectronDensityMeshSettings()
+        self._active_mesh_settings = (
+            legacy_born_average_default_mesh_settings()
+        )
         self._active_mesh_geometry: ElectronDensityMeshGeometry | None = None
-        self._active_smearing_settings = ElectronDensitySmearingSettings()
+        self._active_smearing_settings = (
+            legacy_born_average_default_smearing_settings()
+        )
         self._active_fourier_settings = self._default_fourier_settings()
         self._solvent_presets: dict[str, ContrastSolventPreset] = {}
         self._active_contrast_settings: (
@@ -1941,8 +2186,18 @@ class ElectronDensityMappingMainWindow(QMainWindow):
         self._workspace_load_worker: (
             ElectronDensityWorkspaceLoadWorker | None
         ) = None
+        self._debye_scattering_thread: QThread | None = None
+        self._debye_scattering_worker: (
+            ElectronDensityDebyeScatteringWorker | None
+        ) = None
         self._workspace_load_progress_dialog: SAXSProgressDialog | None = None
         self._batch_operation_progress_dialog: SAXSProgressDialog | None = None
+        self._debye_scattering_progress_dialog: SAXSProgressDialog | None = (
+            None
+        )
+        self._active_debye_scattering_context: (
+            _DebyeScatteringRunContext | None
+        ) = None
         self._restore_distribution_state_after_workspace_load = False
         self._saved_output_entries: list[_SavedOutputEntry] = []
         self._output_history_compare_dialog: QDialog | None = None
@@ -2498,6 +2753,16 @@ class ElectronDensityMappingMainWindow(QMainWindow):
     def _close_batch_operation_progress_dialog(self) -> None:
         if self._batch_operation_progress_dialog is not None:
             self._batch_operation_progress_dialog.close()
+
+    def _ensure_debye_scattering_progress_dialog(
+        self,
+    ) -> SAXSProgressDialog:
+        if self._debye_scattering_progress_dialog is None:
+            dialog = SAXSProgressDialog(self)
+            dialog.setModal(True)
+            dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            self._debye_scattering_progress_dialog = dialog
+        return self._debye_scattering_progress_dialog
 
     @Slot(int, int, str)
     def _on_workspace_load_progress(
@@ -3101,6 +3366,8 @@ class ElectronDensityMappingMainWindow(QMainWindow):
         self.debye_scattering_progress_bar.setValue(0)
         self.debye_scattering_progress_bar.setFormat("%v / %m steps")
         self.debye_scattering_progress_bar.setHidden(True)
+        if self._debye_scattering_progress_dialog is not None:
+            self._debye_scattering_progress_dialog.close()
 
     def _begin_debye_scattering_progress(
         self,
@@ -3119,6 +3386,13 @@ class ElectronDensityMappingMainWindow(QMainWindow):
         self.debye_scattering_progress_bar.setValue(0)
         self.debye_scattering_progress_bar.setFormat("%v / %m steps")
         self.debye_scattering_status_label.setText(stripped)
+        dialog = self._ensure_debye_scattering_progress_dialog()
+        dialog.begin(
+            bounded_total,
+            stripped,
+            unit_label="steps",
+            title="Computing Debye Scattering",
+        )
         self.statusBar().showMessage(stripped)
         QApplication.processEvents()
 
@@ -3137,6 +3411,13 @@ class ElectronDensityMappingMainWindow(QMainWindow):
         self.debye_scattering_progress_bar.setRange(0, bounded_total)
         self.debye_scattering_progress_bar.setValue(bounded_current)
         self.debye_scattering_progress_bar.setFormat("%v / %m steps")
+        if self._debye_scattering_progress_dialog is not None:
+            self._debye_scattering_progress_dialog.update_progress(
+                bounded_current,
+                bounded_total,
+                stripped,
+                unit_label="steps",
+            )
         if stripped:
             self.debye_scattering_status_label.setText(stripped)
             self.statusBar().showMessage(stripped)
@@ -4691,6 +4972,8 @@ class ElectronDensityMappingMainWindow(QMainWindow):
     @staticmethod
     def _saved_output_entry_kind_label(entry_kind: str) -> str:
         normalized = str(entry_kind).strip().lower()
+        if normalized == "debye_scattering":
+            return "Debye Scattering"
         if normalized == "fourier_transform":
             return "Fourier Transform"
         if normalized == "smearing":
@@ -4738,6 +5021,14 @@ class ElectronDensityMappingMainWindow(QMainWindow):
             if entry.transform_result is not None
             else "Preview only"
         )
+        debye_text = ""
+        if entry.debye_scattering_result is not None:
+            debye_text = (
+                " Debye: "
+                f"{entry.debye_scattering_result.source_structure_count} structure"
+                f"{'' if entry.debye_scattering_result.source_structure_count == 1 else 's'} "
+                "on the stored Born q-grid."
+            )
         return (
             f"Saved {ElectronDensityMappingMainWindow._format_saved_output_timestamp(entry.created_at)} "
             f"in {'Preview' if entry.preview_mode else 'Computed Distribution'} mode. "
@@ -4747,6 +5038,7 @@ class ElectronDensityMappingMainWindow(QMainWindow):
             f"Solvent: {solvent_text}. "
             f"Fourier: {fourier_text} with window={entry.fourier_settings.window_function}, "
             f"r={entry.fourier_settings.r_min:.3f}–{entry.fourier_settings.r_max:.3f} Å."
+            + debye_text
         )
 
     @staticmethod
@@ -4783,8 +5075,9 @@ class ElectronDensityMappingMainWindow(QMainWindow):
             )
             self.output_history_summary_label.setText(
                 "Density calculations, solvent-subtracted outputs, Fourier "
-                "evaluations, and optional smearing snapshots will be captured "
-                "here for reload and comparison." + persistence_text
+                "evaluations, Debye scattering comparisons, and optional "
+                "smearing snapshots will be captured here for reload and "
+                "comparison." + persistence_text
             )
             return
         self.output_history_summary_label.setText(
@@ -4865,6 +5158,11 @@ class ElectronDensityMappingMainWindow(QMainWindow):
                         ""
                         if entry.transform_result is not None
                         else " (preview)"
+                    )
+                    + (
+                        ""
+                        if entry.debye_scattering_result is None
+                        else " · Debye saved"
                     )
                 ),
             ]
@@ -5431,14 +5729,13 @@ class ElectronDensityMappingMainWindow(QMainWindow):
 
         intro = QLabel(
             "Prepare a spherical Born-approximation transform of the smeared "
-            "electron-density profile into q-space. The preview panel shows "
-            "the mirrored real-space source used by the transform. Mirrored "
-            "mode is the default: it reflects the profile about r = 0 and "
-            "evaluates the windowed transform over -rmax to rmax. Toggle "
-            "legacy mode to restore the historical rmin to rmax behavior. In "
-            "Apply to All mode, the table becomes the editable per-stoichiometry "
-            "Fourier settings view: q settings stay shared, while each row "
-            "keeps its own r range."
+            "electron-density profile into q-space. The validated default uses "
+            "a 0 to rmax transform with no window, matching the current Born "
+            "versus Debye backend comparison settings. Clear the legacy toggle "
+            "to mirror the profile about r = 0 for an EXAFS-style transform. "
+            "In Apply to All mode, the table becomes the editable "
+            "per-stoichiometry Fourier settings view: q settings stay shared, "
+            "while each row keeps its own r range."
         )
         intro.setWordWrap(True)
         outer.addWidget(intro)
@@ -5722,8 +6019,9 @@ class ElectronDensityMappingMainWindow(QMainWindow):
         group = QGroupBox("Saved Output Sets")
         layout = QVBoxLayout(group)
         self.output_history_summary_label = QLabel(
-            "Density calculations, solvent-subtracted outputs, and Fourier "
-            "evaluations will be captured here for reload and comparison."
+            "Density calculations, solvent-subtracted outputs, Fourier "
+            "evaluations, and Debye scattering comparisons will be captured "
+            "here for reload and comparison."
         )
         self.output_history_summary_label.setWordWrap(True)
         layout.addWidget(self.output_history_summary_label)
@@ -6411,22 +6709,47 @@ class ElectronDensityMappingMainWindow(QMainWindow):
                 self.residual_section.expand()
 
     def _selected_solvent_preset_name(self) -> str | None:
-        return self.solvent_preset_combo.currentData()
+        selected_data = self.solvent_preset_combo.currentData()
+        if selected_data is None:
+            return None
+        preset_name = str(selected_data).strip()
+        if preset_name == _SOLVENT_PRESET_NONE:
+            return None
+        return preset_name or None
+
+    def _selected_solvent_preset_token(self) -> str | None:
+        selected_data = self.solvent_preset_combo.currentData()
+        if selected_data is None:
+            return None
+        preset_name = str(selected_data).strip()
+        return preset_name or None
+
+    def _clear_solvent_contrast_requested_from_controls(self) -> bool:
+        method = str(self.solvent_method_combo.currentData() or "").strip()
+        return (
+            method == CONTRAST_SOLVENT_METHOD_NEAT
+            and self._selected_solvent_preset_token() == _SOLVENT_PRESET_NONE
+        )
 
     def _reload_solvent_presets(
         self,
         *,
         selected_name: str | None = None,
     ) -> None:
-        previous_name = selected_name or self._selected_solvent_preset_name()
+        previous_name = (
+            selected_name
+            if selected_name is not None
+            else self._selected_solvent_preset_token()
+        )
         self._solvent_presets = load_solvent_presets()
         self.solvent_preset_combo.blockSignals(True)
         self.solvent_preset_combo.clear()
         self.solvent_preset_combo.addItem("Custom entry", None)
-        selected_index = 0
+        self.solvent_preset_combo.addItem("None", _SOLVENT_PRESET_NONE)
+        selected_index = 1 if previous_name == _SOLVENT_PRESET_NONE else 0
         for index, preset_name in enumerate(
             ordered_solvent_preset_names(self._solvent_presets),
-            start=1,
+            start=2,
         ):
             preset = self._solvent_presets[preset_name]
             label = (
@@ -6441,14 +6764,20 @@ class ElectronDensityMappingMainWindow(QMainWindow):
 
     @Slot()
     def _load_selected_solvent_preset(self) -> None:
+        if self._selected_solvent_preset_token() == _SOLVENT_PRESET_NONE:
+            self.delete_custom_solvent_button.setEnabled(False)
+            self._sync_density_method_controls()
+            return
         preset_name = self._selected_solvent_preset_name()
         preset = self._solvent_presets.get(preset_name or "")
         if preset is None:
             self.delete_custom_solvent_button.setEnabled(False)
+            self._sync_density_method_controls()
             return
         self.solvent_formula_edit.setText(preset.formula)
         self.solvent_density_spin.setValue(preset.density_g_per_ml)
         self.delete_custom_solvent_button.setEnabled(not preset.builtin)
+        self._sync_density_method_controls()
 
     @Slot()
     def _save_current_solvent_preset(self) -> None:
@@ -6559,10 +6888,209 @@ class ElectronDensityMappingMainWindow(QMainWindow):
                 "Use 0.0 e-/ Å³ to model vacuum."
             )
         else:
-            self.solvent_method_hint_label.setText(
-                "Quick estimate mode uses the selected solvent stoichiometry and "
-                "density. Built-in presets include Water, Vacuum, DMF, and DMSO."
+            if self._clear_solvent_contrast_requested_from_controls():
+                self.solvent_method_hint_label.setText(
+                    "The None solvent option clears the active solvent "
+                    "subtraction from the current density profile or selected "
+                    "stoichiometries."
+                )
+            else:
+                self.solvent_method_hint_label.setText(
+                    "Quick estimate mode uses the selected solvent "
+                    "stoichiometry and density. Built-in presets include "
+                    "Water, Vacuum, DMF, and DMSO."
+                )
+
+    @staticmethod
+    def _clear_solvent_contrast_from_profile_result(
+        result: ElectronDensityProfileResult,
+    ) -> ElectronDensityProfileResult:
+        if result.solvent_contrast is None:
+            return result
+        return replace(result, solvent_contrast=None)
+
+    def _clear_active_solvent_contrast(self) -> None:
+        had_pending_configuration = (
+            self._active_contrast_settings is not None
+            or self._active_contrast_name is not None
+        )
+        had_applied_contrast = (
+            self._profile_result is not None
+            and self._profile_result.solvent_contrast is not None
+        )
+        self._active_contrast_settings = None
+        self._active_contrast_name = None
+        if not had_applied_contrast:
+            self._refresh_contrast_display()
+            self._append_status(
+                "Cleared the configured solvent subtraction. Future density "
+                "runs will stay unsubtracted."
+                if had_pending_configuration
+                else "Solvent subtraction was already cleared."
             )
+            self.statusBar().showMessage("Cleared solvent subtraction")
+            self._sync_workspace_state()
+            return
+        self._profile_result = (
+            self._clear_solvent_contrast_from_profile_result(
+                self._profile_result
+            )
+        )
+        self._debye_scattering_result = None
+        self._close_debye_scattering_compare_dialog()
+        self._sync_fourier_controls_to_domain(reset_bounds=False)
+        self._refresh_profile_plots()
+        self._refresh_contrast_display()
+        self._refresh_fourier_preview_from_controls(clear_transform=True)
+        self._append_status(
+            "Removed solvent subtraction from the active density profile."
+        )
+        self.statusBar().showMessage("Cleared solvent subtraction")
+
+    def _clear_solvent_contrast_from_target_clusters(
+        self,
+        *,
+        apply_to_all: bool,
+    ) -> None:
+        if not self._cluster_group_states:
+            self._show_error(
+                "No Stoichiometry Table",
+                "Load a cluster-folder input before removing solvent "
+                "subtraction across stoichiometries.",
+            )
+            return
+        (
+            target_states,
+            scope_label,
+            selected_keys,
+        ) = self._batch_target_cluster_group_states(apply_to_all=apply_to_all)
+        if not target_states:
+            self._show_error(
+                "No Stoichiometries Selected",
+                "Select at least one stoichiometry row before removing "
+                "solvent subtraction.",
+            )
+            return
+        self._active_contrast_settings = None
+        self._active_contrast_name = None
+        updated_count = 0
+        already_clear_count = 0
+        skipped_pending = 0
+        skipped_debye = 0
+        total_targets = len(target_states)
+        self._begin_batch_operation_progress(
+            total=total_targets,
+            message=(
+                "Preparing batch solvent-subtraction removal across "
+                f"{scope_label}..."
+            ),
+            title="Removing Solvent Subtraction",
+        )
+        try:
+            for index, state in enumerate(target_states, start=1):
+                self._update_batch_operation_progress(
+                    index - 1,
+                    total_targets,
+                    "Removing solvent subtraction from "
+                    f"{state.display_name} ({index}/{total_targets}).",
+                )
+                if state.single_atom_only:
+                    skipped_debye += 1
+                    self._update_batch_operation_progress(
+                        index,
+                        total_targets,
+                        "Skipped Debye-only stoichiometry "
+                        f"{state.display_name} ({index}/{total_targets}).",
+                    )
+                    continue
+                if state.profile_result is None:
+                    skipped_pending += 1
+                    self._update_batch_operation_progress(
+                        index,
+                        total_targets,
+                        "Skipped pending stoichiometry "
+                        f"{state.display_name} ({index}/{total_targets}).",
+                    )
+                    continue
+                if state.profile_result.solvent_contrast is None:
+                    already_clear_count += 1
+                    self._update_batch_operation_progress(
+                        index,
+                        total_targets,
+                        "No solvent subtraction was active for "
+                        f"{state.display_name} ({index}/{total_targets}).",
+                    )
+                    continue
+                preserved_fourier_settings = (
+                    self._cluster_state_fourier_settings(state)
+                )
+                state.profile_result = (
+                    self._clear_solvent_contrast_from_profile_result(
+                        state.profile_result
+                    )
+                )
+                state.transform_result = None
+                state.debye_scattering_result = None
+                self._sync_cluster_state_solvent_metadata(state)
+                self._set_cluster_state_fourier_settings(
+                    state,
+                    preserved_fourier_settings,
+                    prefer_solvent_cutoff=False,
+                )
+                updated_count += 1
+                self._update_batch_operation_progress(
+                    index,
+                    total_targets,
+                    "Removed solvent subtraction from "
+                    f"{state.display_name} ({index}/{total_targets}).",
+                )
+            self._update_batch_operation_progress(
+                total_targets,
+                total_targets,
+                "Refreshing stoichiometry views...",
+            )
+            if updated_count > 0:
+                self._close_debye_scattering_compare_dialog()
+            self._refresh_cluster_views_after_batch_update(
+                target_states,
+                selected_keys=selected_keys,
+            )
+            self._update_batch_operation_progress(
+                total_targets,
+                total_targets,
+                "Batch solvent-subtraction removal complete.",
+            )
+        finally:
+            self._close_batch_operation_progress_dialog()
+        summary_parts = [
+            f"removed solvent subtraction from {updated_count} stoichiometr"
+            f"{'y' if updated_count == 1 else 'ies'}"
+        ]
+        if already_clear_count > 0:
+            summary_parts.append(
+                f"left {already_clear_count} already-clear row"
+                f"{'' if already_clear_count == 1 else 's'} unchanged"
+            )
+        if skipped_pending > 0:
+            summary_parts.append(
+                f"skipped {skipped_pending} pending density row"
+                f"{'' if skipped_pending == 1 else 's'}"
+            )
+        if skipped_debye > 0:
+            summary_parts.append(
+                f"skipped {skipped_debye} Debye-only row"
+                f"{'' if skipped_debye == 1 else 's'}"
+            )
+        self._append_status(
+            "Batch solvent update: "
+            + "; ".join(summary_parts)
+            + f" across {scope_label}. Future density runs will stay "
+            "unsubtracted until a new solvent is applied."
+        )
+        self.statusBar().showMessage(
+            "Cleared solvent subtraction across batch"
+        )
+        self._sync_workspace_state()
 
     @Slot()
     def _choose_reference_solvent_file(self) -> None:
@@ -6805,6 +7333,9 @@ class ElectronDensityMappingMainWindow(QMainWindow):
 
     @Slot()
     def _compute_solvent_contrast(self) -> None:
+        if self._clear_solvent_contrast_requested_from_controls():
+            self._clear_active_solvent_contrast()
+            return
         try:
             self._active_contrast_settings = (
                 self._contrast_settings_from_controls()
@@ -6838,6 +7369,11 @@ class ElectronDensityMappingMainWindow(QMainWindow):
         *,
         apply_to_all: bool,
     ) -> None:
+        if self._clear_solvent_contrast_requested_from_controls():
+            self._clear_solvent_contrast_from_target_clusters(
+                apply_to_all=apply_to_all
+            )
+            return
         if not self._cluster_group_states:
             self._show_error(
                 "No Stoichiometry Table",
@@ -8069,9 +8605,19 @@ class ElectronDensityMappingMainWindow(QMainWindow):
         if self._structure is None:
             return
         if sync_mesh_rmax:
-            self.rmax_spin.setValue(max(float(self._structure.rmax), 0.01))
+            default_mesh_settings = legacy_born_average_default_mesh_settings(
+                self._structure
+            )
+            self.rmax_spin.setValue(float(default_mesh_settings.rmax))
+            if (
+                self._active_mesh_geometry is None
+                and self._manual_mesh_lock_settings is None
+            ):
+                self._active_mesh_settings = default_mesh_settings
         self._sync_reference_element_controls()
         self._refresh_center_display()
+        self._refresh_active_mesh_display()
+        self._refresh_mesh_notice()
         self._refresh_structure_summary()
 
     def _refresh_active_mesh_display(self) -> None:
@@ -9027,6 +9573,13 @@ class ElectronDensityMappingMainWindow(QMainWindow):
                     entry.transform_result
                 )
             ),
+            "debye_scattering_result": (
+                None
+                if entry.debye_scattering_result is None
+                else ElectronDensityMappingMainWindow._serialize_debye_scattering_result(
+                    entry.debye_scattering_result
+                )
+            ),
         }
 
     @staticmethod
@@ -9056,6 +9609,12 @@ class ElectronDensityMappingMainWindow(QMainWindow):
                     single_atom_only=False,
                 )
             )
+        debye_payload = payload.get("debye_scattering_result")
+        debye_scattering_result = None
+        if isinstance(debye_payload, dict):
+            debye_scattering_result = ElectronDensityMappingMainWindow._deserialize_debye_scattering_result(
+                debye_payload
+            )
         input_path = payload.get("input_path")
         return _SavedOutputEntry(
             entry_id=str(payload.get("entry_id") or ""),
@@ -9084,6 +9643,7 @@ class ElectronDensityMappingMainWindow(QMainWindow):
             profile_result=profile_result,
             fourier_settings=fourier_settings,
             transform_result=transform_result,
+            debye_scattering_result=debye_scattering_result,
         )
 
     def _current_input_path(self) -> Path | None:
@@ -9225,6 +9785,18 @@ class ElectronDensityMappingMainWindow(QMainWindow):
             return None
 
     @staticmethod
+    def _saved_output_entry_debye_result(
+        entry: _SavedOutputEntry,
+    ) -> ElectronDensityDebyeScatteringAverageResult | None:
+        debye_result = entry.debye_scattering_result
+        if ElectronDensityMappingMainWindow._debye_result_matches_transform(
+            entry.transform_result,
+            debye_result,
+        ):
+            return debye_result
+        return None
+
+    @staticmethod
     def _constrain_fourier_settings_for_result(
         result: ElectronDensityProfileResult,
         settings: ElectronDensityFourierTransformSettings,
@@ -9314,9 +9886,13 @@ class ElectronDensityMappingMainWindow(QMainWindow):
         transform_result: (
             ElectronDensityScatteringTransformResult | None
         ) = None,
+        debye_scattering_result: (
+            ElectronDensityDebyeScatteringAverageResult | None
+        ) = None,
     ) -> None:
         if self._restoring_saved_output_history:
             return
+        normalized_entry_kind = str(entry_kind).strip() or "density"
         result = profile_result
         if result is None and group_state is not None:
             result = group_state.profile_result
@@ -9329,6 +9905,15 @@ class ElectronDensityMappingMainWindow(QMainWindow):
             current_transform = group_state.transform_result
         elif current_transform is None:
             current_transform = self._fourier_result
+        current_debye_result = debye_scattering_result
+        if (
+            current_debye_result is None
+            and normalized_entry_kind == "debye_scattering"
+        ):
+            if group_state is not None:
+                current_debye_result = group_state.debye_scattering_result
+            else:
+                current_debye_result = self._debye_scattering_result
         if current_transform is not None:
             fourier_settings = current_transform.preview.settings
         else:
@@ -9348,7 +9933,7 @@ class ElectronDensityMappingMainWindow(QMainWindow):
         snapshot = _SavedOutputEntry(
             entry_id=datetime.now().strftime("%Y%m%dT%H%M%S%f"),
             created_at=datetime.now().isoformat(timespec="seconds"),
-            entry_kind=str(entry_kind).strip() or "density",
+            entry_kind=normalized_entry_kind,
             input_path=self._current_input_path(),
             output_basename=self._output_basename(),
             preview_mode=self._preview_mode,
@@ -9360,6 +9945,7 @@ class ElectronDensityMappingMainWindow(QMainWindow):
             profile_result=result,
             fourier_settings=fourier_settings,
             transform_result=current_transform,
+            debye_scattering_result=current_debye_result,
         )
         self._saved_output_entries.append(snapshot)
         self._populate_output_history_table()
@@ -9444,7 +10030,9 @@ class ElectronDensityMappingMainWindow(QMainWindow):
             if target_state is not None:
                 target_state.profile_result = entry.profile_result
                 target_state.transform_result = entry.transform_result
-                target_state.debye_scattering_result = None
+                target_state.debye_scattering_result = (
+                    entry.debye_scattering_result
+                )
                 self._sync_cluster_state_solvent_metadata(target_state)
                 self._populate_cluster_group_table()
                 if row_index >= 0:
@@ -9457,7 +10045,7 @@ class ElectronDensityMappingMainWindow(QMainWindow):
             else:
                 self._profile_result = entry.profile_result
                 self._fourier_result = entry.transform_result
-                self._debye_scattering_result = None
+                self._debye_scattering_result = entry.debye_scattering_result
                 self._structure = entry.profile_result.structure
                 self._active_mesh_settings = (
                     entry.profile_result.mesh_geometry.settings
@@ -9889,37 +10477,272 @@ class ElectronDensityMappingMainWindow(QMainWindow):
         progress_total = self._debye_scattering_progress_total_for_inspection(
             self._inspection
         )
+        self._start_debye_scattering_run(
+            items=(
+                _DebyeScatteringWorkItem(
+                    group_key=None,
+                    label="Active input",
+                    inspection=self._inspection,
+                    q_values=tuple(
+                        float(value)
+                        for value in np.asarray(
+                            self._fourier_result.q_values,
+                            dtype=float,
+                        )
+                    ),
+                    progress_total=progress_total,
+                ),
+            ),
+            context=_DebyeScatteringRunContext(mode="single"),
+            initial_message="Preparing Debye scattering average calculation...",
+        )
+
+    def _start_debye_scattering_run(
+        self,
+        *,
+        items: tuple[_DebyeScatteringWorkItem, ...],
+        context: _DebyeScatteringRunContext,
+        initial_message: str,
+    ) -> None:
+        if (
+            self._debye_scattering_thread is not None
+            and self._debye_scattering_thread.isRunning()
+        ):
+            return
+        progress_total = max(
+            sum(max(int(item.progress_total), 1) for item in items),
+            1,
+        )
+        self._active_debye_scattering_context = context
         self._set_calculation_running(True)
-        self.stop_calculation_button.setEnabled(False)
         self._begin_debye_scattering_progress(
             total=progress_total,
-            message="Preparing Debye scattering average calculation...",
+            message=initial_message,
         )
-        result: ElectronDensityDebyeScatteringAverageResult | None = None
-        error_message: str | None = None
-        try:
-            result = compute_average_debye_scattering_profile_for_input(
-                self._inspection,
-                q_values=np.asarray(
-                    self._fourier_result.q_values, dtype=float
-                ),
-                progress_callback=self._update_debye_scattering_progress,
+        self._debye_scattering_thread = QThread(self)
+        self._debye_scattering_worker = ElectronDensityDebyeScatteringWorker(
+            items=items,
+            scope_label=context.scope_label or None,
+        )
+        self._debye_scattering_worker.moveToThread(
+            self._debye_scattering_thread
+        )
+        self._debye_scattering_thread.started.connect(
+            self._debye_scattering_worker.run
+        )
+        self.cancel_debye_scattering_requested.connect(
+            self._debye_scattering_worker.cancel
+        )
+        self._debye_scattering_worker.progress.connect(
+            self._on_debye_scattering_progress
+        )
+        self._debye_scattering_worker.finished.connect(
+            self._on_debye_scattering_finished
+        )
+        self._debye_scattering_worker.canceled.connect(
+            self._on_debye_scattering_canceled
+        )
+        self._debye_scattering_worker.failed.connect(
+            self._on_debye_scattering_failed
+        )
+        self._debye_scattering_worker.finished.connect(
+            self._debye_scattering_thread.quit
+        )
+        self._debye_scattering_worker.canceled.connect(
+            self._debye_scattering_thread.quit
+        )
+        self._debye_scattering_worker.failed.connect(
+            self._debye_scattering_thread.quit
+        )
+        self._debye_scattering_thread.finished.connect(
+            self._debye_scattering_worker.deleteLater
+        )
+        self._debye_scattering_thread.finished.connect(
+            self._debye_scattering_thread.deleteLater
+        )
+        self._debye_scattering_thread.finished.connect(
+            self._clear_debye_scattering_handles
+        )
+        self._debye_scattering_thread.start(QThread.Priority.LowPriority)
+
+    @Slot()
+    def _clear_debye_scattering_handles(self) -> None:
+        self._debye_scattering_worker = None
+        self._debye_scattering_thread = None
+        self.stop_calculation_button.setEnabled(False)
+        self._refresh_run_action_state()
+
+    @Slot(int, int, str)
+    def _on_debye_scattering_progress(
+        self,
+        current: int,
+        total: int,
+        message: str,
+    ) -> None:
+        self._update_debye_scattering_progress(current, total, message)
+
+    @staticmethod
+    def _debye_scattering_payload_results(
+        payload: object,
+    ) -> tuple[_DebyeScatteringCompletedItem, ...]:
+        if isinstance(payload, _DebyeScatteringRunPayload):
+            return payload.results
+        return ()
+
+    @staticmethod
+    def _debye_scattering_payload_failures(
+        payload: object,
+    ) -> tuple[str, ...]:
+        if isinstance(payload, _DebyeScatteringRunPayload):
+            return payload.failures
+        return ()
+
+    def _apply_batch_debye_scattering_results(
+        self,
+        results: tuple[_DebyeScatteringCompletedItem, ...],
+    ) -> list[_ClusterDensityGroupState]:
+        state_by_key = {
+            state.key: state for state in self._cluster_group_states
+        }
+        updated_states: list[_ClusterDensityGroupState] = []
+        for item in results:
+            if item.group_key is None:
+                continue
+            state = state_by_key.get(item.group_key)
+            if state is None:
+                continue
+            state.debye_scattering_result = item.result
+            if state.key == self._selected_cluster_group_key:
+                self._debye_scattering_result = item.result
+            self._capture_saved_output_entry(
+                "debye_scattering",
+                group_state=state,
+                profile_result=state.profile_result,
+                transform_result=state.transform_result,
+                debye_scattering_result=item.result,
             )
-        except Exception as exc:
-            error_message = str(exc)
-        finally:
-            self._set_calculation_running(False)
-            self.stop_calculation_button.setEnabled(False)
-            self._reset_debye_scattering_progress()
-        if error_message is not None:
-            self._show_error("Debye Scattering Error", error_message)
+            updated_states.append(state)
+        return updated_states
+
+    def _finish_batch_debye_scattering_run(
+        self,
+        *,
+        results: tuple[_DebyeScatteringCompletedItem, ...],
+        failures: tuple[str, ...],
+        context: _DebyeScatteringRunContext,
+        canceled: bool,
+    ) -> None:
+        updated_states = self._apply_batch_debye_scattering_results(results)
+        updated_count = len(updated_states)
+        if updated_count <= 0:
+            self._refresh_debye_scattering_group()
+            if canceled:
+                self._append_status(
+                    "Stopped the active Debye scattering calculation before any target rows finished."
+                )
+                self.statusBar().showMessage(
+                    "Debye scattering calculation stopped"
+                )
+                return
+            if failures:
+                self._show_error(
+                    "Debye Scattering Error",
+                    "\n".join(failures[:6]),
+                )
+                return
+            if (
+                context.skipped_single_atom > 0
+                and context.skipped_pending == 0
+            ):
+                self._show_error(
+                    "No Debye Targets Updated",
+                    "The selected target rows already use direct Debye "
+                    "scattering only, so a separate Born-vs-Debye "
+                    "comparison trace is not needed.",
+                )
+                return
+            self._show_error(
+                "Born Transform Required",
+                "Evaluate the Born-approximation Fourier transform for the "
+                "target rows before computing Debye comparison traces.",
+            )
             return
-        if result is None:
+        self._refresh_cluster_views_after_batch_update(
+            updated_states,
+            selected_keys=list(context.selected_keys),
+        )
+        summary_parts = [
+            f"computed {updated_count} Debye scattering average"
+            f"{'' if updated_count == 1 else 's'}"
+        ]
+        if context.skipped_pending > 0:
+            summary_parts.append(
+                f"skipped {context.skipped_pending} row"
+                f"{'' if context.skipped_pending == 1 else 's'} without a Born trace"
+            )
+        if context.skipped_single_atom > 0:
+            summary_parts.append(
+                f"skipped {context.skipped_single_atom} direct-Debye row"
+                f"{'' if context.skipped_single_atom == 1 else 's'}"
+            )
+        if failures:
+            summary_parts.append(
+                f"{len(failures)} row"
+                f"{'' if len(failures) == 1 else 's'} failed"
+            )
+        if canceled:
+            summary_parts.append("stopped before the remaining rows finished")
+        self._append_status(
+            "Debye scattering batch update: "
+            + "; ".join(summary_parts)
+            + f" across {context.scope_label}. Each trace reused the q-grid from its "
+            "matching Born-approximation transform."
+        )
+        for failure in failures:
+            self._append_status(f"Debye scattering warning: {failure}")
+        self.statusBar().showMessage(
+            (
+                "Debye scattering calculation stopped"
+                if canceled
+                else "Debye scattering averages ready"
+            )
+        )
+        self._sync_workspace_state()
+
+    @Slot(object)
+    def _on_debye_scattering_finished(self, payload: object) -> None:
+        context = self._active_debye_scattering_context
+        self._active_debye_scattering_context = None
+        self._set_calculation_running(False)
+        self._reset_debye_scattering_progress()
+        if context is None:
+            self._on_debye_scattering_failed(
+                "Debye scattering calculation finished without context."
+            )
+            return
+        results = self._debye_scattering_payload_results(payload)
+        failures = self._debye_scattering_payload_failures(payload)
+        if context.mode == "batch":
+            self._finish_batch_debye_scattering_run(
+                results=results,
+                failures=failures,
+                context=context,
+                canceled=False,
+            )
+            return
+        if not results:
             self._show_error(
                 "Debye Scattering Error",
-                "Debye scattering calculation finished without a result.",
+                (
+                    "\n".join(failures[:6])
+                    if failures
+                    else (
+                        "Debye scattering calculation finished without a result."
+                    )
+                ),
             )
             return
+        result = results[0].result
         self._debye_scattering_result = result
         self._refresh_debye_scattering_group()
         q_values = np.asarray(result.q_values, dtype=float)
@@ -9929,10 +10752,55 @@ class ElectronDensityMappingMainWindow(QMainWindow):
             f"{'' if result.source_structure_count == 1 else 's'}, "
             f"{len(q_values)} q points."
         )
+        self._capture_saved_output_entry(
+            "debye_scattering",
+            group_state=self._active_cluster_group_state(),
+            profile_result=self._profile_result,
+            transform_result=self._fourier_result,
+            debye_scattering_result=result,
+        )
         for note in result.notes:
             self._append_status(note)
         self.statusBar().showMessage("Debye scattering average ready")
         self._sync_workspace_state()
+
+    @Slot(object)
+    def _on_debye_scattering_canceled(self, payload: object) -> None:
+        context = self._active_debye_scattering_context
+        self._active_debye_scattering_context = None
+        self._set_calculation_running(False)
+        self._reset_debye_scattering_progress()
+        self.debye_scattering_status_label.setText(
+            "Debye scattering calculation stopped."
+        )
+        if context is None:
+            self._append_status(
+                "Stopped the active Debye scattering calculation."
+            )
+            self.statusBar().showMessage(
+                "Debye scattering calculation stopped"
+            )
+            return
+        results = self._debye_scattering_payload_results(payload)
+        failures = self._debye_scattering_payload_failures(payload)
+        if context.mode == "batch":
+            self._finish_batch_debye_scattering_run(
+                results=results,
+                failures=failures,
+                context=context,
+                canceled=True,
+            )
+            return
+        self._append_status("Stopped the active Debye scattering calculation.")
+        self.statusBar().showMessage("Debye scattering calculation stopped")
+
+    @Slot(str)
+    def _on_debye_scattering_failed(self, message: str) -> None:
+        self._active_debye_scattering_context = None
+        self._set_calculation_running(False)
+        self._reset_debye_scattering_progress()
+        self.debye_scattering_status_label.setText("Debye scattering failed.")
+        self._show_error("Debye Scattering Error", str(message))
 
     def _calculate_debye_scattering_for_target_clusters(
         self,
@@ -9951,10 +10819,8 @@ class ElectronDensityMappingMainWindow(QMainWindow):
             scope_label,
             selected_keys,
         ) = self._batch_target_cluster_group_states(apply_to_all=apply_to_all)
-        updated_count = 0
         skipped_pending = 0
         skipped_single_atom = 0
-        failures: list[str] = []
         eligible_states = [
             state
             for state in target_states
@@ -9970,106 +10836,16 @@ class ElectronDensityMappingMainWindow(QMainWindow):
             )
             for state in eligible_states
         )
-        if progress_total > 0:
-            skipped_count = len(target_states) - len(eligible_states)
-            progress_message = (
-                "Preparing Debye scattering averages across "
-                f"{len(eligible_states)} target row"
-                f"{'' if len(eligible_states) == 1 else 's'} in "
-                f"{scope_label}."
-            )
-            if skipped_count > 0:
-                progress_message += (
-                    f" {skipped_count} row"
-                    f"{'' if skipped_count == 1 else 's'} will be skipped."
-                )
-            self._set_calculation_running(True)
-            self.stop_calculation_button.setEnabled(False)
-            self._begin_debye_scattering_progress(
-                total=progress_total,
-                message=progress_message,
-            )
-        progress_offset = 0
-        eligible_index = 0
-        try:
-            for state in target_states:
-                if state.single_atom_only:
-                    skipped_single_atom += 1
-                    state.debye_scattering_result = None
-                    continue
-                born_result = state.transform_result
-                if not self._is_density_fourier_transform(born_result):
-                    skipped_pending += 1
-                    state.debye_scattering_result = None
-                    continue
-                eligible_index += 1
-                state_progress_total = (
-                    self._debye_scattering_progress_total_for_inspection(
-                        state.inspection
-                    )
-                )
-
-                def emit_state_progress(
-                    current: int,
-                    total: int,
-                    message: str,
-                    *,
-                    _state=state,
-                    _offset=progress_offset,
-                    _scope_label=scope_label,
-                    _scope_index=eligible_index,
-                    _scope_total=len(eligible_states),
-                ) -> None:
-                    self._update_debye_scattering_progress(
-                        _offset
-                        + min(max(int(current), 0), max(int(total), 1)),
-                        progress_total,
-                        "Debye "
-                        f"{_scope_index}/{_scope_total} "
-                        f"[{_state.display_name}] in {_scope_label}: "
-                        f"{str(message).strip()}",
-                    )
-
-                try:
-                    result = (
-                        compute_average_debye_scattering_profile_for_input(
-                            state.inspection,
-                            q_values=np.asarray(
-                                born_result.q_values,
-                                dtype=float,
-                            ),
-                            progress_callback=emit_state_progress,
-                        )
-                    )
-                except Exception as exc:
-                    failures.append(f"{state.display_name}: {exc}")
-                    progress_offset += state_progress_total
-                    if progress_total > 0:
-                        self._update_debye_scattering_progress(
-                            progress_offset,
-                            progress_total,
-                            f"Debye {eligible_index}/{len(eligible_states)} "
-                            f"[{state.display_name}] in {scope_label} failed.",
-                        )
-                    continue
-                state.debye_scattering_result = result
-                if state.key == self._selected_cluster_group_key:
-                    self._debye_scattering_result = result
-                updated_count += 1
-                progress_offset += state_progress_total
-        finally:
-            if progress_total > 0:
-                self._set_calculation_running(False)
-                self.stop_calculation_button.setEnabled(False)
-                self._reset_debye_scattering_progress()
-        if updated_count <= 0:
+        for state in target_states:
+            if state.single_atom_only:
+                skipped_single_atom += 1
+                state.debye_scattering_result = None
+                continue
+            if not self._is_density_fourier_transform(state.transform_result):
+                skipped_pending += 1
+                state.debye_scattering_result = None
+        if progress_total <= 0:
             self._refresh_debye_scattering_group()
-            if failures:
-                self._show_error(
-                    "Debye Scattering Error",
-                    "\n".join(failures[:6]),
-                )
-                return
             if skipped_single_atom > 0 and skipped_pending == 0:
                 self._show_error(
                     "No Debye Targets Updated",
@@ -10084,39 +10860,47 @@ class ElectronDensityMappingMainWindow(QMainWindow):
                 "target rows before computing Debye comparison traces.",
             )
             return
-        self._refresh_cluster_views_after_batch_update(
-            target_states,
-            selected_keys=selected_keys,
+        skipped_count = len(target_states) - len(eligible_states)
+        progress_message = (
+            "Preparing Debye scattering averages across "
+            f"{len(eligible_states)} target row"
+            f"{'' if len(eligible_states) == 1 else 's'} in "
+            f"{scope_label}."
         )
-        summary_parts = [
-            f"computed {updated_count} Debye scattering average"
-            f"{'' if updated_count == 1 else 's'}"
-        ]
-        if skipped_pending > 0:
-            summary_parts.append(
-                f"skipped {skipped_pending} row"
-                f"{'' if skipped_pending == 1 else 's'} without a Born trace"
+        if skipped_count > 0:
+            progress_message += (
+                f" {skipped_count} row"
+                f"{'' if skipped_count == 1 else 's'} will be skipped."
             )
-        if skipped_single_atom > 0:
-            summary_parts.append(
-                f"skipped {skipped_single_atom} direct-Debye row"
-                f"{'' if skipped_single_atom == 1 else 's'}"
-            )
-        if failures:
-            summary_parts.append(
-                f"{len(failures)} row"
-                f"{'' if len(failures) == 1 else 's'} failed"
-            )
-        self._append_status(
-            "Debye scattering batch update: "
-            + "; ".join(summary_parts)
-            + f" across {scope_label}. Each trace reused the q-grid from its "
-            "matching Born-approximation transform."
+        self._start_debye_scattering_run(
+            items=tuple(
+                _DebyeScatteringWorkItem(
+                    group_key=state.key,
+                    label=state.display_name,
+                    inspection=state.inspection,
+                    q_values=tuple(
+                        float(value)
+                        for value in np.asarray(
+                            state.transform_result.q_values,
+                            dtype=float,
+                        )
+                    ),
+                    progress_total=self._debye_scattering_progress_total_for_inspection(
+                        state.inspection
+                    ),
+                )
+                for state in eligible_states
+                if state.transform_result is not None
+            ),
+            context=_DebyeScatteringRunContext(
+                mode="batch",
+                scope_label=scope_label,
+                selected_keys=tuple(selected_keys),
+                skipped_pending=skipped_pending,
+                skipped_single_atom=skipped_single_atom,
+            ),
+            initial_message=progress_message,
         )
-        for failure in failures:
-            self._append_status(f"Debye scattering warning: {failure}")
-        self.statusBar().showMessage("Debye scattering averages ready")
-        self._sync_workspace_state()
 
     @Slot()
     def _open_debye_scattering_comparison_plot(self) -> None:
@@ -10376,6 +11160,62 @@ class ElectronDensityMappingMainWindow(QMainWindow):
             encoding="utf-8",
         )
 
+    def _ensure_linked_distribution_ready_for_push(self) -> None:
+        if (
+            self._preview_mode
+            or self._distribution_root_dir is None
+            or self._project_dir is None
+        ):
+            return
+        metadata_path = self._distribution_root_dir / "distribution.json"
+        prior_weights_path = self._distribution_root_dir / (
+            "md_prior_weights_predicted_structures.json"
+            if self._use_predicted_structure_weights
+            else "md_prior_weights.json"
+        )
+        if metadata_path.is_file() and prior_weights_path.is_file():
+            return
+
+        from saxshell.saxs.contrast.settings import (
+            COMPONENT_BUILD_MODE_BORN_APPROXIMATION,
+        )
+        from saxshell.saxs.project_manager.project import (
+            SAXSProjectManager,
+            project_artifact_paths,
+        )
+
+        project_manager = SAXSProjectManager()
+        settings = project_manager.load_project(self._project_dir)
+        settings.component_build_mode = COMPONENT_BUILD_MODE_BORN_APPROXIMATION
+        settings.use_predicted_structure_weights = bool(
+            self._use_predicted_structure_weights
+        )
+        if self._project_q_min is not None:
+            settings.q_min = float(self._project_q_min)
+        if self._project_q_max is not None:
+            settings.q_max = float(self._project_q_max)
+        artifact_paths = project_artifact_paths(
+            settings,
+            storage_mode="distribution",
+            allow_legacy_fallback=False,
+        )
+        if artifact_paths.root_dir != self._distribution_root_dir:
+            raise ValueError(
+                "The linked computed distribution no longer matches the "
+                "active project settings. Reopen the Born Approximation "
+                "workflow from Project Setup and push the components again."
+            )
+        project_manager.generate_prior_weights(settings)
+        if not metadata_path.is_file() or not prior_weights_path.is_file():
+            raise ValueError(
+                "The linked computed distribution could not be prepared for "
+                "Born-approximation component export."
+            )
+        self._append_status(
+            "Prepared the linked computed distribution metadata and prior "
+            "weights for Born-approximation component export."
+        )
+
     @Slot()
     def _push_components_to_model(self) -> None:
         lock_reason = self._distribution_push_lock_reason()
@@ -10408,6 +11248,7 @@ class ElectronDensityMappingMainWindow(QMainWindow):
                 "Pending: " + ", ".join(pending),
             )
             return
+        self._ensure_linked_distribution_ready_for_push()
         component_dir, component_map_path = artifact_targets
         component_dir.mkdir(parents=True, exist_ok=True)
         saxs_map: dict[str, dict[str, str]] = {}
@@ -10865,6 +11706,21 @@ class ElectronDensityMappingMainWindow(QMainWindow):
 
     @Slot()
     def _request_calculation_stop(self) -> None:
+        if self._debye_scattering_worker is not None:
+            self.stop_calculation_button.setEnabled(False)
+            self._debye_scattering_worker.cancel()
+            self.cancel_debye_scattering_requested.emit()
+            self.debye_scattering_status_label.setText(
+                "Stopping Debye scattering calculation..."
+            )
+            self.statusBar().showMessage(
+                "Stopping Debye scattering calculation...",
+                5000,
+            )
+            self._append_status(
+                "Requested a stop for the active Debye scattering calculation."
+            )
+            return
         if self._calculation_worker is None:
             return
         self._calculation_cancel_requested = True
@@ -11782,6 +12638,9 @@ class ElectronDensityMappingMainWindow(QMainWindow):
         profile_result: ElectronDensityProfileResult | None,
         fourier_preview: ElectronDensityFourierTransformPreview | None,
         transform_result: ElectronDensityScatteringTransformResult | None,
+        debye_scattering_result: (
+            ElectronDensityDebyeScatteringAverageResult | None
+        ) = None,
     ) -> tuple[list[str], list[list[str]]]:
         headers: list[str] = []
         columns: list[list[str]] = []
@@ -11876,6 +12735,33 @@ class ElectronDensityMappingMainWindow(QMainWindow):
                 [f"{value:.10g}" for value in amplitude],
                 [f"{value:.10g}" for value in intensity],
             ]
+        debye_result = debye_scattering_result
+        if debye_result is not None:
+            debye_q_values = np.asarray(debye_result.q_values, dtype=float)
+            debye_mean = np.asarray(
+                debye_result.mean_intensity,
+                dtype=float,
+            )
+            debye_std = np.asarray(
+                debye_result.std_intensity,
+                dtype=float,
+            )
+            debye_se = np.asarray(
+                debye_result.se_intensity,
+                dtype=float,
+            )
+            headers += [
+                "debye_q_a_inv",
+                "debye_mean_intensity",
+                "debye_std_intensity",
+                "debye_se_intensity",
+            ]
+            columns += [
+                [f"{value:.10g}" for value in debye_q_values],
+                [f"{value:.10g}" for value in debye_mean],
+                [f"{value:.10g}" for value in debye_std],
+                [f"{value:.10g}" for value in debye_se],
+            ]
         return headers, columns
 
     @staticmethod
@@ -11885,12 +12771,16 @@ class ElectronDensityMappingMainWindow(QMainWindow):
         profile_result: ElectronDensityProfileResult | None,
         fourier_preview: ElectronDensityFourierTransformPreview | None,
         transform_result: ElectronDensityScatteringTransformResult | None,
+        debye_scattering_result: (
+            ElectronDensityDebyeScatteringAverageResult | None
+        ) = None,
     ) -> None:
         headers, columns = (
             ElectronDensityMappingMainWindow._build_plot_trace_columns(
                 profile_result=profile_result,
                 fourier_preview=fourier_preview,
                 transform_result=transform_result,
+                debye_scattering_result=debye_scattering_result,
             )
         )
         max_rows = max((len(column) for column in columns), default=0)
@@ -11947,6 +12837,7 @@ class ElectronDensityMappingMainWindow(QMainWindow):
                 profile_result=self._profile_result,
                 fourier_preview=self._fourier_preview,
                 transform_result=self._fourier_result,
+                debye_scattering_result=self._debye_scattering_result,
             )
         except Exception as exc:
             self._show_error("Export Failed", str(exc))
@@ -11976,6 +12867,17 @@ class ElectronDensityMappingMainWindow(QMainWindow):
         self._sync_workspace_state()
         self._close_workspace_load_progress_dialog()
         self._close_batch_operation_progress_dialog()
+        if self._debye_scattering_progress_dialog is not None:
+            self._debye_scattering_progress_dialog.close()
+        if (
+            self._debye_scattering_worker is not None
+            and self._debye_scattering_thread is not None
+            and self._debye_scattering_thread.isRunning()
+        ):
+            self._debye_scattering_worker.cancel()
+            self.cancel_debye_scattering_requested.emit()
+            self._debye_scattering_thread.quit()
+            self._debye_scattering_thread.wait(1000)
         if (
             self._calculation_worker is not None
             and self._calculation_thread is not None

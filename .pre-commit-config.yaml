@@ -65,5 +65,6 @@ repos:
     rev: 5757c5190d95e5449f102ace83df92e7d3b06c6c
     hooks:
       - id: docformatter
+        language_version: python3.12
         additional_dependencies: [tomli]
         args: [--in-place, --config, ./pyproject.toml]

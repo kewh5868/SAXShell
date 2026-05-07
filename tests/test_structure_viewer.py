@@ -54,6 +54,10 @@ def test_structure_viewer_loads_single_structure(qapp, tmp_path):
         == structure_path.resolve()
     )
     assert window.structure_viewer.current_mesh_geometry is not None
+    assert (
+        window.structure_viewer.background_color_button.text()
+        == "Background Color #FDFBF8"
+    )
     assert "shells=" in window.active_mesh_value.text()
     window.close()
 
@@ -86,11 +90,13 @@ def test_structure_viewer_center_updates_preserve_viewer_display(
     viewer.mesh_linewidth_spin.interpretText()
     viewer.point_atoms_checkbox.setChecked(True)
 
+    selected_colors = iter((QColor("#ff6600"), QColor("#112233")))
     monkeypatch.setattr(
         "saxshell.saxs.structure_viewer.ui.widget.QColorDialog.getColor",
-        lambda *args, **kwargs: QColor("#ff6600"),
+        lambda *args, **kwargs: next(selected_colors),
     )
     viewer.mesh_color_button.click()
+    viewer.background_color_button.click()
 
     viewer._view_radius = 7.5
     viewer._view_center = np.asarray([0.2, -0.4, 0.6], dtype=float)
@@ -113,6 +119,7 @@ def test_structure_viewer_center_updates_preserve_viewer_display(
     assert viewer._mesh_contrast == pytest.approx(0.45)
     assert viewer._mesh_linewidth == pytest.approx(2.7)
     assert viewer._mesh_color == "#ff6600"
+    assert viewer._background_color == "#112233"
     assert viewer._atom_render_mode == "points"
     assert viewer._view_radius == pytest.approx(7.5)
     assert np.allclose(viewer._view_center, [0.2, -0.4, 0.6])
@@ -141,6 +148,11 @@ def test_structure_viewer_center_updates_preserve_viewer_display(
     assert "MESH 045.0%" in overlay_text
     assert "LINE 2.70px" in overlay_text
     assert "#FF6600" in overlay_text
+    assert "BG #112233" in overlay_text
+    assert np.allclose(
+        viewer.figure.get_facecolor()[:3],
+        QColor("#112233").getRgbF()[:3],
+    )
     window.close()
 
 

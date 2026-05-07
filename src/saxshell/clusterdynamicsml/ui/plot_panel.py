@@ -25,6 +25,7 @@ from saxshell.clusterdynamicsml.workflow import (
     ClusterDynamicsMLResult,
     _resolved_population_weights,
 )
+from saxshell.plotting import Q_A_INVERSE_LABEL
 from saxshell.saxs.debye.profiles import scan_structure_element_counts
 from saxshell.saxs.project_manager.prior_plot import (
     list_secondary_filter_elements,
@@ -701,7 +702,7 @@ class ClusterDynamicsMLPlotPanel(QWidget):
         axis.set_xscale("log" if self.log_x_checkbox.isChecked() else "linear")
         axis.set_yscale("log" if self.log_y_checkbox.isChecked() else "linear")
         if not is_model_axis or not has_separate_model_axis:
-            axis.set_xlabel("q (Å⁻¹)")
+            axis.set_xlabel(Q_A_INVERSE_LABEL)
         if not is_model_axis:
             axis.set_ylabel("Intensity (arb. units)")
         elif has_separate_model_axis:

@@ -7,8 +7,12 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.lines import Line2D
 
+from saxshell.plotting.stacked_histogram import (
+    StackedHistogramPlotDefaults,
+    StackedHistogramPlotSettings,
+    render_stacked_histogram_export_payload,
+)
 from saxshell.saxs.stoichiometry import (
     format_stoich_for_axis,
     parse_stoich_label,
@@ -341,7 +345,6 @@ def plot_md_prior_histogram(
     custom_label_order: list[tuple[str, str]] | None = None,
     ax=None,
 ):
-    small_total_threshold = 1.0
     export_payload = build_prior_histogram_export_payload(
         json_path,
         mode=mode,
@@ -349,121 +352,71 @@ def plot_md_prior_histogram(
         secondary_element=secondary_element,
         custom_label_order=custom_label_order,
     )
-    labels = [str(label) for label in export_payload["labels"]]
-    axis_labels = [str(label) for label in export_payload["axis_labels"]]
-    segments = [str(segment) for segment in export_payload["segments"]]
-    segment_labels = [str(label) for label in export_payload["segment_labels"]]
     plot_mode = str(export_payload["plot_mode"])
-    matrix = np.asarray(export_payload["matrix"], dtype=float)
-    color_keys = [
-        [None if key is None else str(key) for key in row]
-        for row in export_payload.get("color_keys", [])
-    ]
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize)
     else:
         fig = ax.figure
-        ax.clear()
-
-    if not labels:
-        ax.set_title("No prior-weight data available")
-        ax.set_xlabel("Structure")
-        ax.set_ylabel("Fraction")
-        return fig, ax
-
-    colors = plt.get_cmap(cmap)(
-        np.linspace(0.1, 0.9, max(len(segment_labels), 1), endpoint=True)
+    defaults = StackedHistogramPlotDefaults(
+        title=prior_histogram_default_title(plot_mode, secondary_element),
+        x_label="Structure",
+        y_label=prior_histogram_default_y_label(plot_mode),
+        legend_title=prior_histogram_default_legend_title(
+            plot_mode,
+            secondary_element,
+        ),
+        default_colormap_name=cmap,
+        raw_category_labels=tuple(
+            str(label) for label in export_payload.get("labels", ())
+        ),
+        default_label_entries=tuple(
+            (
+                str(raw_label),
+                str(display_label),
+            )
+            for raw_label, display_label in zip(
+                export_payload.get("labels", ()),
+                export_payload.get("axis_labels", ()),
+                strict=False,
+            )
+        ),
     )
+    render_stacked_histogram_export_payload(
+        export_payload,
+        ax=ax,
+        defaults=defaults,
+        settings=StackedHistogramPlotSettings(),
+        cmap=cmap,
+        structure_segment_colors=structure_motif_colors,
+        show_percent=show_percent,
+    )
+    return fig, ax
 
-    bottoms = np.zeros(len(labels), dtype=float)
-    for index, segment_label in enumerate(segment_labels):
-        heights_array = matrix[:, index]
-        bar_colors = colors[index]
-        if structure_motif_colors and not plot_mode.startswith("solvent_sort"):
-            bar_colors = [
-                structure_motif_colors.get(
-                    (
-                        color_keys[row_index][index]
-                        if row_index < len(color_keys)
-                        and index < len(color_keys[row_index])
-                        else f"{label}_{segments[index]}"
-                    ),
-                    fallback_color,
-                )
-                for row_index, (label, fallback_color) in enumerate(
-                    zip(
-                        labels,
-                        [colors[index]] * len(labels),
-                    )
-                )
-            ]
-        ax.bar(
-            labels,
-            heights_array,
-            bottom=bottoms,
-            label=segment_label,
-            color=bar_colors,
-            edgecolor="white",
-            width=0.8,
-        )
-        bottoms += heights_array
 
-    if show_percent:
-        showed_small_total_marker = False
-        for index, total in enumerate(bottoms):
-            if total >= small_total_threshold:
-                ax.text(
-                    index,
-                    total + 1.0,
-                    f"{total:.1f}%",
-                    ha="center",
-                    va="bottom",
-                    fontsize=9,
-                )
-            else:
-                ax.scatter(index, total + 1.0, color="red", s=16, zorder=4)
-                showed_small_total_marker = True
+def prior_histogram_default_title(
+    mode: str,
+    secondary_element: str | None = None,
+) -> str:
+    return _prior_plot_title(mode, secondary_element)
 
-    ax.set_ylim(0.0, max(bottoms.max(initial=0.0) + 4.0, 10.0))
-    ax.set_xlabel("Structure")
-    ax.set_ylabel(
+
+def prior_histogram_default_y_label(mode: str) -> str:
+    return (
         "Percentage of Total Atom-Weighted Count (%)"
-        if plot_mode in {"atom_fraction", "solvent_sort_atom_fraction"}
+        if mode in {"atom_fraction", "solvent_sort_atom_fraction"}
         else "Percentage of Total Structures (%)"
     )
-    ax.set_title(_prior_plot_title(plot_mode, secondary_element))
-    ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(
-        axis_labels,
-        rotation=45,
-        ha="right",
+
+
+def prior_histogram_default_legend_title(
+    mode: str,
+    secondary_element: str | None = None,
+) -> str:
+    return (
+        "Motif"
+        if not str(mode).startswith("solvent_sort")
+        else f"{secondary_element or 'Secondary'} count"
     )
-    legend_handles, legend_labels = ax.get_legend_handles_labels()
-    if show_percent and showed_small_total_marker:
-        legend_handles.append(
-            Line2D(
-                [],
-                [],
-                marker="o",
-                color="red",
-                linestyle="None",
-                markersize=5,
-            )
-        )
-        legend_labels.append("< 1% total")
-    ax.legend(
-        legend_handles,
-        legend_labels,
-        title=(
-            "Motif"
-            if not plot_mode.startswith("solvent_sort")
-            else f"{secondary_element} count"
-        ),
-        bbox_to_anchor=(1.02, 1.0),
-        loc="upper left",
-    )
-    fig.tight_layout()
-    return fig, ax
 
 
 def list_secondary_filter_elements(
