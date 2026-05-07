@@ -58,6 +58,13 @@ def _clamp_fraction(value: float) -> float:
     return float(max(0.0, min(1.0, float(value))))
 
 
+def _button_foreground_color(color_value: str) -> str:
+    color = QColor(str(color_value))
+    if not color.isValid():
+        return "#f8fafc"
+    return "#111827" if color.lightnessF() >= 0.62 else "#f8fafc"
+
+
 def _rotation_matrix_from_axis_angle(
     axis: np.ndarray,
     angle_radians: float,
@@ -146,6 +153,7 @@ class StructureViewerWidget(QWidget):
         self._mesh_contrast = _DEFAULT_MESH_CONTRAST
         self._mesh_linewidth = _DEFAULT_MESH_LINEWIDTH
         self._mesh_color = _DEFAULT_MESH_COLOR
+        self._background_color = _BACKGROUND_COLOR
         self._atom_render_mode = "points"
         self._pending_view_update = False
         self._pending_axis_reference_refresh = False
@@ -247,6 +255,12 @@ class StructureViewerWidget(QWidget):
         self.mesh_color_button.clicked.connect(self._choose_mesh_color)
         contrast_row.addWidget(self.mesh_color_button)
 
+        self.background_color_button = QPushButton("Background Color")
+        self.background_color_button.clicked.connect(
+            self._choose_background_color
+        )
+        contrast_row.addWidget(self.background_color_button)
+
         self.point_atoms_checkbox = QCheckBox("Point Atoms")
         self.point_atoms_checkbox.setChecked(True)
         self.point_atoms_checkbox.toggled.connect(
@@ -256,6 +270,7 @@ class StructureViewerWidget(QWidget):
         contrast_row.addStretch(1)
         layout.addLayout(contrast_row)
         self._update_mesh_color_button_style()
+        self._update_background_color_button_style()
 
         self.canvas.setMinimumHeight(520)
         layout.addWidget(self.canvas, stretch=1)
@@ -293,7 +308,9 @@ class StructureViewerWidget(QWidget):
         self._clear_pending_view_update()
         self._active_settings_artist = None
         self.figure.clear()
+        self.figure.set_facecolor(self._background_color)
         axis = self.figure.add_subplot(111)
+        axis.set_facecolor(self._background_color)
         axis.text(
             0.5,
             0.57,
@@ -453,8 +470,8 @@ class StructureViewerWidget(QWidget):
         axis_reference.set_in_layout(False)
         self._axis = axis
         self._axis_reference = axis_reference
-        self.figure.set_facecolor(_BACKGROUND_COLOR)
-        axis.set_facecolor(_BACKGROUND_COLOR)
+        self.figure.set_facecolor(self._background_color)
+        axis.set_facecolor(self._background_color)
         axis.grid(False)
         axis.set_xticks([])
         axis.set_yticks([])
@@ -781,7 +798,7 @@ class StructureViewerWidget(QWidget):
                 fontsize=8.2,
             )
             frame = legend.get_frame()
-            frame.set_facecolor(_BACKGROUND_COLOR)
+            frame.set_facecolor(self._background_color)
             frame.set_edgecolor("#c6ccd4")
             frame.set_linewidth(0.8)
 
@@ -918,6 +935,7 @@ class StructureViewerWidget(QWidget):
                 f"MESH {self._mesh_contrast * 100.0:05.1f}%",
                 f"LINE {self._mesh_linewidth:04.2f}px",
                 f"COLOR {self._mesh_color.upper()}",
+                f"BG {self._background_color.upper()}",
             )
         )
 
@@ -937,17 +955,36 @@ class StructureViewerWidget(QWidget):
         )
 
     def _update_mesh_color_button_style(self) -> None:
-        self.mesh_color_button.setStyleSheet(
+        self._update_color_button_style(
+            self.mesh_color_button,
+            label="Mesh Color",
+            color_value=self._mesh_color,
+        )
+
+    def _update_background_color_button_style(self) -> None:
+        self._update_color_button_style(
+            self.background_color_button,
+            label="Background Color",
+            color_value=self._background_color,
+        )
+
+    def _update_color_button_style(
+        self,
+        button: QPushButton,
+        *,
+        label: str,
+        color_value: str,
+    ) -> None:
+        text_color = _button_foreground_color(color_value)
+        button.setStyleSheet(
             "QPushButton {"
-            f"background-color: {self._mesh_color};"
-            "color: white;"
+            f"background-color: {color_value};"
+            f"color: {text_color};"
             "border: 1px solid #475569;"
             "padding: 4px 8px;"
             "}"
         )
-        self.mesh_color_button.setText(
-            f"Mesh Color {self._mesh_color.upper()}"
-        )
+        button.setText(f"{label} {color_value.upper()}")
 
     def _choose_mesh_color(self) -> None:
         selected = QColorDialog.getColor(
@@ -961,6 +998,21 @@ class StructureViewerWidget(QWidget):
         self._update_mesh_color_button_style()
         if self.current_structure is not None:
             self._draw_view(reset_view=False)
+
+    def _choose_background_color(self) -> None:
+        selected = QColorDialog.getColor(
+            QColor(self._background_color),
+            self,
+            "Select Background Color",
+        )
+        if not selected.isValid():
+            return
+        self._background_color = str(selected.name())
+        self._update_background_color_button_style()
+        if self.current_structure is not None:
+            self._draw_view(reset_view=False)
+            return
+        self.draw_placeholder()
 
     def _schedule_view_update(
         self,
