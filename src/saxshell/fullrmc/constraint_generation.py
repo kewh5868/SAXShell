@@ -6,7 +6,14 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
-from saxshell.fullrmc._deprecated.constraintpdb import ConstraintPDB
+try:
+    from saxshell.fullrmc._deprecated.constraintpdb import ConstraintPDB
+except ModuleNotFoundError as exc:
+    ConstraintPDB = None  # type: ignore[assignment]
+    _CONSTRAINTPDB_IMPORT_ERROR = exc
+else:
+    _CONSTRAINTPDB_IMPORT_ERROR = None
+
 from saxshell.fullrmc.packmol_setup import PackmolSetupMetadata
 
 if False:  # pragma: no cover
@@ -169,6 +176,15 @@ def build_constraint_generation(
     merged_bond_lengths: dict[str, list[list[object]]] = {}
     merged_bond_angles: dict[str, list[list[object]]] = {}
     entries: list[ConstraintGenerationEntry] = []
+
+    if ConstraintPDB is None:
+        raise RuntimeError(
+            "Constraint generation requires ConstraintPDB, but "
+            "saxshell.fullrmc._deprecated.constraintpdb could not be "
+            "imported. Restore the missing module or update "
+            "constraint_generation.py to use the current ConstraintPDB "
+            "implementation."
+        ) from _CONSTRAINTPDB_IMPORT_ERROR
 
     for setup_entry in active_setup.entries:
         pdb_path = Path(setup_entry.packmol_pdb).expanduser().resolve()
