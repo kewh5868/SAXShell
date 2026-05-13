@@ -27,7 +27,24 @@ Create the environment from the checked-in `.yml` file:
 conda env create -f requirements/saxshell-py312.yml
 ```
 
+### Windows users
+
+On native Windows, create the environment from the Windows-specific environment
+file:
+
+```cmd
+conda env create -f requirements\saxshell-py312-win.yml
+```
+
 If the environment already exists, update it from the same file:
+
+```cmd
+conda env update -n saxshell-py312 -f requirements\saxshell-py312-win.yml --prune
+```
+
+### Linux, macOS, and WSL users
+
+If the environment already exists, update it from the default environment file:
 
 ```bash
 conda env update -n saxshell-py312 -f requirements/saxshell-py312.yml --prune
@@ -38,15 +55,57 @@ logs and tracebacks remain visible in the terminal.
 
 ## Launch SAXSShell
 
-Start the main SAXSShell application from the repository root:
+Start the main SAXSShell application from the repository root.
+
+### Linux, macOS, and WSL users
 
 ```bash
 PYTHONPATH=src conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs
 ```
 
+### Windows users
+
+There are two supported launch methods depending on whether you are using
+Anaconda Prompt or Windows PowerShell.
+
+#### From Anaconda Prompt
+
+Activate the environment, set `PYTHONPATH`, and launch the SAXS UI:
+
+```cmd
+conda activate saxshell-py312
+set PYTHONPATH=src
+python -m saxshell.saxs
+```
+
+You can also launch without activating the environment:
+
+```cmd
+set PYTHONPATH=src
+conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs
+```
+
+#### From Windows PowerShell
+
+Set `PYTHONPATH` using PowerShell syntax, then launch through `conda run`:
+
+```powershell
+$env:PYTHONPATH = "src"
+conda run --no-capture-output -n saxshell-py312 python -m saxshell.saxs
+```
+
+If your PowerShell session is configured for conda activation, this also works:
+
+```powershell
+conda activate saxshell-py312
+$env:PYTHONPATH = "src"
+python -m saxshell.saxs
+```
+
 The application opens to the main SAXS workflow. Create or select a dedicated
 project folder in **Project Setup** after your trajectory-derived frames and
 clusters are ready.
+
 
 ## Recommended starting point
 
