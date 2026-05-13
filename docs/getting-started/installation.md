@@ -106,7 +106,6 @@ The application opens to the main SAXS workflow. Create or select a dedicated
 project folder in **Project Setup** after your trajectory-derived frames and
 clusters are ready.
 
-
 ## Recommended starting point
 
 Before spending time in Prefit or DREAM, prepare the simulation data that the
