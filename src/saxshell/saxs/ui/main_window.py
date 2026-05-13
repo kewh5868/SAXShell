@@ -1067,6 +1067,8 @@ class SAXSMainWindow(QMainWindow):
     """Main Qt window for SAXS project setup, prefit, and DREAM
     refinement."""
 
+    project_load_progress_received = Signal(int, int, str, str)
+
     DREAM_REFRESH_DELAY_MS = 75
     DREAM_REFRESH_STYLE = 1
     DREAM_REFRESH_VIOLIN = 2
@@ -1123,6 +1125,9 @@ class SAXSMainWindow(QMainWindow):
             self._load_console_autoscroll_setting()
         )
         self._ui_scale = 1.0
+        self.project_load_progress_received.connect(
+            self._on_project_load_progress_received
+        )
         self._base_font_point_size = self._resolve_base_font_point_size()
         self._scale_shortcuts: list[QShortcut] = []
         self._child_tool_windows: list[object] = []
@@ -2043,11 +2048,11 @@ class SAXSMainWindow(QMainWindow):
             if progress_callback is None:
                 return
             del total
-            self._update_project_load_progress(
+            self.project_load_progress_received.emit(
                 processed,
                 PROJECT_LOAD_TOTAL_STEPS,
                 message,
-                log_message=message,
+                message,
             )
 
         def on_finished(task_name: str, worker_result: object) -> None:
@@ -3274,6 +3279,21 @@ class SAXSMainWindow(QMainWindow):
         )
         self.statusBar().showMessage(message)
         QApplication.processEvents()
+
+    @Slot(int, int, str, str)
+    def _on_project_load_progress_received(
+        self,
+        processed: int,
+        total_steps: int,
+        message: str,
+        log_message: str,
+    ) -> None:
+        self._update_project_load_progress(
+            processed,
+            total_steps,
+            message,
+            log_message=log_message or None,
+        )
 
     def _update_project_load_progress(
         self,
