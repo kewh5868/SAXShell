@@ -77,17 +77,20 @@ class ExperimentalDataHeaderDialog(QDialog):
     def _build_ui(self) -> None:
         self.setWindowTitle("Check Experimental Data File")
         screen = QApplication.primaryScreen()
-        if screen is None:
-            self.resize(900, 600)
-        else:
+        if screen is not None:
             available = screen.availableGeometry()
-            target_width = min(900, int(available.width() * 0.85))
-            target_height = min(600, int(available.height() * 0.85))
-            self.resize(max(480, target_width), max(360, target_height))
-            self.setMaximumSize(
-                max(520, int(available.width() * 0.95)),
-                max(420, int(available.height() * 0.95)),
+            width = max(900, int(available.width() * 0.85))
+            height = max(600, int(available.height() * 0.85))
+            self.resize(
+                min(width, available.width()),
+                min(height, available.height()),
             )
+            self.setMaximumSize(
+                int(available.width() * 0.95),
+                int(available.height() * 0.95),
+            )
+        else:
+            self.resize(900, 600)
 
         root = QVBoxLayout(self)
         intro_label = QLabel(

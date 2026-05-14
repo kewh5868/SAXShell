@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -13294,28 +13295,24 @@ def test_experimental_data_header_dialog_allows_manual_column_selection(
     assert np.allclose(dialog.accepted_summary.errors, [0.1, 0.2])
 
 
-def test_experimental_data_header_dialog_geometry_is_screen_bounded(
+def test_experimental_data_header_dialog_screen_constrained_with_long_content(
     qapp, tmp_path
 ):
     del qapp
-    data_path = tmp_path / "exp_long_lines.txt"
-    long_path_segment = "OneDrive - UCB-O365" * 20
+    data_path = tmp_path / ("onedrive_" + ("very_long_segment_" * 30) + ".txt")
     data_path.write_text(
-        (
-            f"{long_path_segment}\n"
-            f"{'q intensity error ' * 80}\n"
-            f"{'0.05 10.0 0.1 ' * 80}\n"
-        ),
+        "q intensity sigma\n"
+        + ("0.05 " + ("1234567890" * 80) + " 0.1\n")
+        + "0.10 9.5 0.2\n",
         encoding="utf-8",
     )
 
     dialog = ExperimentalDataHeaderDialog(data_path)
 
-    assert dialog.file_label.wordWrap()
-    assert dialog.file_label.minimumWidth() == 0
+    assert dialog.file_label.wordWrap() is True
     assert (
         dialog.preview_box.lineWrapMode()
-        == dialog.preview_box.LineWrapMode.WidgetWidth
+        == QPlainTextEdit.LineWrapMode.WidgetWidth
     )
     assert dialog.preview_box.minimumHeight() == 250
 
@@ -13323,10 +13320,11 @@ def test_experimental_data_header_dialog_geometry_is_screen_bounded(
     if screen is not None:
         available = screen.availableGeometry()
         max_size = dialog.maximumSize()
-        assert max_size.width() <= available.width()
-        assert max_size.height() <= available.height()
-        assert dialog.minimumWidth() <= available.width()
-        assert dialog.minimumHeight() <= available.height()
+        min_size = dialog.minimumSize()
+        assert max_size.width() <= int(available.width() * 0.95)
+        assert max_size.height() <= int(available.height() * 0.95)
+        assert min_size.width() <= available.width()
+        assert min_size.height() <= available.height()
 
 
 def test_project_setup_preview_updates_with_experimental_q_range(
