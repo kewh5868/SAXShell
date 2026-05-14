@@ -5140,7 +5140,14 @@ def _guess_experimental_header_rows(file_path: Path) -> int:
             if not stripped:
                 header_rows += 1
                 continue
-            tokens = _split_experimental_line(stripped)
+            if _is_comment_metadata_line(stripped):
+                header_rows += 1
+                continue
+            candidate_line = _strip_comment_prefix(stripped)
+            if not candidate_line:
+                header_rows += 1
+                continue
+            tokens = _split_experimental_line(candidate_line)
             if len(tokens) >= 2 and _tokens_look_numeric(tokens):
                 return header_rows
             header_rows += 1
@@ -5155,10 +5162,15 @@ def _read_experimental_column_names(
         encoding="utf-8", errors="replace"
     ).splitlines()
     if header_rows > 0 and header_rows <= len(lines):
+        header_line = lines[header_rows - 1].strip()
         header_tokens = _split_experimental_line(
-            lines[header_rows - 1].lstrip("#").strip()
+            _strip_comment_prefix(header_line)
         )
-        if header_tokens and not _tokens_look_numeric(header_tokens):
+        if (
+            header_tokens
+            and not _tokens_look_numeric(header_tokens)
+            and _tokens_look_like_column_labels(header_tokens)
+        ):
             return _normalize_column_names(header_tokens)
     first_data_tokens = _first_data_tokens(lines, header_rows)
     if first_data_tokens is None:
@@ -5174,10 +5186,47 @@ def _first_data_tokens(
         stripped = line.strip()
         if not stripped:
             continue
-        tokens = _split_experimental_line(stripped)
+        if _is_comment_metadata_line(stripped):
+            continue
+        tokens = _split_experimental_line(_strip_comment_prefix(stripped))
         if len(tokens) >= 2 and _tokens_look_numeric(tokens):
             return tokens
     return None
+
+
+def _strip_comment_prefix(line: str) -> str:
+    return line.lstrip("#").strip() if line.lstrip().startswith("#") else line
+
+
+def _is_comment_metadata_line(line: str) -> bool:
+    if not line.lstrip().startswith("#"):
+        return False
+    candidate = _strip_comment_prefix(line)
+    if not candidate:
+        return True
+    tokens = _split_experimental_line(candidate)
+    if len(tokens) >= 2 and _tokens_look_numeric(tokens):
+        return False
+    if ":" in candidate and not _tokens_look_like_column_labels(tokens):
+        return True
+    return not _tokens_look_like_column_labels(tokens)
+
+
+def _tokens_look_like_column_labels(tokens: list[str]) -> bool:
+    if len(tokens) < 2:
+        return False
+    normalized = [
+        re.sub(r"[^a-z0-9]+", "", token.lower()) for token in tokens
+    ]
+    if all(not token for token in normalized):
+        return False
+    if _tokens_look_numeric(tokens):
+        return False
+    keywords = ("q", "iq", "intensity", "error", "sigma", "uncert")
+    return any(
+        any(keyword in token for keyword in keywords)
+        for token in normalized
+    )
 
 
 def _split_experimental_line(line: str) -> list[str]:

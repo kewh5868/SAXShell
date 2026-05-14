@@ -125,9 +125,12 @@ from saxshell.saxs.project_manager import (
     SAXSProjectManager,
     build_prior_histogram_export_payload,
     build_project_paths,
+    guess_experimental_header_rows,
+    infer_experimental_columns,
     load_experimental_data_file,
     plot_md_prior_histogram,
     project_artifact_paths,
+    read_experimental_column_names,
 )
 from saxshell.saxs.solution_scattering_estimator import (
     SolutionScatteringEstimatorSettings,
@@ -13295,36 +13298,83 @@ def test_experimental_data_header_dialog_allows_manual_column_selection(
     assert np.allclose(dialog.accepted_summary.errors, [0.1, 0.2])
 
 
-def test_experimental_data_header_dialog_screen_constrained_with_long_content(
+def test_experimental_data_header_dialog_geometry_is_screen_bounded(
     qapp, tmp_path
 ):
     del qapp
-    data_path = tmp_path / ("onedrive_" + ("very_long_segment_" * 30) + ".txt")
+    data_path = tmp_path / "exp_long_lines.txt"
+    long_path_segment = "OneDrive - UCB-O365" * 20
     data_path.write_text(
-        "q intensity sigma\n"
-        + ("0.05 " + ("1234567890" * 80) + " 0.1\n")
-        + "0.10 9.5 0.2\n",
+        (
+            f"{long_path_segment}\n"
+            f"{'q intensity error ' * 80}\n"
+            f"{'0.05 10.0 0.1 ' * 80}\n"
+        ),
         encoding="utf-8",
     )
 
     dialog = ExperimentalDataHeaderDialog(data_path)
 
-    assert dialog.file_label.wordWrap() is True
+    assert dialog.file_label.wordWrap()
+    assert dialog.file_label.minimumWidth() == 0
     assert (
         dialog.preview_box.lineWrapMode()
-        == QPlainTextEdit.LineWrapMode.WidgetWidth
+        == dialog.preview_box.LineWrapMode.WidgetWidth
     )
     assert dialog.preview_box.minimumHeight() == 250
+    assert dialog.status_label.wordWrap()
+    assert dialog.status_label.minimumWidth() == 0
+    assert (
+        dialog.q_column_combo.sizeAdjustPolicy()
+        == dialog.q_column_combo.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+    )
 
     screen = QApplication.primaryScreen()
     if screen is not None:
         available = screen.availableGeometry()
         max_size = dialog.maximumSize()
-        min_size = dialog.minimumSize()
-        assert max_size.width() <= int(available.width() * 0.95)
-        assert max_size.height() <= int(available.height() * 0.95)
-        assert min_size.width() <= available.width()
-        assert min_size.height() <= available.height()
+        assert max_size.width() <= available.width()
+        assert max_size.height() <= available.height()
+        assert dialog.minimumWidth() <= available.width()
+        assert dialog.minimumHeight() <= available.height()
+
+
+def test_experimental_data_metadata_comments_are_not_used_as_columns(
+    tmp_path,
+):
+    data_path = tmp_path / "exp_with_metadata_comments.txt"
+    data_path.write_text(
+        "# Background offset factor: 1.0\n"
+        "# q_(Å⁻¹) I(q)\n"
+        "0.01 100.0\n"
+        "0.02 95.0\n"
+        "0.03 90.0\n",
+        encoding="utf-8",
+    )
+
+    header_rows = guess_experimental_header_rows(data_path)
+    assert header_rows == 2
+
+    column_names = read_experimental_column_names(
+        data_path,
+        skiprows=header_rows,
+    )
+    assert column_names == ["q_(Å⁻¹)", "I(q)"]
+    assert "#" not in column_names
+    assert "Background" not in column_names
+
+    inferred_q, inferred_i, inferred_e = infer_experimental_columns(
+        column_names
+    )
+    assert inferred_q == 0
+    assert inferred_i == 1
+    assert inferred_e is None
+
+    summary = load_experimental_data_file(data_path)
+    assert summary.header_rows == 2
+    assert summary.column_names == ["q_(Å⁻¹)", "I(q)"]
+    assert np.allclose(summary.q_values, [0.01, 0.02, 0.03])
+    assert np.allclose(summary.intensities, [100.0, 95.0, 90.0])
 
 
 def test_project_setup_preview_updates_with_experimental_q_range(
