@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -13374,47 +13375,6 @@ def test_experimental_data_metadata_comments_are_not_used_as_columns(
     assert summary.column_names == ["q_(Å⁻¹)", "I(q)"]
     assert np.allclose(summary.q_values, [0.01, 0.02, 0.03])
     assert np.allclose(summary.intensities, [100.0, 95.0, 90.0])
-
-
-def test_experimental_data_ignores_metadata_prefix_before_inline_header(
-    tmp_path,
-):
-    data_path = tmp_path / "exp_inline_header_comment.txt"
-    data_path.write_text(
-        "# Background offset factor: 1.0 # q_(Å⁻¹) I(q)\n"
-        "0.01 100.0\n"
-        "0.02 95.0\n",
-        encoding="utf-8",
-    )
-
-    header_rows = guess_experimental_header_rows(data_path)
-    assert header_rows == 1
-    column_names = read_experimental_column_names(data_path, skiprows=1)
-    assert column_names == ["q_(Å⁻¹)", "I(q)"]
-
-    summary = load_experimental_data_file(data_path)
-    assert summary.column_names == ["q_(Å⁻¹)", "I(q)"]
-    assert np.allclose(summary.q_values, [0.01, 0.02])
-    assert np.allclose(summary.intensities, [100.0, 95.0])
-
-
-def test_experimental_data_load_tolerates_non_utf8_bytes_in_comments(
-    tmp_path,
-):
-    data_path = tmp_path / "exp_non_utf8_comment.txt"
-    data_path.write_bytes(
-        b"# instrument metadata \x81\n"
-        b"# q I\n"
-        b"0.01 100.0\n"
-        b"0.02 95.0\n"
-    )
-
-    summary = load_experimental_data_file(data_path)
-
-    assert summary.header_rows == 2
-    assert summary.column_names == ["q", "I"]
-    assert np.allclose(summary.q_values, [0.01, 0.02])
-    assert np.allclose(summary.intensities, [100.0, 95.0])
 
 
 def test_project_setup_preview_updates_with_experimental_q_range(

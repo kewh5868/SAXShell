@@ -5206,17 +5206,7 @@ def _first_data_tokens(
 
 
 def _strip_comment_prefix(line: str) -> str:
-    if not line.lstrip().startswith("#"):
-        return line
-    raw = line.lstrip("#").strip()
-    if "#" not in raw:
-        return raw
-    segments = [segment.strip() for segment in raw.split("#") if segment.strip()]
-    for segment in reversed(segments):
-        tokens = _split_experimental_line(segment)
-        if _tokens_look_like_column_labels(tokens):
-            return segment
-    return segments[-1] if segments else ""
+    return line.lstrip("#").strip() if line.lstrip().startswith("#") else line
 
 
 def _is_comment_metadata_line(line: str) -> bool:
