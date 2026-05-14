@@ -5,12 +5,14 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
     QLabel,
     QPlainTextEdit,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -75,7 +77,18 @@ class ExperimentalDataHeaderDialog(QDialog):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("Check Experimental Data File")
-        self.resize(900, 720)
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.resize(900, 600)
+        else:
+            available = screen.availableGeometry()
+            target_width = min(900, int(available.width() * 0.85))
+            target_height = min(600, int(available.height() * 0.85))
+            self.resize(max(480, target_width), max(360, target_height))
+            self.setMaximumSize(
+                max(520, int(available.width() * 0.95)),
+                max(420, int(available.height() * 0.95)),
+            )
 
         root = QVBoxLayout(self)
         intro_label = QLabel(
@@ -91,6 +104,12 @@ class ExperimentalDataHeaderDialog(QDialog):
         self.file_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
+        self.file_label.setWordWrap(True)
+        self.file_label.setMinimumWidth(0)
+        self.file_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         form.addRow("File", self.file_label)
 
         self.header_rows_spin = QSpinBox()
@@ -99,25 +118,35 @@ class ExperimentalDataHeaderDialog(QDialog):
         form.addRow("Header rows", self.header_rows_spin)
 
         self.q_column_combo = QComboBox()
+        self._configure_column_combo(self.q_column_combo)
         form.addRow("q column", self.q_column_combo)
 
         self.intensity_column_combo = QComboBox()
+        self._configure_column_combo(self.intensity_column_combo)
         form.addRow("Intensity column", self.intensity_column_combo)
 
         self.error_column_combo = QComboBox()
+        self._configure_column_combo(self.error_column_combo)
         form.addRow("Error column", self.error_column_combo)
         root.addLayout(form)
 
         self.preview_box = QPlainTextEdit()
         self.preview_box.setReadOnly(True)
-        self.preview_box.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self.preview_box.setMinimumHeight(420)
-        root.addWidget(self.preview_box)
+        self.preview_box.setLineWrapMode(
+            QPlainTextEdit.LineWrapMode.WidgetWidth
+        )
+        self.preview_box.setMinimumHeight(250)
+        root.addWidget(self.preview_box, stretch=1)
 
         self.status_label = QLabel(
             "Adjust the header length and selected columns, then click Load File."
         )
         self.status_label.setWordWrap(True)
+        self.status_label.setMinimumWidth(0)
+        self.status_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         root.addWidget(self.status_label)
 
         button_box = QDialogButtonBox(
@@ -131,6 +160,16 @@ class ExperimentalDataHeaderDialog(QDialog):
         button_box.accepted.connect(self._try_accept)
         button_box.rejected.connect(self.reject)
         root.addWidget(button_box)
+
+    def _configure_column_combo(self, combo: QComboBox) -> None:
+        combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        combo.setMinimumContentsLength(1)
+        combo.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Fixed,
+        )
 
     def _read_preview_lines(self, max_lines: int = 80) -> list[str]:
         lines: list[str] = []
