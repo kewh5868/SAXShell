@@ -1,0 +1,47 @@
+name: saxshell-py312
+channels:
+  - conda-forge
+  - defaults
+channel_priority: strict
+dependencies:
+  # Core runtime
+  - python=3.12
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - lmfit
+  - uncertainties
+  - networkx
+  - pyyaml
+  - requests
+
+  # Data / file formats / parallel workflow support
+  - xarray
+  - dask
+  - distributed
+  - netcdf4
+  - h5py
+  - pyarrow
+  - bottleneck
+
+  # Qt GUI stack for Windows
+  - pyside6
+  - qtpy
+  - pyqtgraph
+
+  # Interactive/dev tooling
+  - ipython
+  - ipykernel
+  - jupyterlab
+  - pytest
+  - pytest-cov
+  - coverage
+  - pre-commit
+  - mypy
+
+  # Pip-only / project-specific packages
+  - pip:
+      - pydream
+      - xraydb>=4.5.8

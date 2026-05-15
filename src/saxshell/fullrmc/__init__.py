@@ -2,14 +2,6 @@
 
 from typing import TYPE_CHECKING
 
-from .constraint_generation import (
-    ConstraintGenerationEntry,
-    ConstraintGenerationMetadata,
-    ConstraintGenerationSettings,
-    build_constraint_generation,
-    load_constraint_generation_metadata,
-    save_constraint_generation_metadata,
-)
 from .packmol_docker import (
     DEFAULT_PACKMOL_CONTAINER_ROOT,
     PackmolDockerClient,
@@ -112,6 +104,14 @@ from .solvent_shell_builder import (
 )
 
 if TYPE_CHECKING:
+    from .constraint_generation import (
+        ConstraintGenerationEntry,
+        ConstraintGenerationMetadata,
+        ConstraintGenerationSettings,
+        build_constraint_generation,
+        load_constraint_generation_metadata,
+        save_constraint_generation_metadata,
+    )
     from .ui.main_window import RMCSetupMainWindow, launch_rmcsetup_ui
     from .ui.representative_preview_window import RepresentativePreviewWindow
     from .ui.solvent_shell_builder_window import (
@@ -215,6 +215,36 @@ __all__ = [
 
 
 def __getattr__(name: str):
+    if name in {
+        "ConstraintGenerationEntry",
+        "ConstraintGenerationMetadata",
+        "ConstraintGenerationSettings",
+        "build_constraint_generation",
+        "load_constraint_generation_metadata",
+        "save_constraint_generation_metadata",
+    }:
+        from .constraint_generation import (
+            ConstraintGenerationEntry,
+            ConstraintGenerationMetadata,
+            ConstraintGenerationSettings,
+            build_constraint_generation,
+            load_constraint_generation_metadata,
+            save_constraint_generation_metadata,
+        )
+
+        exports = {
+            "ConstraintGenerationEntry": ConstraintGenerationEntry,
+            "ConstraintGenerationMetadata": ConstraintGenerationMetadata,
+            "ConstraintGenerationSettings": ConstraintGenerationSettings,
+            "build_constraint_generation": build_constraint_generation,
+            "load_constraint_generation_metadata": (
+                load_constraint_generation_metadata
+            ),
+            "save_constraint_generation_metadata": (
+                save_constraint_generation_metadata
+            ),
+        }
+        return exports[name]
     if name in {"RMCSetupMainWindow", "launch_rmcsetup_ui"}:
         from .ui.main_window import RMCSetupMainWindow, launch_rmcsetup_ui
 
