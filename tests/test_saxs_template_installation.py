@@ -3,10 +3,12 @@ from __future__ import annotations
 import textwrap
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from saxshell.saxs._model_templates import (
     list_template_specs,
+    load_template_module,
     load_template_spec,
 )
 from saxshell.saxs.template_installation import (
@@ -15,6 +17,9 @@ from saxshell.saxs.template_installation import (
 )
 
 TEMPLATE_CANDIDATE_DIR = Path("tests/template_candidates")
+CHARGED_MONOSQ_TEMPLATE = (
+    "template_pydream_charged_monosq_normalized_scaled_solvent"
+)
 
 
 def _write_template(path: Path, body: str) -> Path:
@@ -177,10 +182,119 @@ def test_template_listing_hides_deprecated_by_default():
         spec.name for spec in list_template_specs(include_deprecated=True)
     }
 
+    assert CHARGED_MONOSQ_TEMPLATE in visible_names
     assert "template_pd_likelihood_monosq_decoupled" not in visible_names
     assert "template_pd_likelihood_monosq_decoupled" in all_names
     assert "template_pydream_poly_lma_hs_legacy" not in visible_names
     assert "template_pydream_poly_lma_hs_legacy" in all_names
+
+
+def test_charged_monosq_template_spec_exposes_scaled_solvent_metadata():
+    spec = load_template_spec(CHARGED_MONOSQ_TEMPLATE)
+
+    assert spec.display_name == (
+        "pyDREAM Charged MonoSQ Normalized (Scaled Solvent Weight)"
+    )
+    assert [parameter.name for parameter in spec.parameters] == [
+        "solv_w",
+        "offset",
+        "eff_r",
+        "vol_frac",
+        "charge",
+        "temperature",
+        "concentration_salt",
+        "dielectconst",
+        "scale",
+    ]
+    assert (
+        spec.solution_scattering_support.volume_fraction_parameter
+        == "vol_frac"
+    )
+    assert spec.solution_scattering_support.volume_fraction_kind == "solute"
+    assert (
+        spec.solution_scattering_support.volume_fraction_source == "physical"
+    )
+    assert (
+        spec.solution_scattering_support.solvent_contribution_scale_mode
+        == "global_scale"
+    )
+    assert spec.prefit_support.auto_apply_autoscale_on_load
+    assert spec.prefit_support.autoscale_bounds_mode == "adaptive"
+
+    charge_entry = next(
+        parameter
+        for parameter in spec.parameters
+        if parameter.name == "charge"
+    )
+    assert charge_entry.minimum == pytest.approx(1e-6)
+    assert charge_entry.maximum == pytest.approx(200.0)
+
+
+def test_charged_monosq_hayter_msa_matches_sasview_reference_values():
+    module = load_template_module(CHARGED_MONOSQ_TEMPLATE)
+
+    q_values = np.asarray([0.00001, 0.0010, 0.01, 0.075])
+    expected = np.asarray([0.0711646, 0.0712928, 0.0847006, 1.07150])
+
+    actual = module.calc_hayter_msa_sq(
+        20.75,
+        0.0192,
+        19.0,
+        298.0,
+        0.0,
+        78.0,
+        q_values,
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=1e-7)
+
+
+def test_charged_monosq_lmfit_model_uses_scaled_solvent_convention():
+    module = load_template_module(CHARGED_MONOSQ_TEMPLATE)
+    q_values = np.linspace(0.01, 0.08, 5)
+    solvent = np.linspace(1.0, 2.0, 5)
+    components = [
+        np.linspace(10.0, 14.0, 5),
+        np.linspace(4.0, 8.0, 5),
+    ]
+    params = {
+        "w0": 0.25,
+        "w1": 0.75,
+        "solv_w": 0.5,
+        "offset": 0.2,
+        "eff_r": 20.75,
+        "vol_frac": 0.0192,
+        "charge": 19.0,
+        "temperature": 298.0,
+        "concentration_salt": 0.0,
+        "dielectconst": 78.0,
+        "scale": 2.0e-4,
+    }
+
+    structure_factor = module.calc_hayter_msa_sq(
+        params["eff_r"],
+        params["vol_frac"],
+        params["charge"],
+        params["temperature"],
+        params["concentration_salt"],
+        params["dielectconst"],
+        q_values,
+    )
+    mixture = params["w0"] * components[0] + params["w1"] * components[1]
+    expected = (
+        params["scale"]
+        * (mixture * structure_factor + params["solv_w"] * solvent)
+        + params["offset"]
+    )
+
+    actual = module.lmfit_model_profile(
+        q_values,
+        solvent,
+        components,
+        **params,
+    )
+
+    np.testing.assert_allclose(actual, expected)
 
 
 def test_validate_template_candidate_passes_for_sphere_only_geometry_constraints(

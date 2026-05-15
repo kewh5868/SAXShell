@@ -9,16 +9,17 @@ single paper.
 
 ## Template Catalog
 
-| Template file                                          | GUI name                                               | Status     | Model family                                  |
-| ------------------------------------------------------ | ------------------------------------------------------ | ---------- | --------------------------------------------- |
-| `template_pydream_monosq_normalized.py`                | `pyDREAM MonoSQ Normalized`                            | current    | MonoSQ hard-sphere                            |
-| `template_pydream_monosq_normalized_scaled_solvent.py` | `pyDREAM MonoSQ Normalized (Scaled Solvent Weight)`    | current    | MonoSQ hard-sphere with scale-coupled solvent |
-| `template_pydream_poly_lma_hs.py`                      | `pyDREAM Poly LMA Hard-Sphere`                         | current    | sphere-only Poly LMA hard-sphere              |
-| `template_pydream_poly_lma_hs_mix_approx.py`           | `pyDREAM Poly LMA Hard-Sphere/Ellipsoid Mix (Approx.)` | current    | mixed-shape approximate Poly LMA hard-sphere  |
-| `template_likelihood_monosq.py`                        | `MonoSQ Basic (archived)`                              | archived   | MonoSQ hard-sphere                            |
-| `template_pd_likelihood_monosq.py`                     | `MonoSQ PD (archived)`                                 | archived   | MonoSQ hard-sphere                            |
-| `template_pd_likelihood_monosq_decoupled.py`           | `MonoSQ Decoupled (archived)`                          | archived   | MonoSQ hard-sphere                            |
-| `template_pydream_poly_lma_hs_legacy.py`               | `pyDREAM Poly LMA Hard-Sphere (deprecated)`            | deprecated | mixed-shape approximate Poly LMA hard-sphere  |
+| Template file                                                  | GUI name                                                    | Status     | Model family                                  |
+| -------------------------------------------------------------- | ----------------------------------------------------------- | ---------- | --------------------------------------------- |
+| `template_pydream_monosq_normalized.py`                        | `pyDREAM MonoSQ Normalized`                                 | current    | MonoSQ hard-sphere                            |
+| `template_pydream_monosq_normalized_scaled_solvent.py`         | `pyDREAM MonoSQ Normalized (Scaled Solvent Weight)`         | current    | MonoSQ hard-sphere with scale-coupled solvent |
+| `template_pydream_charged_monosq_normalized_scaled_solvent.py` | `pyDREAM Charged MonoSQ Normalized (Scaled Solvent Weight)` | current    | MonoSQ charged hard-sphere RMSA               |
+| `template_pydream_poly_lma_hs.py`                              | `pyDREAM Poly LMA Hard-Sphere`                              | current    | sphere-only Poly LMA hard-sphere              |
+| `template_pydream_poly_lma_hs_mix_approx.py`                   | `pyDREAM Poly LMA Hard-Sphere/Ellipsoid Mix (Approx.)`      | current    | mixed-shape approximate Poly LMA hard-sphere  |
+| `template_likelihood_monosq.py`                                | `MonoSQ Basic (archived)`                                   | archived   | MonoSQ hard-sphere                            |
+| `template_pd_likelihood_monosq.py`                             | `MonoSQ PD (archived)`                                      | archived   | MonoSQ hard-sphere                            |
+| `template_pd_likelihood_monosq_decoupled.py`                   | `MonoSQ Decoupled (archived)`                               | archived   | MonoSQ hard-sphere                            |
+| `template_pydream_poly_lma_hs_legacy.py`                       | `pyDREAM Poly LMA Hard-Sphere (deprecated)`                 | deprecated | mixed-shape approximate Poly LMA hard-sphere  |
 
 ## Shared Notation
 
@@ -30,6 +31,8 @@ Across the bundled templates:
 - \(w_i\) is the raw weight assigned to component \(i\).
 - \(S\_{\mathrm{HS}}(q; R, \phi)\) is the hard-sphere Percus-Yevick structure
   factor evaluated at effective radius \(R\) and packing term \(\phi\).
+- \(S\_{\mathrm{RMSA}}(q)\) is the Hayter-Penfold rescaled mean spherical
+  approximation charged-sphere structure factor.
 - `scale` and `offset` are the global multiplicative and additive terms exposed
   in the Prefit parameter table.
 
@@ -124,16 +127,131 @@ Because the solvent branch is scale-coupled, Prefit's scale recommendation also
 treats the solvent term as part of the scaled model instead of subtracting it as
 an already-scaled background contribution.
 
+### Charged Scaled Solvent MonoSQ
+
+The `pyDREAM Charged MonoSQ Normalized (Scaled Solvent Weight)` template keeps
+the scaled-solvent MonoSQ organization, but replaces the neutral
+Percus-Yevick hard-sphere term with the Hayter-Penfold RMSA structure factor for
+screened Coulomb repulsion between charged spheres.
+
+The cluster-trace form-factor mixture is still
+
+$$
+I_{\mathrm{mix}}(q) = \sum_i w_i I_i(q).
+$$
+
+The charged solute branch is
+
+$$
+I_{\mathrm{solute}}(q) =
+I_{\mathrm{mix}}(q)
+S_{\mathrm{RMSA}}
+\left(q; R_{\mathrm{eff}}, \phi, Z, T, c_{\mathrm{salt}}, \epsilon_r\right),
+$$
+
+and the full model follows the same scale-coupled solvent convention:
+
+$$
+I_{\mathrm{model}}(q) =
+\mathrm{scale}
+\left[
+I_{\mathrm{solute}}(q)
++ w_{\mathrm{solv}} I_{\mathrm{solv}}(q)
+\right]
++ \mathrm{offset}.
+$$
+
+Here \(Z\) is the charged-sphere charge in elementary-charge units,
+\(T\) is the absolute temperature, \(c\_{\mathrm{salt}}\) is the molar
+concentration of added 1:1 electrolyte, and \(\epsilon_r\) is the solvent
+relative dielectric constant.
+
+The implementation follows the SasView `hayter_msa` parameterization. The
+template first converts the fitted parameters into SI-derived screening terms:
+
+$$
+\beta = \frac{1}{k_B T},
+\qquad
+\epsilon = \epsilon_r \epsilon_0,
+\qquad
+\sigma = 2R_{\mathrm{eff}}.
+$$
+
+For monovalent counterions and added 1:1 salt, the ionic-strength term used by
+the RMSA kernel is
+
+$$
+I_{\mathrm{ion}} =
+\frac{e^2}{2}
+\left(
+\frac{Z\phi}{V_p}
++ 2 N_A 10^3 c_{\mathrm{salt}}
+\right),
+$$
+
+where \(V*p = 4\pi R*{\mathrm{eff}}^3 / 3\) after converting \(R\_{\mathrm{eff}}\)
+to meters. The Debye-Huckel screening parameter is
+
+$$
+\kappa =
+\sqrt{\frac{2\beta I_{\mathrm{ion}}}{\epsilon}}.
+$$
+
+The dimensionless contact-potential parameter passed into the
+Hayter-Penfold coefficient calculation is
+
+$$
+\Gamma =
+\frac{
+\beta (Ze)^2
+}{
+\pi \epsilon \sigma (2 + \kappa\sigma)^2
+}.
+$$
+
+The Hayter-Penfold rescaling solves for a rescaled volume fraction
+\(\phi_s\), rescaled screening parameter \(\kappa_s\), and MSA coefficients
+\(A, B, C, F, U, V\) that satisfy the Gillan contact condition. SAXSShell
+then evaluates the same final structure-factor form used by SasView:
+
+$$
+S_{\mathrm{RMSA}}(q) =
+\frac{1}{1 - 24\phi_s\,\mathcal{A}(q\sigma / s)},
+$$
+
+where \(s = (\phi / \phi_s)^{1/3}\) and
+\(\mathcal{A}\) is the Hayter-Penfold Fourier-space coefficient expression.
+The template includes the small-\(q\) Taylor branch used by SasView to avoid
+rounding error near \(q\sigma / s = 0\).
+
+This is a charged-particle model. `charge` is constrained to be positive and
+bounded above by 200 e, matching the SasView stability guidance. For neutral
+systems use one of the hard-sphere MonoSQ templates instead.
+
+Like the scaled-solvent hard-sphere template, this charged template declares
+calculator targets in its metadata:
+
+- `vol_frac` receives the physical solute-associated volume fraction computed
+  from the solution composition.
+- `solv_w` receives the combined solvent-background multiplier from attenuation
+  and SAXS-effective solvent contrast.
+- The solvent contribution is marked as globally scaled, so Prefit's autoscale
+  calculation treats the solvent branch as part of the model curve.
+
 ### Variables
 
-| Symbol / parameter                    | Meaning in SAXSShell                                                                                                       |
-| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| \(w_i\)                               | generated component weight for cluster profile \(i\)                                                                       |
-| \(w\_{\mathrm{solv}}\) / `solv_w`     | bounded solvent contribution weight                                                                                        |
-| \(R\_{\mathrm{eff}}\) / `eff_r`       | effective hard-sphere radius used in `calc_monodisperse_sq(...)`; scaled-solvent MonoSQ defaults to 3 A                    |
-| \(\phi\_{\mathrm{vol}}\) / `vol_frac` | effective hard-sphere volume fraction inside the Percus-Yevick term                                                        |
-| `scale`                               | global intensity scale; original MonoSQ applies it only to solute, scaled-solvent MonoSQ applies it to solute plus solvent |
-| `offset`                              | constant additive background                                                                                               |
+| Symbol / parameter                            | Meaning in SAXSShell                                                                                                       |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| \(w_i\)                                       | generated component weight for cluster profile \(i\)                                                                       |
+| \(w\_{\mathrm{solv}}\) / `solv_w`             | bounded solvent contribution weight                                                                                        |
+| \(R\_{\mathrm{eff}}\) / `eff_r`               | effective hard-sphere radius used in `calc_monodisperse_sq(...)`; scaled-solvent MonoSQ defaults to 3 A                    |
+| \(\phi\_{\mathrm{vol}}\) / `vol_frac`         | effective hard-sphere volume fraction inside the Percus-Yevick term                                                        |
+| `scale`                                       | global intensity scale; original MonoSQ applies it only to solute, scaled-solvent MonoSQ applies it to solute plus solvent |
+| `offset`                                      | constant additive background                                                                                               |
+| \(Z\) / `charge`                              | charged-sphere charge in elementary-charge units for the charged RMSA template                                             |
+| \(T\) / `temperature`                         | absolute temperature in kelvin for the charged RMSA Debye length calculation                                               |
+| \(c\_{\mathrm{salt}}\) / `concentration_salt` | added 1:1 electrolyte concentration in mol/L for the charged RMSA template                                                 |
+| \(\epsilon_r\) / `dielectconst`               | solvent relative dielectric constant for the charged RMSA template                                                         |
 
 ### Likelihood conventions
 
@@ -163,6 +281,10 @@ function before evaluating the likelihood.
   Phys. Rev. Lett. **10**, 321-323 (1963). <https://doi.org/10.1103/PhysRevLett.10.321>
 - J. S. Pedersen, _Analysis of small-angle scattering data from colloids and polymer solutions: modeling and least-squares fitting_,
   Adv. Colloid Interface Sci. **70**, 171-210 (1997). <https://doi.org/10.1016/S0001-8686(97)00312-6>
+- J. B. Hayter and J. Penfold, Molecular Physics **42**, 109-118 (1981).
+- J. P. Hansen and J. B. Hayter, Molecular Physics **46**, 651-656 (1982).
+- SasView `hayter_msa` charged-sphere RMSA model documentation:
+  <https://www.sasview.org/docs/user/models/hayter_msa.html>
 
 ## Poly LMA Hard-Sphere
 

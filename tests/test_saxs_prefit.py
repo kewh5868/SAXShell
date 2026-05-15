@@ -59,6 +59,9 @@ POLY_LMA_HS_MIX_TEMPLATE = "template_pydream_poly_lma_hs_mix_approx"
 SCALED_SOLVENT_MONOSQ_TEMPLATE = (
     "template_pydream_monosq_normalized_scaled_solvent"
 )
+MODEL_SCALED_SOLVENT_MONOSQ_TEMPLATE = (
+    "template_pydream_monosq_normalized_scaled_solvent_model_scale"
+)
 
 
 def _write_component_file(path, q_values, intensities):
@@ -1655,6 +1658,88 @@ def test_scaled_solvent_monosq_template_scales_solvent_with_global_scale():
     )
 
 
+def test_model_scaled_solvent_monosq_template_transforms_model_curve():
+    template_module = load_template_module(
+        MODEL_SCALED_SOLVENT_MONOSQ_TEMPLATE
+    )
+    q_values = np.linspace(0.05, 0.3, 8)
+    component = np.linspace(10.0, 17.0, 8)
+    solvent = np.linspace(1.5, 2.2, 8)
+
+    raw_model = template_module.raw_monosq_scaled_solvent_profile(
+        q_values,
+        solvent,
+        [component],
+        [0.6],
+        solv_w=0.5,
+        eff_r=9.0,
+        vol_frac=0.0,
+    )
+    model = template_module.lmfit_model_profile(
+        q_values,
+        solvent,
+        [component],
+        w0=0.6,
+        solv_w=0.5,
+        offset=0.05,
+        eff_r=9.0,
+        vol_frac=0.0,
+        scale=2e-3,
+    )
+
+    assert np.allclose(raw_model, (0.6 * component) + (0.5 * solvent))
+    assert np.allclose(model, (2e-3 * raw_model) + 0.05)
+
+
+def test_model_scaled_solvent_monosq_likelihood_uses_unmodified_experiment():
+    template_module = load_template_module(
+        MODEL_SCALED_SOLVENT_MONOSQ_TEMPLATE
+    )
+    q_values = np.linspace(0.05, 0.3, 8)
+    component = np.linspace(10.0, 17.0, 8)
+    solvent = np.linspace(1.5, 2.2, 8)
+    params = np.asarray([0.6, 0.5, 0.05, 9.0, 0.0, 2e-3], dtype=float)
+    expected_model = template_module.lmfit_model_profile(
+        q_values,
+        solvent,
+        [component],
+        w0=0.6,
+        solv_w=0.5,
+        offset=0.05,
+        eff_r=9.0,
+        vol_frac=0.0,
+        scale=2e-3,
+    )
+    raw_model = template_module.raw_monosq_scaled_solvent_profile(
+        q_values,
+        solvent,
+        [component],
+        [0.6],
+        solv_w=0.5,
+        eff_r=9.0,
+        vol_frac=0.0,
+    )
+
+    template_module.q_values = q_values
+    template_module.theoretical_intensities = [component]
+    template_module.solvent_intensities = solvent
+    template_module.experimental_intensities = expected_model
+    matching_log_likelihood = (
+        template_module.log_likelihood_monosq_scaled_solvent_model_scale(
+            params
+        )
+    )
+
+    template_module.experimental_intensities = raw_model
+    raw_model_log_likelihood = (
+        template_module.log_likelihood_monosq_scaled_solvent_model_scale(
+            params
+        )
+    )
+
+    assert matching_log_likelihood > raw_model_log_likelihood
+
+
 def test_scaled_solvent_monosq_prefit_evaluates_scaled_solvent_contribution(
     tmp_path,
 ):
@@ -1923,6 +2008,55 @@ def test_scaled_solvent_monosq_prefit_exposes_physical_vol_frac_target(
     manager = SAXSProjectManager()
     settings = manager.load_project(project_dir)
     settings.selected_model_template = SCALED_SOLVENT_MONOSQ_TEMPLATE
+    manager.save_project(settings)
+    workflow = SAXSPrefitWorkflow(project_dir)
+
+    assert workflow.supports_volume_fraction_estimator()
+    assert workflow.volume_fraction_estimator_target() == (
+        "vol_frac",
+        "solute",
+    )
+    assert workflow.solution_scattering_volume_fraction_target() == (
+        "vol_frac",
+        "solute",
+        "physical",
+    )
+    assert workflow.solvent_weight_estimator_target() == "solv_w"
+    assert workflow.solvent_contribution_is_scaled_by_global_scale()
+
+
+def test_model_scaled_solvent_monosq_prefit_metadata_targets_model_scale(
+    tmp_path,
+):
+    spec = load_template_spec(MODEL_SCALED_SOLVENT_MONOSQ_TEMPLATE)
+
+    assert spec.display_name == (
+        "pyDREAM MonoSQ Normalized "
+        "(Scaled Solvent Weight, Model Scale/Offset)"
+    )
+    assert (
+        spec.solution_scattering_support.volume_fraction_parameter
+        == "vol_frac"
+    )
+    assert spec.solution_scattering_support.volume_fraction_kind == "solute"
+    assert (
+        spec.solution_scattering_support.volume_fraction_source == "physical"
+    )
+    assert (
+        spec.solution_scattering_support.solvent_contribution_scale_mode
+        == "global_scale"
+    )
+    assert spec.prefit_support.auto_apply_autoscale_on_load
+    assert spec.prefit_support.autoscale_bounds_mode == "adaptive"
+    scale_entry = next(
+        parameter for parameter in spec.parameters if parameter.name == "scale"
+    )
+    assert scale_entry.vary is True
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.selected_model_template = MODEL_SCALED_SOLVENT_MONOSQ_TEMPLATE
     manager.save_project(settings)
     workflow = SAXSPrefitWorkflow(project_dir)
 
