@@ -4,10 +4,19 @@ from pathlib import Path
 import numpy as np
 import pytest
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
+import saxshell.mdtrajectory.ui.batch_queue_window as md_batch_queue_module
 from saxshell.mdtrajectory.frame.cp2k_ener import CP2KEnergyData
 from saxshell.mdtrajectory.frame.manager import FrameSelectionPreview
+from saxshell.mdtrajectory.ui.batch_queue_window import (
+    DEFAULT_TIME_CUTOFF_FS,
+    MDTrajectoryBatchJob,
+    MDTrajectoryBatchQueueWindow,
+    MDTrajectoryBatchResult,
+    MDTrajectoryBatchWorker,
+)
 from saxshell.mdtrajectory.ui.cutoff_panel import CutoffPanel
 from saxshell.mdtrajectory.ui.export_panel import ExportPanel
 from saxshell.mdtrajectory.ui.main_window import (
@@ -24,6 +33,83 @@ def qapp():
     if app is None:
         app = QApplication([])
     yield app
+
+
+def _write_batch_xyz(path: Path) -> None:
+    path.write_text(
+        "1\n"
+        "i = 0, time = 0.0, E = -1.0\n"
+        "Pb 0.0 0.0 0.0\n"
+        "1\n"
+        "i = 1, time = 500.0, E = -1.0\n"
+        "Pb 0.1 0.0 0.0\n"
+        "1\n"
+        "i = 2, time = 1500.0, E = -1.0\n"
+        "Pb 0.2 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+
+def _write_batch_restart_overlap_xyz(path: Path) -> None:
+    path.write_text(
+        "1\n"
+        "i = 0, time = 0.0, E = -1.0\n"
+        "Pb 0.0 0.0 0.0\n"
+        "1\n"
+        "i = 1, time = 500.0, E = -1.0\n"
+        "Pb 0.1 0.0 0.0\n"
+        "1\n"
+        "i = 2, time = 1500.0, E = -1.0\n"
+        "Pb 0.2 0.0 0.0\n"
+        "1\n"
+        "i = 1, time = 500.0, E = -1.0\n"
+        "Pb 9.1 0.0 0.0\n"
+        "1\n"
+        "i = 2, time = 1500.0, E = -1.0\n"
+        "Pb 9.2 0.0 0.0\n"
+        "1\n"
+        "i = 3, time = 2000.0, E = -1.0\n"
+        "Pb 0.3 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+
+def _write_batch_energy(path: Path) -> None:
+    path.write_text(
+        "# step time kinetic temperature potential\n"
+        "1 0.0 1.0 300.0 -10.0\n"
+        "2 500.0 1.0 301.0 -10.0\n"
+        "3 1500.0 1.0 300.5 -10.0\n",
+        encoding="utf-8",
+    )
+
+
+def _create_mdtrajectory_batch_project(
+    tmp_path: Path,
+    name: str,
+) -> tuple[Path, Path, Path]:
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / name
+    settings = manager.create_project(project_dir)
+    trajectory_file = project_dir / "traj.xyz"
+    energy_file = project_dir / "traj.ener"
+    _write_batch_xyz(trajectory_file)
+    _write_batch_energy(energy_file)
+    settings.trajectory_file = str(trajectory_file)
+    settings.energy_file = str(energy_file)
+    manager.save_project(settings)
+    return project_dir, trajectory_file, energy_file
+
+
+def _create_mdtrajectory_overlap_batch_project(
+    tmp_path: Path,
+    name: str,
+) -> tuple[Path, Path, Path]:
+    project_dir, trajectory_file, energy_file = (
+        _create_mdtrajectory_batch_project(tmp_path, name)
+    )
+    _write_batch_restart_overlap_xyz(trajectory_file)
+    return project_dir, trajectory_file, energy_file
 
 
 def test_export_panel_suggest_output_dir_keeps_manual_override(
@@ -63,6 +149,17 @@ def test_export_panel_post_cutoff_stride_controls_follow_cutoff_toggle(qapp):
 
     assert panel.use_post_cutoff_stride()
     assert panel.get_post_cutoff_stride() == 3
+
+
+def test_export_panel_restart_duplicate_option_defaults_off(qapp):
+    del qapp
+    panel = ExportPanel()
+
+    assert not panel.include_restart_duplicates()
+
+    panel.include_restart_duplicates_box.setChecked(True)
+
+    assert panel.include_restart_duplicates()
 
 
 def test_export_panel_progress_methods_update_ui(qapp):
@@ -119,6 +216,7 @@ def test_cutoff_panel_load_energy_draws_target_temperature_line(
     assert horizontal_lines
     assert panel.temp_target_spin.toolTip()
     assert panel.cutoff_spin.toolTip()
+    assert panel.window_spin.value() == 2
 
 
 def test_cutoff_panel_uses_matplotlib_navigation_toolbar(
@@ -434,4 +532,384 @@ def test_mdtrajectory_export_registers_frames_dir_with_project(
     assert "Registered the exported frames folder with project" in (
         window.export_panel.log_box.toPlainText()
     )
+    window.close()
+
+
+def test_mdtrajectory_batch_queue_prefills_current_project_defaults(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, trajectory_file, energy_file = (
+        _create_mdtrajectory_batch_project(tmp_path, "project_a")
+    )
+
+    window = MDTrajectoryBatchQueueWindow(initial_project_dir=project_dir)
+
+    assert window.queue_list.count() == 1
+    widget = next(iter(window._widgets_by_id.values()))
+    assert widget.project_dir_edit.text() == str(project_dir.resolve())
+    assert widget.trajectory_file_edit.text() == str(trajectory_file.resolve())
+    assert widget.energy_file_edit.text() == str(energy_file.resolve())
+    assert widget.output_dir_edit.text() == ""
+    assert widget.cutoff_spin.value() == pytest.approx(DEFAULT_TIME_CUTOFF_FS)
+    assert not widget.include_restart_duplicates_box.isChecked()
+    window.close()
+
+
+def test_mdtrajectory_batch_queue_exposes_and_uses_editable_output_folder(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _trajectory_file, _energy_file = (
+        _create_mdtrajectory_batch_project(tmp_path, "project_a")
+    )
+    custom_output_dir = tmp_path / "custom_splitxyz"
+    window = MDTrajectoryBatchQueueWindow(initial_project_dir=project_dir)
+    widget = next(iter(window._widgets_by_id.values()))
+
+    widget.preview_selection()
+
+    assert widget.output_dir_edit.text().endswith("splitxyz_f2_t1500fs")
+
+    widget.output_dir_edit.setText(str(custom_output_dir))
+    jobs = [job for _item_id, job in window.queue_jobs_in_order()]
+
+    assert jobs[0].output_dir == custom_output_dir.resolve()
+    window.close()
+
+
+def test_mdtrajectory_batch_queue_exposes_restart_duplicate_option(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _trajectory_file, _energy_file = (
+        _create_mdtrajectory_batch_project(tmp_path, "project_a")
+    )
+    window = MDTrajectoryBatchQueueWindow(initial_project_dir=project_dir)
+    widget = next(iter(window._widgets_by_id.values()))
+
+    widget.include_restart_duplicates_box.setChecked(True)
+    jobs = [job for _item_id, job in window.queue_jobs_in_order()]
+
+    assert jobs[0].include_restart_duplicates
+    window.close()
+
+
+def test_mdtrajectory_batch_queue_adds_multiple_selected_projects(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_a, trajectory_a, energy_a = _create_mdtrajectory_batch_project(
+        tmp_path,
+        "project_a",
+    )
+    project_b, trajectory_b, energy_b = _create_mdtrajectory_batch_project(
+        tmp_path,
+        "project_b",
+    )
+    monkeypatch.setattr(
+        md_batch_queue_module,
+        "_choose_existing_directories",
+        lambda *_args, **_kwargs: (project_a, project_b),
+    )
+    window = MDTrajectoryBatchQueueWindow()
+
+    window._choose_projects_to_add()
+
+    assert window.queue_list.count() == 2
+    jobs = [job for _item_id, job in window.queue_jobs_in_order()]
+    assert [job.project_dir for job in jobs] == [
+        project_a.resolve(),
+        project_b.resolve(),
+    ]
+    assert [job.trajectory_file for job in jobs] == [
+        trajectory_a.resolve(),
+        trajectory_b.resolve(),
+    ]
+    assert [job.energy_file for job in jobs] == [
+        energy_a.resolve(),
+        energy_b.resolve(),
+    ]
+    assert [job.cutoff_fs for job in jobs] == [
+        DEFAULT_TIME_CUTOFF_FS,
+        DEFAULT_TIME_CUTOFF_FS,
+    ]
+    window.close()
+
+
+def test_mdtrajectory_batch_worker_exports_and_registers_each_project(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    manager = SAXSProjectManager()
+    project_a, trajectory_a, energy_a = _create_mdtrajectory_batch_project(
+        tmp_path,
+        "project_a",
+    )
+    project_b, trajectory_b, energy_b = _create_mdtrajectory_batch_project(
+        tmp_path,
+        "project_b",
+    )
+    worker = MDTrajectoryBatchWorker(
+        [
+            (
+                "item-a",
+                MDTrajectoryBatchJob(
+                    project_dir=project_a,
+                    trajectory_file=trajectory_a,
+                    topology_file=None,
+                    energy_file=energy_a,
+                    cutoff_fs=DEFAULT_TIME_CUTOFF_FS,
+                ),
+            ),
+            (
+                "item-b",
+                MDTrajectoryBatchJob(
+                    project_dir=project_b,
+                    trajectory_file=trajectory_b,
+                    topology_file=None,
+                    energy_file=energy_b,
+                    cutoff_fs=DEFAULT_TIME_CUTOFF_FS,
+                ),
+            ),
+        ]
+    )
+    finished: list[list[object]] = []
+    failures: list[tuple[str, str]] = []
+    worker.finished.connect(finished.append)
+    worker.failed.connect(
+        lambda item_id, message: failures.append((item_id, message))
+    )
+
+    worker.run()
+
+    assert failures == []
+    assert len(finished) == 1
+    results = finished[0]
+    assert len(results) == 2
+    for result, project_dir, trajectory_file, energy_file in zip(
+        results,
+        (project_a, project_b),
+        (trajectory_a, trajectory_b),
+        (energy_a, energy_b),
+        strict=True,
+    ):
+        saved_settings = manager.load_project(project_dir)
+        assert saved_settings.resolved_frames_dir == (
+            result.output_dir.resolve()
+        )
+        assert saved_settings.resolved_trajectory_file == (
+            trajectory_file.resolve()
+        )
+        assert saved_settings.resolved_energy_file == energy_file.resolve()
+        assert saved_settings.frames_dir_snapshot is not None
+        assert result.written_count == 1
+        assert result.selected_frames == 1
+        assert result.output_dir.name == "splitxyz_f2_t1500fs"
+        assert result.metadata_file is not None
+        assert result.metadata_file.is_file()
+        assert (result.output_dir / "frame_0002.xyz").is_file()
+
+
+def test_mdtrajectory_batch_worker_honors_custom_output_folder(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    manager = SAXSProjectManager()
+    project_dir, trajectory_file, energy_file = (
+        _create_mdtrajectory_batch_project(tmp_path, "project_custom_output")
+    )
+    custom_output_dir = tmp_path / "queued_xyz_output"
+    worker = MDTrajectoryBatchWorker(
+        [
+            (
+                "item-custom",
+                MDTrajectoryBatchJob(
+                    project_dir=project_dir,
+                    trajectory_file=trajectory_file,
+                    topology_file=None,
+                    energy_file=energy_file,
+                    output_dir=custom_output_dir,
+                    cutoff_fs=DEFAULT_TIME_CUTOFF_FS,
+                ),
+            )
+        ]
+    )
+    finished: list[list[object]] = []
+    failures: list[tuple[str, str]] = []
+    worker.finished.connect(finished.append)
+    worker.failed.connect(
+        lambda item_id, message: failures.append((item_id, message))
+    )
+
+    worker.run()
+
+    assert failures == []
+    result = finished[0][0]
+    assert result.output_dir == custom_output_dir
+    assert (custom_output_dir / "frame_0002.xyz").is_file()
+    saved_settings = manager.load_project(project_dir)
+    assert saved_settings.resolved_frames_dir == custom_output_dir.resolve()
+
+
+def test_mdtrajectory_batch_worker_uses_source_indices_without_validation_pass(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    manager = SAXSProjectManager()
+    project_dir, trajectory_file, energy_file = (
+        _create_mdtrajectory_overlap_batch_project(tmp_path, "project_overlap")
+    )
+
+    def fail_validation(*_args, **_kwargs):
+        raise AssertionError("Batch queue must not run export assertions")
+
+    monkeypatch.setattr(
+        md_batch_queue_module.MDTrajectoryWorkflow,
+        "validate_export",
+        fail_validation,
+    )
+    worker = MDTrajectoryBatchWorker(
+        [
+            (
+                "item-overlap",
+                MDTrajectoryBatchJob(
+                    project_dir=project_dir,
+                    trajectory_file=trajectory_file,
+                    topology_file=None,
+                    energy_file=energy_file,
+                    cutoff_fs=DEFAULT_TIME_CUTOFF_FS,
+                ),
+            )
+        ]
+    )
+    finished: list[list[object]] = []
+    failures: list[tuple[str, str]] = []
+    log_messages: list[str] = []
+    worker.finished.connect(finished.append)
+    worker.failed.connect(
+        lambda item_id, message: failures.append((item_id, message))
+    )
+    worker.log.connect(log_messages.append)
+
+    worker.run()
+
+    assert failures == []
+    assert len(finished) == 1
+    result = finished[0][0]
+    assert result.written_count == 2
+    assert result.selected_frames == 2
+    assert result.output_dir.name == "splitxyz_f2_t1500fs"
+    assert (result.output_dir / "frame_0002.xyz").is_file()
+    assert (result.output_dir / "frame_0003.xyz").is_file()
+    assert not (result.output_dir / "frame_0004.xyz").exists()
+    assert "i = 2" in (result.output_dir / "frame_0002.xyz").read_text()
+    assert "i = 3" in (result.output_dir / "frame_0003.xyz").read_text()
+    assert "9.2" in (result.output_dir / "frame_0002.xyz").read_text()
+    assert any(
+        "Skipped 2 duplicate source frame(s)" in message
+        for message in log_messages
+    )
+    saved_settings = manager.load_project(project_dir)
+    assert saved_settings.resolved_frames_dir == result.output_dir.resolve()
+
+
+def test_mdtrajectory_batch_worker_can_include_restart_duplicates(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, trajectory_file, energy_file = (
+        _create_mdtrajectory_overlap_batch_project(
+            tmp_path,
+            "project_overlap_include",
+        )
+    )
+    worker = MDTrajectoryBatchWorker(
+        [
+            (
+                "item-overlap",
+                MDTrajectoryBatchJob(
+                    project_dir=project_dir,
+                    trajectory_file=trajectory_file,
+                    topology_file=None,
+                    energy_file=energy_file,
+                    cutoff_fs=DEFAULT_TIME_CUTOFF_FS,
+                    include_restart_duplicates=True,
+                ),
+            )
+        ]
+    )
+    finished: list[list[object]] = []
+    failures: list[tuple[str, str]] = []
+    log_messages: list[str] = []
+    worker.finished.connect(finished.append)
+    worker.failed.connect(
+        lambda item_id, message: failures.append((item_id, message))
+    )
+    worker.log.connect(log_messages.append)
+
+    worker.run()
+
+    assert failures == []
+    result = finished[0][0]
+    assert result.include_restart_duplicates
+    assert result.written_count == 3
+    assert result.selected_frames == 3
+    assert (result.output_dir / "frame_0002_duplicate0001.xyz").is_file()
+    assert (result.output_dir / "frame_0002.xyz").is_file()
+    assert (result.output_dir / "frame_0003.xyz").is_file()
+    assert (
+        "0.2"
+        in (result.output_dir / "frame_0002_duplicate0001.xyz").read_text()
+    )
+    assert "9.2" in (result.output_dir / "frame_0002.xyz").read_text()
+    assert any(
+        "Included 2 duplicate source frame(s)" in message
+        for message in log_messages
+    )
+
+
+def test_mdtrajectory_batch_queue_emits_registered_frames_folder(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _trajectory_file, _energy_file = (
+        _create_mdtrajectory_batch_project(tmp_path, "project_a")
+    )
+    output_dir = tmp_path / "splitxyz_f2_t1500fs"
+    output_dir.mkdir()
+    window = MDTrajectoryBatchQueueWindow(initial_project_dir=project_dir)
+    updates: list[dict[str, object]] = []
+    window.project_paths_registered.connect(updates.append)
+    item_id = str(window.queue_list.item(0).data(Qt.ItemDataRole.UserRole))
+
+    window._on_item_finished(
+        item_id,
+        MDTrajectoryBatchResult(
+            project_dir=project_dir.resolve(),
+            output_dir=output_dir.resolve(),
+            written_count=1,
+            selected_frames=1,
+            cutoff_fs=DEFAULT_TIME_CUTOFF_FS,
+            metadata_file=None,
+        ),
+    )
+
+    assert updates == [
+        {
+            "project_dir": project_dir.resolve(),
+            "frames_dir": output_dir.resolve(),
+        }
+    ]
     window.close()

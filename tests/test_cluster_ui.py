@@ -1,7 +1,9 @@
 import json
 import os
+from pathlib import Path
 
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QComboBox, QTableWidgetItem
 
 import saxshell.cluster.cli as cluster_cli_module
@@ -12,6 +14,13 @@ from saxshell.cluster import (
     DEFAULT_SAVE_STATE_FREQUENCY,
     example_atom_type_definitions,
     example_pair_cutoff_definitions,
+)
+from saxshell.cluster.ui.batch_queue_window import (
+    ClusterBatchItem,
+    ClusterBatchJob,
+    ClusterBatchQueueWindow,
+    ClusterBatchResult,
+    ClusterBatchWorker,
 )
 from saxshell.cluster.ui.definitions_panel import ClusterDefinitionsPanel
 from saxshell.cluster.ui.export_panel import ClusterExportPanel
@@ -24,6 +33,7 @@ from saxshell.cluster.ui.main_window import (
     estimate_selection,
     suggest_cluster_output_dir,
 )
+from saxshell.cluster.ui.run_file_window import ClusterRunFileWindow
 from saxshell.saxs.project_manager import SAXSProjectManager
 
 
@@ -246,7 +256,7 @@ def test_cluster_main_window_preview_includes_output_details(
     assert "Search mode: KDTree" in text
     assert (
         "Save-state frequency: every "
-        f"{DEFAULT_SAVE_STATE_FREQUENCY} frames" in text
+        f"{DEFAULT_SAVE_STATE_FREQUENCY} frame(s)" in text
     )
     assert "Stoichiometry bins: solute only" in text
     assert "Frames selected: 10" in text
@@ -337,6 +347,170 @@ def test_cluster_main_window_can_toggle_between_project_xyz_and_pdb_folders(
 
     assert window.trajectory_panel.selected_project_source_kind() == "pdb"
     assert window.trajectory_panel.get_frames_dir() == pdb_frames_dir
+    window.close()
+
+
+def test_cluster_batch_queue_prefills_project_pdb_frames_and_default_preset(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "saxs_project"
+    settings = manager.create_project(project_dir)
+    xyz_frames_dir = tmp_path / "splitxyz0001"
+    xyz_frames_dir.mkdir()
+    (xyz_frames_dir / "frame_0000.xyz").write_text(
+        "2\nframe_0000\nPb 0.0 0.0 0.0\nI 1.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    pdb_frames_dir = tmp_path / "xyz2pdb_splitxyz0001"
+    pdb_frames_dir.mkdir()
+    (pdb_frames_dir / "frame_0000.pdb").write_text(
+        "MODEL        1\n"
+        "ATOM      1 PB1 SOL X   1       0.000   0.000   0.000"
+        "  1.00  0.00          PB\n"
+        "ATOM      2 I1  SOL X   1       1.000   0.000   0.000"
+        "  1.00  0.00           I\n"
+        "ENDMDL\n",
+        encoding="utf-8",
+    )
+    settings.frames_dir = str(xyz_frames_dir)
+    settings.pdb_frames_dir = str(pdb_frames_dir)
+    manager.save_project(settings)
+
+    window = ClusterBatchQueueWindow(initial_project_dir=project_dir)
+
+    assert window.queue_list.count() == 1
+    list_item = window.queue_list.item(0)
+    item_id = str(list_item.data(Qt.ItemDataRole.UserRole))
+    widget = window._widgets_by_id[item_id]
+    assert widget.frames_dir_edit.text() == str(pdb_frames_dir.resolve())
+    assert widget.item().frames_source_kind == "pdb"
+    assert widget.definitions_panel.atom_type_definitions() == {
+        "node": [("Pb", None)],
+        "linker": [("I", None)],
+        "shell": [("O", None)],
+    }
+    assert "Mode: PDB frames" in widget.summary_box.toPlainText()
+    assert Path(widget.output_dir_edit.text()).name == (
+        "clusters_xyz2pdb_splitxyz0001"
+    )
+    window.close()
+
+
+def test_cluster_batch_worker_exports_and_registers_clusters_folder(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "saxs_project"
+    settings = manager.create_project(project_dir)
+    pdb_frames_dir = tmp_path / "xyz2pdb_splitxyz0001"
+    pdb_frames_dir.mkdir()
+    (pdb_frames_dir / "frame_0000.pdb").write_text(
+        "MODEL        1\n"
+        "ATOM      1 PB1 SOL X   1       0.000   0.000   0.000"
+        "  1.00  0.00          PB\n"
+        "ATOM      2 I1  SOL X   1       1.000   0.000   0.000"
+        "  1.00  0.00           I\n"
+        "ENDMDL\n",
+        encoding="utf-8",
+    )
+    settings.pdb_frames_dir = str(pdb_frames_dir)
+    manager.save_project(settings)
+    output_dir = tmp_path / "clusters_xyz2pdb_splitxyz0001"
+    job = ClusterBatchJob(
+        project_dir=project_dir,
+        frames_dir=pdb_frames_dir,
+        frames_source_kind="pdb",
+        config=ClusterJobConfig(
+            frames_dir=pdb_frames_dir,
+            atom_type_definitions=example_atom_type_definitions(),
+            pair_cutoff_definitions=example_pair_cutoff_definitions(),
+            box_dimensions=None,
+            use_pbc=False,
+            search_mode="kdtree",
+            save_state_frequency=250,
+            default_cutoff=None,
+            shell_levels=(),
+            include_shell_levels=(0,),
+            shared_shells=False,
+            smart_solvation_shells=True,
+            include_shell_atoms_in_stoichiometry=False,
+            output_dir=output_dir,
+        ),
+    )
+    worker = ClusterBatchWorker([("job-1", job)])
+    failures = []
+    finished_items = []
+    finished_batches = []
+    worker.failed.connect(
+        lambda item_id, message: failures.append((item_id, message))
+    )
+    worker.item_finished.connect(
+        lambda item_id, result: finished_items.append((item_id, result))
+    )
+    worker.finished.connect(finished_batches.append)
+
+    worker.run()
+
+    assert failures == []
+    assert len(finished_items) == 1
+    item_id, result = finished_items[0]
+    assert item_id == "job-1"
+    assert result.output_dir == output_dir.resolve()
+    assert result.written_count >= 1
+    assert output_dir.is_dir()
+    saved_settings = manager.load_project(project_dir)
+    assert saved_settings.resolved_pdb_frames_dir == pdb_frames_dir.resolve()
+    assert saved_settings.resolved_clusters_dir == output_dir.resolve()
+    assert saved_settings.clusters_dir_snapshot is not None
+    assert finished_batches == [[result]]
+
+
+def test_cluster_batch_queue_emits_registered_clusters_folder(qapp, tmp_path):
+    del qapp
+    project_dir = tmp_path / "saxs_project"
+    SAXSProjectManager().create_project(project_dir)
+    frames_dir = tmp_path / "xyz2pdb_splitxyz0001"
+    frames_dir.mkdir()
+    output_dir = tmp_path / "clusters_xyz2pdb_splitxyz0001"
+    output_dir.mkdir()
+
+    window = ClusterBatchQueueWindow()
+    widget = window.add_queue_item(
+        ClusterBatchItem(
+            item_id="job-1",
+            project_dir=project_dir,
+            frames_dir=frames_dir,
+            output_dir=output_dir,
+        )
+    )
+    updates = []
+    window.project_paths_registered.connect(updates.append)
+
+    window._on_item_finished(
+        widget.item_id,
+        ClusterBatchResult(
+            project_dir=project_dir.resolve(),
+            frames_dir=frames_dir.resolve(),
+            frames_source_kind="pdb",
+            output_dir=output_dir.resolve(),
+            analyzed_frames=1,
+            total_clusters=1,
+            written_count=1,
+        ),
+    )
+
+    assert updates == [
+        {
+            "project_dir": project_dir.resolve(),
+            "clusters_dir": output_dir.resolve(),
+        }
+    ]
+    assert widget.status_label.text() == "Complete"
     window.close()
 
 
@@ -603,3 +777,39 @@ def test_clusters_launcher_forwards_to_cli_module(monkeypatch):
 
     assert exit_code == 9
     assert captured["argv"] == ["ui", "traj.pdb"]
+
+
+def test_cluster_run_file_window_builds_project_relative_config(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir = tmp_path / "project"
+    SAXSProjectManager().create_project(project_dir)
+    frames_dir = project_dir / "frames" / "splitxyz0001"
+    frames_dir.mkdir(parents=True)
+    (frames_dir / "frame_0000.xyz").write_text(
+        "2\nframe_0000\nPb 0.0 0.0 0.0\nI 1.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    window = ClusterRunFileWindow(
+        initial_project_dir=project_dir,
+        initial_frames_dir=frames_dir,
+    )
+    output_dir = project_dir / "clusters_splitxyz0001"
+    window.output_dir_edit.setText(str(output_dir))
+    window.definitions_panel.set_use_pbc(True)
+    window.definitions_panel.set_search_mode("vectorized")
+    window.definitions_panel.set_save_state_frequency(250)
+
+    config = window._current_config(project_dir)
+
+    assert config.frames_dir == "frames/splitxyz0001"
+    assert config.output_dir == "clusters_splitxyz0001"
+    assert config.use_pbc is True
+    assert config.search_mode == "vectorized"
+    assert config.save_state_frequency == 250
+    assert config.atom_type_definitions["node"] == [("Pb", None)]
+    assert config.pair_cutoff_definitions[("Pb", "I")] == {0: 3.36}
+    window.close()

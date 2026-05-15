@@ -6,6 +6,11 @@ from pathlib import Path
 
 from saxshell.version import __version__
 
+from .run_config import (
+    default_xyz2pdb_run_file_path,
+    load_xyz2pdb_run_config,
+    run_xyz2pdb_run_config,
+)
 from .workflow import (
     XYZToPDBWorkflow,
     create_reference_molecule,
@@ -30,6 +35,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers = parser.add_subparsers(dest="command")
+
+    setup_ui_parser = subparsers.add_parser(
+        "setup-ui",
+        help="Launch the project-backed run-file setup UI.",
+    )
+    setup_ui_parser.add_argument(
+        "project_dir",
+        nargs="?",
+        type=Path,
+        help="Optional SAXSShell project folder.",
+    )
+    setup_ui_parser.add_argument(
+        "--input-path",
+        type=Path,
+        default=None,
+        help="Optional XYZ file or folder to prefill.",
+    )
+    setup_ui_parser.set_defaults(handler=_handle_setup_ui)
 
     ui_parser = subparsers.add_parser("ui", help="Launch the Qt UI.")
     ui_parser.add_argument(
@@ -82,6 +105,26 @@ def build_parser() -> argparse.ArgumentParser:
         include_output_dir=True,
     )
     export_parser.set_defaults(handler=_handle_export)
+
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Run XYZ -> PDB conversion from a project run file.",
+    )
+    run_parser.add_argument(
+        "project_dir",
+        type=Path,
+        help="SAXSShell project folder containing the run file.",
+    )
+    run_parser.add_argument(
+        "--run-file",
+        type=Path,
+        default=None,
+        help=(
+            "Run file path. Defaults to xyz2pdb_cli_run.json in the project "
+            "folder."
+        ),
+    )
+    run_parser.set_defaults(handler=_handle_run)
 
     references_parser = subparsers.add_parser(
         "references",
@@ -204,6 +247,28 @@ def _handle_ui(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_setup_ui(args: argparse.Namespace) -> int:
+    from PySide6.QtWidgets import QApplication
+
+    from saxshell.saxs.ui.branding import prepare_saxshell_application_identity
+
+    from .ui.run_file_window import launch_xyz2pdb_run_file_ui
+
+    app = QApplication.instance()
+    created_app = app is None
+    if app is None:
+        prepare_saxshell_application_identity()
+        app = QApplication(sys.argv)
+    launch_xyz2pdb_run_file_ui(
+        initial_project_dir=getattr(args, "project_dir", None),
+        initial_input_path=getattr(args, "input_path", None),
+    )
+    if created_app:
+        assert app is not None
+        return int(app.exec())
+    return 0
+
+
 def _build_workflow(args: argparse.Namespace) -> XYZToPDBWorkflow:
     return XYZToPDBWorkflow(
         input_path=args.input_path,
@@ -311,6 +376,28 @@ def _handle_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_run(args: argparse.Namespace) -> int:
+    project_dir = Path(args.project_dir).expanduser().resolve()
+    run_file = _resolve_run_file(project_dir, args.run_file)
+    config = load_xyz2pdb_run_config(run_file)
+    summary = run_xyz2pdb_run_config(
+        project_dir,
+        config,
+        run_file_path=run_file,
+        log_callback=print,
+        progress_callback=_print_progress,
+    )
+    print("")
+    print("XYZ to PDB project run complete.")
+    print(f"Output directory: {summary.output_dir}")
+    print(f"Files written: {summary.written_count}")
+    if summary.written_files:
+        print(f"First file: {summary.written_files[0]}")
+        print(f"Last file: {summary.written_files[-1]}")
+    print(f"Project file updated: {summary.project_file}")
+    return 0
+
+
 def _handle_reference_list(args: argparse.Namespace) -> int:
     library_dir = (
         default_reference_library_dir()
@@ -342,3 +429,13 @@ def _handle_reference_add(args: argparse.Namespace) -> int:
     print(f"Residue name: {result.residue_name}")
     print(f"Atom count: {result.atom_count}")
     return 0
+
+
+def _resolve_run_file(project_dir: Path, run_file: Path | None) -> Path:
+    if run_file is None:
+        return default_xyz2pdb_run_file_path(project_dir)
+    return Path(run_file).expanduser().resolve()
+
+
+def _print_progress(processed: int, total: int, message: str) -> None:
+    print(f"{processed}/{total} {message}")

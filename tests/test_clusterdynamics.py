@@ -13,11 +13,20 @@ import saxshell.clusterdynamics.cli as clusterdynamics_cli_module
 from saxshell import saxshell as saxshell_module
 from saxshell.clusterdynamics import (
     ClusterDynamicsWorkflow,
+    build_clusterdynamics_run_config,
+    default_clusterdynamics_run_file_path,
     load_cluster_dynamics_dataset,
+    load_clusterdynamics_run_config,
+    resolve_run_config_path,
+    run_clusterdynamics_run_config,
     save_cluster_dynamics_dataset,
+    save_clusterdynamics_run_config,
 )
 from saxshell.clusterdynamics.ui.main_window import ClusterDynamicsMainWindow
 from saxshell.clusterdynamics.ui.plot_panel import ClusterDynamicsPlotPanel
+from saxshell.clusterdynamics.ui.run_file_window import (
+    ClusterDynamicsRunFileWindow,
+)
 from saxshell.plotting import (
     igor_inline_to_mathtext,
     load_pickled_plot_figure,
@@ -359,6 +368,176 @@ def test_cluster_dynamics_dataset_round_trip(tmp_path):
     assert loaded.analysis_settings["frame_timestep_fs"] == 10.0
     assert loaded.analysis_settings["frames_per_colormap_timestep"] == 3
     assert loaded.result.energy_data is not None
+
+
+def test_cluster_dynamics_run_config_round_trips_project_relative_paths(
+    tmp_path,
+):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    frames_dir = project_dir / "frames" / "splitxyz0001"
+    frames_dir.mkdir(parents=True)
+    energy_file = project_dir / "traj.ener"
+    energy_file.write_text("0 0.0 1.0 300.0 -10.0\n", encoding="utf-8")
+    output_file = (
+        project_dir
+        / "exported_results"
+        / "data"
+        / "clusterdynamics"
+        / "splitxyz0001_cluster_dynamics.json"
+    )
+
+    config = build_clusterdynamics_run_config(
+        project_dir=project_dir,
+        frames_dir=frames_dir,
+        output_file=output_file,
+        energy_file=energy_file,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        shell_levels=(1,),
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=3,
+        search_mode="vectorized",
+    )
+    run_file = default_clusterdynamics_run_file_path(project_dir)
+    save_clusterdynamics_run_config(run_file, config)
+
+    loaded = load_clusterdynamics_run_config(run_file)
+
+    assert loaded.frames_dir == "frames/splitxyz0001"
+    assert loaded.energy_file == "traj.ener"
+    assert loaded.output_file == (
+        "exported_results/data/clusterdynamics/"
+        "splitxyz0001_cluster_dynamics.json"
+    )
+    assert loaded.shell_levels == (1,)
+    assert loaded.frame_timestep_fs == 10.0
+    assert loaded.frames_per_colormap_timestep == 3
+    assert loaded.search_mode == "vectorized"
+    assert (
+        resolve_run_config_path(loaded.frames_dir, project_dir=project_dir)
+        == frames_dir.resolve()
+    )
+
+
+def test_cluster_dynamics_project_run_saves_dataset_and_updates_project(
+    tmp_path,
+    capsys,
+):
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "project"
+    manager.create_project(project_dir)
+    frames_dir = project_dir / "frames" / "splitxyz0001"
+    frames_dir.mkdir(parents=True)
+    for index, content in enumerate(
+        (
+            _disconnected_xyz_lines(),
+            _connected_xyz_lines(),
+            _connected_xyz_lines(),
+            _disconnected_xyz_lines(),
+            _connected_xyz_lines(),
+            _disconnected_xyz_lines(),
+        )
+    ):
+        (frames_dir / f"frame_{index:04d}.xyz").write_text(
+            content,
+            encoding="utf-8",
+        )
+    energy_file = _write_energy_file(project_dir)
+    output_file = (
+        project_dir
+        / "exported_results"
+        / "data"
+        / "clusterdynamics"
+        / "splitxyz0001_cluster_dynamics.json"
+    )
+    config = build_clusterdynamics_run_config(
+        project_dir=project_dir,
+        frames_dir=frames_dir,
+        output_file=output_file,
+        energy_file=energy_file,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        shell_levels=(1,),
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=3,
+    )
+    run_file = default_clusterdynamics_run_file_path(project_dir)
+    save_clusterdynamics_run_config(run_file, config)
+
+    summary = run_clusterdynamics_run_config(
+        project_dir,
+        load_clusterdynamics_run_config(run_file),
+        run_file_path=run_file,
+    )
+    saved_settings = manager.load_project(project_dir)
+
+    assert summary.result.analyzed_frames == 6
+    assert summary.output_file == output_file.resolve()
+    assert output_file.is_file()
+    assert output_file.with_name(
+        "splitxyz0001_cluster_dynamics_lifetime.csv"
+    ).is_file()
+    assert saved_settings.resolved_frames_dir == frames_dir.resolve()
+    assert saved_settings.resolved_energy_file == energy_file.resolve()
+    assert saved_settings.frames_dir_snapshot is not None
+    assert saved_settings.energy_file_snapshot is not None
+
+    exit_code = clusterdynamics_cli_module.main(["run", str(project_dir)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Cluster dynamics CLI run complete" in captured.out
+    assert "Lifetime rows:" in captured.out
+    assert "Files written:" in captured.out
+
+
+def test_cluster_dynamics_run_file_window_builds_project_config(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir = tmp_path / "project"
+    SAXSProjectManager().create_project(project_dir)
+    frames_dir = project_dir / "frames" / "splitxyz0001"
+    frames_dir.mkdir(parents=True)
+    (frames_dir / "frame_0000.xyz").write_text(
+        "2\nframe_0000\nPb 0.0 0.0 0.0\nI 1.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    energy_file = project_dir / "traj.ener"
+    energy_file.write_text("0 0.0 1.0 300.0 -10.0\n", encoding="utf-8")
+
+    window = ClusterDynamicsRunFileWindow(
+        initial_project_dir=project_dir,
+        initial_frames_dir=frames_dir,
+        initial_energy_file=energy_file,
+    )
+    output_file = (
+        project_dir
+        / "exported_results"
+        / "data"
+        / "clusterdynamics"
+        / "splitxyz0001_cluster_dynamics.json"
+    )
+    window.output_file_edit.setText(str(output_file))
+    window.time_panel.set_frame_timestep_fs(10.0)
+    window.time_panel.set_frames_per_colormap_timestep(3)
+    window.definitions_panel.set_search_mode("vectorized")
+
+    config = window._current_config(project_dir)
+
+    assert config.frames_dir == "frames/splitxyz0001"
+    assert config.energy_file == "traj.ener"
+    assert config.output_file == (
+        "exported_results/data/clusterdynamics/"
+        "splitxyz0001_cluster_dynamics.json"
+    )
+    assert config.frame_timestep_fs == 10.0
+    assert config.frames_per_colormap_timestep == 3
+    assert config.search_mode == "vectorized"
+    assert "clusterdynamics run" in window.command_box.toPlainText()
+    window.close()
 
 
 def test_cluster_dynamics_main_window_updates_preview_for_xyz_frames(

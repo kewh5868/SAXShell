@@ -46,6 +46,11 @@ from saxshell.representativefinder import (
 from saxshell.representativefinder.cli import (
     main as representativefinder_cli_main,
 )
+from saxshell.representativefinder.ui.batch_queue_window import (
+    RepresentativeFinderBatchJob,
+    RepresentativeFinderBatchQueueWindow,
+    RepresentativeFinderBatchWorker,
+)
 from saxshell.representativefinder.ui.main_window import (
     RepresentativeStructureFinderMainWindow,
 )
@@ -391,10 +396,25 @@ def test_representativefinder_result_json_preserves_analysis_details(tmp_path):
     assert loaded.candidates[0].score_total is not None
 
 
-def test_representativefinder_single_atom_shortcuts_full_analysis(tmp_path):
+def test_representativefinder_single_atom_shortcuts_full_analysis(
+    tmp_path,
+    monkeypatch,
+):
     stoich_dir = _build_single_atom_test_folder(tmp_path)
     progress_events: list[tuple[int, int, str]] = []
     log_messages: list[str] = []
+
+    def fail_measurement(*_args, **_kwargs):
+        pytest.fail(
+            "Single-atom representative selection should not run full "
+            "bond/angle measurement."
+        )
+
+    monkeypatch.setattr(
+        "saxshell.representativefinder.workflow."
+        "BondAnalyzer.measure_structure_data",
+        fail_measurement,
+    )
 
     result = analyze_representative_structure_folder(
         stoich_dir,
@@ -423,6 +443,9 @@ def test_representativefinder_single_atom_shortcuts_full_analysis(tmp_path):
     assert not any(
         "Aggregating bond and angle distributions" in message
         for _processed, _total, message in progress_events
+    )
+    assert not any(
+        "Measuring " in message for _p, _t, message in progress_events
     )
     assert not any(
         "Scoring " in message for _p, _t, message in progress_events
@@ -1264,6 +1287,118 @@ def test_representativefinder_input_inspection_discovers_stoichiometry_subfolder
         pb_dir.name,
         sn_dir.name,
     ]
+
+
+def test_representativefinder_batch_queue_prefills_project_clusters_and_all_mode(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    monkeypatch.setenv(
+        "SAXSHELL_BONDANALYSIS_PRESETS_PATH",
+        str(tmp_path / "bondanalysis_presets.json"),
+    )
+    project_dir = tmp_path / "project"
+    root_dir, _pb_dir, _sn_dir = _build_multi_stoichiometry_root(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.create_project(project_dir)
+    settings.clusters_dir = str(root_dir.resolve())
+    manager.save_project(settings)
+
+    window = RepresentativeFinderBatchQueueWindow(
+        initial_project_dir=project_dir,
+    )
+
+    assert window.queue_list.count() == 1
+    widget = window.queue_list.itemWidget(window.queue_list.item(0))
+    assert widget.project_dir_edit.text() == str(project_dir.resolve())
+    assert widget.clusters_dir_edit.text() == str(root_dir.resolve())
+    assert "representativefinder_batch_cluster_root" in (
+        widget.output_dir_edit.text()
+    )
+    assert (
+        widget.analysis_mode_label.text() == "All Discovered Stoichiometries"
+    )
+    assert window.preset_combo.count() >= 1
+
+    window.close()
+
+
+def test_representativefinder_batch_worker_publishes_project_results_and_restores_ui(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    monkeypatch.setenv(
+        "SAXSHELL_BONDANALYSIS_PRESETS_PATH",
+        str(tmp_path / "bondanalysis_presets.json"),
+    )
+    project_dir = tmp_path / "project"
+    root_dir, _pb_dir, _sn_dir = _build_multi_stoichiometry_root(tmp_path)
+    manager = SAXSProjectManager()
+    project_settings = manager.create_project(project_dir)
+    project_settings.clusters_dir = str(root_dir.resolve())
+    manager.save_project(project_settings)
+    settings = RepresentativeFinderSettings(
+        bond_pairs=(
+            BondPairDefinition("Pb", "I", 3.2),
+            BondPairDefinition("Sn", "Br", 3.2),
+        ),
+        angle_triplets=(
+            AngleTripletDefinition("Pb", "I", "I", 3.2, 3.2),
+            AngleTripletDefinition("Sn", "Br", "Br", 3.2, 3.2),
+        ),
+        solvent_weight=0.0,
+        parallel_workers=1,
+    )
+    output_dir = project_dir / "representative_finder" / "batch_run"
+    config = build_representativefinder_run_config(
+        project_dir=project_dir,
+        input_dir=root_dir,
+        output_dir=output_dir,
+        analysis_mode="all",
+        settings=settings,
+        overwrite_existing=False,
+    )
+    job = RepresentativeFinderBatchJob(
+        project_dir=project_dir.resolve(),
+        clusters_dir=root_dir.resolve(),
+        output_dir=output_dir.resolve(),
+        config=config,
+    )
+    worker = RepresentativeFinderBatchWorker([("job-1", job)])
+    finished_results: list[object] = []
+    failed_items: list[tuple[str, str]] = []
+    changed_projects: list[str] = []
+    worker.finished.connect(finished_results.append)
+    worker.failed.connect(
+        lambda item_id, message: failed_items.append((item_id, message))
+    )
+    worker.project_results_changed.connect(changed_projects.append)
+
+    worker.run()
+
+    assert failed_items == []
+    assert changed_projects == [str(project_dir.resolve())]
+    assert len(finished_results) == 1
+    assert finished_results[0][0].completed_count == 2
+    state = manager.inspect_representative_structures(project_dir)
+    assert state.representative_count == 2
+
+    window = RepresentativeStructureFinderMainWindow(
+        initial_project_dir=project_dir,
+        initial_input_path=root_dir,
+    )
+    assert window.stoichiometry_table.rowCount() == 2
+    assert window.stoichiometry_table.item(0, 3).text() == "Complete"
+    assert window.stoichiometry_table.item(1, 3).text() == "Complete"
+    assert (
+        window.run_status_label.text()
+        == "Representative selection: restored from saved project analysis"
+    )
+    window.close()
 
 
 def test_representativefinder_window_builds_split_scrollable_layout(

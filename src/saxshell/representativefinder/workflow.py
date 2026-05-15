@@ -24,7 +24,7 @@ from saxshell.saxs.contrast.descriptors import (
     describe_parsed_contrast_structure,
     estimate_pair_contact_distance_medians,
 )
-from saxshell.saxs.debye import load_structure_file
+from saxshell.saxs.debye import load_structure_file, scan_structure_elements
 from saxshell.saxs.stoichiometry import parse_stoich_label
 
 _STRUCTURE_SUFFIXES = {".pdb", ".xyz"}
@@ -1039,19 +1039,37 @@ def analyze_representative_structure_folder(
         else Path(project_dir).expanduser().resolve()
     )
 
-    measured_structures, skipped_files, processed_work = (
-        _measure_candidate_entries(
-            candidates_to_measure,
-            analyzer=analyzer,
-            include_parsed_structure=settings.solvent_weight > 0.0,
-            parallel_workers=parallel_workers,
-            progress_callback=progress_callback,
-            log_callback=log_callback,
-            cancel_callback=cancel_callback,
-            processed_work=processed_work,
-            total_work=total_work,
-        )
+    single_atom_structures = _inspect_single_atom_candidate_entries(
+        candidates_to_measure,
+        progress_callback=progress_callback,
+        cancel_callback=cancel_callback,
+        processed_work=processed_work,
+        total_work=total_work,
     )
+    if single_atom_structures is None:
+        measured_structures, skipped_files, processed_work = (
+            _measure_candidate_entries(
+                candidates_to_measure,
+                analyzer=analyzer,
+                include_parsed_structure=settings.solvent_weight > 0.0,
+                parallel_workers=parallel_workers,
+                progress_callback=progress_callback,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+                processed_work=processed_work,
+                total_work=total_work,
+            )
+        )
+    else:
+        measured_structures = single_atom_structures
+        skipped_files = []
+        processed_work += len(single_atom_structures)
+        _emit_progress(
+            progress_callback,
+            processed_work,
+            total_work,
+            "Inspected single-atom candidate structure files.",
+        )
     measured_candidates = [
         measured.candidate for measured in measured_structures
     ]
@@ -1606,6 +1624,81 @@ def _effective_parallel_workers(
         else:
             return 1
     return max(1, min(int(item_count), requested, 32))
+
+
+def _inspect_single_atom_candidate_entries(
+    entries: tuple[RepresentativeFinderFolderCandidate, ...],
+    *,
+    progress_callback: RepresentativeFinderProgressCallback | None,
+    cancel_callback: RepresentativeFinderCancelCallback | None,
+    processed_work: int,
+    total_work: int,
+) -> list[_MeasuredCandidateStructure] | None:
+    if not entries:
+        return None
+    _emit_progress(
+        progress_callback,
+        processed_work,
+        total_work,
+        "Inspecting candidate atom counts...",
+    )
+    scanned_elements_by_index: dict[int, tuple[str, ...]] = {}
+    element_signatures: set[tuple[tuple[str, int], ...]] = set()
+    for index, entry in enumerate(entries):
+        _raise_if_cancelled(cancel_callback)
+        try:
+            elements = tuple(
+                str(element).strip()
+                for element in scan_structure_elements(entry.file_path)
+                if str(element).strip()
+            )
+        except Exception:
+            return None
+        if len(elements) != 1:
+            return None
+        element_counts = Counter(elements)
+        element_signatures.add(tuple(sorted(element_counts.items())))
+        if len(element_signatures) > 1:
+            return None
+        scanned_elements_by_index[index] = elements
+
+    measured_structures: list[_MeasuredCandidateStructure] = []
+    for index, entry in enumerate(entries):
+        _raise_if_cancelled(cancel_callback)
+        try:
+            coordinates, loaded_elements = load_structure_file(entry.file_path)
+        except Exception:
+            return None
+        elements = tuple(str(element).strip() for element in loaded_elements)
+        if len(elements) != 1:
+            return None
+        if elements != scanned_elements_by_index[index]:
+            return None
+        coordinates_array = np.asarray(coordinates, dtype=float)
+        element_counts = Counter(elements)
+        candidate = RepresentativeFinderCandidate(
+            file_path=entry.file_path,
+            relative_label=entry.relative_label,
+            motif_label=entry.motif_label,
+            atom_count=1,
+            element_counts=dict(sorted(element_counts.items())),
+            bond_values={},
+            angle_values={},
+            solvent_metrics={},
+            solvent_atom_count=0,
+            direct_solvent_atom_count=0,
+            outer_solvent_atom_count=0,
+            mean_direct_solvent_coordination=0.0,
+        )
+        measured_structures.append(
+            _MeasuredCandidateStructure(
+                candidate=candidate,
+                coordinates=coordinates_array,
+                elements=elements,
+                parsed_structure=None,
+            )
+        )
+    return measured_structures
 
 
 def _measure_candidate_entries(

@@ -17,7 +17,18 @@ from PySide6.QtWidgets import (
 
 from saxshell.saxs.project_manager import SAXSProjectManager
 from saxshell.structure import PDBAtom, PDBStructure
+from saxshell.xyz2pdb.mapping_workflow import (
+    FreeAtomMappingInput,
+    MoleculeMappingInput,
+)
+from saxshell.xyz2pdb.ui.batch_queue_window import (
+    XYZToPDBBatchItem,
+    XYZToPDBBatchQueueWindow,
+    XYZToPDBBatchResult,
+    XYZToPDBBatchWorker,
+)
 from saxshell.xyz2pdb.ui.main_window import XYZToPDBMainWindow
+from saxshell.xyz2pdb.ui.run_file_window import XYZToPDBRunFileWindow
 from saxshell.xyz2pdb.workflow import (
     XYZToPDBAssertionResidueSummary,
     XYZToPDBAssertionResult,
@@ -291,6 +302,198 @@ def test_xyz2pdb_export_registers_pdb_folder_with_project(qapp, tmp_path):
     assert "Registered the converted PDB structure folder with project" in (
         window.export_panel.log_box.toPlainText()
     )
+    window.close()
+
+
+def test_xyz2pdb_batch_queue_prefills_project_xyz_reference_and_elements(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "saxs_project"
+    settings = manager.create_project(project_dir)
+    refs_dir = tmp_path / "references"
+    refs_dir.mkdir()
+    _write_reference_pdb(refs_dir / "pbi.pdb")
+    frames_dir = tmp_path / "splitxyz_f0fs"
+    frames_dir.mkdir()
+    _write_xyz(frames_dir / "frame_0000.xyz", i_x=1.0, oxygen_x=2.0)
+    settings.frames_dir = str(frames_dir)
+    manager.save_project(settings)
+
+    window = XYZToPDBBatchQueueWindow(
+        initial_project_dir=project_dir,
+        reference_library_dir=refs_dir,
+    )
+
+    assert window.queue_list.count() == 1
+    list_item = window.queue_list.item(0)
+    item_id = str(list_item.data(Qt.ItemDataRole.UserRole))
+    widget = window._widgets_by_id[item_id]
+    assert widget.input_path_edit.text() == str(frames_dir.resolve())
+    assert {
+        widget.free_element_combo.itemData(index)
+        for index in range(widget.free_element_combo.count())
+    } == {"I", "O", "Pb"}
+    assert {
+        widget.reference_combo.itemData(index)
+        for index in range(widget.reference_combo.count())
+    } == {"pbi"}
+    assert "Elements: I x1, O x1, Pb x1" in (
+        widget.analysis_summary_label.text()
+    )
+    window.close()
+
+
+def test_xyz2pdb_batch_worker_exports_and_registers_pdb_folder(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "saxs_project"
+    settings = manager.create_project(project_dir)
+    refs_dir = tmp_path / "references"
+    refs_dir.mkdir()
+    _write_reference_pdb(refs_dir / "pbi.pdb")
+    frames_dir = tmp_path / "splitxyz_f0fs"
+    frames_dir.mkdir()
+    _write_xyz(frames_dir / "frame_0000.xyz", i_x=1.0, oxygen_x=2.0)
+    settings.frames_dir = str(frames_dir)
+    manager.save_project(settings)
+
+    worker = XYZToPDBBatchWorker(
+        [
+            (
+                "job-1",
+                XYZToPDBBatchItem(
+                    item_id="job-1",
+                    project_dir=project_dir,
+                    input_path=frames_dir,
+                    reference_library_dir=refs_dir,
+                    molecule_inputs=(
+                        MoleculeMappingInput(
+                            reference_name="pbi",
+                            residue_name="PBI",
+                        ),
+                    ),
+                    free_atom_inputs=(
+                        FreeAtomMappingInput(
+                            element="O",
+                            residue_name="SOL",
+                        ),
+                    ),
+                ).to_job(),
+            )
+        ]
+    )
+    failures: list[tuple[str, str]] = []
+    finished_items: list[tuple[str, XYZToPDBBatchResult]] = []
+    finished_batches: list[list[XYZToPDBBatchResult]] = []
+    worker.failed.connect(
+        lambda item_id, message: failures.append((item_id, message))
+    )
+    worker.item_finished.connect(
+        lambda item_id, result: finished_items.append((item_id, result))
+    )
+    worker.finished.connect(finished_batches.append)
+
+    worker.run()
+
+    assert failures == []
+    assert len(finished_items) == 1
+    item_id, result = finished_items[0]
+    assert item_id == "job-1"
+    assert result.output_dir.name == "xyz2pdb_splitxyz_f0fs"
+    assert result.written_count == 1
+    assert (result.output_dir / "frame_0000.pdb").is_file()
+    saved_settings = manager.load_project(project_dir)
+    assert saved_settings.resolved_frames_dir == frames_dir.resolve()
+    assert saved_settings.resolved_pdb_frames_dir == result.output_dir
+    assert saved_settings.pdb_frames_dir_snapshot is not None
+    assert finished_batches == [[result]]
+
+
+def test_xyz2pdb_batch_queue_emits_registered_pdb_folder(qapp, tmp_path):
+    del qapp
+    project_dir = tmp_path / "saxs_project"
+    SAXSProjectManager().create_project(project_dir)
+    output_dir = tmp_path / "xyz2pdb_splitxyz_f0fs"
+    output_dir.mkdir()
+    input_dir = tmp_path / "splitxyz_f0fs"
+    input_dir.mkdir()
+
+    window = XYZToPDBBatchQueueWindow()
+    widget = window.add_queue_item(
+        XYZToPDBBatchItem(
+            item_id="job-1",
+            project_dir=project_dir,
+            input_path=input_dir,
+        )
+    )
+    updates = []
+    window.project_paths_registered.connect(updates.append)
+
+    window._on_item_finished(
+        widget.item_id,
+        XYZToPDBBatchResult(
+            project_dir=project_dir.resolve(),
+            input_path=input_dir.resolve(),
+            output_dir=output_dir.resolve(),
+            written_count=1,
+        ),
+    )
+
+    assert updates == [
+        {
+            "project_dir": project_dir.resolve(),
+            "pdb_frames_dir": output_dir.resolve(),
+        }
+    ]
+    assert widget.status_label.text() == "Complete"
+    window.close()
+
+
+def test_xyz2pdb_run_file_window_builds_project_config(qapp, tmp_path):
+    del qapp
+    project_dir = tmp_path / "project"
+    SAXSProjectManager().create_project(project_dir)
+
+    refs_dir = project_dir / "references"
+    refs_dir.mkdir()
+    _write_reference_pdb(refs_dir / "pbi.pdb")
+
+    frames_dir = project_dir / "frames"
+    frames_dir.mkdir()
+    _write_xyz(frames_dir / "frame_0000.xyz", i_x=1.0, oxygen_x=2.0)
+
+    window = XYZToPDBRunFileWindow(
+        initial_project_dir=project_dir,
+        initial_input_path=frames_dir,
+    )
+    window.reference_panel.library_dir_edit.setText(str(refs_dir))
+    window.refresh_reference_library()
+    window.mapping_panel._molecule_inputs = [
+        MoleculeMappingInput(reference_name="pbi", residue_name="PBI")
+    ]
+    window.mapping_panel._refresh_molecule_table()
+    window.mapping_panel.set_available_elements(("O", "Pb", "I"))
+    window.mapping_panel.free_element_combo.setCurrentText("O")
+    window.mapping_panel.free_residue_edit.setText("SOL")
+    window.mapping_panel._add_free_atom()
+    window.output_dir_edit.setText(str(project_dir / "pdb_frames"))
+    window.pbc_params_edit.setPlainText('{"a": 20.0, "b": 21.0, "c": 22.0}')
+
+    config = window._current_config(project_dir)
+
+    assert config.input_path == "frames"
+    assert config.output_dir == "pdb_frames"
+    assert config.reference_library_dir == "references"
+    assert config.molecule_inputs[0].reference_name == "pbi"
+    assert config.free_atom_inputs[0].element == "O"
+    assert config.pbc_params["a"] == 20.0
+    assert "xyz2pdb run" in window.command_box.toPlainText()
     window.close()
 
 

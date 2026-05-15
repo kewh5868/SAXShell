@@ -3,10 +3,22 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from saxshell.saxs.project_manager import SAXSProjectManager
 from saxshell.saxshell import main as saxshell_main
 from saxshell.structure import PDBAtom, PDBStructure
 from saxshell.xyz2pdb import XYZToPDBWorkflow
 from saxshell.xyz2pdb.cli import main as xyz2pdb_main
+from saxshell.xyz2pdb.mapping_workflow import (
+    FreeAtomMappingInput,
+    MoleculeMappingInput,
+)
+from saxshell.xyz2pdb.run_config import (
+    build_xyz2pdb_run_config,
+    default_xyz2pdb_run_file_path,
+    load_xyz2pdb_run_config,
+    run_xyz2pdb_run_config,
+    save_xyz2pdb_run_config,
+)
 
 
 def _write_reference_pdb(path: Path) -> None:
@@ -140,6 +152,118 @@ def test_xyz2pdb_cli_export_runs_complete_headless_workflow(
     assert "XYZ to PDB conversion complete." in captured.out
     assert f"Output directory: {tmp_path / 'xyz2pdb_frames'}" in captured.out
     assert "Files written: 2" in captured.out
+
+
+def test_xyz2pdb_run_config_round_trips_project_relative_paths(tmp_path):
+    refs_dir = tmp_path / "references"
+    frames_dir = tmp_path / "frames"
+    output_dir = tmp_path / "pdb_frames"
+    config = build_xyz2pdb_run_config(
+        project_dir=tmp_path,
+        input_path=frames_dir,
+        output_dir=output_dir,
+        reference_library_dir=refs_dir,
+        molecule_inputs=(
+            MoleculeMappingInput(reference_name="pbi", residue_name="PBI"),
+        ),
+        free_atom_inputs=(
+            FreeAtomMappingInput(element="O", residue_name="SOL"),
+        ),
+        pbc_params={"a": 20.0, "space_group": "P 1"},
+    )
+    run_file = default_xyz2pdb_run_file_path(tmp_path)
+
+    save_xyz2pdb_run_config(run_file, config)
+    loaded = load_xyz2pdb_run_config(run_file)
+
+    assert loaded.input_path == "frames"
+    assert loaded.output_dir == "pdb_frames"
+    assert loaded.reference_library_dir == "references"
+    assert loaded.molecule_inputs[0].reference_name == "pbi"
+    assert loaded.free_atom_inputs[0].residue_name == "SOL"
+    assert loaded.pbc_params == {"a": 20.0, "space_group": "P 1"}
+
+
+def test_xyz2pdb_project_run_updates_project_pdb_frames_dir(tmp_path):
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "project"
+    manager.create_project(project_dir)
+
+    refs_dir = project_dir / "references"
+    refs_dir.mkdir()
+    _write_reference_pdb(refs_dir / "pbi.pdb")
+
+    frames_dir = project_dir / "frames"
+    frames_dir.mkdir()
+    _write_xyz(frames_dir / "frame_0000.xyz", i_x=1.0, oxygen_x=2.0)
+    _write_xyz(frames_dir / "frame_0001.xyz", i_x=1.1, oxygen_x=2.1)
+
+    output_dir = project_dir / "pdb_frames"
+    config = build_xyz2pdb_run_config(
+        project_dir=project_dir,
+        input_path=frames_dir,
+        output_dir=output_dir,
+        reference_library_dir=refs_dir,
+        molecule_inputs=(
+            MoleculeMappingInput(reference_name="pbi", residue_name="PBI"),
+        ),
+        free_atom_inputs=(
+            FreeAtomMappingInput(element="O", residue_name="SOL"),
+        ),
+    )
+    run_file = default_xyz2pdb_run_file_path(project_dir)
+    save_xyz2pdb_run_config(run_file, config)
+
+    summary = run_xyz2pdb_run_config(
+        project_dir,
+        load_xyz2pdb_run_config(run_file),
+        run_file_path=run_file,
+    )
+
+    saved_settings = manager.load_project(project_dir)
+    assert summary.written_count == 2
+    assert saved_settings.resolved_pdb_frames_dir == output_dir.resolve()
+    assert saved_settings.pdb_frames_dir_snapshot is not None
+    assert (output_dir / "frame_0000.pdb").is_file()
+
+
+def test_xyz2pdb_cli_project_run_uses_project_default_run_file(
+    tmp_path,
+    capsys,
+):
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "project"
+    manager.create_project(project_dir)
+
+    refs_dir = project_dir / "references"
+    refs_dir.mkdir()
+    _write_reference_pdb(refs_dir / "pbi.pdb")
+    frames_dir = project_dir / "frames"
+    frames_dir.mkdir()
+    _write_xyz(frames_dir / "frame_0000.xyz", i_x=1.0, oxygen_x=2.0)
+
+    save_xyz2pdb_run_config(
+        default_xyz2pdb_run_file_path(project_dir),
+        build_xyz2pdb_run_config(
+            project_dir=project_dir,
+            input_path=frames_dir,
+            output_dir=project_dir / "pdb_frames",
+            reference_library_dir=refs_dir,
+            molecule_inputs=(
+                MoleculeMappingInput(reference_name="pbi", residue_name="PBI"),
+            ),
+            free_atom_inputs=(
+                FreeAtomMappingInput(element="O", residue_name="SOL"),
+            ),
+        ),
+    )
+
+    exit_code = xyz2pdb_main(["run", str(project_dir)])
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "XYZ to PDB project run complete." in output
+    assert "Files written: 1" in output
 
 
 def test_xyz2pdb_reference_cli_and_saxshell_forwarding(tmp_path, capsys):

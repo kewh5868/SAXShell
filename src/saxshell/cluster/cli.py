@@ -6,6 +6,11 @@ from pathlib import Path
 from saxshell.version import __version__
 
 from .clusternetwork import DEFAULT_SAVE_STATE_FREQUENCY, SEARCH_MODE_CHOICES
+from .run_config import (
+    default_cluster_run_file_path,
+    load_cluster_run_config,
+    run_cluster_run_config,
+)
 from .workflow import (
     ClusterExportResult,
     ClusterSelectionResult,
@@ -45,6 +50,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers = parser.add_subparsers(dest="command")
+
+    setup_ui_parser = subparsers.add_parser(
+        "setup-ui",
+        help="Launch the beta project-backed run-file setup interface.",
+    )
+    setup_ui_parser.add_argument(
+        "project_dir",
+        nargs="?",
+        type=Path,
+        help="Optional SAXSShell project folder.",
+    )
+    setup_ui_parser.add_argument(
+        "--frames-dir",
+        type=Path,
+        default=None,
+        help="Optional extracted PDB or XYZ frames folder to prefill.",
+    )
+    setup_ui_parser.set_defaults(handler=_handle_setup_ui)
 
     ui_parser = subparsers.add_parser("ui", help="Launch the Qt UI.")
     ui_parser.add_argument(
@@ -87,6 +110,26 @@ def build_parser() -> argparse.ArgumentParser:
         "the extracted frames directory.",
     )
     export_parser.set_defaults(handler=_handle_export)
+
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Run cluster extraction from a project-backed run file.",
+    )
+    run_parser.add_argument(
+        "project_dir",
+        type=Path,
+        help="SAXSShell project folder containing the run file.",
+    )
+    run_parser.add_argument(
+        "--run-file",
+        type=Path,
+        default=None,
+        help=(
+            "Run file path. Defaults to cluster_extraction_cli_run.json "
+            "in the project folder."
+        ),
+    )
+    run_parser.set_defaults(handler=_handle_run)
 
     return parser
 
@@ -222,6 +265,22 @@ def _handle_ui(args: argparse.Namespace) -> int:
     return launch_cluster_ui(getattr(args, "frames_dir", None))
 
 
+def _handle_setup_ui(args: argparse.Namespace) -> int:
+    from PySide6.QtWidgets import QApplication
+
+    from .ui.run_file_window import launch_cluster_run_file_ui
+
+    owns_app = QApplication.instance() is None
+    launch_cluster_run_file_ui(
+        initial_project_dir=getattr(args, "project_dir", None),
+        initial_frames_dir=getattr(args, "frames_dir", None),
+    )
+    app = QApplication.instance()
+    if owns_app and app is not None:
+        return app.exec()
+    return 0
+
+
 def _build_workflow(args: argparse.Namespace) -> ClusterWorkflow:
     return ClusterWorkflow(
         frames_dir=args.frames_dir,
@@ -347,6 +406,36 @@ def _handle_export(args: argparse.Namespace) -> int:
     result = workflow.export_clusters(output_dir=args.output_dir)
     print(_format_export_result(result))
     return 0
+
+
+def _handle_run(args: argparse.Namespace) -> int:
+    project_dir = Path(args.project_dir).expanduser().resolve()
+    run_file = _resolve_run_file(project_dir, args.run_file)
+    config = load_cluster_run_config(run_file)
+    summary = run_cluster_run_config(
+        project_dir,
+        config,
+        run_file_path=run_file,
+        log_callback=print,
+    )
+    print("")
+    print("Cluster extraction CLI run complete")
+    print(f"Frames folder: {summary.frames_dir}")
+    print(f"Output folder: {summary.output_dir}")
+    print(f"Frames analyzed: {summary.result.analyzed_frames}")
+    print(f"Clusters found: {summary.result.total_clusters}")
+    print(f"Files written: {summary.written_count}")
+    print(f"Project file: {summary.project_file}")
+    return 0
+
+
+def _resolve_run_file(project_dir: Path, run_file: Path | None) -> Path:
+    if run_file is None:
+        return default_cluster_run_file_path(project_dir)
+    path = Path(run_file).expanduser()
+    if not path.is_absolute():
+        path = project_dir / path
+    return path.resolve()
 
 
 def _format_selection_result(selection: ClusterSelectionResult) -> str:

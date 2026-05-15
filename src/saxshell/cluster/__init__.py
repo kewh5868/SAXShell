@@ -37,6 +37,20 @@ from .presets import (
     ordered_cluster_extraction_preset_names,
     save_custom_cluster_extraction_preset,
 )
+from .run_config import (
+    ClusterRunConfig,
+    ClusterRunExecutionSummary,
+    build_cluster_run_config,
+    default_cluster_run_file_path,
+    load_cluster_run_config,
+    path_text_for_run_config,
+    preview_cluster_run_config,
+    resolve_run_config_path,
+    run_cluster_run_config,
+    save_cluster_run_config,
+    suggest_run_config_output_dir,
+    workflow_from_cluster_run_config,
+)
 from .workflow import (
     ClusterExportResult,
     ClusterSelectionResult,
@@ -90,4 +104,16 @@ __all__ = [
     "load_cluster_extraction_presets",
     "ordered_cluster_extraction_preset_names",
     "save_custom_cluster_extraction_preset",
+    "ClusterRunConfig",
+    "ClusterRunExecutionSummary",
+    "build_cluster_run_config",
+    "default_cluster_run_file_path",
+    "load_cluster_run_config",
+    "path_text_for_run_config",
+    "preview_cluster_run_config",
+    "resolve_run_config_path",
+    "run_cluster_run_config",
+    "save_cluster_run_config",
+    "suggest_run_config_output_dir",
+    "workflow_from_cluster_run_config",
 ]
