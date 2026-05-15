@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFormLayout,
@@ -140,6 +141,9 @@ from saxshell.saxs.ui.distribution_window import (
 from saxshell.saxs.ui.dream_tab import DreamTab
 from saxshell.saxs.ui.experimental_data_loader import (
     ExperimentalDataHeaderDialog,
+)
+from saxshell.saxs.ui.experimental_overlay_window import (
+    ExperimentalDataOverlayWindow,
 )
 from saxshell.saxs.ui.main_window import (
     AUTO_SNAP_PANES_KEY,
@@ -2878,6 +2882,7 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert window.tools_menu.title() == "Tools"
     assert window.md_extraction_menu.title() == "MD Extraction"
     assert window.structure_analysis_menu.title() == "Structure Analysis"
+    assert window.batch_processing_menu.title() == "Batch Processing"
     assert window.visualization_menu.title() == "Visualization"
     assert window.cli_setup_menu.title() == "CLI Setup"
     assert window.beta_menu.title() == "(beta)"
@@ -2898,6 +2903,7 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
         "Structure Analysis",
         "Cluster Dynamics",
         "PDF",
+        "Batch Processing",
         "Visualization",
         "SAXS Calculation Preview",
         "X-ray Toolkit",
@@ -2917,12 +2923,21 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
         "Open Bond Analysis",
         "Open Representative Structures",
     ]
+    visualization_actions = [
+        action.text() for action in window.visualization_menu.actions()
+    ]
+    assert visualization_actions == [
+        "Structure Viewer",
+        "Experimental Data Overlay",
+        "Open Blender XYZ Renderer",
+    ]
     window._build_menu_bar()
     assert [action.text() for action in window.tools_menu.actions()] == [
         "MD Extraction",
         "Structure Analysis",
         "Cluster Dynamics",
         "PDF",
+        "Batch Processing",
         "Visualization",
         "SAXS Calculation Preview",
         "X-ray Toolkit",
@@ -2935,6 +2950,14 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
         "Open Bond Analysis",
         "Open Representative Structures",
     ]
+    visualization_actions = [
+        action.text() for action in window.visualization_menu.actions()
+    ]
+    assert visualization_actions == [
+        "Structure Viewer",
+        "Experimental Data Overlay",
+        "Open Blender XYZ Renderer",
+    ]
     assert (
         window.clusterdynamics_action.text() == "Open Cluster Dynamics (only)"
     )
@@ -2944,8 +2967,40 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert [
         action.text() for action in window.cluster_dynamics_menu.actions()
     ] == ["Open Cluster Dynamics (ML)"]
+    assert [action.text() for action in window.pdf_menu.actions()] == [
+        "Open PDF Calculation",
+        "Open RMC Setup (fullrmc)",
+    ]
+    assert (
+        window.mdtrajectory_batch_queue_action.text()
+        == "Open MD Trajectory Batch Queue"
+    )
+    assert (
+        window.xyz2pdb_batch_queue_action.text()
+        == "Open XYZ -> PDB Batch Queue"
+    )
+    assert (
+        window.cluster_batch_queue_action.text()
+        == "Open Cluster Extraction Batch Queue"
+    )
+    assert (
+        window.representativefinder_batch_queue_action.text()
+        == "Open Representative Structures Batch Queue"
+    )
+    assert [
+        action.text() for action in window.batch_processing_menu.actions()
+    ] == [
+        "Open MD Trajectory Batch Queue",
+        "Open XYZ -> PDB Batch Queue",
+        "Open Cluster Extraction Batch Queue",
+        "Open Representative Structures Batch Queue",
+        "Open PDF Batch Queue",
+    ]
     assert window.fullrmc_action.text() == "Open RMC Setup (fullrmc)"
     assert window.structure_viewer_action.text() == "Structure Viewer"
+    assert window.experimental_overlay_action.text() == (
+        "Experimental Data Overlay"
+    )
     assert window.blenderxyz_action.text() == "Open Blender XYZ Renderer"
     assert (
         window.representative_finder_action.text()
@@ -2978,10 +3033,30 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
         == "Open Solvent Shell Builder (Beta)"
     )
     assert (
+        window.xyz2pdb_cli_setup_action.text()
+        == "Open XYZ -> PDB CLI Setup (Beta)"
+    )
+    assert (
+        window.cluster_cli_setup_action.text()
+        == "Open Cluster Extraction CLI Setup (Beta)"
+    )
+    assert (
+        window.clusterdynamics_cli_setup_action.text()
+        == "Open Cluster Dynamics CLI Setup (Beta)"
+    )
+    assert (
+        window.clusterdynamicsml_cli_setup_action.text()
+        == "Open Cluster Dynamics ML CLI Setup (Beta)"
+    )
+    assert (
         window.representative_cli_setup_action.text()
         == "Open Representative CLI Setup (Beta)"
     )
     assert [action.text() for action in window.cli_setup_menu.actions()] == [
+        "Open XYZ -> PDB CLI Setup (Beta)",
+        "Open Cluster Extraction CLI Setup (Beta)",
+        "Open Cluster Dynamics CLI Setup (Beta)",
+        "Open Cluster Dynamics ML CLI Setup (Beta)",
         "Open Representative CLI Setup (Beta)",
     ]
     assert [action.text() for action in window.beta_menu.actions()] == [
@@ -3479,6 +3554,123 @@ def test_mdtrajectory_tool_uses_active_project_references(
     assert launched["topology_file"] == topology_file.resolve()
     assert launched["energy_file"] == energy_file.resolve()
     assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
+def test_mdtrajectory_batch_queue_uses_active_project_references(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    trajectory_file = tmp_path / "traj.xyz"
+    topology_file = tmp_path / "topology.pdb"
+    energy_file = tmp_path / "traj.ener"
+    trajectory_file.write_text("1\nframe\nPb 0.0 0.0 0.0\n", encoding="utf-8")
+    topology_file.write_text("MODEL        1\nENDMDL\n", encoding="utf-8")
+    energy_file.write_text(
+        "# step time kinetic temperature potential\n"
+        "1 0.0 1.0 300.0 -10.0\n",
+        encoding="utf-8",
+    )
+    window.current_settings.trajectory_file = str(trajectory_file)
+    window.current_settings.topology_file = str(topology_file)
+    window.current_settings.energy_file = str(energy_file)
+    window.project_manager.save_project(window.current_settings)
+    launched: dict[str, object] = {}
+
+    class FakeMDTrajectoryBatchQueueWindow(QWidget):
+        def __init__(self, **kwargs):
+            super().__init__()
+            launched.update(kwargs)
+            launched["instance"] = self
+
+        def show(self):
+            launched["shown"] = True
+
+        def raise_(self):
+            launched["raised"] = True
+
+    monkeypatch.setattr(
+        "saxshell.mdtrajectory.ui.batch_queue_window."
+        "MDTrajectoryBatchQueueWindow",
+        FakeMDTrajectoryBatchQueueWindow,
+    )
+
+    window._open_mdtrajectory_batch_queue_tool()
+
+    assert launched["initial_project_dir"] == Path(project_dir).resolve()
+    assert launched["initial_trajectory_file"] == trajectory_file.resolve()
+    assert launched["initial_topology_file"] == topology_file.resolve()
+    assert launched["initial_energy_file"] == energy_file.resolve()
+    assert launched["shown"] is True
+    assert launched["raised"] is True
+    assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
+def test_mdtrajectory_batch_queue_updates_main_project_frames_dir_from_child(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    exported_frames_dir = tmp_path / "splitxyz_f12_t1000fs"
+    exported_frames_dir.mkdir()
+
+    saved_settings = window.project_manager.load_project(project_dir)
+    saved_settings.frames_dir = str(exported_frames_dir.resolve())
+    window.project_manager.save_project(saved_settings)
+
+    class FakeMDTrajectoryBatchQueueWindow(QWidget):
+        project_paths_registered = Signal(object)
+
+        def __init__(self, **kwargs):
+            super().__init__()
+            self.kwargs = kwargs
+
+        def show(self):
+            return None
+
+        def raise_(self):
+            return None
+
+    fake_window: FakeMDTrajectoryBatchQueueWindow | None = None
+
+    def fake_batch_queue_window(**kwargs):
+        nonlocal fake_window
+        fake_window = FakeMDTrajectoryBatchQueueWindow(**kwargs)
+        return fake_window
+
+    monkeypatch.setattr(
+        "saxshell.mdtrajectory.ui.batch_queue_window."
+        "MDTrajectoryBatchQueueWindow",
+        fake_batch_queue_window,
+    )
+
+    window._open_mdtrajectory_batch_queue_tool()
+    assert fake_window is not None
+    fake_window.project_paths_registered.emit(
+        {
+            "project_dir": Path(project_dir).resolve(),
+            "frames_dir": exported_frames_dir.resolve(),
+        }
+    )
+    qapp.processEvents()
+
+    assert (
+        window.project_setup_tab.frames_dir() == exported_frames_dir.resolve()
+    )
+    assert window.current_settings is not None
+    assert window.current_settings.resolved_frames_dir == (
+        exported_frames_dir.resolve()
+    )
+    window.save_project_state()
+    saved_after_save = window.project_manager.load_project(project_dir)
+    assert saved_after_save.resolved_frames_dir == (
+        exported_frames_dir.resolve()
+    )
     window.close()
 
 
@@ -4055,6 +4247,103 @@ def test_cluster_tool_uses_active_project_frames_dir_and_project_dir(
     window.close()
 
 
+def test_cluster_batch_queue_uses_active_project_pdb_frames_dir_and_project_dir(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    frames_dir = tmp_path / "splitxyz_f0fs"
+    frames_dir.mkdir()
+    pdb_frames_dir = tmp_path / "xyz2pdb_splitxyz_f0fs"
+    pdb_frames_dir.mkdir()
+    window.current_settings.frames_dir = str(frames_dir)
+    window.current_settings.pdb_frames_dir = str(pdb_frames_dir)
+    window.project_manager.save_project(window.current_settings)
+    launched: dict[str, object] = {}
+
+    class FakeClusterBatchWindow(QWidget):
+        project_paths_registered = Signal(object)
+
+        def __init__(self, **kwargs):
+            super().__init__()
+            launched.update(kwargs)
+            launched["instance"] = self
+
+        def show(self):
+            launched["shown"] = True
+
+        def raise_(self):
+            launched["raised"] = True
+
+    monkeypatch.setattr(
+        "saxshell.cluster.ui.batch_queue_window.ClusterBatchQueueWindow",
+        FakeClusterBatchWindow,
+    )
+
+    window._open_cluster_batch_queue_tool()
+
+    assert launched["initial_frames_dir"] == pdb_frames_dir.resolve()
+    assert launched["initial_project_dir"] == Path(project_dir).resolve()
+    assert launched["shown"] is True
+    assert launched["raised"] is True
+    assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
+def test_representativefinder_batch_queue_uses_active_project_clusters_dir(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    clusters_dir = tmp_path / "clusters_xyz2pdb_splitxyz_f0fs"
+    clusters_dir.mkdir()
+    window.current_settings.clusters_dir = str(clusters_dir)
+    window.project_manager.save_project(window.current_settings)
+    launched: dict[str, object] = {}
+    refreshed_projects: list[str] = []
+    window._handle_representative_structure_results_changed = (
+        refreshed_projects.append
+    )
+
+    class FakeRepresentativeBatchWindow(QWidget):
+        project_results_changed = Signal(str)
+
+        def __init__(self, **kwargs):
+            super().__init__()
+            launched.update(kwargs)
+            launched["instance"] = self
+
+        def show(self):
+            launched["shown"] = True
+
+        def raise_(self):
+            launched["raised"] = True
+
+    monkeypatch.setattr(
+        "saxshell.representativefinder.ui.batch_queue_window."
+        "RepresentativeFinderBatchQueueWindow",
+        FakeRepresentativeBatchWindow,
+    )
+
+    window._open_representative_batch_queue_tool()
+    project_key = str(Path(project_dir).resolve())
+    launched["instance"].project_results_changed.emit(project_key)
+    qapp.processEvents()
+
+    assert launched["initial_clusters_dir"] == clusters_dir.resolve()
+    assert launched["initial_project_dir"] == Path(project_dir).resolve()
+    assert launched["shown"] is True
+    assert launched["raised"] is True
+    assert launched["instance"] in window._child_tool_windows
+    assert refreshed_projects == [project_key]
+    window.close()
+
+
 def test_xyz2pdb_tool_uses_active_project_frames_dir_and_project_dir(
     qapp, tmp_path, monkeypatch
 ):
@@ -4084,6 +4373,49 @@ def test_xyz2pdb_tool_uses_active_project_frames_dir_and_project_dir(
 
     assert launched["input_path"] == frames_dir.resolve()
     assert launched["project_dir"] == Path(project_dir).resolve()
+    assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
+def test_xyz2pdb_batch_queue_uses_active_project_frames_dir_and_project_dir(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    frames_dir = tmp_path / "splitxyz_f0fs"
+    frames_dir.mkdir()
+    window.current_settings.frames_dir = str(frames_dir)
+    window.project_manager.save_project(window.current_settings)
+    launched: dict[str, object] = {}
+
+    class FakeXYZToPDBBatchWindow(QWidget):
+        project_paths_registered = Signal(object)
+
+        def __init__(self, **kwargs):
+            super().__init__()
+            launched.update(kwargs)
+            launched["instance"] = self
+
+        def show(self):
+            launched["shown"] = True
+
+        def raise_(self):
+            launched["raised"] = True
+
+    monkeypatch.setattr(
+        "saxshell.xyz2pdb.ui.batch_queue_window.XYZToPDBBatchQueueWindow",
+        FakeXYZToPDBBatchWindow,
+    )
+
+    window._open_xyz2pdb_batch_queue_tool()
+
+    assert launched["initial_input_path"] == frames_dir.resolve()
+    assert launched["initial_project_dir"] == Path(project_dir).resolve()
+    assert launched["shown"] is True
+    assert launched["raised"] is True
     assert launched["instance"] in window._child_tool_windows
     window.close()
 
@@ -4182,6 +4514,100 @@ def test_xyz2pdb_tool_updates_main_project_pdb_folder_from_child(
     window.close()
 
 
+def test_xyz2pdb_batch_queue_updates_main_project_pdb_folder_from_child(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    pdb_frames_dir = tmp_path / "xyz2pdb_splitxyz_f5fs"
+    pdb_frames_dir.mkdir()
+    saved_settings = window.project_manager.load_project(project_dir)
+    saved_settings.pdb_frames_dir = str(pdb_frames_dir.resolve())
+    window.project_manager.save_project(saved_settings)
+
+    class FakeXYZToPDBBatchWindow(QWidget):
+        project_paths_registered = Signal(object)
+
+        def show(self):
+            return
+
+        def raise_(self):
+            return
+
+    fake_window = FakeXYZToPDBBatchWindow()
+
+    monkeypatch.setattr(
+        "saxshell.xyz2pdb.ui.batch_queue_window.XYZToPDBBatchQueueWindow",
+        lambda **kwargs: fake_window,
+    )
+
+    window._open_xyz2pdb_batch_queue_tool()
+    fake_window.project_paths_registered.emit(
+        {
+            "project_dir": Path(project_dir).resolve(),
+            "pdb_frames_dir": pdb_frames_dir.resolve(),
+        }
+    )
+    qapp.processEvents()
+
+    assert (
+        window.project_setup_tab.pdb_frames_dir() == pdb_frames_dir.resolve()
+    )
+    assert window.current_settings is not None
+    assert window.current_settings.resolved_pdb_frames_dir == (
+        pdb_frames_dir.resolve()
+    )
+    window.close()
+
+
+def test_cluster_batch_queue_updates_main_project_clusters_folder_from_child(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    clusters_dir = tmp_path / "clusters_xyz2pdb_splitxyz_f5fs"
+    clusters_dir.mkdir()
+    saved_settings = window.project_manager.load_project(project_dir)
+    saved_settings.clusters_dir = str(clusters_dir.resolve())
+    window.project_manager.save_project(saved_settings)
+
+    class FakeClusterBatchWindow(QWidget):
+        project_paths_registered = Signal(object)
+
+        def show(self):
+            return
+
+        def raise_(self):
+            return
+
+    fake_window = FakeClusterBatchWindow()
+
+    monkeypatch.setattr(
+        "saxshell.cluster.ui.batch_queue_window.ClusterBatchQueueWindow",
+        lambda **kwargs: fake_window,
+    )
+
+    window._open_cluster_batch_queue_tool()
+    fake_window.project_paths_registered.emit(
+        {
+            "project_dir": Path(project_dir).resolve(),
+            "clusters_dir": clusters_dir.resolve(),
+        }
+    )
+    qapp.processEvents()
+
+    assert window.project_setup_tab.clusters_dir() == clusters_dir.resolve()
+    assert window.current_settings is not None
+    assert window.current_settings.resolved_clusters_dir == (
+        clusters_dir.resolve()
+    )
+    window.close()
+
+
 def test_cluster_tool_updates_main_project_folder_refs_from_child(
     qapp,
     tmp_path,
@@ -4252,6 +4678,148 @@ def test_cluster_tool_updates_main_project_folder_refs_from_child(
     window.close()
 
 
+def test_project_writing_tool_launches_reuse_existing_instances(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    launches = {
+        "mdtrajectory": 0,
+        "xyz2pdb": 0,
+        "cluster": 0,
+        "representativefinder": 0,
+    }
+
+    class FakeToolWindow(QWidget):
+        def __init__(self, tool_key: str, *args, **kwargs):
+            super().__init__()
+            del args, kwargs
+            self.tool_key = tool_key
+            self.show_count = 0
+            self.raise_count = 0
+            self.activate_count = 0
+
+        def show(self):
+            self.show_count += 1
+
+        def raise_(self):
+            self.raise_count += 1
+
+        def activateWindow(self):
+            self.activate_count += 1
+
+    fake_windows = {key: FakeToolWindow(key) for key in launches}
+
+    def fake_launch_mdtrajectory_app(**kwargs):
+        del kwargs
+        launches["mdtrajectory"] += 1
+        return fake_windows["mdtrajectory"]
+
+    def fake_launch_xyz2pdb_ui(**kwargs):
+        del kwargs
+        launches["xyz2pdb"] += 1
+        return fake_windows["xyz2pdb"]
+
+    def fake_launch_representativefinder_ui(**kwargs):
+        del kwargs
+        launches["representativefinder"] += 1
+        return fake_windows["representativefinder"]
+
+    def fake_cluster_window(*args, **kwargs):
+        del args, kwargs
+        launches["cluster"] += 1
+        return fake_windows["cluster"]
+
+    monkeypatch.setattr(
+        "saxshell.mdtrajectory.ui.main_window.launch_mdtrajectory_app",
+        fake_launch_mdtrajectory_app,
+    )
+    monkeypatch.setattr(
+        "saxshell.xyz2pdb.ui.main_window.launch_xyz2pdb_ui",
+        fake_launch_xyz2pdb_ui,
+    )
+    monkeypatch.setattr(
+        "saxshell.cluster.ui.main_window.ClusterMainWindow",
+        fake_cluster_window,
+    )
+    monkeypatch.setattr(
+        "saxshell.representativefinder.ui.main_window."
+        "launch_representativefinder_ui",
+        fake_launch_representativefinder_ui,
+    )
+
+    launch_methods = {
+        "mdtrajectory": window._open_mdtrajectory_tool,
+        "xyz2pdb": window._open_xyz2pdb_tool,
+        "cluster": window._open_cluster_tool,
+        "representativefinder": window._open_representative_finder_tool,
+    }
+
+    for tool_key, open_tool in launch_methods.items():
+        open_tool()
+        open_tool()
+
+        assert launches[tool_key] == 1
+        assert fake_windows[tool_key] in window._child_tool_windows
+        assert fake_windows[tool_key].show_count >= 1
+        assert fake_windows[tool_key].raise_count >= 1
+        assert fake_windows[tool_key].activate_count >= 1
+
+    assert "already open" in window.statusBar().currentMessage().lower()
+    window.close()
+
+
+def test_pdf_tools_are_mutually_exclusive(qapp, tmp_path):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    class FakeToolWindow(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.show_count = 0
+            self.raise_count = 0
+            self.activate_count = 0
+
+        def show(self):
+            self.show_count += 1
+
+        def raise_(self):
+            self.raise_count += 1
+
+        def activateWindow(self):
+            self.activate_count += 1
+
+    batch_window = FakeToolWindow()
+    window._track_child_tool_window(
+        batch_window,
+        single_instance_key="pdf_batch_queue",
+    )
+    window._open_pdfsetup_tool()
+    assert "pdf batch queue is already open" in (
+        window.statusBar().currentMessage().lower()
+    )
+    assert batch_window.show_count >= 1
+    assert "pdfsetup" not in window._single_instance_child_tool_windows
+
+    window._forget_child_tool_window(batch_window)
+    pdf_window = FakeToolWindow()
+    window._track_child_tool_window(
+        pdf_window,
+        single_instance_key="pdfsetup",
+    )
+    window._open_pdf_batch_queue_tool()
+    assert "pdf calculation is already open" in (
+        window.statusBar().currentMessage().lower()
+    )
+    assert pdf_window.show_count >= 1
+    assert "pdf_batch_queue" not in window._single_instance_child_tool_windows
+    window.close()
+
+
 def test_main_window_refuses_close_when_child_tool_refuses_close(
     qapp,
     tmp_path,
@@ -4305,6 +4873,37 @@ def test_fullrmc_tool_uses_active_project_dir(qapp, tmp_path, monkeypatch):
     assert launched["shown"] is True
     assert launched["raised"] is True
     assert launched["instance"] in window._child_tool_windows
+
+
+def test_experimental_overlay_tool_opens_from_visualization_menu(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    launched: dict[str, object] = {}
+
+    class FakeExperimentalOverlayWindow(QWidget):
+        def __init__(self):
+            super().__init__()
+            launched["instance"] = self
+
+    def fake_launch_experimental_data_overlay_ui():
+        return FakeExperimentalOverlayWindow()
+
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.experimental_overlay_window."
+        "launch_experimental_data_overlay_ui",
+        fake_launch_experimental_data_overlay_ui,
+    )
+
+    window._open_experimental_data_overlay_tool()
+
+    assert launched["instance"] in window._child_tool_windows
+    assert "experimental data overlay" in window.statusBar().currentMessage()
+    window.close()
 
 
 def test_cluster_dynamics_tool_uses_active_project_dir(
@@ -4427,6 +5026,122 @@ def test_cluster_dynamics_ml_tool_uses_active_project_dir(
     )
     assert launched["shown"] is True
     assert launched["raised"] is True
+    assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
+def test_cluster_dynamics_cli_setup_uses_active_project_dir(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    frames_dir = tmp_path / "splitxyz_f0fs"
+    frames_dir.mkdir()
+    energy_file = tmp_path / "traj.ener"
+    energy_file.write_text(
+        "# step time kinetic temperature potential\n"
+        "1 0.0 1.0 300.0 -10.0\n",
+        encoding="utf-8",
+    )
+    window.current_settings.frames_dir = str(frames_dir)
+    window.current_settings.energy_file = str(energy_file)
+    window.project_manager.save_project(window.current_settings)
+    launched: dict[str, object] = {}
+
+    class FakeRunFileWindow:
+        pass
+
+    def fake_launch_clusterdynamics_run_file_ui(
+        *,
+        initial_project_dir=None,
+        initial_frames_dir=None,
+        initial_energy_file=None,
+    ):
+        launched["project_dir"] = initial_project_dir
+        launched["frames_dir"] = initial_frames_dir
+        launched["energy_file"] = initial_energy_file
+        launched["instance"] = FakeRunFileWindow()
+        return launched["instance"]
+
+    monkeypatch.setattr(
+        "saxshell.clusterdynamics.ui.run_file_window."
+        "launch_clusterdynamics_run_file_ui",
+        fake_launch_clusterdynamics_run_file_ui,
+    )
+
+    window._open_clusterdynamics_cli_setup_tool()
+
+    assert launched["frames_dir"] == frames_dir.resolve()
+    assert launched["energy_file"] == energy_file.resolve()
+    assert (
+        launched["project_dir"]
+        == Path(window.current_settings.project_dir).resolve()
+    )
+    assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
+def test_cluster_dynamics_ml_cli_setup_uses_active_project_dir(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    frames_dir = tmp_path / "splitxyz_f0fs"
+    frames_dir.mkdir()
+    clusters_dir = tmp_path / "clusters"
+    clusters_dir.mkdir()
+    energy_file = tmp_path / "traj.ener"
+    energy_file.write_text(
+        "# step time kinetic temperature potential\n"
+        "1 0.0 1.0 300.0 -10.0\n",
+        encoding="utf-8",
+    )
+    window.current_settings.frames_dir = str(frames_dir)
+    window.current_settings.clusters_dir = str(clusters_dir)
+    window.current_settings.energy_file = str(energy_file)
+    window.project_manager.save_project(window.current_settings)
+    launched: dict[str, object] = {}
+
+    class FakeRunFileWindow:
+        pass
+
+    def fake_launch_clusterdynamicsml_run_file_ui(
+        *,
+        initial_project_dir=None,
+        initial_frames_dir=None,
+        initial_energy_file=None,
+        initial_clusters_dir=None,
+        initial_experimental_data_file=None,
+    ):
+        launched["project_dir"] = initial_project_dir
+        launched["frames_dir"] = initial_frames_dir
+        launched["energy_file"] = initial_energy_file
+        launched["clusters_dir"] = initial_clusters_dir
+        launched["experimental_data_file"] = initial_experimental_data_file
+        launched["instance"] = FakeRunFileWindow()
+        return launched["instance"]
+
+    monkeypatch.setattr(
+        "saxshell.clusterdynamicsml.ui.run_file_window."
+        "launch_clusterdynamicsml_run_file_ui",
+        fake_launch_clusterdynamicsml_run_file_ui,
+    )
+
+    window._open_clusterdynamicsml_cli_setup_tool()
+
+    assert launched["frames_dir"] == frames_dir.resolve()
+    assert launched["energy_file"] == energy_file.resolve()
+    assert launched["clusters_dir"] == clusters_dir.resolve()
+    assert (
+        launched["experimental_data_file"]
+        == window.current_settings.resolved_experimental_data_path
+    )
+    assert (
+        launched["project_dir"]
+        == Path(window.current_settings.project_dir).resolve()
+    )
     assert launched["instance"] in window._child_tool_windows
     window.close()
 
@@ -13252,6 +13967,105 @@ def test_load_experimental_data_file_detects_three_column_headers(
     assert np.allclose(summary.q_values, [0.05, 0.10])
     assert np.allclose(summary.intensities, [10.0, 9.5])
     assert np.allclose(summary.errors, [0.1, 0.2])
+
+
+def test_experimental_overlay_window_loads_multiple_header_styles(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    plain_path = tmp_path / "plain_trace.dat"
+    plain_path.write_text(
+        "# q intensity error\n"
+        "0.05 10.0 0.5\n"
+        "0.10 9.0 0.4\n"
+        "0.20 9.5 0.3\n",
+        encoding="utf-8",
+    )
+    header_path = tmp_path / "instrument_export.txt"
+    header_path.write_text(
+        "Detector export\n"
+        "q_value intensity_value sigma_value\n"
+        "0.04 100.0 2.0\n"
+        "0.10 105.0 2.2\n"
+        "0.30 110.0 2.5\n",
+        encoding="utf-8",
+    )
+
+    window = ExperimentalDataOverlayWindow()
+    added = window.add_data_files([plain_path, header_path])
+
+    assert added == 2
+    assert len(window.traces) == 2
+    assert window.trace_table.rowCount() == 2
+    assert window.q_min_spin.value() == pytest.approx(0.04)
+    assert window.q_max_spin.value() == pytest.approx(0.30)
+    assert "q_value" in window.trace_table.item(1, 6).text()
+    assert "intensity_value" in window.trace_table.item(1, 6).text()
+    assert len(window._left_axis.get_lines()) == 2
+    assert window.log_x_axis_button.isChecked() is True
+    assert window.log_y_axis_button.isChecked() is True
+    assert window.log_x_axis_button.text() == "Log X: On"
+    assert window.log_y_axis_button.text() == "Log Y: On"
+    assert window._left_axis.get_xscale() == "log"
+    assert window._left_axis.get_yscale() == "log"
+
+    axis_combo = window.trace_table.cellWidget(1, window.AXIS_COLUMN)
+    assert isinstance(axis_combo, QComboBox)
+    axis_combo.setCurrentIndex(axis_combo.findData("right"))
+
+    assert window.traces[1].axis == "right"
+    assert window._right_axis is not None
+    assert len(window._right_axis.get_lines()) == 1
+    assert window._right_axis.get_xscale() == "log"
+    assert window._right_axis.get_yscale() == "log"
+
+    window.log_x_axis_button.setChecked(False)
+    window.log_y_axis_button.setChecked(False)
+
+    assert window.log_x_axis_button.text() == "Log X: Off"
+    assert window.log_y_axis_button.text() == "Log Y: Off"
+    assert window._left_axis.get_xscale() == "linear"
+    assert window._left_axis.get_yscale() == "linear"
+    assert window._right_axis is not None
+    assert window._right_axis.get_xscale() == "linear"
+    assert window._right_axis.get_yscale() == "linear"
+
+    window.align_y_axes_checkbox.setChecked(False)
+    window.rescale_axes_button.click()
+
+    assert window.align_y_axes_checkbox.isChecked() is True
+
+    right_ylim_before_q_range = tuple(window._right_axis.get_ylim())
+
+    window.full_q_range_checkbox.setChecked(False)
+    window.q_min_spin.setValue(0.08)
+    window.q_max_spin.setValue(0.20)
+
+    assert window._left_axis.get_xlim() == pytest.approx((0.08, 0.20))
+    assert window._right_axis is not None
+    assert not np.allclose(
+        window._right_axis.get_ylim(),
+        right_ylim_before_q_range,
+    )
+
+    window._set_trace_color(0, "#123456")
+
+    assert window.traces[0].color == "#123456"
+    assert window.trace_table.item(0, window.COLOR_COLUMN).text() == "#123456"
+    assert window._left_axis.get_lines()[0].get_color() == "#123456"
+
+    visible_item = window.trace_table.item(0, window.SHOW_COLUMN)
+    visible_item.setCheckState(Qt.CheckState.Unchecked)
+
+    assert window.traces[0].visible is False
+
+    window.trace_table.selectRow(0)
+    window._remove_selected_traces()
+
+    assert len(window.traces) == 1
+    assert window.trace_table.rowCount() == 1
+    window.close()
 
 
 def test_experimental_data_header_dialog_allows_manual_column_selection(

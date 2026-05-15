@@ -3,9 +3,11 @@ from __future__ import annotations
 __all__ = [
     "DistributionSetupWindow",
     "ExperimentalDataHeaderDialog",
+    "ExperimentalDataOverlayWindow",
     "PriorHistogramWindow",
     "SAXSProgressDialog",
     "SAXSMainWindow",
+    "launch_experimental_data_overlay_ui",
     "launch_saxs_ui",
 ]
 
@@ -19,6 +21,21 @@ def __getattr__(name: str):
         from .experimental_data_loader import ExperimentalDataHeaderDialog
 
         return ExperimentalDataHeaderDialog
+    if name in {
+        "ExperimentalDataOverlayWindow",
+        "launch_experimental_data_overlay_ui",
+    }:
+        from .experimental_overlay_window import (
+            ExperimentalDataOverlayWindow,
+            launch_experimental_data_overlay_ui,
+        )
+
+        return {
+            "ExperimentalDataOverlayWindow": ExperimentalDataOverlayWindow,
+            "launch_experimental_data_overlay_ui": (
+                launch_experimental_data_overlay_ui
+            ),
+        }[name]
     if name == "PriorHistogramWindow":
         from .prior_histogram_window import PriorHistogramWindow
 

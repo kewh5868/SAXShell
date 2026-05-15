@@ -1131,6 +1131,7 @@ class SAXSMainWindow(QMainWindow):
         self._base_font_point_size = self._resolve_base_font_point_size()
         self._scale_shortcuts: list[QShortcut] = []
         self._child_tool_windows: list[object] = []
+        self._single_instance_child_tool_windows: dict[str, object] = {}
         self._contrast_mode_tool_window: object | None = None
         self._solute_volume_fraction_tool_window: (
             SoluteVolumeFractionToolWindow | None
@@ -1510,6 +1511,58 @@ class SAXSMainWindow(QMainWindow):
         self.pdfsetup_action.triggered.connect(self._open_pdfsetup_tool)
         self.pdf_menu.addAction(self.pdfsetup_action)
 
+        self.batch_processing_menu = self.tools_menu.addMenu(
+            "Batch Processing"
+        )
+        self.mdtrajectory_batch_queue_action = QAction(
+            "Open MD Trajectory Batch Queue",
+            self,
+        )
+        self.mdtrajectory_batch_queue_action.triggered.connect(
+            self._open_mdtrajectory_batch_queue_tool
+        )
+        self.batch_processing_menu.addAction(
+            self.mdtrajectory_batch_queue_action
+        )
+
+        self.xyz2pdb_batch_queue_action = QAction(
+            "Open XYZ -> PDB Batch Queue",
+            self,
+        )
+        self.xyz2pdb_batch_queue_action.triggered.connect(
+            self._open_xyz2pdb_batch_queue_tool
+        )
+        self.batch_processing_menu.addAction(self.xyz2pdb_batch_queue_action)
+
+        self.cluster_batch_queue_action = QAction(
+            "Open Cluster Extraction Batch Queue",
+            self,
+        )
+        self.cluster_batch_queue_action.triggered.connect(
+            self._open_cluster_batch_queue_tool
+        )
+        self.batch_processing_menu.addAction(self.cluster_batch_queue_action)
+
+        self.representativefinder_batch_queue_action = QAction(
+            "Open Representative Structures Batch Queue",
+            self,
+        )
+        self.representativefinder_batch_queue_action.triggered.connect(
+            self._open_representative_batch_queue_tool
+        )
+        self.batch_processing_menu.addAction(
+            self.representativefinder_batch_queue_action
+        )
+
+        self.pdf_batch_queue_action = QAction(
+            "Open PDF Batch Queue",
+            self,
+        )
+        self.pdf_batch_queue_action.triggered.connect(
+            self._open_pdf_batch_queue_tool
+        )
+        self.batch_processing_menu.addAction(self.pdf_batch_queue_action)
+
         self.fullrmc_action = QAction("Open RMC Setup (fullrmc)", self)
         self.fullrmc_action.triggered.connect(self._open_fullrmc_tool)
         self.pdf_menu.addAction(self.fullrmc_action)
@@ -1523,6 +1576,15 @@ class SAXSMainWindow(QMainWindow):
             self._open_structure_viewer_tool
         )
         self.visualization_menu.addAction(self.structure_viewer_action)
+
+        self.experimental_overlay_action = QAction(
+            "Experimental Data Overlay",
+            self,
+        )
+        self.experimental_overlay_action.triggered.connect(
+            self._open_experimental_data_overlay_tool
+        )
+        self.visualization_menu.addAction(self.experimental_overlay_action)
 
         self.blenderxyz_action = QAction(
             "Open Blender XYZ Renderer",
@@ -1616,6 +1678,38 @@ class SAXSMainWindow(QMainWindow):
         )
         self.xray_toolkit_menu.addAction(self.fluorescence_estimate_action)
         self.cli_setup_menu = self.tools_menu.addMenu("CLI Setup")
+        self.xyz2pdb_cli_setup_action = QAction(
+            "Open XYZ -> PDB CLI Setup (Beta)",
+            self,
+        )
+        self.xyz2pdb_cli_setup_action.triggered.connect(
+            self._open_xyz2pdb_cli_setup_tool
+        )
+        self.cli_setup_menu.addAction(self.xyz2pdb_cli_setup_action)
+        self.cluster_cli_setup_action = QAction(
+            "Open Cluster Extraction CLI Setup (Beta)",
+            self,
+        )
+        self.cluster_cli_setup_action.triggered.connect(
+            self._open_cluster_cli_setup_tool
+        )
+        self.cli_setup_menu.addAction(self.cluster_cli_setup_action)
+        self.clusterdynamics_cli_setup_action = QAction(
+            "Open Cluster Dynamics CLI Setup (Beta)",
+            self,
+        )
+        self.clusterdynamics_cli_setup_action.triggered.connect(
+            self._open_clusterdynamics_cli_setup_tool
+        )
+        self.cli_setup_menu.addAction(self.clusterdynamics_cli_setup_action)
+        self.clusterdynamicsml_cli_setup_action = QAction(
+            "Open Cluster Dynamics ML CLI Setup (Beta)",
+            self,
+        )
+        self.clusterdynamicsml_cli_setup_action.triggered.connect(
+            self._open_clusterdynamicsml_cli_setup_tool
+        )
+        self.cli_setup_menu.addAction(self.clusterdynamicsml_cli_setup_action)
         self.representative_cli_setup_action = QAction(
             "Open Representative CLI Setup (Beta)",
             self,
@@ -10404,8 +10498,17 @@ class SAXSMainWindow(QMainWindow):
             return
         signal.connect(self._on_debye_waller_project_saved)
 
-    def _track_child_tool_window(self, window: object) -> None:
+    def _track_child_tool_window(
+        self,
+        window: object,
+        *,
+        single_instance_key: str | None = None,
+    ) -> None:
         if window in self._child_tool_windows:
+            if single_instance_key is not None:
+                self._single_instance_child_tool_windows[
+                    single_instance_key
+                ] = window
             return
         if isinstance(window, QWidget):
             window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -10419,6 +10522,10 @@ class SAXSMainWindow(QMainWindow):
                 )
             )
         self._child_tool_windows.append(window)
+        if single_instance_key is not None:
+            self._single_instance_child_tool_windows[single_instance_key] = (
+                window
+            )
 
     def _forget_child_tool_window(self, window: object) -> None:
         self._child_tool_windows = [
@@ -10426,6 +10533,60 @@ class SAXSMainWindow(QMainWindow):
             for existing in self._child_tool_windows
             if existing is not window
         ]
+        self._single_instance_child_tool_windows = {
+            key: existing
+            for key, existing in self._single_instance_child_tool_windows.items()
+            if existing is not window
+        }
+
+    def _focus_single_instance_child_tool_window(
+        self,
+        single_instance_key: str,
+        tool_label: str,
+    ) -> bool:
+        window = self._single_instance_child_tool_windows.get(
+            single_instance_key
+        )
+        if window is None:
+            return False
+        try:
+            for method_name in ("show", "raise_", "activateWindow"):
+                method = getattr(window, method_name, None)
+                if callable(method):
+                    method()
+        except RuntimeError:
+            self._forget_child_tool_window(window)
+            return False
+        self.statusBar().showMessage(
+            f"{tool_label} is already open; focused the existing window.",
+            5000,
+        )
+        return True
+
+    def _block_conflicting_child_tool_window(
+        self,
+        conflict_key: str,
+        *,
+        requested_tool_label: str,
+        open_tool_label: str,
+    ) -> bool:
+        window = self._single_instance_child_tool_windows.get(conflict_key)
+        if window is None:
+            return False
+        try:
+            for method_name in ("show", "raise_", "activateWindow"):
+                method = getattr(window, method_name, None)
+                if callable(method):
+                    method()
+        except RuntimeError:
+            self._forget_child_tool_window(window)
+            return False
+        self.statusBar().showMessage(
+            f"{open_tool_label} is already open; close it before opening "
+            f"{requested_tool_label}.",
+            5000,
+        )
+        return True
 
     def _close_child_tool_windows(self) -> bool:
         for window in list(self._child_tool_windows):
@@ -10559,6 +10720,11 @@ class SAXSMainWindow(QMainWindow):
             )
 
     def _open_mdtrajectory_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "mdtrajectory",
+            "MD trajectory extraction",
+        ):
+            return
         from saxshell.mdtrajectory.ui.main_window import (
             launch_mdtrajectory_app,
         )
@@ -10580,7 +10746,10 @@ class SAXSMainWindow(QMainWindow):
             energy_file=energy_file,
         )
         self._connect_project_path_updates(window)
-        self._track_child_tool_window(window)
+        self._track_child_tool_window(
+            window,
+            single_instance_key="mdtrajectory",
+        )
         if project_dir is not None:
             self.statusBar().showMessage(
                 f"Opened MD trajectory extraction for {project_dir}"
@@ -10588,7 +10757,52 @@ class SAXSMainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Opened MD trajectory extraction")
 
+    def _open_mdtrajectory_batch_queue_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "mdtrajectory_batch_queue",
+            "MD trajectory batch queue",
+        ):
+            return
+        from saxshell.mdtrajectory.ui.batch_queue_window import (
+            MDTrajectoryBatchQueueWindow,
+        )
+
+        settings = self._active_project_launch_settings()
+        project_dir = None
+        trajectory_file = None
+        topology_file = None
+        energy_file = None
+        if settings is not None:
+            project_dir = Path(settings.project_dir).resolve()
+            trajectory_file = settings.resolved_trajectory_file
+            topology_file = settings.resolved_topology_file
+            energy_file = settings.resolved_energy_file
+        window = MDTrajectoryBatchQueueWindow(
+            initial_project_dir=project_dir,
+            initial_trajectory_file=trajectory_file,
+            initial_topology_file=topology_file,
+            initial_energy_file=energy_file,
+        )
+        self._connect_project_path_updates(window)
+        window.show()
+        window.raise_()
+        self._track_child_tool_window(
+            window,
+            single_instance_key="mdtrajectory_batch_queue",
+        )
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                f"Opened MD trajectory batch queue for {project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened MD trajectory batch queue")
+
     def _open_cluster_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "cluster",
+            "Cluster extraction",
+        ):
+            return
         from saxshell.cluster.ui.main_window import ClusterMainWindow
 
         settings = self._active_project_launch_settings()
@@ -10604,7 +10818,10 @@ class SAXSMainWindow(QMainWindow):
         self._connect_project_path_updates(window)
         window.show()
         window.raise_()
-        self._track_child_tool_window(window)
+        self._track_child_tool_window(
+            window,
+            single_instance_key="cluster",
+        )
         if frames_dir is not None:
             self.statusBar().showMessage(
                 f"Opened cluster extraction for {frames_dir}"
@@ -10612,7 +10829,51 @@ class SAXSMainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Opened cluster extraction")
 
+    def _open_cluster_batch_queue_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "cluster_batch_queue",
+            "Cluster extraction batch queue",
+        ):
+            return
+        from saxshell.cluster.ui.batch_queue_window import (
+            ClusterBatchQueueWindow,
+        )
+
+        settings = self._active_project_launch_settings()
+        frames_dir = None
+        project_dir = None
+        if settings is not None:
+            frames_dir = (
+                settings.resolved_pdb_frames_dir
+                or settings.resolved_frames_dir
+            )
+            project_dir = Path(settings.project_dir).resolve()
+        window = ClusterBatchQueueWindow(
+            initial_project_dir=project_dir,
+            initial_frames_dir=frames_dir,
+        )
+        self._connect_project_path_updates(window)
+        window.show()
+        window.raise_()
+        self._track_child_tool_window(
+            window,
+            single_instance_key="cluster_batch_queue",
+        )
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                f"Opened cluster extraction batch queue for {project_dir}"
+            )
+        else:
+            self.statusBar().showMessage(
+                "Opened cluster extraction batch queue"
+            )
+
     def _open_xyz2pdb_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "xyz2pdb",
+            "XYZ -> PDB conversion",
+        ):
+            return
         from saxshell.xyz2pdb.ui.main_window import launch_xyz2pdb_ui
 
         settings = self._active_project_launch_settings()
@@ -10626,7 +10887,10 @@ class SAXSMainWindow(QMainWindow):
             project_dir=project_dir,
         )
         self._connect_project_path_updates(window)
-        self._track_child_tool_window(window)
+        self._track_child_tool_window(
+            window,
+            single_instance_key="xyz2pdb",
+        )
         if input_path is not None:
             self.statusBar().showMessage(
                 f"Opened XYZ -> PDB conversion for {input_path}"
@@ -10634,7 +10898,187 @@ class SAXSMainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Opened XYZ -> PDB conversion")
 
+    def _open_xyz2pdb_batch_queue_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "xyz2pdb_batch_queue",
+            "XYZ -> PDB batch queue",
+        ):
+            return
+        from saxshell.xyz2pdb.ui.batch_queue_window import (
+            XYZToPDBBatchQueueWindow,
+        )
+
+        settings = self._active_project_launch_settings()
+        input_path = None
+        project_dir = None
+        if settings is not None:
+            input_path = settings.resolved_frames_dir
+            project_dir = Path(settings.project_dir).resolve()
+        window = XYZToPDBBatchQueueWindow(
+            initial_project_dir=project_dir,
+            initial_input_path=input_path,
+        )
+        self._connect_project_path_updates(window)
+        window.show()
+        window.raise_()
+        self._track_child_tool_window(
+            window,
+            single_instance_key="xyz2pdb_batch_queue",
+        )
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                f"Opened XYZ -> PDB batch queue for {project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened XYZ -> PDB batch queue")
+
+    def _open_xyz2pdb_cli_setup_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "xyz2pdb_cli_setup",
+            "XYZ -> PDB CLI setup",
+        ):
+            return
+        from saxshell.xyz2pdb.ui.run_file_window import (
+            launch_xyz2pdb_run_file_ui,
+        )
+
+        settings = self._active_project_launch_settings()
+        input_path = None
+        project_dir = None
+        if settings is not None:
+            input_path = settings.resolved_frames_dir
+            project_dir = Path(settings.project_dir).resolve()
+        window = launch_xyz2pdb_run_file_ui(
+            initial_project_dir=project_dir,
+            initial_input_path=input_path,
+        )
+        self._track_child_tool_window(
+            window,
+            single_instance_key="xyz2pdb_cli_setup",
+        )
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                "Opened XYZ -> PDB CLI setup for " f"{project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened XYZ -> PDB CLI setup")
+
+    def _open_cluster_cli_setup_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "cluster_cli_setup",
+            "Cluster extraction CLI setup",
+        ):
+            return
+        from saxshell.cluster.ui.run_file_window import (
+            launch_cluster_run_file_ui,
+        )
+
+        settings = self._active_project_launch_settings()
+        frames_dir = None
+        project_dir = None
+        if settings is not None:
+            frames_dir = (
+                settings.resolved_pdb_frames_dir
+                or settings.resolved_frames_dir
+            )
+            project_dir = Path(settings.project_dir).resolve()
+        window = launch_cluster_run_file_ui(
+            initial_project_dir=project_dir,
+            initial_frames_dir=frames_dir,
+        )
+        self._track_child_tool_window(
+            window,
+            single_instance_key="cluster_cli_setup",
+        )
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                "Opened cluster extraction CLI setup for " f"{project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened cluster extraction CLI setup")
+
+    def _open_clusterdynamics_cli_setup_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "clusterdynamics_cli_setup",
+            "Cluster dynamics CLI setup",
+        ):
+            return
+        from saxshell.clusterdynamics.ui.run_file_window import (
+            launch_clusterdynamics_run_file_ui,
+        )
+
+        settings = self._active_project_launch_settings()
+        project_dir = None
+        frames_dir = None
+        energy_file = None
+        if settings is not None:
+            project_dir = Path(settings.project_dir).resolve()
+            frames_dir = settings.resolved_frames_dir
+            energy_file = settings.resolved_energy_file
+        window = launch_clusterdynamics_run_file_ui(
+            initial_project_dir=project_dir,
+            initial_frames_dir=frames_dir,
+            initial_energy_file=energy_file,
+        )
+        self._track_child_tool_window(
+            window,
+            single_instance_key="clusterdynamics_cli_setup",
+        )
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                "Opened cluster dynamics CLI setup for " f"{project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened cluster dynamics CLI setup")
+
+    def _open_clusterdynamicsml_cli_setup_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "clusterdynamicsml_cli_setup",
+            "Cluster dynamics ML CLI setup",
+        ):
+            return
+        from saxshell.clusterdynamicsml.ui.run_file_window import (
+            launch_clusterdynamicsml_run_file_ui,
+        )
+
+        settings = self._active_project_launch_settings()
+        project_dir = None
+        frames_dir = None
+        clusters_dir = None
+        energy_file = None
+        experimental_data_file = None
+        if settings is not None:
+            project_dir = Path(settings.project_dir).resolve()
+            frames_dir = settings.resolved_frames_dir
+            clusters_dir = settings.resolved_clusters_dir
+            energy_file = settings.resolved_energy_file
+            experimental_data_file = settings.resolved_experimental_data_path
+        window = launch_clusterdynamicsml_run_file_ui(
+            initial_project_dir=project_dir,
+            initial_frames_dir=frames_dir,
+            initial_energy_file=energy_file,
+            initial_clusters_dir=clusters_dir,
+            initial_experimental_data_file=experimental_data_file,
+        )
+        self._track_child_tool_window(
+            window,
+            single_instance_key="clusterdynamicsml_cli_setup",
+        )
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                "Opened cluster dynamics ML CLI setup for " f"{project_dir}"
+            )
+        else:
+            self.statusBar().showMessage(
+                "Opened cluster dynamics ML CLI setup"
+            )
+
     def _open_bondanalysis_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "bondanalysis",
+            "Bond analysis",
+        ):
+            return
         from saxshell.bondanalysis.ui.main_window import BondAnalysisMainWindow
 
         settings = self._active_project_launch_settings()
@@ -10649,7 +11093,10 @@ class SAXSMainWindow(QMainWindow):
         )
         window.show()
         window.raise_()
-        self._track_child_tool_window(window)
+        self._track_child_tool_window(
+            window,
+            single_instance_key="bondanalysis",
+        )
         if clusters_dir:
             self.statusBar().showMessage(
                 f"Opened bond analysis for {clusters_dir}"
@@ -10658,6 +11105,11 @@ class SAXSMainWindow(QMainWindow):
             self.statusBar().showMessage("Opened bond analysis")
 
     def _open_debye_waller_analysis_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "debye_waller_analysis",
+            "Debye-Waller analysis",
+        ):
+            return
         from saxshell.saxs.debye_waller.ui.main_window import (
             DEBYE_WALLER_WINDOW_LOAD_TOTAL_STEPS,
             launch_debye_waller_analysis_ui,
@@ -10725,7 +11177,10 @@ class SAXSMainWindow(QMainWindow):
                 self._close_progress_dialog()
         self._connect_project_path_updates(window)
         self._connect_debye_waller_updates(window)
-        self._track_child_tool_window(window)
+        self._track_child_tool_window(
+            window,
+            single_instance_key="debye_waller_analysis",
+        )
         if clusters_dir is not None:
             self.statusBar().showMessage(
                 f"Opened Debye-Waller analysis for {clusters_dir}"
@@ -10734,6 +11189,11 @@ class SAXSMainWindow(QMainWindow):
             self.statusBar().showMessage("Opened Debye-Waller analysis")
 
     def _open_clusterdynamics_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "clusterdynamics",
+            "Cluster dynamics",
+        ):
+            return
         from saxshell.clusterdynamics.ui.main_window import (
             ClusterDynamicsMainWindow,
         )
@@ -10753,7 +11213,10 @@ class SAXSMainWindow(QMainWindow):
         )
         window.show()
         window.raise_()
-        self._track_child_tool_window(window)
+        self._track_child_tool_window(
+            window,
+            single_instance_key="clusterdynamics",
+        )
         if project_dir is not None:
             self.statusBar().showMessage(
                 f"Opened cluster dynamics for {project_dir}"
@@ -10762,6 +11225,11 @@ class SAXSMainWindow(QMainWindow):
             self.statusBar().showMessage("Opened cluster dynamics")
 
     def _open_clusterdynamicsml_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "clusterdynamicsml",
+            "Cluster dynamics (ML)",
+        ):
+            return
         from saxshell.clusterdynamicsml.ui.main_window import (
             ClusterDynamicsMLMainWindow,
         )
@@ -10787,7 +11255,10 @@ class SAXSMainWindow(QMainWindow):
         )
         window.show()
         window.raise_()
-        self._track_child_tool_window(window)
+        self._track_child_tool_window(
+            window,
+            single_instance_key="clusterdynamicsml",
+        )
         if project_dir is not None:
             self.statusBar().showMessage(
                 f"Opened cluster dynamics (ML) for {project_dir}"
@@ -10796,6 +11267,11 @@ class SAXSMainWindow(QMainWindow):
             self.statusBar().showMessage("Opened cluster dynamics (ML)")
 
     def _open_fullrmc_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "fullrmc",
+            "RMC setup",
+        ):
+            return
         from saxshell.fullrmc.ui.main_window import RMCSetupMainWindow
 
         project_dir = None
@@ -10804,7 +11280,10 @@ class SAXSMainWindow(QMainWindow):
         window = RMCSetupMainWindow(initial_project_dir=project_dir)
         window.show()
         window.raise_()
-        self._track_child_tool_window(window)
+        self._track_child_tool_window(
+            window,
+            single_instance_key="fullrmc",
+        )
         if project_dir:
             self.statusBar().showMessage(
                 f"Opened fullrmc setup for {project_dir}"
@@ -10813,6 +11292,17 @@ class SAXSMainWindow(QMainWindow):
             self.statusBar().showMessage("Opened fullrmc setup")
 
     def _open_pdfsetup_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "pdfsetup",
+            "PDF calculation",
+        ):
+            return
+        if self._block_conflicting_child_tool_window(
+            "pdf_batch_queue",
+            requested_tool_label="PDF calculation",
+            open_tool_label="PDF batch queue",
+        ):
+            return
         from saxshell.pdf.debyer.ui.main_window import DebyerPDFMainWindow
 
         settings = self._active_project_launch_settings()
@@ -10827,13 +11317,55 @@ class SAXSMainWindow(QMainWindow):
         )
         window.show()
         window.raise_()
-        self._track_child_tool_window(window)
+        self._track_child_tool_window(
+            window,
+            single_instance_key="pdfsetup",
+        )
         if project_dir is not None:
             self.statusBar().showMessage(
                 f"Opened PDF calculation for {project_dir}"
             )
         else:
             self.statusBar().showMessage("Opened PDF calculation")
+
+    def _open_pdf_batch_queue_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "pdf_batch_queue",
+            "PDF batch queue",
+        ):
+            return
+        if self._block_conflicting_child_tool_window(
+            "pdfsetup",
+            requested_tool_label="PDF batch queue",
+            open_tool_label="PDF calculation",
+        ):
+            return
+        from saxshell.pdf.debyer.ui.batch_queue_window import (
+            DebyerPDFBatchQueueWindow,
+        )
+
+        settings = self._active_project_launch_settings()
+        project_dir = None
+        frames_dir = None
+        if settings is not None:
+            project_dir = Path(settings.project_dir).resolve()
+            frames_dir = settings.resolved_frames_dir
+        window = DebyerPDFBatchQueueWindow(
+            initial_project_dir=project_dir,
+            initial_frames_dir=frames_dir,
+        )
+        window.show()
+        window.raise_()
+        self._track_child_tool_window(
+            window,
+            single_instance_key="pdf_batch_queue",
+        )
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                f"Opened PDF batch queue for {project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened PDF batch queue")
 
     def _open_blenderxyz_tool(self) -> None:
         from saxshell.toolbox.blender.ui.main_window import (
@@ -10853,7 +11385,21 @@ class SAXSMainWindow(QMainWindow):
         self._track_child_tool_window(window)
         self.statusBar().showMessage("Opened Structure Viewer")
 
+    def _open_experimental_data_overlay_tool(self) -> None:
+        from saxshell.saxs.ui.experimental_overlay_window import (
+            launch_experimental_data_overlay_ui,
+        )
+
+        window = launch_experimental_data_overlay_ui()
+        self._track_child_tool_window(window)
+        self.statusBar().showMessage("Opened experimental data overlay")
+
     def _open_solvent_shell_builder_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "solvent_shell_builder",
+            "Solvent shell builder",
+        ):
+            return
         from saxshell.fullrmc.ui.solvent_shell_builder_window import (
             launch_solvent_shell_builder_ui,
         )
@@ -10870,7 +11416,10 @@ class SAXSMainWindow(QMainWindow):
             initial_project_dir=project_dir,
             initial_input_path=initial_input_path,
         )
-        self._track_child_tool_window(window)
+        self._track_child_tool_window(
+            window,
+            single_instance_key="solvent_shell_builder",
+        )
         if project_dir is not None:
             self.statusBar().showMessage(
                 f"Opened solvent shell builder (beta) for {project_dir}"
@@ -10878,7 +11427,56 @@ class SAXSMainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Opened solvent shell builder (beta)")
 
+    def _open_representative_batch_queue_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "representativefinder_batch_queue",
+            "Representative structures batch queue",
+        ):
+            return
+        from saxshell.representativefinder.ui.batch_queue_window import (
+            RepresentativeFinderBatchQueueWindow,
+        )
+
+        project_dir = None
+        initial_clusters_dir = None
+        if self.current_settings is not None:
+            project_dir = Path(self.current_settings.project_dir).resolve()
+            initial_clusters_dir = self.current_settings.resolved_clusters_dir
+        window = RepresentativeFinderBatchQueueWindow(
+            initial_project_dir=project_dir,
+            initial_clusters_dir=initial_clusters_dir,
+        )
+        project_results_changed = getattr(
+            window, "project_results_changed", None
+        )
+        if project_results_changed is not None and hasattr(
+            project_results_changed, "connect"
+        ):
+            project_results_changed.connect(
+                self._handle_representative_structure_results_changed
+            )
+        window.show()
+        window.raise_()
+        self._track_child_tool_window(
+            window,
+            single_instance_key="representativefinder_batch_queue",
+        )
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                "Opened representative structures batch queue for "
+                f"{project_dir}"
+            )
+        else:
+            self.statusBar().showMessage(
+                "Opened representative structures batch queue"
+            )
+
     def _open_representative_finder_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "representativefinder",
+            "Representative structures",
+        ):
+            return
         from saxshell.representativefinder.ui.main_window import (
             launch_representativefinder_ui,
         )
@@ -10901,7 +11499,10 @@ class SAXSMainWindow(QMainWindow):
             project_results_changed.connect(
                 self._handle_representative_structure_results_changed
             )
-        self._track_child_tool_window(window)
+        self._track_child_tool_window(
+            window,
+            single_instance_key="representativefinder",
+        )
         if project_dir is not None:
             self.statusBar().showMessage(
                 "Opened representative structures for " f"{project_dir}"
@@ -10910,6 +11511,11 @@ class SAXSMainWindow(QMainWindow):
             self.statusBar().showMessage("Opened representative structures")
 
     def _open_representative_cli_setup_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "representative_cli_setup",
+            "Representative CLI setup",
+        ):
+            return
         from saxshell.representativefinder.ui.run_file_window import (
             launch_representativefinder_run_file_ui,
         )
@@ -10923,7 +11529,10 @@ class SAXSMainWindow(QMainWindow):
             initial_project_dir=project_dir,
             initial_input_path=initial_input_path,
         )
-        self._track_child_tool_window(window)
+        self._track_child_tool_window(
+            window,
+            single_instance_key="representative_cli_setup",
+        )
         if project_dir is not None:
             self.statusBar().showMessage(
                 "Opened representative CLI setup for " f"{project_dir}"
