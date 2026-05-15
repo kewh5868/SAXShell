@@ -163,7 +163,11 @@ def list_template_specs(
     ):
         if path.stem in seen_names:
             continue
-        specs.append(load_template_spec(path.stem, resolved_dir))
+        spec = load_template_spec(path.stem, resolved_dir)
+        if spec.deprecated and not include_deprecated:
+            seen_names.add(path.stem)
+            continue
+        specs.append(spec)
         seen_names.add(path.stem)
     return specs
 
@@ -190,7 +194,10 @@ def load_template_spec(
         name=template_name,
         module_path=module_path,
         metadata_path=metadata_path if metadata_path.is_file() else None,
-        deprecated=module_path.parent.name == "_deprecated",
+        deprecated=(
+            module_path.parent.name == "_deprecated"
+            or bool(metadata["deprecated"])
+        ),
         display_name=str(metadata["display_name"]),
         description=str(metadata["description"]),
         lmfit_model_name=directives["model_lmfit"],
@@ -326,6 +333,7 @@ def _load_template_metadata(
                 "the _model_templates folder to provide a friendly display "
                 "name and a detailed description."
             ),
+            "deprecated": False,
             "cluster_geometry_support": TemplateClusterGeometrySupport(
                 supported=False
             ),
@@ -361,6 +369,7 @@ def _load_template_metadata(
     return {
         "display_name": display_name,
         "description": description,
+        "deprecated": bool(payload.get("deprecated", False)),
         "cluster_geometry_support": cluster_geometry_support,
         "solution_scattering_support": solution_scattering_support,
         "prefit_support": prefit_support,

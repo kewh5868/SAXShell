@@ -534,7 +534,8 @@ def test_validate_template_candidate_rejects_cluster_geometry_binding_missing_fr
 
 def test_install_template_candidate_copies_files_and_loads_spec(tmp_path):
     source_template = Path(
-        "src/saxshell/saxs/_model_templates/template_pd_likelihood_monosq.py"
+        "src/saxshell/saxs/_model_templates/_deprecated/"
+        "template_pd_likelihood_monosq.py"
     )
     source_metadata = source_template.with_suffix(".json")
     candidate_template = tmp_path / source_template.name

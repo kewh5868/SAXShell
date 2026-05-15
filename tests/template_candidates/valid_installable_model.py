@@ -37,4 +37,8 @@ def log_likelihood_candidate(params):
         offset=offset,
     )
     residuals = np.asarray(experimental_intensities, dtype=float) - model
+    if residuals.size == 0:
+        return -1.0
+    if not np.all(np.isfinite(residuals)):
+        return -1.0e12
     return float(-0.5 * np.mean(residuals**2))
