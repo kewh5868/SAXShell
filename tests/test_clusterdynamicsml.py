@@ -22,8 +22,12 @@ from saxshell import saxshell as saxshell_module
 from saxshell.cluster import PDBShellReferenceDefinition
 from saxshell.clusterdynamicsml import (
     ClusterDynamicsMLWorkflow,
+    build_clusterdynamicsml_run_config,
+    default_clusterdynamicsml_run_file_path,
     load_cluster_dynamicsai_dataset,
+    load_clusterdynamicsml_run_config,
     save_cluster_dynamicsai_dataset,
+    save_clusterdynamicsml_run_config,
 )
 from saxshell.clusterdynamicsml.ui.main_window import (
     _UI_REFRESH_DELAY_MS,
@@ -34,6 +38,10 @@ from saxshell.clusterdynamicsml.ui.main_window import (
 from saxshell.clusterdynamicsml.ui.plot_panel import (
     _build_population_histogram_payload,
     _distribution_entries,
+    build_cluster_lifetime_distributions,
+)
+from saxshell.clusterdynamicsml.ui.run_file_window import (
+    ClusterDynamicsMLRunFileWindow,
 )
 from saxshell.saxs.debye import (
     compute_debye_intensity,
@@ -713,6 +721,143 @@ def test_clusterdynamicsml_workflow_predicts_larger_clusters(tmp_path):
     )
     assert result.saxs_comparison.rmse is not None
     assert len(result.saxs_comparison.component_weights) >= 3
+
+
+def test_clusterdynamicsml_project_run_saves_dataset_and_updates_project(
+    tmp_path,
+    capsys,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    clusters_dir = _build_clusters_dir(tmp_path)
+    experimental_data_file = _write_experimental_data_file(tmp_path)
+    energy_file = _write_energy_file(tmp_path)
+    project_dir = _build_project_dir(
+        tmp_path,
+        frames_dir=frames_dir,
+        clusters_dir=clusters_dir,
+        experimental_data_file=experimental_data_file,
+        energy_file=energy_file,
+    )
+    output_file = (
+        project_dir
+        / "exported_results"
+        / "data"
+        / "clusterdynamicsml"
+        / "splitxyz_f0fs_clusterdynamicsml.json"
+    )
+    config = build_clusterdynamicsml_run_config(
+        project_dir=project_dir,
+        frames_dir=frames_dir,
+        output_file=output_file,
+        clusters_dir=clusters_dir,
+        experimental_data_file=experimental_data_file,
+        energy_file=energy_file,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=1,
+        target_node_counts=(4,),
+        candidates_per_size=1,
+        q_points=60,
+    )
+    run_file = default_clusterdynamicsml_run_file_path(project_dir)
+    save_clusterdynamicsml_run_config(run_file, config)
+    loaded = load_clusterdynamicsml_run_config(run_file)
+
+    assert loaded.frames_dir == str(frames_dir.resolve())
+    assert loaded.output_file == (
+        "exported_results/data/clusterdynamicsml/"
+        "splitxyz_f0fs_clusterdynamicsml.json"
+    )
+    assert loaded.target_node_counts == (4,)
+    assert loaded.candidates_per_size == 1
+    assert loaded.q_points == 60
+
+    exit_code = clusterdynamicsml_cli_module.main(["run", str(project_dir)])
+    captured = capsys.readouterr()
+    saved_settings = SAXSProjectManager().load_project(project_dir)
+
+    assert exit_code == 0
+    assert "Cluster dynamics ML CLI run complete" in captured.out
+    assert "Predictions:" in captured.out
+    assert output_file.is_file()
+    assert output_file.with_name(
+        "splitxyz_f0fs_clusterdynamicsml_predictions.csv"
+    ).is_file()
+    loaded_dataset = load_cluster_dynamicsai_dataset(output_file)
+    assert loaded_dataset.result.predictions
+    assert saved_settings.resolved_frames_dir == frames_dir.resolve()
+    assert saved_settings.resolved_clusters_dir == clusters_dir.resolve()
+    assert saved_settings.resolved_energy_file == energy_file.resolve()
+
+
+def test_clusterdynamicsml_run_file_window_builds_project_config(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    frames_dir = _build_frames_dir(tmp_path)
+    clusters_dir = _build_clusters_dir(tmp_path)
+    experimental_data_file = _write_experimental_data_file(tmp_path)
+    energy_file = _write_energy_file(tmp_path)
+    project_dir = _build_project_dir(
+        tmp_path,
+        frames_dir=frames_dir,
+        clusters_dir=clusters_dir,
+        experimental_data_file=experimental_data_file,
+        energy_file=energy_file,
+    )
+
+    window = ClusterDynamicsMLRunFileWindow(
+        initial_project_dir=project_dir,
+        initial_frames_dir=frames_dir,
+        initial_energy_file=energy_file,
+        initial_clusters_dir=clusters_dir,
+        initial_experimental_data_file=experimental_data_file,
+    )
+    output_file = (
+        project_dir
+        / "exported_results"
+        / "data"
+        / "clusterdynamicsml"
+        / "splitxyz_f0fs_clusterdynamicsml.json"
+    )
+    window.output_file_edit.setText(str(output_file))
+    window.definitions_panel.load_atom_type_definitions(
+        ATOM_TYPE_DEFINITIONS,
+        emit_signal=False,
+    )
+    window.definitions_panel.load_pair_cutoff_definitions(
+        PAIR_CUTOFFS,
+        emit_signal=False,
+    )
+    window.time_panel.set_frame_timestep_fs(10.0)
+    window.time_panel.set_frames_per_colormap_timestep(1)
+    window.prediction_panel.set_target_node_counts((4,))
+    window.prediction_panel.set_candidates_per_size(1)
+    window.prediction_panel.set_q_settings(
+        q_min=0.05,
+        q_max=1.0,
+        q_points=60,
+    )
+
+    config = window._current_config(project_dir)
+
+    assert config.frames_dir == str(frames_dir.resolve())
+    assert config.clusters_dir == str(clusters_dir.resolve())
+    assert config.experimental_data_file == str(
+        experimental_data_file.resolve()
+    )
+    assert config.energy_file == str(energy_file.resolve())
+    assert config.output_file == (
+        "exported_results/data/clusterdynamicsml/"
+        "splitxyz_f0fs_clusterdynamicsml.json"
+    )
+    assert config.target_node_counts == (4,)
+    assert config.candidates_per_size == 1
+    assert config.q_points == 60
+    assert "clusterdynamicsml run" in window.command_box.toPlainText()
+    window.close()
 
 
 def test_clusterdynamicsml_estimates_debye_waller_pairs_and_uses_them_for_predicted_traces(
@@ -2858,6 +3003,56 @@ def test_clusterdynamicsml_window_shows_observed_lifetime_tab(
     assert sigma_sq_value == pytest.approx(sigma_value**2, abs=1e-5)
     assert all(weight != "n/a" for weight in observed_only_weights)
     assert window.lifetime_table.item(0, 8) is not None
+    window.close()
+
+
+def test_clusterdynamicsml_window_opens_lifetime_distribution_plots(
+    qapp,
+    tmp_path,
+):
+    frames_dir = _build_frames_dir(tmp_path)
+    clusters_dir = _build_clusters_dir(tmp_path)
+
+    result = ClusterDynamicsMLWorkflow(
+        frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoff_definitions=PAIR_CUTOFFS,
+        clusters_dir=clusters_dir,
+        frame_timestep_fs=10.0,
+        frames_per_colormap_timestep=1,
+        target_node_counts=(4, 5),
+    ).analyze()
+    distributions = build_cluster_lifetime_distributions(result)
+
+    window = ClusterDynamicsMLMainWindow(initial_frames_dir=frames_dir)
+    window._on_run_finished(result)
+    window.lifetime_distribution_button.click()
+    qapp.processEvents()
+
+    distribution_window = window._lifetime_distribution_window
+
+    assert distributions
+    assert any(
+        distribution.completed_lifetime_count > 0
+        for distribution in distributions
+    )
+    assert window.lifetime_distribution_button.isEnabled()
+    assert distribution_window is not None
+    assert distribution_window.isVisible()
+    assert "Lorentzian" in distribution_window.panel.summary_box.toPlainText()
+    assert any(
+        axis.patches
+        for axis in distribution_window.panel.figure.axes
+        if axis.get_visible()
+    )
+
+    distribution_window.panel.include_truncated_checkbox.setChecked(True)
+    qapp.processEvents()
+
+    assert "window-truncated" in (
+        distribution_window.panel.summary_box.toPlainText()
+    )
+    distribution_window.close()
     window.close()
 
 

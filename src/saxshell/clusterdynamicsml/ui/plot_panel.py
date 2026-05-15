@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -15,12 +17,16 @@ from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QLabel,
+    QMainWindow,
     QPushButton,
+    QSpinBox,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from saxshell.cluster.clusternetwork import stoichiometry_label
+from saxshell.clusterdynamics.workflow import _summarize_series_lifetimes
 from saxshell.clusterdynamicsml.workflow import (
     ClusterDynamicsMLResult,
     _resolved_population_weights,
@@ -31,7 +37,10 @@ from saxshell.saxs.project_manager.prior_plot import (
     list_secondary_filter_elements,
     plot_md_prior_histogram,
 )
-from saxshell.saxs.stoichiometry import parse_stoich_label
+from saxshell.saxs.stoichiometry import (
+    format_stoich_for_axis,
+    parse_stoich_label,
+)
 
 _EXPERIMENTAL_COLOR = "#111111"
 _OBSERVED_MODEL_COLOR = "#1f77b4"
@@ -44,6 +53,29 @@ _HISTOGRAM_MODES = (
     ("Solvent Sort - Atom Fraction", "solvent_sort_atom_fraction"),
 )
 _STRUCTURE_FILE_SUFFIXES = {".xyz", ".pdb"}
+_COMPLETED_LIFETIME_COLOR = "#2e86ab"
+_TRUNCATED_LIFETIME_COLOR = "#d95f02"
+_LORENTZIAN_COLOR = "#7b3294"
+
+
+@dataclass(slots=True)
+class ClusterLifetimeDistribution:
+    label: str
+    cluster_size: int
+    completed_lifetimes_fs: np.ndarray
+    window_truncated_lifetimes_fs: np.ndarray
+    mean_lifetime_fs: float | None
+    std_lifetime_fs: float | None
+    completed_lifetime_count: int
+    window_truncated_lifetime_count: int
+
+
+@dataclass(slots=True)
+class _LorentzianFit:
+    center: float
+    gamma: float
+    r_squared: float | None
+    interpretation: str
 
 
 class ClusterDynamicsMLHistogramPanel(QWidget):
@@ -266,6 +298,217 @@ class ClusterDynamicsMLHistogramPanel(QWidget):
         visible = self._fixed_include_predictions is None
         self.population_label.setVisible(visible)
         self.population_combo.setVisible(visible)
+
+
+class ClusterDynamicsMLLifetimeDistributionPanel(QWidget):
+    """Plot completed lifetime distributions for each observed
+    stoichiometry."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._result: ClusterDynamicsMLResult | None = None
+        self._distributions: tuple[ClusterLifetimeDistribution, ...] = ()
+        self._build_ui()
+        self.refresh_plot()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        controls_widget = QWidget()
+        controls = QHBoxLayout(controls_widget)
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(8)
+
+        controls.addWidget(QLabel("Units"))
+        self.unit_combo = QComboBox()
+        self.unit_combo.addItem("fs", "fs")
+        self.unit_combo.addItem("ps", "ps")
+        self.unit_combo.currentIndexChanged.connect(
+            lambda _index: self.refresh_plot()
+        )
+        controls.addWidget(self.unit_combo)
+
+        controls.addWidget(QLabel("Bins"))
+        self.bin_spin = QSpinBox()
+        self.bin_spin.setRange(1, 80)
+        self.bin_spin.setValue(12)
+        self.bin_spin.valueChanged.connect(lambda _value: self.refresh_plot())
+        controls.addWidget(self.bin_spin)
+
+        self.include_truncated_checkbox = QCheckBox(
+            "Include window-truncated lifetimes"
+        )
+        self.include_truncated_checkbox.setToolTip(
+            "Window-truncated lifetimes are right- or left-censored by the "
+            "selected time window. They are useful for seeing persistence, "
+            "but can bias the distribution shape."
+        )
+        self.include_truncated_checkbox.toggled.connect(
+            lambda _checked: self.refresh_plot()
+        )
+        controls.addWidget(self.include_truncated_checkbox)
+        controls.addStretch(1)
+        layout.addWidget(controls_widget)
+
+        self.figure = Figure(figsize=(10.8, 7.2))
+        self.canvas = FigureCanvas(self.figure)
+        layout.addWidget(NavigationToolbar(self.canvas, self))
+        layout.addWidget(self.canvas, stretch=1)
+
+        self.summary_box = QTextEdit()
+        self.summary_box.setReadOnly(True)
+        self.summary_box.setMaximumHeight(170)
+        self.summary_box.setMinimumHeight(96)
+        layout.addWidget(self.summary_box)
+
+    def set_result(self, result: ClusterDynamicsMLResult | None) -> None:
+        self._result = result
+        self._distributions = (
+            ()
+            if result is None
+            else build_cluster_lifetime_distributions(result)
+        )
+        self.refresh_plot()
+
+    def refresh_plot(self) -> None:
+        self.figure.clear()
+        if self._result is None:
+            axis = self.figure.add_subplot(111)
+            axis.text(
+                0.5,
+                0.5,
+                "Run the prediction workflow or open a saved result to plot\n"
+                "cluster lifetime distributions by stoichiometry.",
+                ha="center",
+                va="center",
+                transform=axis.transAxes,
+            )
+            axis.set_axis_off()
+            self.summary_box.setPlainText("")
+            self.canvas.draw_idle()
+            return
+
+        if not self._distributions:
+            axis = self.figure.add_subplot(111)
+            axis.text(
+                0.5,
+                0.5,
+                "No lifetime distributions are available for this result.",
+                ha="center",
+                va="center",
+                transform=axis.transAxes,
+            )
+            axis.set_axis_off()
+            self.summary_box.setPlainText("")
+            self.canvas.draw_idle()
+            return
+
+        unit = str(self.unit_combo.currentData() or "fs")
+        include_truncated = bool(self.include_truncated_checkbox.isChecked())
+        requested_bins = int(self.bin_spin.value())
+        distribution_count = len(self._distributions)
+        column_count = min(3, max(1, math.ceil(math.sqrt(distribution_count))))
+        row_count = int(math.ceil(distribution_count / column_count))
+        self.figure.set_size_inches(
+            max(10.8, 4.2 * column_count),
+            max(6.4, 3.3 * row_count),
+            forward=True,
+        )
+        axes = self.figure.subplots(row_count, column_count, squeeze=False)
+        summary_lines: list[str] = []
+        for index, distribution in enumerate(self._distributions):
+            row = index // column_count
+            column = index % column_count
+            summary_lines.append(
+                _plot_lifetime_distribution_axis(
+                    axes[row][column],
+                    distribution,
+                    unit=unit,
+                    requested_bins=requested_bins,
+                    include_truncated=include_truncated,
+                )
+            )
+
+        for index in range(distribution_count, row_count * column_count):
+            row = index // column_count
+            column = index % column_count
+            axes[row][column].set_axis_off()
+
+        self.figure.suptitle(
+            "Cluster Lifetime Distributions by Stoichiometry",
+            y=0.995,
+        )
+        self.figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.965))
+        self.summary_box.setPlainText("\n".join(summary_lines))
+        self.canvas.draw_idle()
+
+
+class ClusterDynamicsMLLifetimeDistributionWindow(QMainWindow):
+    """Separate window for lifetime-distribution diagnostics."""
+
+    def __init__(
+        self,
+        result: ClusterDynamicsMLResult | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Cluster Lifetime Distributions")
+        self.resize(1220, 850)
+        self.panel = ClusterDynamicsMLLifetimeDistributionPanel(self)
+        self.setCentralWidget(self.panel)
+        self.set_result(result)
+
+    def set_result(self, result: ClusterDynamicsMLResult | None) -> None:
+        self.panel.set_result(result)
+
+
+def build_cluster_lifetime_distributions(
+    result: ClusterDynamicsMLResult,
+) -> tuple[ClusterLifetimeDistribution, ...]:
+    dynamics_result = result.dynamics_result
+    frame_count_matrix = np.asarray(
+        dynamics_result.frame_count_matrix,
+        dtype=float,
+    )
+    frame_times_fs = dynamics_result.frame_times_fs
+    distributions: list[ClusterLifetimeDistribution] = []
+    if frame_count_matrix.ndim != 2:
+        return ()
+
+    for row_index, label in enumerate(dynamics_result.cluster_labels):
+        if row_index >= frame_count_matrix.shape[0]:
+            continue
+        metrics = _summarize_series_lifetimes(
+            frame_count_matrix[row_index, :],
+            frame_times_fs=frame_times_fs,
+            observation_start_fs=dynamics_result.preview.analysis_start_fs,
+            observation_stop_fs=dynamics_result.preview.analysis_stop_fs,
+        )
+        distributions.append(
+            ClusterLifetimeDistribution(
+                label=str(label),
+                cluster_size=int(
+                    dynamics_result.cluster_sizes.get(str(label), 0)
+                ),
+                completed_lifetimes_fs=np.asarray(
+                    metrics.completed_lifetimes_fs,
+                    dtype=float,
+                ),
+                window_truncated_lifetimes_fs=np.asarray(
+                    metrics.window_truncated_lifetimes_fs,
+                    dtype=float,
+                ),
+                mean_lifetime_fs=metrics.mean_lifetime_fs,
+                std_lifetime_fs=metrics.std_lifetime_fs,
+                completed_lifetime_count=len(metrics.completed_lifetimes_fs),
+                window_truncated_lifetime_count=len(
+                    metrics.window_truncated_lifetimes_fs
+                ),
+            )
+        )
+    return tuple(distributions)
 
 
 class ClusterDynamicsMLPlotPanel(QWidget):
@@ -1365,6 +1608,325 @@ def _predicted_structure_label(
             if int(count) > 0
         }
     return stoichiometry_label(primary_counts)
+
+
+def _plot_lifetime_distribution_axis(
+    axis,
+    distribution: ClusterLifetimeDistribution,
+    *,
+    unit: str,
+    requested_bins: int,
+    include_truncated: bool,
+) -> str:
+    completed = _scaled_lifetimes(
+        distribution.completed_lifetimes_fs,
+        unit=unit,
+    )
+    truncated = _scaled_lifetimes(
+        distribution.window_truncated_lifetimes_fs,
+        unit=unit,
+    )
+    fitted_values = (
+        np.concatenate([completed, truncated])
+        if include_truncated and truncated.size
+        else completed
+    )
+    finite_values = fitted_values[np.isfinite(fitted_values)]
+    unit_label = "ps" if unit == "ps" else "fs"
+    axis.set_title(
+        f"{format_stoich_for_axis(distribution.label)} "
+        f"(n={completed.size})"
+    )
+    axis.set_xlabel(f"Lifetime ({unit_label})")
+    axis.set_ylabel("Probability density")
+
+    if finite_values.size == 0:
+        axis.text(
+            0.5,
+            0.5,
+            "No completed lifetimes",
+            ha="center",
+            va="center",
+            transform=axis.transAxes,
+        )
+        return _lifetime_distribution_summary_line(
+            distribution,
+            values=finite_values,
+            unit=unit,
+            fit=None,
+        )
+
+    bin_edges = _histogram_bin_edges(finite_values, requested_bins)
+    if completed.size:
+        axis.hist(
+            completed,
+            bins=bin_edges,
+            density=True,
+            alpha=0.72,
+            color=_COMPLETED_LIFETIME_COLOR,
+            edgecolor="white",
+            linewidth=0.8,
+            label="Completed",
+        )
+    if include_truncated and truncated.size:
+        axis.hist(
+            truncated,
+            bins=bin_edges,
+            density=True,
+            alpha=0.38,
+            color=_TRUNCATED_LIFETIME_COLOR,
+            edgecolor="white",
+            linewidth=0.8,
+            hatch="//",
+            label="Window-truncated",
+        )
+
+    mean_value = float(np.mean(finite_values))
+    median_value = float(np.median(finite_values))
+    q1, q3 = np.percentile(finite_values, [25.0, 75.0])
+    axis.axvspan(
+        float(q1),
+        float(q3),
+        color="#4d4d4d",
+        alpha=0.10,
+        label="IQR",
+    )
+    axis.axvline(
+        mean_value,
+        color="#222222",
+        linewidth=1.1,
+        linestyle="--",
+        label="Mean",
+    )
+    axis.axvline(
+        median_value,
+        color="#005f73",
+        linewidth=1.1,
+        linestyle=":",
+        label="Median",
+    )
+
+    fit = _fit_lorentzian_to_lifetimes(finite_values)
+    if fit is not None:
+        x_min = float(np.min(finite_values))
+        x_max = float(np.max(finite_values))
+        if x_max <= x_min:
+            x_min = max(0.0, fit.center - fit.gamma * 3.0)
+            x_max = fit.center + fit.gamma * 3.0
+        else:
+            padding = (x_max - x_min) * 0.10
+            x_min = max(0.0, x_min - padding)
+            x_max += padding
+        x_values = np.linspace(x_min, x_max, 256)
+        axis.plot(
+            x_values,
+            _lorentzian_pdf(x_values, fit.center, fit.gamma),
+            color=_LORENTZIAN_COLOR,
+            linewidth=1.45,
+            label="Lorentzian fit",
+        )
+
+    info_lines = [
+        f"completed {completed.size}",
+        f"truncated {truncated.size}",
+        f"mean {_format_float(mean_value)} +/- "
+        f"{_format_float(float(np.std(finite_values, ddof=0)))} {unit_label}",
+        f"median {_format_float(median_value)} {unit_label}",
+        f"IQR {_format_float(float(q3 - q1))} {unit_label}",
+    ]
+    if fit is None:
+        info_lines.append("Lorentzian: too few/degenerate")
+    else:
+        r_squared = (
+            "n/a"
+            if fit.r_squared is None
+            else _format_float(float(fit.r_squared))
+        )
+        info_lines.append(
+            f"Lorentzian R2 {r_squared}; gamma "
+            f"{_format_float(fit.gamma)} {unit_label}"
+        )
+    axis.text(
+        0.02,
+        0.98,
+        "\n".join(info_lines),
+        ha="left",
+        va="top",
+        fontsize=8,
+        transform=axis.transAxes,
+        bbox={
+            "boxstyle": "round,pad=0.35",
+            "facecolor": "white",
+            "alpha": 0.78,
+            "edgecolor": "#cccccc",
+        },
+    )
+    axis.legend(fontsize=7, loc="best", framealpha=0.85)
+    return _lifetime_distribution_summary_line(
+        distribution,
+        values=finite_values,
+        unit=unit,
+        fit=fit,
+    )
+
+
+def _scaled_lifetimes(values: np.ndarray, *, unit: str) -> np.ndarray:
+    scale = 1000.0 if unit == "ps" else 1.0
+    array = np.asarray(values, dtype=float)
+    return array[np.isfinite(array)] / scale
+
+
+def _histogram_bin_edges(values: np.ndarray, requested_bins: int):
+    finite_values = np.asarray(values, dtype=float)
+    finite_values = finite_values[np.isfinite(finite_values)]
+    if finite_values.size <= 1:
+        return 1
+    lower = float(np.min(finite_values))
+    upper = float(np.max(finite_values))
+    if upper <= lower:
+        return 1
+    bin_count = min(
+        max(int(requested_bins), 1), max(int(finite_values.size), 1)
+    )
+    padding = (upper - lower) * 0.04
+    return np.linspace(lower - padding, upper + padding, bin_count + 1)
+
+
+def _fit_lorentzian_to_lifetimes(
+    values: np.ndarray,
+) -> _LorentzianFit | None:
+    finite_values = np.asarray(values, dtype=float)
+    finite_values = finite_values[np.isfinite(finite_values)]
+    if finite_values.size < 3:
+        return None
+    if float(np.max(finite_values)) <= float(np.min(finite_values)):
+        return None
+
+    q1, center, q3 = np.percentile(finite_values, [25.0, 50.0, 75.0])
+    gamma = float((q3 - q1) / 2.0)
+    if gamma <= 0.0:
+        mad = float(np.median(np.abs(finite_values - center)))
+        gamma = mad if mad > 0.0 else float(np.std(finite_values, ddof=0))
+    if gamma <= 0.0:
+        return None
+
+    bin_edges = _histogram_bin_edges(
+        finite_values,
+        requested_bins=max(3, int(math.sqrt(finite_values.size))),
+    )
+    if isinstance(bin_edges, int):
+        return None
+    density, edges = np.histogram(
+        finite_values,
+        bins=bin_edges,
+        density=True,
+    )
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    fitted_density = _lorentzian_pdf(centers, float(center), gamma)
+    finite_mask = np.isfinite(density) & np.isfinite(fitted_density)
+    r_squared: float | None
+    if np.count_nonzero(finite_mask) >= 2:
+        y_true = density[finite_mask]
+        y_fit = fitted_density[finite_mask]
+        residual_sum = float(np.sum((y_true - y_fit) ** 2))
+        total_sum = float(np.sum((y_true - float(np.mean(y_true))) ** 2))
+        r_squared = (
+            None if total_sum <= 0.0 else 1.0 - residual_sum / total_sum
+        )
+    else:
+        r_squared = None
+    return _LorentzianFit(
+        center=float(center),
+        gamma=float(gamma),
+        r_squared=r_squared,
+        interpretation=_lorentzian_interpretation(
+            sample_count=int(finite_values.size),
+            r_squared=r_squared,
+        ),
+    )
+
+
+def _lorentzian_pdf(
+    x_values: np.ndarray,
+    center: float,
+    gamma: float,
+) -> np.ndarray:
+    safe_gamma = max(float(gamma), 1.0e-12)
+    normalized = (
+        np.asarray(x_values, dtype=float) - float(center)
+    ) / safe_gamma
+    return 1.0 / (np.pi * safe_gamma * (1.0 + normalized**2))
+
+
+def _lorentzian_interpretation(
+    *,
+    sample_count: int,
+    r_squared: float | None,
+) -> str:
+    if sample_count < 5:
+        return "limited support"
+    if r_squared is None:
+        return "shape unresolved"
+    if r_squared >= 0.80:
+        return "Lorentzian-like heavy tail"
+    if r_squared >= 0.50:
+        return "partly Lorentzian-like"
+    return "not clearly Lorentzian"
+
+
+def _lifetime_distribution_summary_line(
+    distribution: ClusterLifetimeDistribution,
+    *,
+    values: np.ndarray,
+    unit: str,
+    fit: _LorentzianFit | None,
+) -> str:
+    unit_label = "ps" if unit == "ps" else "fs"
+    if values.size == 0:
+        spread = "no completed lifetimes"
+    else:
+        mean_value = float(np.mean(values))
+        std_value = float(np.std(values, ddof=0))
+        median_value = float(np.median(values))
+        q1, q3 = np.percentile(values, [25.0, 75.0])
+        cv_text = (
+            "n/a"
+            if mean_value <= 0.0
+            else _format_float(std_value / mean_value)
+        )
+        spread = (
+            f"mean {_format_float(mean_value)} {unit_label}, "
+            f"std {_format_float(std_value)} {unit_label}, "
+            f"median {_format_float(median_value)} {unit_label}, "
+            f"IQR {_format_float(float(q3 - q1))} {unit_label}, "
+            f"CV {cv_text}"
+        )
+    if fit is None:
+        lorentzian = "Lorentzian: too few or degenerate values"
+    else:
+        r_squared = (
+            "n/a"
+            if fit.r_squared is None
+            else _format_float(float(fit.r_squared))
+        )
+        lorentzian = (
+            "Lorentzian: "
+            f"center {_format_float(fit.center)} {unit_label}, "
+            f"gamma {_format_float(fit.gamma)} {unit_label}, "
+            f"R2 {r_squared}, {fit.interpretation}"
+        )
+    return (
+        f"{distribution.label}: completed "
+        f"{distribution.completed_lifetime_count}, window-truncated "
+        f"{distribution.window_truncated_lifetime_count}; {spread}; "
+        f"{lorentzian}"
+    )
+
+
+def _format_float(value: float) -> str:
+    if not np.isfinite(value):
+        return "n/a"
+    return f"{float(value):.4g}"
 
 
 def _build_saxs_model(

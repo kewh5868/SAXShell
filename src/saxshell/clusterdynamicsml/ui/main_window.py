@@ -90,6 +90,7 @@ from ..workflow import (
 )
 from .plot_panel import (
     ClusterDynamicsMLHistogramPanel,
+    ClusterDynamicsMLLifetimeDistributionWindow,
     ClusterDynamicsMLPlotPanel,
 )
 
@@ -674,6 +675,9 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self._active_job_config: ClusterDynamicsMLJobConfig | None = None
         self._active_job_preview: ClusterDynamicsMLPreview | None = None
         self._auto_detected_energy_file: Path | None = None
+        self._lifetime_distribution_window: (
+            ClusterDynamicsMLLifetimeDistributionWindow | None
+        ) = None
         self._history_panel_expanded = True
         self._history_expanded_splitter_size = _HISTORY_EXPANDED_DEFAULT_HEIGHT
         self._suspend_preview_refresh = False
@@ -744,6 +748,9 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             )
             event.ignore()
             return
+        if self._lifetime_distribution_window is not None:
+            self._lifetime_distribution_window.close()
+            self._lifetime_distribution_window = None
         app = QApplication.instance()
         if self._app_event_filter_installed and app is not None:
             app.removeEventFilter(self)
@@ -974,6 +981,26 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         history_button_row.addStretch(1)
         history_content_layout.addLayout(history_button_row)
         history_layout.addWidget(self.history_content, stretch=1)
+        self.lifetime_tab = QWidget()
+        lifetime_layout = QVBoxLayout(self.lifetime_tab)
+        lifetime_layout.setContentsMargins(0, 0, 0, 0)
+        lifetime_layout.setSpacing(8)
+        lifetime_button_row = QHBoxLayout()
+        lifetime_button_row.setContentsMargins(0, 0, 0, 0)
+        self.lifetime_distribution_button = QPushButton(
+            "Plot Lifetime Distributions"
+        )
+        self.lifetime_distribution_button.setToolTip(
+            "Open completed cluster lifetime histograms for each observed "
+            "stoichiometry, with spread metrics and Lorentzian/Cauchy shape "
+            "diagnostics."
+        )
+        self.lifetime_distribution_button.clicked.connect(
+            self.open_lifetime_distribution_window
+        )
+        lifetime_button_row.addWidget(self.lifetime_distribution_button)
+        lifetime_button_row.addStretch(1)
+        lifetime_layout.addLayout(lifetime_button_row)
         self.lifetime_table = self._build_table(
             (
                 "Type",
@@ -996,6 +1023,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
                 "Notes",
             )
         )
+        lifetime_layout.addWidget(self.lifetime_table, stretch=1)
         self.debye_waller_table = self._build_table(
             (
                 "Type",
@@ -1018,7 +1046,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self.combined_histogram_panel = self.histogram_panel
         self.predicted_structures_plot_panel = self.saxs_panel
         self.results_tabs.addTab(self.summary_tab, "Summary")
-        self.results_tabs.addTab(self.lifetime_table, "Lifetimes")
+        self.results_tabs.addTab(self.lifetime_tab, "Lifetimes")
         self.results_tabs.addTab(self.debye_waller_table, "Debye-Waller")
         self.results_tabs.addTab(self.histogram_panel, "Histograms")
         self.results_tabs.addTab(self.saxs_panel, "SAXS")
@@ -1093,6 +1121,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             "representative structures."
         )
         self._set_frame_format(None)
+        self._set_lifetime_distribution_result(None)
         self._update_history_controls()
 
     def _load_shell_reference_library_entries(self) -> None:
@@ -1152,6 +1181,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             self.dynamics_plot_panel.set_result(None)
             self.histogram_panel.set_result(None)
             self.saxs_panel.set_result(None)
+            self._set_lifetime_distribution_result(None)
             self.summary_box.clear()
             self.lifetime_table.setRowCount(0)
             self.debye_waller_table.setRowCount(0)
@@ -1410,6 +1440,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self.dynamics_plot_panel.set_result(result.dynamics_result)
         self.histogram_panel.set_result(result)
         self.saxs_panel.set_result(result)
+        self._set_lifetime_distribution_result(result)
         self.run_panel.progress_bar.setRange(
             0, max(result.dynamics_result.analyzed_frames, 1)
         )
@@ -1602,6 +1633,30 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             f"Rows written: {row_count}"
         )
         self.statusBar().showMessage(f"Saved lifetime table to {saved_path}")
+
+    def open_lifetime_distribution_window(self) -> None:
+        if self._last_result is None:
+            self._show_error(
+                "Run an analysis or load a saved result before plotting "
+                "lifetime distributions."
+            )
+            return
+        if self._lifetime_distribution_window is None:
+            self._lifetime_distribution_window = (
+                ClusterDynamicsMLLifetimeDistributionWindow(parent=self)
+            )
+        self._lifetime_distribution_window.set_result(self._last_result)
+        self._lifetime_distribution_window.show()
+        self._lifetime_distribution_window.raise_()
+        self._lifetime_distribution_window.activateWindow()
+
+    def _set_lifetime_distribution_result(
+        self,
+        result: ClusterDynamicsMLResult | None,
+    ) -> None:
+        self.lifetime_distribution_button.setEnabled(result is not None)
+        if self._lifetime_distribution_window is not None:
+            self._lifetime_distribution_window.set_result(result)
 
     def save_powerpoint_report(self) -> None:
         if self._last_result is None:
@@ -1805,6 +1860,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
         self.dynamics_plot_panel.set_result(None)
         self.histogram_panel.set_result(None)
         self.saxs_panel.set_result(None)
+        self._set_lifetime_distribution_result(None)
         self.summary_box.clear()
         self.lifetime_table.setRowCount(0)
         self.debye_waller_table.setRowCount(0)
@@ -2926,6 +2982,7 @@ class ClusterDynamicsMLMainWindow(QMainWindow):
             self.dynamics_plot_panel.set_result(loaded.result.dynamics_result)
             self.histogram_panel.set_result(loaded.result)
             self.saxs_panel.set_result(loaded.result)
+            self._set_lifetime_distribution_result(loaded.result)
             self.run_panel.set_selection_summary(
                 self._format_preview_text(loaded.result.preview)
             )
