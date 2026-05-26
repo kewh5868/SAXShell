@@ -234,7 +234,7 @@ def test_pdfsetup_rejects_pdb_frame_folders(tmp_path):
         debyer_workflow.inspect_frames_dir(frames_dir)
 
 
-def test_pdf_batch_item_uses_saved_or_manual_xyz_settings(qapp, tmp_path):
+def test_pdf_batch_settings_module_inspects_xyz_defaults(qapp, tmp_path):
     project_dir = tmp_path / "project"
     frames_dir = _build_frames_dir(
         tmp_path,
@@ -246,30 +246,27 @@ def test_pdf_batch_item_uses_saved_or_manual_xyz_settings(qapp, tmp_path):
             "I 0.0 2.0 0.0\n"
         ),
     )
+    _write_pbc_source_file(frames_dir)
     widget = DebyerPDFBatchItemWidget(
         DebyerPDFBatchItem(
             item_id="batch-item",
             project_dir=project_dir,
             frames_dir=frames_dir,
-            filename_prefix="stored_pdf",
-            box_dimensions=(12.0, 10.0, 8.0),
-            atom_count=3,
-            solute_elements=("Cs", "Pb", "I"),
         )
     )
     widget.to_edit.setText("25")
 
+    widget.inspect_frames()
     settings = widget.settings()
 
-    assert not hasattr(widget, "inspect_button")
-    assert not hasattr(widget, "inspect_frames")
     assert settings.project_dir == project_dir.resolve()
     assert settings.frames_dir == frames_dir.resolve()
-    assert settings.filename_prefix == "stored_pdf"
+    assert settings.filename_prefix == frames_dir.name
     assert settings.atom_count == 3
     assert settings.box_dimensions == pytest.approx((12.0, 10.0, 8.0))
     assert settings.to_value == pytest.approx(4.0)
     assert settings.solute_elements == ("Cs", "Pb", "I")
+    assert "Detected XYZ frames" in widget.inspection_summary_label.text()
 
 
 def test_pdf_batch_queue_window_keeps_collapsible_reorderable_items(

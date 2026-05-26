@@ -45,6 +45,8 @@ from saxshell.pdf.debyer.workflow import (
     calculate_number_density,
     check_debyer_runtime,
     default_parallel_debyer_jobs,
+    infer_default_solute_elements,
+    inspect_frames_dir,
     list_saved_debyer_calculations,
     load_debyer_calculation,
     rewrite_debyer_calculation_output,
@@ -67,6 +69,13 @@ def _optional_path(text: str) -> Path | None:
     if not stripped:
         return None
     return Path(stripped).expanduser().resolve()
+
+
+def _required_path(text: str, field_name: str) -> Path:
+    path = _optional_path(text)
+    if path is None:
+        raise ValueError(f"{field_name} is required.")
+    return path
 
 
 def _normalize_solute_text(raw: str) -> tuple[str, ...]:
@@ -104,6 +113,10 @@ def _project_reference_text(project_dir: Path | None) -> str:
         "Project reference: "
         f"{project_file} will be used when the calculation is saved."
     )
+
+
+def _box_text(box_dimensions: tuple[float, float, float]) -> str:
+    return " x ".join(f"{value:.3f}" for value in box_dimensions) + " A"
 
 
 def _project_path(value: object, project_dir: Path) -> Path | None:
@@ -517,6 +530,17 @@ class DebyerPDFBatchItemWidget(QFrame):
     def set_append_grouped_mode(self, enabled: bool) -> None:
         self._append_grouped_mode = bool(enabled)
         self._refresh_setting_widget_states()
+        if enabled:
+            self.inspection_summary_label.setText(
+                "Append mode uses the project folder and solute elements to "
+                "update existing saved Debyer calculations. Full Debyer "
+                "settings are ignored."
+            )
+        else:
+            self.inspection_summary_label.setText(
+                "Inspect the XYZ frames folder to detect atoms, solutes, and "
+                "box."
+            )
 
     def set_status(self, message: str) -> None:
         self.status_label.setText(message)
@@ -610,6 +634,74 @@ class DebyerPDFBatchItemWidget(QFrame):
             solute_elements=solute_elements,
         )
 
+    def inspect_frames(self) -> None:
+        frames_dir = _required_path(
+            self.frames_dir_edit.text(),
+            "XYZ frames folder",
+        )
+        inspection = inspect_frames_dir(frames_dir)
+        self.frames_dir_edit.setText(str(inspection.frames_dir))
+        if self.filename_prefix_edit.text().strip() in {"", "debyer_pdf"}:
+            self.filename_prefix_edit.setText(inspection.frames_dir.name)
+        if not self.project_dir_edit.text().strip():
+            self.project_dir_edit.setText(
+                str(_suggest_project_dir(inspection.frames_dir))
+            )
+        if (
+            not self.atom_count_edit.text().strip()
+            or int(float(self.atom_count_edit.text().strip() or "0")) <= 0
+        ):
+            self.atom_count_edit.setText(str(inspection.atom_count))
+
+        detected_box = (
+            inspection.detected_box_dimensions
+            if inspection.detected_box_dimensions is not None
+            else inspection.estimated_box_dimensions
+        )
+        if detected_box is not None:
+            self._set_box_if_blank_or_zero(detected_box)
+            to_value, changed = _coerce_r_range_maximum_for_box(
+                float(self.to_edit.text().strip() or "0"),
+                detected_box,
+            )
+            if changed:
+                self.to_edit.setText(f"{to_value:g}")
+
+        inferred_solutes = infer_default_solute_elements(
+            inspection.element_counts
+        )
+        if inferred_solutes and not self.solute_elements_edit.text().strip():
+            self.solute_elements_edit.setText(_solute_text(inferred_solutes))
+
+        element_summary = ", ".join(
+            f"{element}{count if count != 1 else ''}"
+            for element, count in sorted(inspection.element_counts.items())
+        )
+        solute_summary = (
+            _solute_text(inferred_solutes)
+            if inferred_solutes
+            else "not inferred"
+        )
+        box_summary = "unknown"
+        if inspection.detected_box_dimensions is not None:
+            box_summary = _box_text(inspection.detected_box_dimensions)
+            if inspection.detected_box_source is not None:
+                box_summary += f" from {inspection.detected_box_source}"
+        elif inspection.estimated_box_dimensions is not None:
+            box_summary = (
+                _box_text(inspection.estimated_box_dimensions)
+                + " estimated from first frame"
+            )
+        self.inspection_summary_label.setText(
+            f"Detected {inspection.frame_format.upper()} frames: "
+            f"{len(inspection.frame_paths)} files\n"
+            f"Elements in first frame: {element_summary or 'unknown'}\n"
+            f"Default solutes: {solute_summary}\n"
+            f"Bounding box: {box_summary}"
+        )
+        self.status_label.setText("Settings inspected")
+        self._on_editor_changed()
+
     def _build_ui(self) -> None:
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setSizePolicy(
@@ -678,12 +770,22 @@ class DebyerPDFBatchItemWidget(QFrame):
         frames_layout = QHBoxLayout(frames_row)
         frames_layout.setContentsMargins(0, 0, 0, 0)
         self.frames_dir_edit = QLineEdit()
-        self.frames_dir_edit.editingFinished.connect(self._on_editor_changed)
+        self.frames_dir_edit.editingFinished.connect(self._inspect_from_edit)
         frames_layout.addWidget(self.frames_dir_edit, stretch=1)
         self.frames_button = QPushButton("Browse...")
         self.frames_button.clicked.connect(self._choose_frames_dir)
         frames_layout.addWidget(self.frames_button)
+        self.inspect_button = QPushButton("Inspect")
+        self.inspect_button.clicked.connect(self._inspect_from_button)
+        frames_layout.addWidget(self.inspect_button)
         form.addRow("XYZ frames folder", frames_row)
+
+        self.inspection_summary_label = QLabel(
+            "Inspect the XYZ frames folder to detect atoms, solutes, and box."
+        )
+        self.inspection_summary_label.setWordWrap(True)
+        self.inspection_summary_label.setFrameShape(QFrame.Shape.StyledPanel)
+        form.addRow("", self.inspection_summary_label)
 
         self.filename_prefix_edit = QLineEdit("debyer_pdf")
         self.filename_prefix_edit.editingFinished.connect(
@@ -766,6 +868,7 @@ class DebyerPDFBatchItemWidget(QFrame):
         self._full_calculation_widgets = (
             self.frames_dir_edit,
             self.frames_button,
+            self.inspect_button,
             self.filename_prefix_edit,
             self.mode_combo,
             self.from_edit,
@@ -860,7 +963,43 @@ class DebyerPDFBatchItemWidget(QFrame):
         if not selected:
             return
         self.frames_dir_edit.setText(selected)
-        self._on_editor_changed()
+        self._inspect_from_button()
+
+    def _inspect_from_edit(self) -> None:
+        if not self.frames_dir_edit.text().strip():
+            self._on_editor_changed()
+            return
+        try:
+            self.inspect_frames()
+        except Exception as exc:
+            self.inspection_summary_label.setText(str(exc))
+            self.status_label.setText("Inspection failed")
+            self._on_editor_changed()
+
+    def _inspect_from_button(self) -> None:
+        try:
+            self.inspect_frames()
+        except Exception as exc:
+            QMessageBox.warning(self, "Unable to inspect frames", str(exc))
+            self.inspection_summary_label.setText(str(exc))
+            self.status_label.setText("Inspection failed")
+            self._on_editor_changed()
+
+    def _set_box_if_blank_or_zero(
+        self,
+        box_dimensions: tuple[float, float, float],
+    ) -> None:
+        for line_edit, value in zip(
+            (self.box_a_edit, self.box_b_edit, self.box_c_edit),
+            box_dimensions,
+        ):
+            text = line_edit.text().strip()
+            try:
+                current = float(text) if text else 0.0
+            except ValueError:
+                current = 0.0
+            if current <= 0.0:
+                line_edit.setText(f"{float(value):g}")
 
     def _on_editor_changed(self) -> None:
         if self._loading:
@@ -1139,7 +1278,10 @@ class DebyerPDFBatchQueueWindow(QMainWindow):
                     ),
                 )
             )
-            self.add_queue_item(initial_item)
+            self.add_queue_item(
+                initial_item,
+                auto_inspect=self._initial_frames_dir is not None,
+            )
 
     def closeEvent(self, event) -> None:
         if self._run_thread is not None and self._run_thread.isRunning():
@@ -1158,6 +1300,8 @@ class DebyerPDFBatchQueueWindow(QMainWindow):
     def add_queue_item(
         self,
         item: DebyerPDFBatchItem | None = None,
+        *,
+        auto_inspect: bool = False,
     ) -> DebyerPDFBatchItemWidget:
         resolved_item = item or DebyerPDFBatchItem(item_id=_new_item_id())
         list_item = QListWidgetItem()
@@ -1175,6 +1319,12 @@ class DebyerPDFBatchQueueWindow(QMainWindow):
         self.queue_list.setItemWidget(list_item, widget)
         self.queue_list.setCurrentItem(list_item)
         self._refresh_order_labels()
+        if auto_inspect:
+            try:
+                widget.inspect_frames()
+            except Exception as exc:
+                widget.inspection_summary_label.setText(str(exc))
+                widget.set_status("Inspection failed")
         return widget
 
     def queue_settings_in_order(self) -> list[tuple[str, DebyerPDFSettings]]:
@@ -1344,7 +1494,8 @@ class DebyerPDFBatchQueueWindow(QMainWindow):
                         else "debyer_pdf"
                     ),
                 )
-            )
+            ),
+            auto_inspect=self._initial_frames_dir is not None,
         )
 
     def _choose_project_to_add(self) -> None:
@@ -1422,7 +1573,8 @@ class DebyerPDFBatchQueueWindow(QMainWindow):
                     project_dir=self._initial_project_dir,
                     frames_dir=frames_dir,
                     filename_prefix=frames_dir.name,
-                )
+                ),
+                auto_inspect=True,
             )
 
     def _on_item_settings_changed(self, _item_id: str) -> None:
