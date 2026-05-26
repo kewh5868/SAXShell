@@ -86,6 +86,11 @@ tests/contrast_fft_backend_debug_*/
 tests/edm_contiguous_mode_report/
 tests/representativefinder_performance/output_results/
 tests/smearing_analysis_*/
+tests/CsPbI3_SAXS_fit/
+tests/CsPbI3_SAXS_fit.zip
+
+# Generated reports
+docs/reports/
 
 # PyBuilder
 target/
