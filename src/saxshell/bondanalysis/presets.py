@@ -5,7 +5,11 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from .bondanalyzer import AngleTripletDefinition, BondPairDefinition
+from .bondanalyzer import (
+    AngleTripletDefinition,
+    BondPairDefinition,
+    CoordinationNumberDefinition,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +20,7 @@ class BondAnalysisPreset:
     bond_pairs: tuple[BondPairDefinition, ...]
     angle_triplets: tuple[AngleTripletDefinition, ...]
     builtin: bool = False
+    coordination_numbers: tuple[CoordinationNumberDefinition, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -24,6 +29,10 @@ class BondAnalysisPreset:
             ],
             "angle_triplets": [
                 definition.to_dict() for definition in self.angle_triplets
+            ],
+            "coordination_numbers": [
+                definition.to_dict()
+                for definition in self.coordination_numbers
             ],
         }
 
@@ -53,11 +62,20 @@ class BondAnalysisPreset:
             )
             for entry in list(payload.get("angle_triplets", []))
         )
+        coordination_numbers = tuple(
+            CoordinationNumberDefinition(
+                str(entry["center_atom"]),
+                str(entry["neighbor_atom"]),
+                float(entry["cutoff_angstrom"]),
+            )
+            for entry in list(payload.get("coordination_numbers", []))
+        )
         return cls(
             name=name,
             bond_pairs=bond_pairs,
             angle_triplets=angle_triplets,
             builtin=builtin,
+            coordination_numbers=coordination_numbers,
         )
 
 
@@ -91,6 +109,11 @@ def default_presets() -> dict[str, BondAnalysisPreset]:
                 AngleTripletDefinition("S", "O", "C", 2.2, 2.2),
                 AngleTripletDefinition("S", "C", "C", 2.2, 2.2),
             ),
+            coordination_numbers=(
+                CoordinationNumberDefinition("Pb", "I", 4.0),
+                CoordinationNumberDefinition("Pb", "O", 4.0),
+                CoordinationNumberDefinition("Pb", "S", 4.8),
+            ),
         ),
         "DMF": BondAnalysisPreset(
             name="DMF",
@@ -110,6 +133,11 @@ def default_presets() -> dict[str, BondAnalysisPreset]:
                 AngleTripletDefinition("O", "Pb", "C", 4.0, 2.2),
                 AngleTripletDefinition("O", "Pb", "N", 4.0, 3.0),
                 AngleTripletDefinition("N", "C", "C", 2.2, 2.2),
+            ),
+            coordination_numbers=(
+                CoordinationNumberDefinition("Pb", "I", 4.0),
+                CoordinationNumberDefinition("Pb", "O", 4.0),
+                CoordinationNumberDefinition("Pb", "N", 6.0),
             ),
         ),
     }

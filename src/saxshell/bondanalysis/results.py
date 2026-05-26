@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,9 +11,13 @@ from typing import Literal
 import numpy as np
 from matplotlib.axes import Axes
 
-from .bondanalyzer import AngleTripletDefinition, BondPairDefinition
+from .bondanalyzer import (
+    AngleTripletDefinition,
+    BondPairDefinition,
+    CoordinationNumberDefinition,
+)
 
-DistributionCategory = Literal["bond", "angle"]
+DistributionCategory = Literal["bond", "angle", "coordination"]
 RESULTS_INDEX_FILENAME = "bondanalysis_results_index.json"
 LEGACY_RESULTS_INDEX_FILENAME = "bondanalysis_manifest.json"
 
@@ -71,8 +76,10 @@ class BondAnalysisResultIndex:
     cluster_type_names: tuple[str, ...]
     bond_pairs: tuple[BondPairDefinition, ...]
     angle_triplets: tuple[AngleTripletDefinition, ...]
+    coordination_numbers: tuple[CoordinationNumberDefinition, ...]
     bond_groups: tuple[BondAnalysisResultGroup, ...]
     angle_groups: tuple[BondAnalysisResultGroup, ...]
+    coordination_groups: tuple[BondAnalysisResultGroup, ...]
 
     @property
     def manifest_path(self) -> Path:
@@ -84,7 +91,12 @@ class BondAnalysisResultIndex:
         category: DistributionCategory,
         display_label: str,
     ) -> BondAnalysisResultGroup:
-        groups = self.bond_groups if category == "bond" else self.angle_groups
+        if category == "bond":
+            groups = self.bond_groups
+        elif category == "angle":
+            groups = self.angle_groups
+        else:
+            groups = self.coordination_groups
         for group in groups:
             if group.display_label == display_label:
                 return group
@@ -103,6 +115,7 @@ def draw_plot_request(
     non_empty_series = [
         series for series in request.series if series.values.size > 0
     ]
+    histogram_bins: int | np.ndarray = 60
     if not non_empty_series:
         axis.text(
             0.5,
@@ -112,18 +125,23 @@ def draw_plot_request(
             va="center",
             transform=axis.transAxes,
         )
-    elif len(non_empty_series) == 1:
+    else:
+        histogram_bins = _histogram_bins_for_request(
+            request,
+            non_empty_series,
+        )
+    if len(non_empty_series) == 1:
         axis.hist(
             non_empty_series[0].values,
-            bins=60,
+            bins=histogram_bins,
             color="#355070",
             edgecolor="white",
         )
-    else:
+    elif non_empty_series:
         for series in non_empty_series:
             axis.hist(
                 series.values,
-                bins=60,
+                bins=histogram_bins,
                 histtype="step",
                 linewidth=1.7,
                 label=series.label,
@@ -136,6 +154,26 @@ def draw_plot_request(
     return len(non_empty_series)
 
 
+def _histogram_bins_for_request(
+    request: BondAnalysisPlotRequest,
+    series: list[BondAnalysisDistributionSeries],
+) -> int | np.ndarray:
+    if request.category != "coordination":
+        return 60
+    values = np.concatenate(
+        [entry.values for entry in series if entry.values.size > 0]
+        or [np.array([], dtype=float)]
+    )
+    if values.size == 0:
+        return np.asarray([0.0, 1.0], dtype=float)
+    left = math.floor(float(np.min(values))) - 0.5
+    right = math.ceil(float(np.max(values))) + 0.5
+    edges = np.arange(left, right + 1.0, 1.0, dtype=float)
+    if edges.size < 2:
+        return np.asarray([left, right], dtype=float)
+    return edges
+
+
 def load_result_index(output_dir: str | Path) -> BondAnalysisResultIndex:
     """Load the computed result tree from a bondanalysis results
     index."""
@@ -143,6 +181,10 @@ def load_result_index(output_dir: str | Path) -> BondAnalysisResultIndex:
     output_path = Path(output_dir)
     results_index_path = output_path / RESULTS_INDEX_FILENAME
     if not results_index_path.exists():
+        # Legacy bondanalysis runs wrote bondanalysis_manifest.json before the
+        # result browser settled on bondanalysis_results_index.json. Keep the
+        # fallback so historical project folders remain readable while new raw
+        # measurements are cached in StructureDistributionStore.
         results_index_path = output_path / LEGACY_RESULTS_INDEX_FILENAME
     if not results_index_path.exists():
         raise ValueError(
@@ -159,6 +201,10 @@ def load_result_index(output_dir: str | Path) -> BondAnalysisResultIndex:
         AngleTripletDefinition(**entry)
         for entry in payload.get("angle_triplets", [])
     )
+    coordination_numbers = tuple(
+        CoordinationNumberDefinition(**entry)
+        for entry in payload.get("coordination_numbers", [])
+    )
     bond_groups = tuple(
         _build_bond_group(definition, cluster_results)
         for definition in bond_pairs
@@ -166,6 +212,10 @@ def load_result_index(output_dir: str | Path) -> BondAnalysisResultIndex:
     angle_groups = tuple(
         _build_angle_group(definition, cluster_results)
         for definition in angle_triplets
+    )
+    coordination_groups = tuple(
+        _build_coordination_group(definition, cluster_results)
+        for definition in coordination_numbers
     )
     return BondAnalysisResultIndex(
         results_index_path=results_index_path,
@@ -181,8 +231,10 @@ def load_result_index(output_dir: str | Path) -> BondAnalysisResultIndex:
         ),
         bond_pairs=bond_pairs,
         angle_triplets=angle_triplets,
+        coordination_numbers=coordination_numbers,
         bond_groups=bond_groups,
         angle_groups=angle_groups,
+        coordination_groups=coordination_groups,
     )
 
 
@@ -203,7 +255,7 @@ def build_plot_request(
         for leaf in selected_leaves[1:]
     ):
         raise ValueError(
-            "Select bond pairs or bond angles of the same type before "
+            "Select distributions of the same type before "
             "plotting them together."
         )
 
@@ -360,6 +412,44 @@ def _build_angle_group(
         cluster_leaves=cluster_leaves,
         all_leaf=BondAnalysisResultLeaf(
             category="angle",
+            display_label=definition.display_label,
+            scope_name="all",
+            npy_path=None,
+            point_count=sum(leaf.point_count for leaf in cluster_leaves),
+            is_all=True,
+        ),
+    )
+
+
+def _build_coordination_group(
+    definition: CoordinationNumberDefinition,
+    cluster_results: tuple[dict[str, object], ...],
+) -> BondAnalysisResultGroup:
+    cluster_leaves = tuple(
+        BondAnalysisResultLeaf(
+            category="coordination",
+            display_label=definition.display_label,
+            scope_name=str(cluster_result["cluster_type"]),
+            npy_path=(
+                Path(str(cluster_result["output_dir"]))
+                / f"{definition.filename_stem}_coordination.npy"
+            ),
+            point_count=int(
+                cluster_result.get("coordination_value_counts", {}).get(
+                    definition.display_label,
+                    0,
+                )
+            ),
+        )
+        for cluster_result in cluster_results
+    )
+    return BondAnalysisResultGroup(
+        category="coordination",
+        display_label=definition.display_label,
+        xlabel="Coordination Number",
+        cluster_leaves=cluster_leaves,
+        all_leaf=BondAnalysisResultLeaf(
+            category="coordination",
             display_label=definition.display_label,
             scope_name="all",
             npy_path=None,

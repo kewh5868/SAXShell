@@ -131,9 +131,51 @@ class AngleTripletDefinition:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class CoordinationNumberDefinition:
+    """One requested first-shell coordination-number distribution."""
+
+    center_atom: str
+    neighbor_atom: str
+    cutoff_angstrom: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "center_atom",
+            _normalized_element_symbol(self.center_atom),
+        )
+        object.__setattr__(
+            self,
+            "neighbor_atom",
+            _normalized_element_symbol(self.neighbor_atom),
+        )
+        cutoff = float(self.cutoff_angstrom)
+        if cutoff <= 0.0:
+            raise ValueError(
+                "Coordination-number cutoffs must be greater than zero."
+            )
+        object.__setattr__(self, "cutoff_angstrom", cutoff)
+
+    @property
+    def display_label(self) -> str:
+        return f"CN {self.center_atom}-{self.neighbor_atom}"
+
+    @property
+    def filename_stem(self) -> str:
+        return f"CN_{self.center_atom}_{self.neighbor_atom}"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "center_atom": self.center_atom,
+            "neighbor_atom": self.neighbor_atom,
+            "cutoff_angstrom": self.cutoff_angstrom,
+        }
+
+
 class BondAnalyzer:
-    """Measure bond-pair and angle-triplet distributions from flat
-    cluster folders.
+    """Measure bond-pair, angle-triplet, and coordination distributions
+    from flat cluster folders.
 
     The analyzer expects one cluster-type directory to contain single-frame
     ``.pdb`` or ``.xyz`` files directly inside the directory. The higher-level
@@ -147,9 +189,15 @@ class BondAnalyzer:
         self,
         bond_pairs: Iterable[BondPairDefinition] | None = None,
         angle_triplets: Iterable[AngleTripletDefinition] | None = None,
+        coordination_numbers: (
+            Iterable[CoordinationNumberDefinition] | None
+        ) = None,
     ) -> None:
         self.bond_pairs = tuple(self._dedupe_bond_pairs(bond_pairs or ()))
         self.angle_triplets = tuple(dict.fromkeys(angle_triplets or ()))
+        self.coordination_numbers = tuple(
+            dict.fromkeys(coordination_numbers or ())
+        )
 
     def structure_files(self, cluster_dir: str | Path) -> list[Path]:
         """Return all structure files directly inside one cluster
@@ -179,6 +227,18 @@ class BondAnalyzer:
     ]:
         return self.measure_atoms(self.read_structure(structure_file))
 
+    def measure_structure_with_coordination(
+        self,
+        structure_file: str | Path,
+    ) -> tuple[
+        dict[BondPairDefinition, list[float]],
+        dict[AngleTripletDefinition, list[float]],
+        dict[CoordinationNumberDefinition, list[float]],
+    ]:
+        return self.measure_atoms_with_coordination(
+            self.read_structure(structure_file)
+        )
+
     def measure_atoms(
         self,
         atoms: list[AtomRecord],
@@ -197,6 +257,26 @@ class BondAnalyzer:
         elements = [atom.element for atom in atoms]
         return self.measure_structure_data(coords, elements)
 
+    def measure_atoms_with_coordination(
+        self,
+        atoms: list[AtomRecord],
+    ) -> tuple[
+        dict[BondPairDefinition, list[float]],
+        dict[AngleTripletDefinition, list[float]],
+        dict[CoordinationNumberDefinition, list[float]],
+    ]:
+        if not atoms:
+            return (
+                {definition: [] for definition in self.bond_pairs},
+                {definition: [] for definition in self.angle_triplets},
+                {definition: [] for definition in self.coordination_numbers},
+            )
+        coords = np.asarray(
+            [[atom.x, atom.y, atom.z] for atom in atoms], dtype=float
+        )
+        elements = [atom.element for atom in atoms]
+        return self.measure_structure_data_with_coordination(coords, elements)
+
     def measure_structure_data(
         self,
         coordinates: np.ndarray,
@@ -205,15 +285,35 @@ class BondAnalyzer:
         dict[BondPairDefinition, list[float]],
         dict[AngleTripletDefinition, list[float]],
     ]:
+        bond_values, angle_values, _coordination_values = (
+            self.measure_structure_data_with_coordination(
+                coordinates,
+                elements,
+            )
+        )
+        return bond_values, angle_values
+
+    def measure_structure_data_with_coordination(
+        self,
+        coordinates: np.ndarray,
+        elements: Iterable[str],
+    ) -> tuple[
+        dict[BondPairDefinition, list[float]],
+        dict[AngleTripletDefinition, list[float]],
+        dict[CoordinationNumberDefinition, list[float]],
+    ]:
         bond_values = {definition: [] for definition in self.bond_pairs}
         angle_values = {definition: [] for definition in self.angle_triplets}
+        coordination_values = {
+            definition: [] for definition in self.coordination_numbers
+        }
 
         coords = np.asarray(coordinates, dtype=float)
         normalized_elements = tuple(
             _normalized_element_symbol(element) for element in elements
         )
         if coords.size == 0 or not normalized_elements:
-            return bond_values, angle_values
+            return bond_values, angle_values, coordination_values
         if coords.ndim != 2 or coords.shape[0] != len(normalized_elements):
             raise ValueError(
                 "Coordinates and element symbols must describe the same atoms."
@@ -333,7 +433,38 @@ class BondAnalyzer:
                         )
                         angle_values[definition].extend(angles)
 
-        return bond_values, angle_values
+        coordination_groups: defaultdict[
+            tuple[str, float], list[CoordinationNumberDefinition]
+        ] = defaultdict(list)
+        for definition in self.coordination_numbers:
+            coordination_groups[
+                (definition.center_atom, float(definition.cutoff_angstrom))
+            ].append(definition)
+        for (center_atom, cutoff), definitions in coordination_groups.items():
+            center_indices = np.flatnonzero(element_array == center_atom)
+            if center_indices.size == 0:
+                continue
+            for center_index in center_indices.tolist():
+                neighbor_indices = np.asarray(
+                    tree.query_ball_point(coords[center_index], r=cutoff),
+                    dtype=int,
+                )
+                if neighbor_indices.size == 0:
+                    neighbor_elements = np.asarray((), dtype=object)
+                else:
+                    neighbor_indices = neighbor_indices[
+                        neighbor_indices != center_index
+                    ]
+                    neighbor_elements = element_array[neighbor_indices]
+                for definition in definitions:
+                    count = int(
+                        np.count_nonzero(
+                            neighbor_elements == definition.neighbor_atom
+                        )
+                    )
+                    coordination_values[definition].append(float(count))
+
+        return bond_values, angle_values, coordination_values
 
     def _read_pdb(self, filepath: Path) -> list[AtomRecord]:
         atoms: list[AtomRecord] = []
@@ -435,4 +566,5 @@ __all__ = [
     "AtomRecord",
     "BondAnalyzer",
     "BondPairDefinition",
+    "CoordinationNumberDefinition",
 ]

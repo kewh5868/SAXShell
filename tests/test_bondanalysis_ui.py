@@ -1,5 +1,6 @@
 import os
 import shutil
+from pathlib import Path
 
 import pytest
 from matplotlib.colors import to_hex
@@ -17,9 +18,13 @@ from saxshell.bondanalysis import (
     AngleTripletDefinition,
     BondAnalysisWorkflow,
     BondPairDefinition,
+    CoordinationNumberDefinition,
 )
 from saxshell.bondanalysis.results import build_plot_request, load_result_index
-from saxshell.bondanalysis.ui.main_window import BondAnalysisMainWindow
+from saxshell.bondanalysis.ui.main_window import (
+    BOND_ANALYSIS_WINDOW_LOAD_TOTAL_STEPS,
+    BondAnalysisMainWindow,
+)
 from saxshell.bondanalysis.ui.plot_window import BondAnalysisPlotWindow
 from saxshell.saxs.project_manager import SAXSProjectManager
 
@@ -60,6 +65,7 @@ def _build_bondanalysis_output(tmp_path):
         clusters_dir,
         bond_pairs=[BondPairDefinition("Pb", "I", 3.1)],
         angle_triplets=[AngleTripletDefinition("Pb", "I", "I", 3.1, 3.1)],
+        coordination_numbers=[CoordinationNumberDefinition("Pb", "I", 3.1)],
         output_dir=tmp_path / "bondanalysis_results",
     )
     result = workflow.run()
@@ -162,6 +168,94 @@ def test_bondanalysis_main_window_prefills_cluster_types_and_output_dir(
     assert window.angle_triplet_table.item(2, 0).text() == "O"
     assert window.angle_triplet_table.item(2, 1).text() == "Pb"
     assert window.angle_triplet_table.item(2, 2).text() == "S"
+    assert window.coordination_number_table.rowCount() == 3
+    assert window.coordination_number_table.item(0, 0).text() == "Pb"
+    assert window.coordination_number_table.item(0, 1).text() == "I"
+    assert window.coordination_number_table.item(0, 2).text() == "4"
+    window.close()
+
+
+def test_bondanalysis_main_window_reports_startup_loader_progress(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    monkeypatch.setenv(
+        "SAXSHELL_BONDANALYSIS_PRESETS_PATH",
+        str(tmp_path / "bondanalysis_presets.json"),
+    )
+    clusters_dir = tmp_path / "clusters_splitxyz0001"
+    pbi2_dir = clusters_dir / "PbI2"
+    pbo_dir = clusters_dir / "PbO"
+    pbi2_dir.mkdir(parents=True)
+    pbo_dir.mkdir(parents=True)
+    _write_xyz_cluster(
+        pbi2_dir / "frame_0000_AAA.xyz",
+        [
+            ("Pb", 0.0, 0.0, 0.0),
+            ("I", 2.0, 0.0, 0.0),
+        ],
+    )
+    _write_xyz_cluster(
+        pbo_dir / "frame_0001_AAA.xyz",
+        [
+            ("Pb", 0.0, 0.0, 0.0),
+            ("O", 1.8, 0.0, 0.0),
+        ],
+    )
+
+    window = BondAnalysisMainWindow(initial_clusters_dir=clusters_dir)
+
+    dialog = window._startup_progress_dialog
+    assert dialog is not None
+    assert not dialog.isVisible()
+    assert dialog.windowTitle() == "Opening Bond Analysis"
+    assert (
+        dialog.progress_bar.maximum() == BOND_ANALYSIS_WINDOW_LOAD_TOTAL_STEPS
+    )
+    assert dialog.progress_bar.value() == BOND_ANALYSIS_WINDOW_LOAD_TOTAL_STEPS
+    output = dialog.output_box.toPlainText()
+    assert "Preparing Bond Analysis window." in output
+    assert "Loading built-in and custom bond-analysis presets." in output
+    assert "Inspecting 2 cluster folder(s)." in output
+    assert "Discovered 2 cluster type(s)." in output
+    assert "Bond Analysis window is ready." in output
+    window.close()
+
+
+def test_bondanalysis_cluster_types_section_collapses(qapp, tmp_path):
+    clusters_dir = tmp_path / "clusters_splitxyz0001"
+    pbi2_dir = clusters_dir / "PbI2"
+    pbi2_dir.mkdir(parents=True)
+    _write_xyz_cluster(
+        pbi2_dir / "frame_0000_AAA.xyz",
+        [
+            ("Pb", 0.0, 0.0, 0.0),
+            ("I", 2.0, 0.0, 0.0),
+        ],
+    )
+
+    window = BondAnalysisMainWindow(initial_clusters_dir=clusters_dir)
+
+    assert not window.cluster_types_section.is_collapsed()
+    assert not window.cluster_types_content.isHidden()
+    assert window.cluster_type_list.count() == 1
+    assert window.cluster_type_status_label.text() == (
+        "1 cluster type(s) ready."
+    )
+
+    window.cluster_types_section.set_collapsed(True)
+    qapp.processEvents()
+
+    assert window.cluster_types_section.is_collapsed()
+    assert window.cluster_types_content.isHidden()
+
+    window.cluster_types_section.set_collapsed(False)
+    qapp.processEvents()
+
+    assert not window.cluster_types_content.isHidden()
+    assert window.cluster_type_list.count() == 1
     window.close()
 
 
@@ -205,6 +299,63 @@ def test_bondanalysis_main_window_shows_compact_project_status_and_registers_clu
     window.close()
 
 
+def test_bondanalysis_main_window_loads_project_batch_results(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    monkeypatch.setenv(
+        "SAXSHELL_BONDANALYSIS_PRESETS_PATH",
+        str(tmp_path / "bondanalysis_presets.json"),
+    )
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "saxs_project"
+    manager.create_project(project_dir)
+    clusters_dir = tmp_path / "clusters_splitxyz0001"
+    pbi2_dir = clusters_dir / "PbI2"
+    pbi2_dir.mkdir(parents=True)
+    _write_xyz_cluster(
+        pbi2_dir / "frame_0000_AAA.xyz",
+        [
+            ("Pb", 0.0, 0.0, 0.0),
+            ("I", 2.0, 0.0, 0.0),
+            ("I", 0.0, 2.0, 0.0),
+        ],
+    )
+    output_dir = (
+        project_dir / "analysis" / "bondanalysis" / "clusters_splitxyz0001"
+    )
+    result = BondAnalysisWorkflow(
+        clusters_dir,
+        bond_pairs=[BondPairDefinition("Pb", "I", 3.1)],
+        angle_triplets=[AngleTripletDefinition("Pb", "I", "I", 3.1, 3.1)],
+        coordination_numbers=[CoordinationNumberDefinition("Pb", "I", 3.1)],
+        output_dir=output_dir,
+    ).run()
+
+    window = BondAnalysisMainWindow(
+        initial_clusters_dir=clusters_dir,
+        initial_project_dir=project_dir,
+    )
+
+    assert Path(window.output_dir_edit.text()) == result.output_dir
+    assert window.results_tree.topLevelItemCount() == 3
+    assert (
+        _find_results_leaf(window, "Bond Pairs", "Pb-I", "all").text(2) == "2"
+    )
+    assert (
+        _find_results_leaf(
+            window,
+            "Coordination Numbers",
+            "CN Pb-I",
+            "all",
+        ).text(2)
+        == "1"
+    )
+    window.close()
+
+
 def test_bondanalysis_main_window_saves_custom_presets_across_sessions(
     qapp,
     tmp_path,
@@ -243,6 +394,7 @@ def test_bondanalysis_main_window_saves_custom_presets_across_sessions(
     reloaded_window.load_preset("DMF Custom")
 
     assert reloaded_window.bond_pair_table.item(0, 2).text() == "4.5"
+    assert reloaded_window.coordination_number_table.rowCount() == 3
 
 
 def test_bondanalysis_main_window_uses_checked_cluster_types_filter(
@@ -301,7 +453,7 @@ def test_bondanalysis_results_tree_groups_distributions_by_type(
     window.output_dir_edit.setText(str(output_dir))
     window._refresh_results_tree()
 
-    assert window.results_tree.topLevelItemCount() == 2
+    assert window.results_tree.topLevelItemCount() == 3
     all_bond_leaf = _find_results_leaf(window, "Bond Pairs", "Pb-I", "all")
     pb_i2_leaf = _find_results_leaf(window, "Bond Pairs", "Pb-I", "PbI2")
     all_angle_leaf = _find_results_leaf(
@@ -310,10 +462,69 @@ def test_bondanalysis_results_tree_groups_distributions_by_type(
         "I-Pb-I",
         "all",
     )
+    all_coordination_leaf = _find_results_leaf(
+        window,
+        "Coordination Numbers",
+        "CN Pb-I",
+        "all",
+    )
 
     assert all_bond_leaf.text(2) == "5"
     assert pb_i2_leaf.text(2) == "2"
     assert all_angle_leaf.text(2) == "4"
+    assert all_coordination_leaf.text(2) == "2"
+
+
+def test_bondanalysis_run_finishes_by_refreshing_results_tree(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "SAXSHELL_BONDANALYSIS_PRESETS_PATH",
+        str(tmp_path / "bondanalysis_presets.json"),
+    )
+    clusters_dir = tmp_path / "clusters_splitxyz0001"
+    pbi2_dir = clusters_dir / "PbI2"
+    pbi2_dir.mkdir(parents=True)
+    _write_xyz_cluster(
+        pbi2_dir / "frame_0000_AAA.xyz",
+        [
+            ("Pb", 0.0, 0.0, 0.0),
+            ("I", 2.0, 0.0, 0.0),
+            ("I", 0.0, 2.0, 0.0),
+        ],
+    )
+    window = BondAnalysisMainWindow(initial_clusters_dir=clusters_dir)
+    window.output_dir_edit.setText(str(tmp_path / "bondanalysis_async_run"))
+    window._set_bond_pair_rows((BondPairDefinition("Pb", "I", 3.1),))
+    window._set_angle_triplet_rows(
+        (AngleTripletDefinition("Pb", "I", "I", 3.1, 3.1),)
+    )
+
+    window._start_run()
+    for _attempt in range(200):
+        qapp.processEvents()
+        if window._run_thread is None:
+            break
+        QTest.qWait(25)
+
+    assert window._run_thread is None, window._active_run_status
+    assert window.run_button.isEnabled()
+    assert window.progress_bar.value() == window.progress_bar.maximum()
+    assert "complete" in window.progress_label.text().lower()
+    assert "Bond analysis complete" in window.statusBar().currentMessage()
+    assert window.results_tree.topLevelItemCount() == 2
+    all_bond_leaf = _find_results_leaf(window, "Bond Pairs", "Pb-I", "all")
+    all_angle_leaf = _find_results_leaf(
+        window,
+        "Bond Angles",
+        "I-Pb-I",
+        "all",
+    )
+    assert all_bond_leaf.text(2) == "2"
+    assert all_angle_leaf.text(2) == "1"
+    assert window.close()
 
 
 def test_bondanalysis_can_reload_existing_results_folder_without_recomputing(
@@ -338,10 +549,42 @@ def test_bondanalysis_can_reload_existing_results_folder_without_recomputing(
     assert window.bond_pair_table.item(0, 1).text() == "I"
     assert window.angle_triplet_table.rowCount() == 1
     assert window.angle_triplet_table.item(0, 0).text() == "Pb"
-    assert window.results_tree.topLevelItemCount() == 2
+    assert window.coordination_number_table.rowCount() == 1
+    assert window.coordination_number_table.item(0, 0).text() == "Pb"
+    assert window.results_tree.topLevelItemCount() == 3
     assert (
         "Loaded existing bondanalysis folder" in window.log_box.toPlainText()
     )
+
+
+def test_bondanalysis_show_output_folder_button_opens_results_dir(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    monkeypatch.setenv(
+        "SAXSHELL_BONDANALYSIS_PRESETS_PATH",
+        str(tmp_path / "bondanalysis_presets.json"),
+    )
+    clusters_dir, output_dir = _build_bondanalysis_output(tmp_path)
+    window = BondAnalysisMainWindow(initial_clusters_dir=clusters_dir)
+    window.load_existing_results_dir(output_dir)
+    opened: dict[str, str] = {}
+
+    def fake_open_url(url):
+        opened["path"] = url.toLocalFile()
+        return True
+
+    monkeypatch.setattr(
+        "saxshell.bondanalysis.ui.main_window.QDesktopServices.openUrl",
+        fake_open_url,
+    )
+
+    window.show_output_folder_button.click()
+
+    assert opened["path"] == str(output_dir.resolve())
+    window.close()
 
 
 def test_bondanalysis_results_tree_selection_updates_ready_status(
@@ -426,6 +669,43 @@ def test_bondanalysis_open_selected_window_can_overlay_selected_clusters_and_all
     assert not all_window.series_color_container.isVisible()
 
 
+def test_bondanalysis_can_open_every_all_cluster_distribution(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "SAXSHELL_BONDANALYSIS_PRESETS_PATH",
+        str(tmp_path / "bondanalysis_presets.json"),
+    )
+    clusters_dir, output_dir = _build_bondanalysis_output(tmp_path)
+    window = BondAnalysisMainWindow(initial_clusters_dir=clusters_dir)
+    window.show()
+    window.output_dir_edit.setText(str(output_dir))
+    window._refresh_results_tree()
+
+    window.open_all_all_plots_button.click()
+    qapp.processEvents()
+
+    assert len(window._plot_windows) == 1
+    plot_window = window._plot_windows[0]
+    assert plot_window.tab_widget.count() == 3
+    requests = [
+        plot_window.tab_widget.widget(index).plot_request
+        for index in range(plot_window.tab_widget.count())
+    ]
+    assert {request.display_label for request in requests} == {
+        "Pb-I",
+        "I-Pb-I",
+        "CN Pb-I",
+    }
+    assert all(request.series[0].label == "all" for request in requests)
+    assert all(request.series[0].values.size > 0 for request in requests)
+    assert "Opened 3 all-cluster distribution plot(s)." in (
+        window.results_status_label.text()
+    )
+
+
 def test_bondanalysis_right_pane_is_scrollable_with_tree_above_run_log(
     qapp,
     tmp_path,
@@ -447,7 +727,7 @@ def test_bondanalysis_right_pane_is_scrollable_with_tree_above_run_log(
     )
 
     window = BondAnalysisMainWindow(initial_clusters_dir=clusters_dir)
-    splitter = window.centralWidget().layout().itemAt(0).widget()
+    splitter = window.centralWidget().layout().itemAt(1).widget()
 
     assert isinstance(splitter, QSplitter)
     assert isinstance(splitter.widget(1), QScrollArea)
