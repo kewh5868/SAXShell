@@ -3,32 +3,39 @@ from scipy.stats import norm
 
 # ==============================================
 # model_lmfit: lmfit_model_profile
-# model_pydream: log_likelihood_monosq_scaled_solvent_model_scale
+# model_pydream: log_likelihood_monosq_legacy
 # inputs_lmfit: q, solvent_data, model_data, params
 # inputs_pydream: q, solvent_data, model_data, params
 # param_columns: Structure, Motif, Param, Value, Vary, Min, Max
 #
-# param: solv_w,1.0,False,0.0,1.0
-# param: offset,0,True,-20,30
-# param: eff_r,3.0,True,3,20
-# param: vol_frac,0.0,False,0.0,0.5
-# param: scale,5e-4,True,1e-8,5e-3
-#
-# MonoSQ normalized, scaled-solvent, model-scaled variant:
-#   I_raw(q) = I_solute(q) + solv_w * I_solvent(q)
-#   I_model(q) = scale * I_raw(q) + offset
-#
-# The experimental trace is compared directly against I_model(q); scale and
-# offset are never applied to experimental_intensities in this template.
-# Existing templates are intentionally left unchanged for compatibility.
+# Legacy MDScatter pyDREAM template:
+# - weighted simulated SAXS component profiles
+# - monodisperse hard-sphere Percus-Yevick S(q)
+# - optional solvent profile inside the same global scale as the solute
+# - fixed Gaussian likelihood sigma of 1e-4
+# - unnormalized summed log-likelihood
 # ==============================================
+#
+# param: solv_w,0.0,True,0.0,1e10
+# param: offset,0.0,True,-20.0,30.0
+# param: eff_r,9.0,True,3.0,20.0
+# param: vol_frac,0.0,True,0.0,0.1
+# param: scale,1e-10,False,1e-12,1e-8
+
+
+LEGACY_LIKELIHOOD_SIGMA = 1e-4
 
 
 def calc_monodisperse_sq(r, vol_frac, q_values):
-    """Return the hard-sphere Percus-Yevick structure factor."""
+    """Return the legacy hard-sphere Percus-Yevick structure factor."""
     q_values = np.asarray(q_values, dtype=float)
     r = float(r)
     vol_frac = float(vol_frac)
+    if r <= 0.0:
+        raise ValueError("eff_r must be positive")
+    if vol_frac < 0.0 or vol_frac >= 1.0:
+        raise ValueError("vol_frac must satisfy 0 <= vol_frac < 1")
+
     a = 2.0 * q_values * r
     a_safe = np.where(np.abs(a) < 1e-12, 1e-12, a)
 
@@ -39,7 +46,6 @@ def calc_monodisperse_sq(r, vol_frac, q_values):
     gamma = (
         0.5 * vol_frac * (1.0 + 2.0 * vol_frac) ** 2 / (1.0 - vol_frac) ** 4
     )
-
     g1 = alpha / a_safe**2 * (np.sin(a_safe) - a_safe * np.cos(a_safe))
     g2 = (
         beta
@@ -71,23 +77,18 @@ def calc_monodisperse_sq(r, vol_frac, q_values):
         sq[np.abs(a) < 1e-12] = (1.0 - vol_frac) ** 4 / (
             1.0 + 2.0 * vol_frac
         ) ** 2
-
     return sq
-
-
-def _bounded_solvent_weight(value):
-    return float(value)
 
 
 def _weight_keys_from_params(params):
     return sorted(
         (key for key in params if key.startswith("w") and key[1:].isdigit()),
-        key=lambda key: int(key[1:]),
+        key=lambda key: int(key.lstrip("w")),
     )
 
 
 def structure_factor_profile(q, solvent_data, model_data, **params):
-    """Return the pure hard-sphere structure-factor trace S(q)."""
+    """Return the hard-sphere structure-factor trace S(q)."""
     del solvent_data, model_data
     return calc_monodisperse_sq(
         params["eff_r"],
@@ -96,84 +97,56 @@ def structure_factor_profile(q, solvent_data, model_data, **params):
     )
 
 
-def raw_monosq_scaled_solvent_profile(
+def _legacy_forward_model(
     q_values,
-    solvent_intensities,
-    component_intensities,
+    solvent_data,
+    model_data,
     weights,
     solv_w,
-    eff_r,
-    vol_frac,
-):
-    """Return the unscaled solute-plus-weighted-solvent model branch."""
-    q_values = np.asarray(q_values, dtype=float)
-    mixture = np.zeros_like(q_values, dtype=float)
-    for weight, component in zip(weights, component_intensities):
-        mixture += float(weight) * np.asarray(component, dtype=float)
-
-    solute_intensity = mixture * calc_monodisperse_sq(
-        eff_r,
-        vol_frac,
-        q_values,
-    )
-    solvent_contribution = _bounded_solvent_weight(solv_w) * np.asarray(
-        solvent_intensities,
-        dtype=float,
-    )
-    return solute_intensity + solvent_contribution
-
-
-def scaled_monosq_model_profile(
-    q_values,
-    solvent_intensities,
-    component_intensities,
-    weights,
-    solv_w,
+    offset,
     eff_r,
     vol_frac,
     scale,
-    offset,
 ):
-    """Apply the fit transform to the model curve, not the data
-    curve."""
-    raw_model = raw_monosq_scaled_solvent_profile(
-        q_values,
-        solvent_intensities,
-        component_intensities,
-        weights,
-        solv_w,
-        eff_r,
-        vol_frac,
+    q_values = np.asarray(q_values, dtype=float)
+    solvent = (
+        np.zeros_like(q_values)
+        if solvent_data is None
+        else np.asarray(solvent_data, dtype=float)
     )
+    mixture = np.zeros_like(q_values, dtype=float)
+    for weight, component in zip(weights, model_data):
+        mixture += float(weight) * np.asarray(component, dtype=float)
+
+    solute = mixture * calc_monodisperse_sq(eff_r, vol_frac, q_values)
+    raw_model = solute + float(solv_w) * solvent
     return float(scale) * raw_model + float(offset)
 
 
 def lmfit_model_profile(q, solvent_data, model_data, **params):
-    """Evaluate the model-scaled MonoSQ SAXS model for lmfit."""
+    """Evaluate the legacy monodisperse SAXS model for Prefit."""
     weight_keys = _weight_keys_from_params(params)
     weights = [params[key] for key in weight_keys]
-
-    return scaled_monosq_model_profile(
+    return _legacy_forward_model(
         q,
         solvent_data,
         model_data,
         weights,
         params["solv_w"],
+        params["offset"],
         params["eff_r"],
         params["vol_frac"],
         params["scale"],
-        params["offset"],
     )
 
 
-def model_monosq_scaled_solvent_model_scale(params):
-    """Return the forward model intensity for pyDREAM."""
+def model_monosq_legacy(params):
+    """Return the pyDREAM forward model intensity."""
     global q_values
     global theoretical_intensities
     global solvent_intensities
 
     n_profiles = len(theoretical_intensities)
-
     weights = params[:n_profiles]
     solv_w = params[n_profiles]
     offset = params[n_profiles + 1]
@@ -181,41 +154,35 @@ def model_monosq_scaled_solvent_model_scale(params):
     vol_frac = params[n_profiles + 3]
     scale = params[n_profiles + 4]
 
-    return scaled_monosq_model_profile(
+    return _legacy_forward_model(
         q_values,
         solvent_intensities,
         theoretical_intensities,
         weights,
         solv_w,
+        offset,
         eff_r,
         vol_frac,
         scale,
-        offset,
     )
 
 
-def log_likelihood_monosq_scaled_solvent_model_scale(params):
-    """Return the normalized Gaussian log-likelihood for pyDREAM."""
+def log_likelihood_monosq_legacy(params):
+    """Return the legacy unnormalized Gaussian log-likelihood."""
     global experimental_intensities
 
     try:
-        model_intensity = model_monosq_scaled_solvent_model_scale(params)
+        model_intensity = model_monosq_legacy(params)
     except (ValueError, FloatingPointError):
         return -np.inf
     if not np.all(np.isfinite(model_intensity)):
         return -np.inf
 
     experimental = np.asarray(experimental_intensities, dtype=float)
-    n_points = len(experimental)
-    log_likelihood = np.sum(
+    return np.sum(
         norm.logpdf(
             experimental,
             loc=model_intensity,
-            scale=1e-4,
+            scale=LEGACY_LIKELIHOOD_SIGMA,
         )
     )
-
-    if n_points == 0:
-        return log_likelihood
-
-    return log_likelihood / n_points

@@ -106,6 +106,9 @@ from saxshell.saxs.ui.branding import (
 from saxshell.saxs.ui.progress_dialog import SAXSProgressDialog
 
 AUTO_SNAP_PANES_KEY = "contrast_fft_auto_snap_panes_enabled"
+STARTUP_LOAD_TOTAL_STEPS = 3
+PUSH_TO_MODEL_STATIC_STEPS = 4
+DEFAULT_FFT_BORN_WINDOW_SIZE = (1680, 1040)
 _SOLVENT_PRESET_NONE = "__none__"
 _OPEN_WINDOWS: list["FFTBornApproximationMainWindow"] = []
 
@@ -1137,6 +1140,7 @@ class FFTBornApproximationMainWindow(QMainWindow):
         self._progress_dialog: SAXSProgressDialog | None = None
         self._close_requested_while_running = False
         self._build_ui()
+        self.resize(*DEFAULT_FFT_BORN_WINDOW_SIZE)
         self._build_menu_bar()
         self._apply_preview_mode_title()
         self._refresh_preview_mode_banner()
@@ -3116,9 +3120,22 @@ class FFTBornApproximationMainWindow(QMainWindow):
     def _load_deferred_input(self) -> None:
         if self._deferred_initial_input_path is None:
             return
-        self.input_path_edit.setText(str(self._deferred_initial_input_path))
-        self._load_input_path(self._deferred_initial_input_path)
-        self._deferred_initial_input_path = None
+        input_path = self._deferred_initial_input_path
+        self.input_path_edit.setText(str(input_path))
+        self._begin_startup_load_progress(input_path)
+        try:
+            self._update_startup_load_progress(
+                1,
+                "Discovering 3D FFT Born profile targets...",
+            )
+            self._load_input_path(input_path)
+            self._update_startup_load_progress(
+                STARTUP_LOAD_TOTAL_STEPS,
+                "3D FFT Born Approximation ready.",
+            )
+        finally:
+            self._deferred_initial_input_path = None
+            self._close_progress_dialog()
 
     def _current_fft_settings(self) -> ContrastFFTSettings:
         return ContrastFFTSettings(
@@ -4510,92 +4527,134 @@ class FFTBornApproximationMainWindow(QMainWindow):
                 "The linked computed distribution paths are not available.",
             )
             return
-        self._ensure_linked_distribution_ready_for_push()
         component_dir, component_map_path = artifact_targets
-        component_dir.mkdir(parents=True, exist_ok=True)
-        saxs_map: dict[str, dict[str, str]] = {}
-        for result in self._computed_profile_results.values():
-            profile_file = self._write_component_trace_file(
-                result,
-                component_dir,
+        profile_results = tuple(self._computed_profile_results.values())
+        total_steps = PUSH_TO_MODEL_STATIC_STEPS + len(profile_results)
+        processed_steps = 0
+        self._begin_push_to_model_progress(total_steps)
+        try:
+            processed_steps += 1
+            self._update_push_to_model_progress(
+                processed_steps,
+                total_steps,
+                "Preparing linked computed distribution...",
             )
-            saxs_map.setdefault(result.target.structure_name, {})
-            saxs_map[result.target.structure_name][
-                result.target.motif_name
-            ] = profile_file
-        component_map_path.write_text(
-            json.dumps({"saxs_map": saxs_map}, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        self._write_distribution_component_summary(summary_path)
-        if self._project_dir is not None:
-            from saxshell.saxs.contrast.settings import (
-                COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT,
-            )
-            from saxshell.saxs.project_manager.project import (
-                SAXSProjectManager,
-                project_artifact_paths,
-            )
-
-            project_manager = SAXSProjectManager()
-            settings = project_manager.load_project(self._project_dir)
-            settings.component_build_mode = (
-                COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
-            )
-            settings.use_predicted_structure_weights = bool(
-                self._use_predicted_structure_weights
-            )
-            settings.use_representative_structures = (
-                self._current_structure_source_mode() == "representative"
-            )
-            artifact_paths = project_artifact_paths(
-                settings,
-                storage_mode="distribution",
-                allow_legacy_fallback=False,
-            )
-            if artifact_paths.root_dir.resolve() == (
-                self._distribution_root_dir.expanduser().resolve()
-            ):
-                project_manager._write_distribution_metadata(
-                    settings,
-                    artifact_paths=artifact_paths,
-                    built_component_source_mode=(
-                        self._current_structure_source_mode()
+            self._ensure_linked_distribution_ready_for_push()
+            component_dir.mkdir(parents=True, exist_ok=True)
+            saxs_map: dict[str, dict[str, str]] = {}
+            for index, result in enumerate(profile_results, start=1):
+                processed_steps += 1
+                self._update_push_to_model_progress(
+                    processed_steps,
+                    total_steps,
+                    (
+                        "Writing 3D FFT Born component trace "
+                        f"{index} of {len(profile_results)}..."
                     ),
                 )
-                project_manager.save_project(
+                profile_file = self._write_component_trace_file(
+                    result,
+                    component_dir,
+                )
+                saxs_map.setdefault(result.target.structure_name, {})
+                saxs_map[result.target.structure_name][
+                    result.target.motif_name
+                ] = profile_file
+            processed_steps += 1
+            self._update_push_to_model_progress(
+                processed_steps,
+                total_steps,
+                "Writing component map and summary...",
+            )
+            component_map_path.write_text(
+                json.dumps({"saxs_map": saxs_map}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            self._write_distribution_component_summary(summary_path)
+            processed_steps += 1
+            self._update_push_to_model_progress(
+                processed_steps,
+                total_steps,
+                "Refreshing project metadata...",
+            )
+            if self._project_dir is not None:
+                from saxshell.saxs.contrast.settings import (
+                    COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT,
+                )
+                from saxshell.saxs.project_manager.project import (
+                    SAXSProjectManager,
+                    project_artifact_paths,
+                )
+
+                project_manager = SAXSProjectManager()
+                settings = project_manager.load_project(self._project_dir)
+                settings.component_build_mode = (
+                    COMPONENT_BUILD_MODE_BORN_APPROXIMATION_3D_FFT
+                )
+                settings.use_predicted_structure_weights = bool(
+                    self._use_predicted_structure_weights
+                )
+                settings.use_representative_structures = (
+                    self._current_structure_source_mode() == "representative"
+                )
+                artifact_paths = project_artifact_paths(
                     settings,
-                    refresh_registered_paths=False,
+                    storage_mode="distribution",
+                    allow_legacy_fallback=False,
                 )
-            else:
-                raise ValueError(
-                    "The linked computed distribution no longer matches the "
-                    "active project settings. Reopen the 3D FFT Born workflow "
-                    "from Project Setup and push again."
-                )
-        self._append_status(
-            "Pushed 3D FFT Born component traces into the linked computed "
-            f"distribution: {component_map_path}"
-        )
-        self.statusBar().showMessage("3D FFT Born components pushed to model")
-        self.born_components_built.emit(
-            {
-                "project_dir": (
-                    None
-                    if self._project_dir is None
-                    else str(self._project_dir)
-                ),
-                "distribution_id": self._distribution_id,
-                "distribution_dir": (
-                    None
-                    if self._distribution_root_dir is None
-                    else str(self._distribution_root_dir)
-                ),
-                "component_dir": str(component_dir),
-                "component_map_path": str(component_map_path),
-                "component_summary_path": str(summary_path),
-            }
-        )
+                if artifact_paths.root_dir.resolve() == (
+                    self._distribution_root_dir.expanduser().resolve()
+                ):
+                    project_manager._write_distribution_metadata(
+                        settings,
+                        artifact_paths=artifact_paths,
+                        built_component_source_mode=(
+                            self._current_structure_source_mode()
+                        ),
+                    )
+                    project_manager.save_project(
+                        settings,
+                        refresh_registered_paths=False,
+                    )
+                else:
+                    raise ValueError(
+                        "The linked computed distribution no longer matches the "
+                        "active project settings. Reopen the 3D FFT Born workflow "
+                        "from Project Setup and push again."
+                    )
+            processed_steps += 1
+            self._update_push_to_model_progress(
+                processed_steps,
+                total_steps,
+                "Notifying model of pushed 3D FFT Born traces...",
+            )
+            self._append_status(
+                "Pushed 3D FFT Born component traces into the linked computed "
+                f"distribution: {component_map_path}"
+            )
+            self.statusBar().showMessage(
+                "3D FFT Born components pushed to model"
+            )
+            self.born_components_built.emit(
+                {
+                    "project_dir": (
+                        None
+                        if self._project_dir is None
+                        else str(self._project_dir)
+                    ),
+                    "distribution_id": self._distribution_id,
+                    "distribution_dir": (
+                        None
+                        if self._distribution_root_dir is None
+                        else str(self._distribution_root_dir)
+                    ),
+                    "component_dir": str(component_dir),
+                    "component_map_path": str(component_map_path),
+                    "component_summary_path": str(summary_path),
+                }
+            )
+        finally:
+            self._close_progress_dialog()
 
     def _show_error(self, title: str, message: str) -> None:
         QMessageBox.critical(self, title, message)
@@ -4614,6 +4673,57 @@ class FFTBornApproximationMainWindow(QMainWindow):
         dialog.begin_busy(
             str(message).strip() or "Running 3D FFT Born Approximation...",
             title="Calculating 3D FFT Born Approximation",
+        )
+        QApplication.processEvents()
+
+    def _begin_startup_load_progress(self, input_path: Path) -> None:
+        dialog = self._ensure_progress_dialog()
+        dialog.begin(
+            STARTUP_LOAD_TOTAL_STEPS,
+            f"Opening 3D FFT Born Approximation for {input_path}...",
+            unit_label="steps",
+            title="Opening 3D FFT Born Approximation",
+        )
+        QApplication.processEvents()
+
+    def _update_startup_load_progress(
+        self,
+        processed_steps: int,
+        message: str,
+    ) -> None:
+        dialog = self._ensure_progress_dialog()
+        dialog.setWindowTitle("Opening 3D FFT Born Approximation")
+        dialog.update_progress(
+            processed_steps,
+            STARTUP_LOAD_TOTAL_STEPS,
+            str(message).strip() or "Opening 3D FFT Born Approximation...",
+            unit_label="steps",
+        )
+        QApplication.processEvents()
+
+    def _begin_push_to_model_progress(self, total_steps: int) -> None:
+        dialog = self._ensure_progress_dialog()
+        dialog.begin(
+            total_steps,
+            "Pushing 3D FFT Born traces to the model...",
+            unit_label="steps",
+            title="Pushing Traces to Model",
+        )
+        QApplication.processEvents()
+
+    def _update_push_to_model_progress(
+        self,
+        processed_steps: int,
+        total_steps: int,
+        message: str,
+    ) -> None:
+        dialog = self._ensure_progress_dialog()
+        dialog.setWindowTitle("Pushing Traces to Model")
+        dialog.update_progress(
+            processed_steps,
+            total_steps,
+            str(message).strip() or "Pushing traces to the model...",
+            unit_label="steps",
         )
         QApplication.processEvents()
 

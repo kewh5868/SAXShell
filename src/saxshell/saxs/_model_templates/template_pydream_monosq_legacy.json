@@ -1,0 +1,17 @@
+{
+  "display_name": "pyDREAM MonoSQ Legacy (MDScatter)",
+  "description": "pyDREAM MonoSQ Legacy (MDScatter)\n\nPurpose:\nLegacy-compatible monodisperse hard-sphere SAXS template reconstructed from the historical MDScatter pyDREAM and Prefit workflow. Use this when reproducing older MDScatter notebook behavior is more important than the point-normalized likelihood convention used by newer SAXSShell templates.\n\nStructure Factor:\nMonodisperse hard-sphere structure factor evaluated with the Percus-Yevick expression used in the legacy notebooks and template_likelihood_monosq.py. eff_r controls the effective hard-sphere radius and vol_frac controls the packing term.\n\nForm Factor:\nThe model uses a linear mixture of MD-derived component profiles. The component weights w0, w1, ..., wN are multiplied by the corresponding simulated SAXS traces, summed, and then modulated by S_HS(q).\n\nModel Equation:\nI_mix(q) = sum_i w_i I_i(q)\nI_raw(q) = I_mix(q) S_HS(q; eff_r, vol_frac) + solv_w I_solv(q)\nI_model(q) = scale I_raw(q) + offset\n\nLegacy Convention:\nUnlike the newer normalized MonoSQ templates, the DREAM likelihood returns the raw sum of Gaussian log-probabilities over fitted q-points. The Gaussian sigma is fixed at 1e-4, matching the notebook and template convention. The default scale is 1e-10 and fixed by default, matching the legacy pyDREAM hard-coded scale; Prefit can still expose the value for inspection or manual override.\n\nModel Parameters:\nw0, w1, ..., wN: Relative contribution of each MD-derived component profile.\nsolv_w: Solvent trace multiplier placed inside the global scale branch, with a broad legacy upper bound for notebook-scale solvent weights.\noffset: Additive baseline term applied after global scaling.\neff_r: Effective hard-sphere radius used in the structure-factor calculation.\nvol_frac: Hard-sphere volume fraction used by the Percus-Yevick structure factor.\nscale: Multiplicative scale applied to the solute plus weighted-solvent model branch.",
+  "capabilities": {
+    "solution_scattering_estimator": {
+      "volume_fraction_target": {
+        "parameter": "vol_frac",
+        "fraction_kind": "solute",
+        "source": "saxs_effective"
+      },
+      "solvent_contribution_scale_mode": "global_scale"
+    },
+    "prefit": {
+      "auto_apply_autoscale_on_load": false
+    }
+  }
+}

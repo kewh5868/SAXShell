@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -44,6 +45,10 @@ from saxshell.plotting import (
     PlotEditorWindow,
 )
 from saxshell.saxs._model_templates import TemplateSpec
+from saxshell.saxs.dielectric_presets import (
+    DIELECTRIC_CONSTANT_PRESETS,
+    DIELECTRIC_CONSTANT_PRESETS_BY_KEY,
+)
 from saxshell.saxs.prefit import (
     ClusterGeometryMetadataRow,
     PrefitEvaluation,
@@ -57,6 +62,9 @@ from saxshell.saxs.prefit.cluster_geometry import (
     RADIUS_TYPE_OPTIONS,
     STRUCTURE_FACTOR_RECOMMENDATIONS,
     synchronize_cluster_geometry_row,
+)
+from saxshell.saxs.stoichiometry_compensator import (
+    guess_single_atom_compensator_names,
 )
 from saxshell.saxs.ui._pane_snap import PaneSnapFilter
 from saxshell.saxs.ui.solute_volume_fraction_widget import (
@@ -124,6 +132,15 @@ class TableCellComboBox(QComboBox):
 class PrefitTab(QWidget):
     PARAMETER_VALUE_ROLE = int(Qt.ItemDataRole.UserRole)
     PARAMETER_VARY_MEMORY_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+    PARAM_COL_STRUCTURE = 0
+    PARAM_COL_MOTIF = 1
+    PARAM_COL_NAME = 2
+    PARAM_COL_VALUE = 3
+    PARAM_COL_VARY = 4
+    PARAM_COL_MIN = 5
+    PARAM_COL_MAX = 6
+    PARAM_COL_ACTIVE = 7
+    PARAM_COL_RESET = 8
 
     template_changed = Signal(str)
     change_template_requested = Signal(str)
@@ -134,7 +151,9 @@ class PrefitTab(QWidget):
     parameter_table_edited = Signal()
     parameter_reset_requested = Signal(str, str, str)
     update_model_requested = Signal()
+    charge_estimate_requested = Signal()
     run_fit_requested = Signal()
+    undo_fit_requested = Signal()
     apply_recommended_scale_requested = Signal()
     set_best_prefit_requested = Signal()
     reset_best_prefit_requested = Signal()
@@ -148,6 +167,8 @@ class PrefitTab(QWidget):
     cluster_geometry_sf_approximation_changed = Signal(str, str)
     cluster_geometry_radii_type_changed = Signal(str)
     cluster_geometry_ionic_radius_type_changed = Signal(str)
+    stoichiometry_compensator_settings_changed = Signal()
+    fit_range_changed = Signal(float, float)
 
     PREFIT_HELP_TEXT = (
         "Recommended prefit workflow:\n"
@@ -207,6 +228,8 @@ class PrefitTab(QWidget):
     CLUSTER_COL_NOTES = 11
     PARAMETER_SCROLL_RESOLUTION = 2000
     PARAMETER_SCROLL_LOG_DECADE_THRESHOLD = 2.0
+    DIELECTRIC_PARAMETER_NAME = "dielectconst"
+    CHARGE_PARAMETER_NAME = "charge"
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -227,12 +250,19 @@ class PrefitTab(QWidget):
         self._expanded_cluster_geometry_note_rows: set[int] = set()
         self._model_only_mode = False
         self._prefit_execution_enabled = True
+        self._fit_undo_available = False
         self._updating_parameter_table = False
         self._updating_parameter_scrollbar = False
         self._parameter_entries_dirty = True
         self._cached_parameter_entries: list[PrefitParameterEntry] | None = (
             None
         )
+        self._stoichiometry_compensator_entries: list[PrefitParameterEntry] = (
+            []
+        )
+        self._updating_stoichiometry_compensator = False
+        self._updating_fit_range_controls = False
+        self._prefit_range_drag_start: float | None = None
         self._last_cluster_geometry_radii_type = DEFAULT_RADIUS_TYPE
         self._last_cluster_geometry_ionic_radius_type = (
             DEFAULT_IONIC_RADIUS_TYPE
@@ -283,6 +313,10 @@ class PrefitTab(QWidget):
         left_layout.addWidget(self._solute_volume_fraction_group)
         self._cluster_geometry_group = self._build_cluster_geometry_group()
         left_layout.addWidget(self._cluster_geometry_group)
+        self._stoichiometry_compensator_group = (
+            self._build_stoichiometry_compensator_group()
+        )
+        left_layout.addWidget(self._stoichiometry_compensator_group)
         left_layout.addWidget(self._build_parameter_group())
         left_layout.addStretch(1)
         self._left_scroll_area = QScrollArea()
@@ -456,6 +490,49 @@ class PrefitTab(QWidget):
         self.stoichiometry_status_label.setWordWrap(True)
         layout.addWidget(self.stoichiometry_status_label, 6, 0, 1, 3)
 
+        self.fit_q_min_spin = QDoubleSpinBox()
+        self.fit_q_min_spin.setDecimals(8)
+        self.fit_q_min_spin.setKeyboardTracking(False)
+        self.fit_q_min_spin.setEnabled(False)
+        self.fit_q_min_spin.setToolTip(
+            "Lower q bound for the active Prefit fit window."
+        )
+        self.fit_q_max_spin = QDoubleSpinBox()
+        self.fit_q_max_spin.setDecimals(8)
+        self.fit_q_max_spin.setKeyboardTracking(False)
+        self.fit_q_max_spin.setEnabled(False)
+        self.fit_q_max_spin.setToolTip(
+            "Upper q bound for the active Prefit fit window."
+        )
+        self.fit_q_min_spin.valueChanged.connect(
+            self._on_fit_range_spin_changed
+        )
+        self.fit_q_max_spin.valueChanged.connect(
+            self._on_fit_range_spin_changed
+        )
+        self.fit_range_reset_button = QPushButton("Full Range")
+        self.fit_range_reset_button.setEnabled(False)
+        self.fit_range_reset_button.setToolTip(
+            "Reset the active Prefit fit window to the full model trace."
+        )
+        self.fit_range_reset_button.clicked.connect(
+            self._reset_fit_range_to_model_bounds
+        )
+        self.fit_range_status_label = QLabel("Fit range unavailable")
+        self.fit_range_status_label.setWordWrap(True)
+        fit_range_row = QWidget()
+        self.fit_range_controls_row = fit_range_row
+        fit_range_layout = QHBoxLayout(fit_range_row)
+        fit_range_layout.setContentsMargins(0, 0, 0, 0)
+        fit_range_layout.setSpacing(6)
+        fit_range_layout.addWidget(QLabel("Fit q min"))
+        fit_range_layout.addWidget(self.fit_q_min_spin)
+        fit_range_layout.addWidget(QLabel("Fit q max"))
+        fit_range_layout.addWidget(self.fit_q_max_spin)
+        fit_range_layout.addWidget(self.fit_range_reset_button)
+        fit_range_layout.addWidget(self.fit_range_status_label, stretch=1)
+        layout.addWidget(fit_range_row, 7, 0, 1, 3)
+
         button_grid = QGridLayout()
         self.update_button = QPushButton("Update Model")
         self.update_button.setToolTip(
@@ -469,6 +546,13 @@ class PrefitTab(QWidget):
             "max nfev, and current parameter table."
         )
         self.run_button.clicked.connect(self.run_fit_requested.emit)
+        self.undo_fit_button = QPushButton("Undo Fit")
+        self.undo_fit_button.setToolTip(
+            "Restore the parameter table from before the most recent "
+            "successful Prefit run."
+        )
+        self.undo_fit_button.setEnabled(False)
+        self.undo_fit_button.clicked.connect(self.undo_fit_requested.emit)
         self.prefit_help_button = QToolButton()
         self.prefit_help_button.setText("?")
         self.prefit_help_button.setToolTip(self.PREFIT_HELP_TEXT)
@@ -524,6 +608,7 @@ class PrefitTab(QWidget):
         run_button_row = QHBoxLayout()
         run_button_row.setContentsMargins(0, 0, 0, 0)
         run_button_row.addWidget(self.run_button)
+        run_button_row.addWidget(self.undo_fit_button)
         run_button_row.addWidget(self.prefit_help_button)
         run_button_row.addStretch(1)
         run_cell_layout.addLayout(run_button_row)
@@ -534,7 +619,7 @@ class PrefitTab(QWidget):
         button_grid.addWidget(self.reset_button, 1, 1)
         button_grid.addWidget(self.set_best_button, 2, 0)
         button_grid.addWidget(self.reset_best_button, 2, 1)
-        layout.addLayout(button_grid, 7, 0, 1, 3)
+        layout.addLayout(button_grid, 8, 0, 1, 3)
         return group
 
     def _build_solute_volume_fraction_group(self) -> QGroupBox:
@@ -631,6 +716,14 @@ class PrefitTab(QWidget):
         self.figure = Figure(figsize=(9.6, 5.6))
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.canvas.mpl_connect("pick_event", self._handle_legend_pick)
+        self.canvas.mpl_connect(
+            "button_press_event",
+            self._handle_prefit_range_press,
+        )
+        self.canvas.mpl_connect(
+            "button_release_event",
+            self._handle_prefit_range_release,
+        )
         self.plot_toolbar = NavigationToolbar2QT(self.canvas, self)
         self.canvas.setMinimumHeight(340)
         layout.addWidget(self.plot_toolbar)
@@ -669,6 +762,54 @@ class PrefitTab(QWidget):
         action_row.addWidget(self.scrollable_parameter_checkbox)
         action_row.addStretch(1)
         layout.addLayout(action_row)
+        self.dielectric_preset_row = QWidget()
+        dielectric_preset_layout = QHBoxLayout(self.dielectric_preset_row)
+        dielectric_preset_layout.setContentsMargins(0, 0, 0, 0)
+        self.dielectric_preset_label = QLabel("Dielectric preset")
+        self.dielectric_preset_combo = QComboBox()
+        self.dielectric_preset_combo.addItem("Custom", userData=None)
+        for preset in DIELECTRIC_CONSTANT_PRESETS:
+            self.dielectric_preset_combo.addItem(
+                preset.combo_label,
+                userData=preset.key,
+            )
+        self.dielectric_preset_combo.setToolTip(
+            "Apply a solvent relative dielectric constant to dielectconst. "
+            "Choose Custom to keep the table value."
+        )
+        self.dielectric_preset_combo.currentIndexChanged.connect(
+            self._on_dielectric_preset_changed
+        )
+        dielectric_preset_layout.addWidget(self.dielectric_preset_label)
+        dielectric_preset_layout.addWidget(
+            self.dielectric_preset_combo,
+            stretch=1,
+        )
+        dielectric_preset_layout.addStretch(1)
+        self.dielectric_preset_row.setVisible(False)
+        layout.addWidget(self.dielectric_preset_row)
+        self.charge_estimate_row = QWidget()
+        charge_estimate_layout = QHBoxLayout(self.charge_estimate_row)
+        charge_estimate_layout.setContentsMargins(0, 0, 0, 0)
+        self.charge_estimate_label = QLabel("Charge estimate")
+        self.charge_estimate_button = QPushButton("Estimate")
+        self.charge_estimate_button.setToolTip(
+            "Estimate the charged-sphere charge magnitude from the current "
+            "component stoichiometries and weights."
+        )
+        self.charge_estimate_button.clicked.connect(
+            self.charge_estimate_requested.emit
+        )
+        self.charge_estimate_status_label = QLabel("")
+        self.charge_estimate_status_label.setWordWrap(True)
+        charge_estimate_layout.addWidget(self.charge_estimate_label)
+        charge_estimate_layout.addWidget(self.charge_estimate_button)
+        charge_estimate_layout.addWidget(
+            self.charge_estimate_status_label,
+            stretch=1,
+        )
+        self.charge_estimate_row.setVisible(False)
+        layout.addWidget(self.charge_estimate_row)
         self.parameter_scroll_panel = QWidget()
         self.parameter_scroll_panel.setVisible(False)
         scroll_panel_layout = QVBoxLayout(self.parameter_scroll_panel)
@@ -700,7 +841,7 @@ class PrefitTab(QWidget):
         )
         scroll_panel_layout.addWidget(self.parameter_scroll_bar)
         layout.addWidget(self.parameter_scroll_panel)
-        self.parameter_table = QTableWidget(0, 8)
+        self.parameter_table = QTableWidget(0, 9)
         self.parameter_table.setHorizontalHeaderLabels(
             [
                 "Structure",
@@ -710,6 +851,7 @@ class PrefitTab(QWidget):
                 "Vary",
                 "Min",
                 "Max",
+                "Use",
                 "Reset",
             ]
         )
@@ -839,6 +981,69 @@ class PrefitTab(QWidget):
         self._update_cluster_geometry_ionic_radius_type_enabled_state()
         return group
 
+    def _build_stoichiometry_compensator_group(self) -> QGroupBox:
+        group = QGroupBox("Stoichiometry Compensator (Experimental)")
+        layout = QVBoxLayout(group)
+
+        header_row = QHBoxLayout()
+        self.stoich_compensator_collapse_button = QToolButton()
+        self.stoich_compensator_collapse_button.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        self.stoich_compensator_collapse_button.setAutoRaise(True)
+        self.stoich_compensator_collapse_button.clicked.connect(
+            self._toggle_stoichiometry_compensator_collapsed
+        )
+        header_row.addWidget(self.stoich_compensator_collapse_button)
+        header_row.addStretch(1)
+        layout.addLayout(header_row)
+
+        self.stoich_compensator_body = QWidget()
+        body_layout = QVBoxLayout(self.stoich_compensator_body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+
+        status = QLabel(
+            "Selected compensator weights are recomputed by the experimental "
+            "stoichiometry-compensator template before the model curve is "
+            "evaluated."
+        )
+        status.setWordWrap(True)
+        body_layout.addWidget(status)
+
+        fields = QGridLayout()
+        self.stoich_compensator_elements_edit = QLineEdit()
+        self.stoich_compensator_elements_edit.setPlaceholderText("e.g. Pb, I")
+        self.stoich_compensator_elements_edit.textChanged.connect(
+            self._on_stoichiometry_compensator_settings_changed
+        )
+        self.stoich_compensator_ratio_edit = QLineEdit()
+        self.stoich_compensator_ratio_edit.setPlaceholderText("e.g. 1:2")
+        self.stoich_compensator_ratio_edit.textChanged.connect(
+            self._on_stoichiometry_compensator_settings_changed
+        )
+        fields.addWidget(QLabel("Target elements"), 0, 0)
+        fields.addWidget(self.stoich_compensator_elements_edit, 0, 1)
+        fields.addWidget(QLabel("Target ratio"), 0, 2)
+        fields.addWidget(self.stoich_compensator_ratio_edit, 0, 3)
+        body_layout.addLayout(fields)
+
+        self.stoich_compensator_table = QTableWidget(0, 4)
+        self.stoich_compensator_table.setHorizontalHeaderLabels(
+            ["Param", "Structure", "Motif", "Compensator"]
+        )
+        self.stoich_compensator_table.itemChanged.connect(
+            self._on_stoichiometry_compensator_table_changed
+        )
+        header = self.stoich_compensator_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.stoich_compensator_table.setMinimumHeight(140)
+        body_layout.addWidget(self.stoich_compensator_table)
+
+        layout.addWidget(self.stoich_compensator_body)
+        self.set_stoichiometry_compensator_collapsed(True)
+        group.setVisible(False)
+        return group
+
     def _build_output_group(self) -> QGroupBox:
         group = QGroupBox("Prefit Output")
         layout = QVBoxLayout(group)
@@ -925,6 +1130,10 @@ class PrefitTab(QWidget):
         self._prefit_execution_enabled = bool(enabled)
         self._update_prefit_execution_control_state()
 
+    def set_fit_undo_available(self, available: bool) -> None:
+        self._fit_undo_available = bool(available)
+        self._update_prefit_execution_control_state()
+
     def set_run_config(self, *, method: str, max_nfev: int) -> None:
         method_index = self.method_combo.findText(method)
         if method_index >= 0:
@@ -982,25 +1191,34 @@ class PrefitTab(QWidget):
         self._updating_parameter_table = True
         self.parameter_table.blockSignals(True)
         try:
-            self.parameter_table.setColumnCount(8)
+            self.parameter_table.setColumnCount(9)
             self.parameter_table.setRowCount(len(entries))
             for row, entry in enumerate(entries):
                 self.parameter_table.setItem(
-                    row, 0, QTableWidgetItem(entry.structure)
+                    row,
+                    self.PARAM_COL_STRUCTURE,
+                    QTableWidgetItem(entry.structure),
                 )
                 self.parameter_table.setItem(
-                    row, 1, QTableWidgetItem(entry.motif)
+                    row,
+                    self.PARAM_COL_MOTIF,
+                    QTableWidgetItem(entry.motif),
                 )
                 self.parameter_table.setItem(
-                    row, 2, QTableWidgetItem(entry.name)
+                    row,
+                    self.PARAM_COL_NAME,
+                    QTableWidgetItem(entry.name),
                 )
+                self._set_parameter_active_widget(row, entry)
                 vary_item = QTableWidgetItem()
                 vary_item.setCheckState(
                     Qt.CheckState.Checked
                     if entry.vary
                     else Qt.CheckState.Unchecked
                 )
-                self.parameter_table.setItem(row, 4, vary_item)
+                self.parameter_table.setItem(
+                    row, self.PARAM_COL_VARY, vary_item
+                )
                 self._set_parameter_value_item(
                     row,
                     value=float(entry.value),
@@ -1009,12 +1227,12 @@ class PrefitTab(QWidget):
                 )
                 self.parameter_table.setItem(
                     row,
-                    5,
+                    self.PARAM_COL_MIN,
                     QTableWidgetItem(f"{entry.minimum:.6g}"),
                 )
                 self.parameter_table.setItem(
                     row,
-                    6,
+                    self.PARAM_COL_MAX,
                     QTableWidgetItem(f"{entry.maximum:.6g}"),
                 )
                 reset_button = QPushButton("Reset")
@@ -1029,17 +1247,154 @@ class PrefitTab(QWidget):
                         name,
                     )
                 )
-                self.parameter_table.setCellWidget(row, 7, reset_button)
+                self.parameter_table.setCellWidget(
+                    row,
+                    self.PARAM_COL_RESET,
+                    reset_button,
+                )
         finally:
             self.parameter_table.blockSignals(False)
             self._updating_parameter_table = False
         self.parameter_table.resizeRowsToContents()
         self._cached_parameter_entries = cached_entries
         self._parameter_entries_dirty = False
+        self._refresh_dielectric_preset_controls()
+        self._refresh_charge_estimate_controls()
+        if not self._stoichiometry_compensator_group.isHidden():
+            elements_text, ratio_text, selected_names = (
+                self.stoichiometry_compensator_settings()
+            )
+            self.set_stoichiometry_compensator_settings(
+                target_elements_text=elements_text,
+                target_ratio_text=ratio_text,
+                compensator_weight_names=selected_names,
+                parameter_entries=cached_entries,
+            )
         self._refresh_parameter_scroll_panel()
 
     def set_cluster_geometry_visible(self, visible: bool) -> None:
         self._cluster_geometry_group.setVisible(bool(visible))
+
+    def set_stoichiometry_compensator_visible(self, visible: bool) -> None:
+        was_visible = not self._stoichiometry_compensator_group.isHidden()
+        self._stoichiometry_compensator_group.setVisible(bool(visible))
+        if visible and not was_visible:
+            self.set_stoichiometry_compensator_collapsed(True)
+
+    def set_stoichiometry_compensator_settings(
+        self,
+        *,
+        target_elements_text: str,
+        target_ratio_text: str,
+        compensator_weight_names: list[str] | tuple[str, ...],
+        parameter_entries: list[PrefitParameterEntry],
+    ) -> None:
+        selected_names = {
+            str(name).strip()
+            for name in compensator_weight_names
+            if str(name).strip()
+        }
+        weight_entries = [
+            PrefitParameterEntry.from_dict(entry.to_dict())
+            for entry in parameter_entries
+            if self._is_component_weight_entry(entry)
+            and bool(getattr(entry, "active", True))
+        ]
+        if not selected_names:
+            selected_names = set(
+                self._guessed_stoichiometry_compensator_names(
+                    target_elements_text,
+                    weight_entries,
+                )
+            )
+        self._updating_stoichiometry_compensator = True
+        self.stoich_compensator_table.blockSignals(True)
+        self.stoich_compensator_elements_edit.blockSignals(True)
+        self.stoich_compensator_ratio_edit.blockSignals(True)
+        try:
+            self.stoich_compensator_elements_edit.setText(
+                str(target_elements_text or "")
+            )
+            self.stoich_compensator_ratio_edit.setText(
+                str(target_ratio_text or "")
+            )
+            self._stoichiometry_compensator_entries = weight_entries
+            self.stoich_compensator_table.setRowCount(len(weight_entries))
+            for row, entry in enumerate(weight_entries):
+                self.stoich_compensator_table.setItem(
+                    row,
+                    0,
+                    QTableWidgetItem(entry.name),
+                )
+                self.stoich_compensator_table.setItem(
+                    row,
+                    1,
+                    QTableWidgetItem(entry.structure),
+                )
+                self.stoich_compensator_table.setItem(
+                    row,
+                    2,
+                    QTableWidgetItem(entry.motif),
+                )
+                item = QTableWidgetItem()
+                item.setFlags(
+                    Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                item.setCheckState(
+                    Qt.CheckState.Checked
+                    if entry.name in selected_names
+                    else Qt.CheckState.Unchecked
+                )
+                self.stoich_compensator_table.setItem(row, 3, item)
+        finally:
+            self.stoich_compensator_ratio_edit.blockSignals(False)
+            self.stoich_compensator_elements_edit.blockSignals(False)
+            self.stoich_compensator_table.blockSignals(False)
+            self._updating_stoichiometry_compensator = False
+        self.stoich_compensator_table.resizeRowsToContents()
+
+    def stoichiometry_compensator_settings(
+        self,
+    ) -> tuple[str, str, list[str]]:
+        selected_names: list[str] = []
+        for row in range(self.stoich_compensator_table.rowCount()):
+            item = self.stoich_compensator_table.item(row, 3)
+            if item is None or item.checkState() != Qt.CheckState.Checked:
+                continue
+            name_item = self.stoich_compensator_table.item(row, 0)
+            if name_item is None:
+                continue
+            name = name_item.text().strip()
+            if name:
+                selected_names.append(name)
+        return (
+            self.stoich_compensator_elements_edit.text().strip(),
+            self.stoich_compensator_ratio_edit.text().strip(),
+            selected_names,
+        )
+
+    def stoichiometry_compensator_is_collapsed(self) -> bool:
+        return self.stoich_compensator_body.isHidden()
+
+    def set_stoichiometry_compensator_collapsed(
+        self,
+        collapsed: bool,
+    ) -> None:
+        is_collapsed = bool(collapsed)
+        self.stoich_compensator_body.setVisible(not is_collapsed)
+        self.stoich_compensator_collapse_button.setArrowType(
+            Qt.ArrowType.RightArrow if is_collapsed else Qt.ArrowType.DownArrow
+        )
+        self.stoich_compensator_collapse_button.setText(
+            "Show Compensator" if is_collapsed else "Hide Compensator"
+        )
+
+    def _toggle_stoichiometry_compensator_collapsed(self) -> None:
+        self.set_stoichiometry_compensator_collapsed(
+            not self.stoich_compensator_body.isHidden()
+        )
 
     def set_solute_volume_fraction_visible(self, visible: bool) -> None:
         was_visible = not self._solute_volume_fraction_group.isHidden()
@@ -1053,6 +1408,7 @@ class PrefitTab(QWidget):
         fraction_kind: str | None,
         fraction_source: str = "saxs_effective",
         solvent_weight_parameter: str | None = None,
+        molar_concentration_parameter: str | None = None,
     ) -> None:
         target_messages: list[str] = []
         if parameter_name and fraction_kind:
@@ -1083,6 +1439,10 @@ class PrefitTab(QWidget):
                     "combined solvent background multiplier -> "
                     f"{solvent_weight_parameter}"
                 )
+        if molar_concentration_parameter:
+            target_messages.append(
+                f"solute molar concentration -> {molar_concentration_parameter}"
+            )
         if target_messages:
             self.solute_volume_fraction_status_label.setText(
                 "Automatic Prefit targets: " + "; ".join(target_messages) + "."
@@ -1097,6 +1457,7 @@ class PrefitTab(QWidget):
             fraction_kind,
             fraction_source,
             solvent_weight_parameter,
+            molar_concentration_parameter,
         )
 
     def solute_volume_fraction_is_collapsed(self) -> bool:
@@ -1304,11 +1665,13 @@ class PrefitTab(QWidget):
             ]
         entries: list[PrefitParameterEntry] = []
         for row in range(self.parameter_table.rowCount()):
-            value_text = self._item_text(row, 3)
+            value_text = self._item_text(row, self.PARAM_COL_VALUE)
             value_expression: str | None = None
             initial_value_expression: str | None = None
             vary = (
-                self.parameter_table.item(row, 4).checkState()
+                self.parameter_table.item(
+                    row, self.PARAM_COL_VARY
+                ).checkState()
                 == Qt.CheckState.Checked
             )
             try:
@@ -1324,24 +1687,25 @@ class PrefitTab(QWidget):
                 else:
                     value_expression = value_text
                 value = self._parameter_item_numeric_value(
-                    self.parameter_table.item(row, 3)
+                    self.parameter_table.item(row, self.PARAM_COL_VALUE)
                 )
+            name = self._item_text(row, self.PARAM_COL_NAME)
+            category = (
+                "weight" if self._is_weight_parameter_name(name) else "fit"
+            )
             entries.append(
                 PrefitParameterEntry(
-                    structure=self._item_text(row, 0),
-                    motif=self._item_text(row, 1),
-                    name=self._item_text(row, 2),
+                    structure=self._item_text(row, self.PARAM_COL_STRUCTURE),
+                    motif=self._item_text(row, self.PARAM_COL_MOTIF),
+                    name=name,
                     value=value,
                     vary=vary,
-                    minimum=float(self._item_text(row, 5)),
-                    maximum=float(self._item_text(row, 6)),
-                    category=(
-                        "weight"
-                        if self._item_text(row, 2).startswith("w")
-                        else "fit"
-                    ),
+                    minimum=float(self._item_text(row, self.PARAM_COL_MIN)),
+                    maximum=float(self._item_text(row, self.PARAM_COL_MAX)),
+                    category=category,
                     value_expression=value_expression,
                     initial_value_expression=initial_value_expression,
+                    active=self._parameter_row_active(row, category, name),
                 )
             )
         resolved_entries = resolve_prefit_parameter_entries(entries)
@@ -1349,7 +1713,9 @@ class PrefitTab(QWidget):
         self.parameter_table.blockSignals(True)
         try:
             for row, entry in enumerate(resolved_entries):
-                value_item = self.parameter_table.item(row, 3)
+                value_item = self.parameter_table.item(
+                    row, self.PARAM_COL_VALUE
+                )
                 if value_item is not None:
                     value_item.setData(
                         self.PARAMETER_VALUE_ROLE,
@@ -1367,7 +1733,7 @@ class PrefitTab(QWidget):
 
     def find_parameter_row(self, parameter_name: str) -> int:
         for row in range(self.parameter_table.rowCount()):
-            if self._item_text(row, 2) == parameter_name:
+            if self._item_text(row, self.PARAM_COL_NAME) == parameter_name:
                 return row
         return -1
 
@@ -1381,10 +1747,25 @@ class PrefitTab(QWidget):
             if (
                 self._item_text(row, 0) == structure
                 and self._item_text(row, 1) == motif
-                and self._item_text(row, 2) == parameter_name
+                and self._item_text(row, self.PARAM_COL_NAME) == parameter_name
             ):
                 return row
         return -1
+
+    def _parameter_row_active(
+        self,
+        row: int,
+        category: str,
+        name: str,
+    ) -> bool:
+        if str(
+            category
+        ).strip() != "weight" or not self._is_weight_parameter_name(name):
+            return True
+        widget = self.parameter_table.cellWidget(row, self.PARAM_COL_ACTIVE)
+        if isinstance(widget, QPushButton):
+            return bool(widget.isChecked())
+        return True
 
     def set_parameter_row(
         self,
@@ -1419,7 +1800,7 @@ class PrefitTab(QWidget):
                     initial_value_expression=None,
                 )
             if vary is not None:
-                vary_item = self.parameter_table.item(row, 4)
+                vary_item = self.parameter_table.item(row, self.PARAM_COL_VARY)
                 if vary_item is not None:
                     vary_item.setCheckState(
                         Qt.CheckState.Checked
@@ -1429,19 +1810,21 @@ class PrefitTab(QWidget):
             if minimum is not None:
                 self.parameter_table.setItem(
                     row,
-                    5,
+                    self.PARAM_COL_MIN,
                     QTableWidgetItem(f"{float(minimum):.6g}"),
                 )
             if maximum is not None:
                 self.parameter_table.setItem(
                     row,
-                    6,
+                    self.PARAM_COL_MAX,
                     QTableWidgetItem(f"{float(maximum):.6g}"),
                 )
         finally:
             self.parameter_table.blockSignals(False)
             self._updating_parameter_table = False
         self._invalidate_parameter_entries_cache()
+        self._refresh_dielectric_preset_controls()
+        self._refresh_charge_estimate_controls()
         self._refresh_parameter_scroll_panel()
 
     def auto_update_on_parameter_change(self) -> bool:
@@ -1454,26 +1837,57 @@ class PrefitTab(QWidget):
         self,
         item: QTableWidgetItem,
     ) -> None:
-        if item.column() in {3, 4, 5, 6}:
+        if item.column() in {
+            self.PARAM_COL_VALUE,
+            self.PARAM_COL_VARY,
+            self.PARAM_COL_MIN,
+            self.PARAM_COL_MAX,
+        }:
             self._invalidate_parameter_entries_cache()
-        if item.column() in {3, 4}:
+        if item.column() in {self.PARAM_COL_VALUE, self.PARAM_COL_VARY}:
             self._sync_parameter_row_link_state(item.row())
         if not self._updating_parameter_table and item.column() in {
-            3,
-            4,
-            5,
-            6,
+            self.PARAM_COL_VALUE,
+            self.PARAM_COL_VARY,
+            self.PARAM_COL_MIN,
+            self.PARAM_COL_MAX,
         }:
             self.parameter_table_edited.emit()
         resolved_entries_valid = False
-        if not self._updating_parameter_table and item.column() in {3, 4}:
+        if not self._updating_parameter_table and item.column() in {
+            self.PARAM_COL_VALUE,
+            self.PARAM_COL_VARY,
+        }:
             try:
                 self.parameter_entries()
                 resolved_entries_valid = True
             except Exception:
                 pass
+        if (
+            not self._updating_parameter_table
+            and item.column() == self.PARAM_COL_VALUE
+            and self._item_text(item.row(), self.PARAM_COL_NAME)
+            == self.DIELECTRIC_PARAMETER_NAME
+        ):
+            self._refresh_dielectric_preset_controls()
+        if (
+            not self._updating_parameter_table
+            and item.column()
+            in {
+                self.PARAM_COL_VALUE,
+                self.PARAM_COL_VARY,
+                self.PARAM_COL_MIN,
+                self.PARAM_COL_MAX,
+            }
+            and self._item_text(item.row(), self.PARAM_COL_NAME)
+            == self.CHARGE_PARAMETER_NAME
+        ):
+            self._refresh_charge_estimate_controls()
         self._refresh_parameter_scroll_panel()
-        if self._updating_parameter_table or item.column() != 3:
+        if (
+            self._updating_parameter_table
+            or item.column() != self.PARAM_COL_VALUE
+        ):
             return
         if not self.auto_update_on_parameter_change():
             return
@@ -1490,6 +1904,71 @@ class PrefitTab(QWidget):
         self.scrollable_parameter_checkbox.setChecked(False)
         self.scrollable_parameter_checkbox.blockSignals(False)
         self._refresh_parameter_scroll_panel()
+
+    def _on_dielectric_preset_changed(self, _index: int) -> None:
+        if self._updating_parameter_table:
+            return
+        preset_key = self.dielectric_preset_combo.currentData()
+        if not preset_key:
+            return
+        preset = DIELECTRIC_CONSTANT_PRESETS_BY_KEY.get(str(preset_key))
+        if preset is None:
+            return
+        row = self.find_parameter_row(self.DIELECTRIC_PARAMETER_NAME)
+        if row < 0:
+            return
+        self.set_parameter_row(
+            self.DIELECTRIC_PARAMETER_NAME,
+            value=preset.value,
+        )
+        self.parameter_table_edited.emit()
+        if self.auto_update_on_parameter_change():
+            self.update_model_requested.emit()
+
+    def _refresh_dielectric_preset_controls(self) -> None:
+        if not hasattr(self, "dielectric_preset_row"):
+            return
+        row = self.find_parameter_row(self.DIELECTRIC_PARAMETER_NAME)
+        has_dielectric_parameter = row >= 0
+        self.dielectric_preset_row.setVisible(has_dielectric_parameter)
+        if not has_dielectric_parameter:
+            self.dielectric_preset_combo.blockSignals(True)
+            self.dielectric_preset_combo.setCurrentIndex(0)
+            self.dielectric_preset_combo.blockSignals(False)
+            return
+        try:
+            value = float(self._item_text(row, self.PARAM_COL_VALUE))
+        except (TypeError, ValueError):
+            value = None
+        selected_key = None
+        if value is not None:
+            for preset in DIELECTRIC_CONSTANT_PRESETS:
+                if abs(value - preset.value) <= 1.0e-6:
+                    selected_key = preset.key
+                    break
+        selected_index = (
+            self.dielectric_preset_combo.findData(selected_key)
+            if selected_key
+            else 0
+        )
+        if selected_index < 0:
+            selected_index = 0
+        self.dielectric_preset_combo.blockSignals(True)
+        self.dielectric_preset_combo.setCurrentIndex(selected_index)
+        self.dielectric_preset_combo.blockSignals(False)
+
+    def set_charge_estimate_status_text(self, text: str) -> None:
+        self.charge_estimate_status_label.setText(str(text or "").strip())
+
+    def _refresh_charge_estimate_controls(self) -> None:
+        if not hasattr(self, "charge_estimate_row"):
+            return
+        row = self.find_parameter_row(self.CHARGE_PARAMETER_NAME)
+        has_charge_parameter = row >= 0
+        self.charge_estimate_row.setVisible(has_charge_parameter)
+        self.charge_estimate_button.setEnabled(has_charge_parameter)
+        if not has_charge_parameter:
+            self.charge_estimate_status_label.clear()
 
     def _on_scrollable_parameter_toggled(self, enabled: bool) -> None:
         if enabled and not self.auto_update_on_parameter_change():
@@ -1521,9 +2000,9 @@ class PrefitTab(QWidget):
         if row < 0:
             self.parameter_scroll_panel.setVisible(False)
             return
-        parameter_name = self._item_text(row, 2)
-        value_item = self.parameter_table.item(row, 3)
-        value_text = self._item_text(row, 3)
+        parameter_name = self._item_text(row, self.PARAM_COL_NAME)
+        value_item = self.parameter_table.item(row, self.PARAM_COL_VALUE)
+        value_text = self._item_text(row, self.PARAM_COL_VALUE)
         uses_expression = self._parameter_value_uses_expression(value_text)
         try:
             value = (
@@ -1531,8 +2010,8 @@ class PrefitTab(QWidget):
                 if uses_expression
                 else float(value_text)
             )
-            minimum = float(self._item_text(row, 5))
-            maximum = float(self._item_text(row, 6))
+            minimum = float(self._item_text(row, self.PARAM_COL_MIN))
+            maximum = float(self._item_text(row, self.PARAM_COL_MAX))
         except (TypeError, ValueError):
             self.parameter_scroll_name_label.setText(
                 f"{parameter_name or 'Selected parameter'} has no numeric range."
@@ -1558,7 +2037,7 @@ class PrefitTab(QWidget):
             f"{parameter_name} [{lower:.6g}, {upper:.6g}]"
         )
         if uses_expression:
-            vary_item = self.parameter_table.item(row, 4)
+            vary_item = self.parameter_table.item(row, self.PARAM_COL_VARY)
             expression_mode = (
                 "Initial expression seed"
                 if vary_item is not None
@@ -1596,8 +2075,8 @@ class PrefitTab(QWidget):
         if row < 0:
             return
         try:
-            minimum = float(self._item_text(row, 5))
-            maximum = float(self._item_text(row, 6))
+            minimum = float(self._item_text(row, self.PARAM_COL_MIN))
+            maximum = float(self._item_text(row, self.PARAM_COL_MAX))
         except (TypeError, ValueError):
             return
         lower = min(minimum, maximum)
@@ -1611,10 +2090,10 @@ class PrefitTab(QWidget):
             upper,
             scroll_mode,
         )
-        item = self.parameter_table.item(row, 3)
+        item = self.parameter_table.item(row, self.PARAM_COL_VALUE)
         if item is None:
             item = QTableWidgetItem()
-            self.parameter_table.setItem(row, 3, item)
+            self.parameter_table.setItem(row, self.PARAM_COL_VALUE, item)
         formatted = f"{float(value):.6g}"
         self.parameter_scroll_value_label.setText(f"Value {formatted}")
         if item.text().strip() == formatted:
@@ -1731,6 +2210,126 @@ class PrefitTab(QWidget):
         return PrefitRunConfig(
             method=self.method_combo.currentText(),
             max_nfev=int(self.nfev_spin.value()),
+        )
+
+    def fit_q_range(self) -> tuple[float | None, float | None]:
+        if not self.fit_q_min_spin.isEnabled():
+            return (None, None)
+        return (
+            float(self.fit_q_min_spin.value()),
+            float(self.fit_q_max_spin.value()),
+        )
+
+    def set_fit_range_controls(
+        self,
+        *,
+        model_q_min: float | None,
+        model_q_max: float | None,
+        fit_q_min: float | None,
+        fit_q_max: float | None,
+    ) -> None:
+        if (
+            model_q_min is None
+            or model_q_max is None
+            or not np.isfinite(float(model_q_min))
+            or not np.isfinite(float(model_q_max))
+            or float(model_q_max) < float(model_q_min)
+        ):
+            self._updating_fit_range_controls = True
+            self.fit_q_min_spin.setEnabled(False)
+            self.fit_q_max_spin.setEnabled(False)
+            self.fit_range_reset_button.setEnabled(False)
+            self.fit_range_status_label.setText("Fit range unavailable")
+            self._updating_fit_range_controls = False
+            return
+        lower = float(model_q_min)
+        upper = float(model_q_max)
+        selected_lower = (
+            lower if fit_q_min is None else max(lower, float(fit_q_min))
+        )
+        selected_upper = (
+            upper if fit_q_max is None else min(upper, float(fit_q_max))
+        )
+        if selected_lower > selected_upper:
+            selected_lower, selected_upper = lower, upper
+        step = max((upper - lower) / 100.0, 1.0e-6)
+        self._updating_fit_range_controls = True
+        try:
+            for spin in (self.fit_q_min_spin, self.fit_q_max_spin):
+                spin.blockSignals(True)
+                spin.setRange(lower, upper)
+                spin.setSingleStep(step)
+                spin.setEnabled(True)
+            self.fit_q_min_spin.setValue(selected_lower)
+            self.fit_q_max_spin.setValue(selected_upper)
+            for spin in (self.fit_q_min_spin, self.fit_q_max_spin):
+                spin.blockSignals(False)
+            self.fit_range_reset_button.setEnabled(True)
+            self.fit_range_status_label.setText(
+                f"Active fit: {selected_lower:.6g} to {selected_upper:.6g} A^-1"
+            )
+        finally:
+            self._updating_fit_range_controls = False
+
+    def _set_fit_range_control_values(
+        self,
+        q_min: float,
+        q_max: float,
+        *,
+        emit_signal: bool,
+    ) -> None:
+        if not self.fit_q_min_spin.isEnabled():
+            return
+        lower = float(self.fit_q_min_spin.minimum())
+        upper = float(self.fit_q_max_spin.maximum())
+        selected_lower = min(max(float(q_min), lower), upper)
+        selected_upper = min(max(float(q_max), lower), upper)
+        if selected_lower > selected_upper:
+            selected_lower, selected_upper = selected_upper, selected_lower
+        self._updating_fit_range_controls = True
+        try:
+            self.fit_q_min_spin.blockSignals(True)
+            self.fit_q_max_spin.blockSignals(True)
+            self.fit_q_min_spin.setValue(selected_lower)
+            self.fit_q_max_spin.setValue(selected_upper)
+            self.fit_q_min_spin.blockSignals(False)
+            self.fit_q_max_spin.blockSignals(False)
+            self.fit_range_status_label.setText(
+                f"Active fit: {selected_lower:.6g} to {selected_upper:.6g} A^-1"
+            )
+        finally:
+            self._updating_fit_range_controls = False
+        if emit_signal:
+            self.fit_range_changed.emit(selected_lower, selected_upper)
+
+    def _on_fit_range_spin_changed(self, _value: float) -> None:
+        if self._updating_fit_range_controls:
+            return
+        q_min = float(self.fit_q_min_spin.value())
+        q_max = float(self.fit_q_max_spin.value())
+        sender = self.sender()
+        if q_min > q_max:
+            if sender is self.fit_q_min_spin:
+                q_max = q_min
+            else:
+                q_min = q_max
+            self._set_fit_range_control_values(
+                q_min,
+                q_max,
+                emit_signal=False,
+            )
+        self.fit_range_status_label.setText(
+            f"Active fit: {q_min:.6g} to {q_max:.6g} A^-1"
+        )
+        self.fit_range_changed.emit(q_min, q_max)
+
+    def _reset_fit_range_to_model_bounds(self) -> None:
+        if not self.fit_q_min_spin.isEnabled():
+            return
+        self._set_fit_range_control_values(
+            float(self.fit_q_min_spin.minimum()),
+            float(self.fit_q_max_spin.maximum()),
+            emit_signal=True,
         )
 
     def open_plot_editor(self) -> None:
@@ -1940,6 +2539,51 @@ class PrefitTab(QWidget):
             interactive=False,
         )
 
+    def _prefit_range_drag_is_enabled(self) -> bool:
+        if not self.fit_q_min_spin.isEnabled():
+            return False
+        mode_value = getattr(self.plot_toolbar, "mode", "")
+        if hasattr(mode_value, "value"):
+            mode_value = mode_value.value
+        mode = str(mode_value or "")
+        return not mode
+
+    def _handle_prefit_range_press(self, event) -> None:
+        if not self._prefit_range_drag_is_enabled():
+            self._prefit_range_drag_start = None
+            return
+        if getattr(event, "button", None) != 1:
+            self._prefit_range_drag_start = None
+            return
+        if getattr(event, "inaxes", None) not in self.figure.axes:
+            self._prefit_range_drag_start = None
+            return
+        x_value = getattr(event, "xdata", None)
+        if x_value is None or not np.isfinite(float(x_value)):
+            self._prefit_range_drag_start = None
+            return
+        self._prefit_range_drag_start = float(x_value)
+
+    def _handle_prefit_range_release(self, event) -> None:
+        start = self._prefit_range_drag_start
+        self._prefit_range_drag_start = None
+        if start is None or not self._prefit_range_drag_is_enabled():
+            return
+        if getattr(event, "button", None) != 1:
+            return
+        if getattr(event, "inaxes", None) not in self.figure.axes:
+            return
+        end = getattr(event, "xdata", None)
+        if end is None or not np.isfinite(float(end)):
+            return
+        q_min, q_max = sorted((float(start), float(end)))
+        model_span = float(self.fit_q_max_spin.maximum()) - float(
+            self.fit_q_min_spin.minimum()
+        )
+        if abs(q_max - q_min) <= max(model_span * 1.0e-4, 1.0e-8):
+            return
+        self._set_fit_range_control_values(q_min, q_max, emit_signal=True)
+
     def _render_evaluation_figure(
         self,
         figure: Figure,
@@ -1976,6 +2620,17 @@ class PrefitTab(QWidget):
             figure.tight_layout()
             return
 
+        q_values = np.asarray(evaluation.q_values, dtype=float)
+        fit_q_min = (
+            float(evaluation.fit_q_min)
+            if evaluation.fit_q_min is not None
+            else (float(np.min(q_values)) if q_values.size else None)
+        )
+        fit_q_max = (
+            float(evaluation.fit_q_max)
+            if evaluation.fit_q_max is not None
+            else (float(np.max(q_values)) if q_values.size else None)
+        )
         has_experimental = evaluation.experimental_intensities is not None
         has_residuals = evaluation.residuals is not None
         if has_experimental and has_residuals:
@@ -1985,6 +2640,16 @@ class PrefitTab(QWidget):
         else:
             top = figure.add_subplot(111)
             bottom = None
+
+        if fit_q_min is not None and fit_q_max is not None:
+            top.axvspan(
+                fit_q_min,
+                fit_q_max,
+                color="tab:blue",
+                alpha=0.08,
+                linewidth=0.0,
+                zorder=0,
+            )
 
         plotted_lines: list[object] = []
         structure_axis = None
@@ -2149,6 +2814,15 @@ class PrefitTab(QWidget):
 
         if bottom is not None and evaluation.residuals is not None:
             bottom.axhline(0.0, color="0.5", linewidth=1.0)
+            if fit_q_min is not None and fit_q_max is not None:
+                bottom.axvspan(
+                    fit_q_min,
+                    fit_q_max,
+                    color="tab:blue",
+                    alpha=0.08,
+                    linewidth=0.0,
+                    zorder=0,
+                )
             bottom.plot(
                 evaluation.q_values,
                 evaluation.residuals,
@@ -2261,6 +2935,25 @@ class PrefitTab(QWidget):
         evaluation: PrefitEvaluation | None,
     ) -> None:
         self._current_evaluation = evaluation
+        if evaluation is None:
+            self.set_fit_range_controls(
+                model_q_min=None,
+                model_q_max=None,
+                fit_q_min=None,
+                fit_q_max=None,
+            )
+        else:
+            q_values = np.asarray(evaluation.q_values, dtype=float)
+            self.set_fit_range_controls(
+                model_q_min=(
+                    float(np.min(q_values)) if q_values.size else None
+                ),
+                model_q_max=(
+                    float(np.max(q_values)) if q_values.size else None
+                ),
+                fit_q_min=evaluation.fit_q_min,
+                fit_q_max=evaluation.fit_q_max,
+            )
         self._render_evaluation_figure(
             self.figure,
             evaluation,
@@ -2290,7 +2983,25 @@ class PrefitTab(QWidget):
             dtype=float,
         )
         model_values = np.asarray(evaluation.model_intensities, dtype=float)
-        residuals = np.asarray(model_values - experimental_values, dtype=float)
+        residuals = np.asarray(evaluation.residuals, dtype=float)
+        fit_mask = np.ones(residuals.shape, dtype=bool)
+        if evaluation.fit_mask is not None:
+            candidate_mask = np.asarray(evaluation.fit_mask, dtype=bool)
+            if candidate_mask.shape == residuals.shape:
+                fit_mask &= candidate_mask
+        fit_mask &= (
+            np.isfinite(residuals)
+            & np.isfinite(experimental_values)
+            & np.isfinite(model_values)
+        )
+        if not np.any(fit_mask):
+            return [
+                "Fit metrics unavailable",
+                "No finite points in active fit range",
+            ]
+        residuals = residuals[fit_mask]
+        experimental_values = experimental_values[fit_mask]
+        model_values = model_values[fit_mask]
         rmse = float(np.sqrt(np.mean(residuals**2)))
         mean_abs_residual = float(np.mean(np.abs(residuals)))
         experimental_mean = float(np.mean(experimental_values))
@@ -2308,6 +3019,8 @@ class PrefitTab(QWidget):
             f"Mean |res|: {mean_abs_residual:.4g}",
             f"R²: {r_squared:.4g}",
         ]
+        if evaluation.fitted_stoichiometry_text:
+            metric_lines.append(evaluation.fitted_stoichiometry_text)
         non_positive_model_points = int(
             np.count_nonzero(np.isfinite(model_values) & (model_values <= 0.0))
         )
@@ -2389,17 +3102,81 @@ class PrefitTab(QWidget):
         )
         value_item = QTableWidgetItem(display_text)
         value_item.setData(self.PARAMETER_VALUE_ROLE, float(value))
-        self.parameter_table.setItem(row, 3, value_item)
+        self.parameter_table.setItem(row, self.PARAM_COL_VALUE, value_item)
         self._sync_parameter_row_link_state(row)
+
+    def _set_parameter_active_widget(
+        self,
+        row: int,
+        entry: PrefitParameterEntry,
+    ) -> None:
+        if not self._is_component_weight_entry(entry):
+            item = QTableWidgetItem("")
+            item.setFlags(
+                Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
+            )
+            item.setToolTip(
+                "Only component weights w<NN> can be turned on or off."
+            )
+            self.parameter_table.setItem(row, self.PARAM_COL_ACTIVE, item)
+            return
+        button = QPushButton()
+        button.setCheckable(True)
+        button.setChecked(bool(getattr(entry, "active", True)))
+        self._update_parameter_active_button(button)
+        button.clicked.connect(
+            lambda checked=False, row_index=row, control=button: (
+                self._on_parameter_active_toggled(row_index, control)
+            )
+        )
+        self.parameter_table.setCellWidget(row, self.PARAM_COL_ACTIVE, button)
+
+    def _on_parameter_active_toggled(
+        self,
+        row: int,
+        button: QPushButton,
+    ) -> None:
+        self._update_parameter_active_button(button)
+        self._invalidate_parameter_entries_cache()
+        self._refresh_parameter_scroll_panel()
+        if not self._updating_parameter_table:
+            self.parameter_table_edited.emit()
+            if self.auto_update_on_parameter_change():
+                self.update_model_requested.emit()
+
+    @staticmethod
+    def _update_parameter_active_button(button: QPushButton) -> None:
+        enabled = bool(button.isChecked())
+        button.setText("On" if enabled else "Off")
+        button.setToolTip(
+            "This component weight is included in Prefit and DREAM."
+            if enabled
+            else "This component weight is excluded from Prefit and DREAM."
+        )
+
+    @staticmethod
+    def _is_component_weight_entry(entry: PrefitParameterEntry) -> bool:
+        return str(
+            entry.category
+        ).strip() == "weight" and PrefitTab._is_weight_parameter_name(
+            entry.name
+        )
+
+    @staticmethod
+    def _is_weight_parameter_name(name: str) -> bool:
+        text = str(name or "").strip()
+        return text.startswith("w") and text[1:].isdigit()
 
     def _sync_parameter_row_link_state(self, row: int) -> None:
         if row < 0:
             return
-        vary_item = self.parameter_table.item(row, 4)
-        value_item = self.parameter_table.item(row, 3)
+        vary_item = self.parameter_table.item(row, self.PARAM_COL_VARY)
+        value_item = self.parameter_table.item(row, self.PARAM_COL_VALUE)
         if vary_item is None or value_item is None:
             return
-        linked = self._parameter_value_uses_expression(self._item_text(row, 3))
+        linked = self._parameter_value_uses_expression(
+            self._item_text(row, self.PARAM_COL_VALUE)
+        )
         resolved_value = self._parameter_item_numeric_value(value_item)
         was_updating = self._updating_parameter_table
         self._updating_parameter_table = True
@@ -2461,6 +3238,7 @@ class PrefitTab(QWidget):
             enabled and self.saved_state_combo.count() > 0
         )
         self.run_button.setEnabled(enabled)
+        self.undo_fit_button.setEnabled(enabled and self._fit_undo_available)
         self.recommended_scale_button.setEnabled(enabled)
         self.autosave_checkbox.setEnabled(enabled)
         self.save_button.setEnabled(enabled)
@@ -2512,6 +3290,66 @@ class PrefitTab(QWidget):
             else None
         )
         self.cluster_geometry_mapping_changed.emit()
+
+    def _on_stoichiometry_compensator_settings_changed(self) -> None:
+        if self._updating_stoichiometry_compensator:
+            return
+        self.stoichiometry_compensator_settings_changed.emit()
+
+    def _on_stoichiometry_compensator_table_changed(
+        self,
+        item: QTableWidgetItem,
+    ) -> None:
+        if self._updating_stoichiometry_compensator or item.column() != 3:
+            return
+        self.stoichiometry_compensator_settings_changed.emit()
+
+    def _guess_stoichiometry_compensators(self) -> None:
+        guesses = set(
+            self._guessed_stoichiometry_compensator_names(
+                self.stoich_compensator_elements_edit.text().strip()
+            )
+        )
+        self._updating_stoichiometry_compensator = True
+        self.stoich_compensator_table.blockSignals(True)
+        try:
+            for row in range(self.stoich_compensator_table.rowCount()):
+                name_item = self.stoich_compensator_table.item(row, 0)
+                item = self.stoich_compensator_table.item(row, 3)
+                if name_item is None or item is None:
+                    continue
+                item.setCheckState(
+                    Qt.CheckState.Checked
+                    if name_item.text().strip() in guesses
+                    else Qt.CheckState.Unchecked
+                )
+        finally:
+            self.stoich_compensator_table.blockSignals(False)
+            self._updating_stoichiometry_compensator = False
+        self.stoichiometry_compensator_settings_changed.emit()
+
+    def _guessed_stoichiometry_compensator_names(
+        self,
+        elements_text: str,
+        entries: list[PrefitParameterEntry] | None = None,
+    ) -> tuple[str, ...]:
+        elements = [
+            token.strip()
+            for token in str(elements_text or "")
+            .replace(":", ",")
+            .replace(";", ",")
+            .split(",")
+            if token.strip()
+        ]
+        source_entries = (
+            self._stoichiometry_compensator_entries
+            if entries is None
+            else entries
+        )
+        return guess_single_atom_compensator_names(
+            tuple((entry.name, entry.structure) for entry in source_entries),
+            tuple(elements),
+        )
 
     def _on_cluster_geometry_sf_approximation_changed(
         self,

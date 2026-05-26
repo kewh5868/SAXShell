@@ -3,9 +3,9 @@ from scipy.stats import norm
 
 # ==============================================
 # model_lmfit: lmfit_model_profile
-# model_pydream: log_likelihood_monosq_scaled_solvent_model_scale
-# inputs_lmfit: q, solvent_data, model_data, params
-# inputs_pydream: q, solvent_data, model_data, params
+# model_pydream: log_likelihood_monosq_scaled_solvent_stoich_compensator
+# inputs_lmfit: q, solvent_data, model_data, stoich_target_ratio, stoich_component_counts, stoich_compensator_mask, stoich_compensator_base_weights, params
+# inputs_pydream: q, solvent_data, model_data, stoich_target_ratio, stoich_component_counts, stoich_compensator_mask, stoich_compensator_base_weights, params
 # param_columns: Structure, Motif, Param, Value, Vary, Min, Max
 #
 # param: solv_w,1.0,False,0.0,1.0
@@ -14,13 +14,13 @@ from scipy.stats import norm
 # param: vol_frac,0.0,False,0.0,0.5
 # param: scale,5e-4,True,1e-8,5e-3
 #
-# MonoSQ normalized, scaled-solvent, model-scaled variant:
-#   I_raw(q) = I_solute(q) + solv_w * I_solvent(q)
+# Experimental template:
+#   I_raw(q) = I_solute_compensated(q) + solv_w * I_solvent(q)
 #   I_model(q) = scale * I_raw(q) + offset
 #
-# The experimental trace is compared directly against I_model(q); scale and
-# offset are never applied to experimental_intensities in this template.
-# Existing templates are intentionally left unchanged for compatibility.
+# Selected compensator weights are recomputed from the other component
+# weights before the model curve is evaluated, so the configured target
+# stoichiometry is preserved at every likelihood evaluation.
 # ==============================================
 
 
@@ -86,9 +86,85 @@ def _weight_keys_from_params(params):
     )
 
 
-def structure_factor_profile(q, solvent_data, model_data, **params):
+def compensated_stoichiometry_weights(
+    weights,
+    stoich_target_ratio,
+    stoich_component_counts,
+    stoich_compensator_mask,
+    stoich_compensator_base_weights,
+):
+    """Return weights with compensator components recomputed."""
+    weights = np.asarray(weights, dtype=float).reshape(-1).copy()
+    target_ratio = np.asarray(stoich_target_ratio, dtype=float).reshape(-1)
+    component_counts = np.asarray(stoich_component_counts, dtype=float)
+    compensator_mask = (
+        np.asarray(stoich_compensator_mask, dtype=float).reshape(-1) > 0.5
+    )
+    base_weights = np.asarray(
+        stoich_compensator_base_weights,
+        dtype=float,
+    ).reshape(-1)
+
+    if (
+        weights.size == 0
+        or target_ratio.size < 2
+        or component_counts.shape != (weights.size, target_ratio.size)
+        or compensator_mask.size != weights.size
+        or base_weights.size != weights.size
+        or not np.any(compensator_mask)
+    ):
+        return weights
+    if not np.all(np.isfinite(target_ratio)) or np.any(target_ratio <= 0.0):
+        return weights
+
+    noncompensator_weights = np.maximum(weights, 0.0)
+    noncompensator_weights[compensator_mask] = 0.0
+    noncompensator_totals = noncompensator_weights @ component_counts
+
+    compensator_indices = np.flatnonzero(compensator_mask)
+    compensator_design = component_counts[compensator_indices, :].T
+    if compensator_design.size == 0 or not np.any(compensator_design > 0.0):
+        return weights
+
+    design = np.column_stack([compensator_design, -target_ratio])
+    try:
+        solution, *_ = np.linalg.lstsq(
+            design,
+            -noncompensator_totals,
+            rcond=None,
+        )
+    except np.linalg.LinAlgError:
+        return weights
+    compensator_weights = np.asarray(
+        solution[: compensator_indices.size],
+        dtype=float,
+    )
+    if not np.all(np.isfinite(compensator_weights)):
+        return weights
+
+    weights[compensator_indices] = np.maximum(compensator_weights, 0.0)
+    return weights
+
+
+def structure_factor_profile(
+    q,
+    solvent_data,
+    model_data,
+    stoich_target_ratio,
+    stoich_component_counts,
+    stoich_compensator_mask,
+    stoich_compensator_base_weights,
+    **params,
+):
     """Return the pure hard-sphere structure-factor trace S(q)."""
-    del solvent_data, model_data
+    del (
+        solvent_data,
+        model_data,
+        stoich_target_ratio,
+        stoich_component_counts,
+        stoich_compensator_mask,
+        stoich_compensator_base_weights,
+    )
     return calc_monodisperse_sq(
         params["eff_r"],
         params["vol_frac"],
@@ -104,11 +180,23 @@ def raw_monosq_scaled_solvent_profile(
     solv_w,
     eff_r,
     vol_frac,
+    stoich_target_ratio,
+    stoich_component_counts,
+    stoich_compensator_mask,
+    stoich_compensator_base_weights,
 ):
-    """Return the unscaled solute-plus-weighted-solvent model branch."""
+    """Return the compensated unscaled solute-plus-solvent model
+    branch."""
     q_values = np.asarray(q_values, dtype=float)
+    adjusted_weights = compensated_stoichiometry_weights(
+        weights,
+        stoich_target_ratio,
+        stoich_component_counts,
+        stoich_compensator_mask,
+        stoich_compensator_base_weights,
+    )
     mixture = np.zeros_like(q_values, dtype=float)
-    for weight, component in zip(weights, component_intensities):
+    for weight, component in zip(adjusted_weights, component_intensities):
         mixture += float(weight) * np.asarray(component, dtype=float)
 
     solute_intensity = mixture * calc_monodisperse_sq(
@@ -133,9 +221,12 @@ def scaled_monosq_model_profile(
     vol_frac,
     scale,
     offset,
+    stoich_target_ratio,
+    stoich_component_counts,
+    stoich_compensator_mask,
+    stoich_compensator_base_weights,
 ):
-    """Apply the fit transform to the model curve, not the data
-    curve."""
+    """Apply the fit transform to the compensated model curve."""
     raw_model = raw_monosq_scaled_solvent_profile(
         q_values,
         solvent_intensities,
@@ -144,12 +235,25 @@ def scaled_monosq_model_profile(
         solv_w,
         eff_r,
         vol_frac,
+        stoich_target_ratio,
+        stoich_component_counts,
+        stoich_compensator_mask,
+        stoich_compensator_base_weights,
     )
     return float(scale) * raw_model + float(offset)
 
 
-def lmfit_model_profile(q, solvent_data, model_data, **params):
-    """Evaluate the model-scaled MonoSQ SAXS model for lmfit."""
+def lmfit_model_profile(
+    q,
+    solvent_data,
+    model_data,
+    stoich_target_ratio,
+    stoich_component_counts,
+    stoich_compensator_mask,
+    stoich_compensator_base_weights,
+    **params,
+):
+    """Evaluate the stoichiometry-compensated MonoSQ model for lmfit."""
     weight_keys = _weight_keys_from_params(params)
     weights = [params[key] for key in weight_keys]
 
@@ -163,14 +267,22 @@ def lmfit_model_profile(q, solvent_data, model_data, **params):
         params["vol_frac"],
         params["scale"],
         params["offset"],
+        stoich_target_ratio,
+        stoich_component_counts,
+        stoich_compensator_mask,
+        stoich_compensator_base_weights,
     )
 
 
-def model_monosq_scaled_solvent_model_scale(params):
+def model_monosq_scaled_solvent_stoich_compensator(params):
     """Return the forward model intensity for pyDREAM."""
     global q_values
     global theoretical_intensities
     global solvent_intensities
+    global stoich_target_ratio
+    global stoich_component_counts
+    global stoich_compensator_mask
+    global stoich_compensator_base_weights
 
     n_profiles = len(theoretical_intensities)
 
@@ -191,15 +303,21 @@ def model_monosq_scaled_solvent_model_scale(params):
         vol_frac,
         scale,
         offset,
+        stoich_target_ratio,
+        stoich_component_counts,
+        stoich_compensator_mask,
+        stoich_compensator_base_weights,
     )
 
 
-def log_likelihood_monosq_scaled_solvent_model_scale(params):
+def log_likelihood_monosq_scaled_solvent_stoich_compensator(params):
     """Return the normalized Gaussian log-likelihood for pyDREAM."""
     global experimental_intensities
 
     try:
-        model_intensity = model_monosq_scaled_solvent_model_scale(params)
+        model_intensity = model_monosq_scaled_solvent_stoich_compensator(
+            params
+        )
     except (ValueError, FloatingPointError):
         return -np.inf
     if not np.all(np.isfinite(model_intensity)):

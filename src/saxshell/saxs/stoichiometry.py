@@ -1,8 +1,150 @@
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+
+_ELEMENT_SYMBOL_PATTERN = re.compile(r"^[A-Za-z]{1,2}$")
+_ELEMENT_SYMBOLS = frozenset(
+    {
+        "H",
+        "He",
+        "Li",
+        "Be",
+        "B",
+        "C",
+        "N",
+        "O",
+        "F",
+        "Ne",
+        "Na",
+        "Mg",
+        "Al",
+        "Si",
+        "P",
+        "S",
+        "Cl",
+        "Ar",
+        "K",
+        "Ca",
+        "Sc",
+        "Ti",
+        "V",
+        "Cr",
+        "Mn",
+        "Fe",
+        "Co",
+        "Ni",
+        "Cu",
+        "Zn",
+        "Ga",
+        "Ge",
+        "As",
+        "Se",
+        "Br",
+        "Kr",
+        "Rb",
+        "Sr",
+        "Y",
+        "Zr",
+        "Nb",
+        "Mo",
+        "Tc",
+        "Ru",
+        "Rh",
+        "Pd",
+        "Ag",
+        "Cd",
+        "In",
+        "Sn",
+        "Sb",
+        "Te",
+        "I",
+        "Xe",
+        "Cs",
+        "Ba",
+        "La",
+        "Ce",
+        "Pr",
+        "Nd",
+        "Pm",
+        "Sm",
+        "Eu",
+        "Gd",
+        "Tb",
+        "Dy",
+        "Ho",
+        "Er",
+        "Tm",
+        "Yb",
+        "Lu",
+        "Hf",
+        "Ta",
+        "W",
+        "Re",
+        "Os",
+        "Ir",
+        "Pt",
+        "Au",
+        "Hg",
+        "Tl",
+        "Pb",
+        "Bi",
+        "Po",
+        "At",
+        "Rn",
+        "Fr",
+        "Ra",
+        "Ac",
+        "Th",
+        "Pa",
+        "U",
+        "Np",
+        "Pu",
+        "Am",
+        "Cm",
+        "Bk",
+        "Cf",
+        "Es",
+        "Fm",
+        "Md",
+        "No",
+        "Lr",
+        "Rf",
+        "Db",
+        "Sg",
+        "Bh",
+        "Hs",
+        "Mt",
+        "Ds",
+        "Rg",
+        "Cn",
+        "Nh",
+        "Fl",
+        "Mc",
+        "Lv",
+        "Ts",
+        "Og",
+    }
+)
+
+DEFAULT_FORMAL_CHARGE_BY_SPECIES = {
+    "Pb": 2.0,
+    "Sn": 2.0,
+    "I": -1.0,
+    "Br": -1.0,
+    "Cl": -1.0,
+    "F": -1.0,
+    "Cs": 1.0,
+    "Rb": 1.0,
+    "K": 1.0,
+    "Na": 1.0,
+    "Li": 1.0,
+    "MA": 1.0,
+    "FA": 1.0,
+    "NH4": 1.0,
+}
 
 
 def parse_stoich_label(label: str) -> dict[str, int]:
@@ -34,6 +176,29 @@ class StoichiometryEvaluation:
     is_valid: bool
 
 
+@dataclass(slots=True, frozen=True)
+class FormalChargeComponent:
+    label: str
+    weight: float
+    signed_charge_e: float
+    counts: dict[str, int]
+    unassigned_species: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class FormalChargeEstimate:
+    components: tuple[FormalChargeComponent, ...]
+    weighted_mean_signed_charge_e: float | None
+    weighted_mean_absolute_charge_e: float | None
+    absolute_weighted_mean_charge_e: float | None
+    total_weight: float
+    unassigned_species: tuple[str, ...]
+
+    @property
+    def is_valid(self) -> bool:
+        return self.absolute_weighted_mean_charge_e is not None
+
+
 def parse_stoichiometry_elements_input(
     value: str | Iterable[str],
 ) -> tuple[str, ...]:
@@ -41,7 +206,11 @@ def parse_stoichiometry_elements_input(
         tokens = re.split(r"[\s,:;]+", value.strip())
     else:
         tokens = [str(token).strip() for token in value]
-    elements = tuple(token for token in tokens if token)
+    elements = tuple(
+        _normalize_stoichiometry_element_token(token)
+        for token in tokens
+        if str(token).strip()
+    )
     return elements
 
 
@@ -56,7 +225,12 @@ def parse_stoichiometry_ratio_input(
     for token in tokens:
         if not token:
             continue
-        ratios.append(float(token))
+        try:
+            ratios.append(float(token))
+        except ValueError as exc:
+            raise ValueError(
+                "Stoichiometry target ratios must be numeric values."
+            ) from exc
     return tuple(ratios)
 
 
@@ -76,12 +250,19 @@ def build_stoichiometry_target(
         raise ValueError(
             "The stoichiometry target elements and ratio must have the same length."
         )
+    if len(set(parsed_elements)) != len(parsed_elements):
+        raise ValueError("Stoichiometry target elements must be unique.")
     if len(parsed_elements) < 2:
         raise ValueError(
             "Enter at least two target elements to define a stoichiometric ratio."
         )
-    if any(component <= 0.0 for component in parsed_ratio):
-        raise ValueError("Stoichiometry target ratios must all be positive.")
+    if any(
+        (not math.isfinite(component)) or component <= 0.0
+        for component in parsed_ratio
+    ):
+        raise ValueError(
+            "Stoichiometry target ratios must all be finite positive values."
+        )
     reference = float(parsed_ratio[0])
     normalized = tuple(
         float(component) / reference for component in parsed_ratio
@@ -90,6 +271,123 @@ def build_stoichiometry_target(
         elements=parsed_elements,
         ratio=tuple(float(component) for component in parsed_ratio),
         normalized_ratio=normalized,
+    )
+
+
+def _normalize_stoichiometry_element_token(token: object) -> str:
+    value = str(token).strip()
+    if not _ELEMENT_SYMBOL_PATTERN.fullmatch(value):
+        raise ValueError(
+            "Stoichiometry target elements must be element symbols, "
+            "for example Pb, I."
+        )
+    return value[0].upper() + value[1:].lower()
+
+
+def parse_formal_charge_species_counts(label: str) -> dict[str, int]:
+    species_tokens = (
+        frozenset(DEFAULT_FORMAL_CHARGE_BY_SPECIES) | _ELEMENT_SYMBOLS
+    )
+    ordered_tokens = sorted(species_tokens, key=len, reverse=True)
+    counts: dict[str, int] = {}
+    index = 0
+    value = str(label)
+    while index < len(value):
+        if not value[index].isupper():
+            index += 1
+            continue
+        matched_token = None
+        for token in ordered_tokens:
+            if value.startswith(token, index):
+                matched_token = token
+                break
+        if matched_token is None:
+            index += 1
+            continue
+        number_start = index + len(matched_token)
+        number_end = number_start
+        while number_end < len(value) and value[number_end].isdigit():
+            number_end += 1
+        count = int(value[number_start:number_end] or "1")
+        counts[matched_token] = counts.get(matched_token, 0) + count
+        index = number_end
+    return counts
+
+
+def formal_charge_for_stoich_label(
+    label: str,
+    *,
+    charge_states: dict[str, float] | None = None,
+) -> tuple[float, dict[str, int], tuple[str, ...]]:
+    charges = (
+        DEFAULT_FORMAL_CHARGE_BY_SPECIES
+        if charge_states is None
+        else charge_states
+    )
+    counts = parse_formal_charge_species_counts(label)
+    total_charge = 0.0
+    unassigned_species: list[str] = []
+    for species, count in counts.items():
+        if species in charges:
+            total_charge += float(charges[species]) * float(count)
+        else:
+            unassigned_species.append(species)
+    return (
+        float(total_charge),
+        counts,
+        tuple(sorted(unassigned_species)),
+    )
+
+
+def estimate_weighted_formal_charge(
+    structure_weights: Iterable[tuple[str, float]],
+    *,
+    charge_states: dict[str, float] | None = None,
+) -> FormalChargeEstimate:
+    components: list[FormalChargeComponent] = []
+    weighted_signed_sum = 0.0
+    weighted_absolute_sum = 0.0
+    total_weight = 0.0
+    unassigned_species: set[str] = set()
+    for label, raw_weight in structure_weights:
+        weight = max(float(raw_weight), 0.0)
+        if weight <= 0.0:
+            continue
+        charge, counts, unresolved = formal_charge_for_stoich_label(
+            str(label),
+            charge_states=charge_states,
+        )
+        unassigned_species.update(unresolved)
+        components.append(
+            FormalChargeComponent(
+                label=str(label),
+                weight=weight,
+                signed_charge_e=charge,
+                counts=counts,
+                unassigned_species=unresolved,
+            )
+        )
+        weighted_signed_sum += weight * charge
+        weighted_absolute_sum += weight * abs(charge)
+        total_weight += weight
+    if total_weight <= 0.0:
+        return FormalChargeEstimate(
+            components=tuple(components),
+            weighted_mean_signed_charge_e=None,
+            weighted_mean_absolute_charge_e=None,
+            absolute_weighted_mean_charge_e=None,
+            total_weight=0.0,
+            unassigned_species=tuple(sorted(unassigned_species)),
+        )
+    weighted_mean_signed = weighted_signed_sum / total_weight
+    weighted_mean_absolute = weighted_absolute_sum / total_weight
+    return FormalChargeEstimate(
+        components=tuple(components),
+        weighted_mean_signed_charge_e=float(weighted_mean_signed),
+        weighted_mean_absolute_charge_e=float(weighted_mean_absolute),
+        absolute_weighted_mean_charge_e=float(abs(weighted_mean_signed)),
+        total_weight=float(total_weight),
+        unassigned_species=tuple(sorted(unassigned_species)),
     )
 
 
@@ -173,6 +471,70 @@ def stoichiometry_deviation_text(
         "Deviation from target: "
         f"{float(evaluation.max_deviation_percent or 0.0):.3g}%"
     )
+
+
+def weighted_stoichiometry_text(
+    structure_weights: Iterable[tuple[str, float]],
+    *,
+    label: str = "Stoich",
+) -> str | None:
+    element_totals: dict[str, float] = {}
+    for structure, raw_weight in structure_weights:
+        try:
+            weight = max(float(raw_weight), 0.0)
+        except (TypeError, ValueError):
+            continue
+        if weight <= 0.0:
+            continue
+        counts = parse_stoich_label(str(structure))
+        for element, count in counts.items():
+            if count <= 0:
+                continue
+            element_totals[element] = element_totals.get(element, 0.0) + (
+                weight * float(count)
+            )
+    positive_elements = [
+        element
+        for element, total in element_totals.items()
+        if math.isfinite(total) and total > 0.0
+    ]
+    if not positive_elements:
+        return None
+    elements = _weighted_stoichiometry_element_order(positive_elements)
+    reference_element = next(
+        (
+            element
+            for element in elements
+            if float(element_totals.get(element, 0.0)) > 0.0
+        ),
+        None,
+    )
+    if reference_element is None:
+        return None
+    reference_total = float(element_totals[reference_element])
+    if reference_total <= 0.0 or not math.isfinite(reference_total):
+        return None
+    ratio_values = [
+        float(element_totals.get(element, 0.0)) / reference_total
+        for element in elements
+    ]
+    return (
+        f"{label}: {':'.join(elements)} = "
+        f"{':'.join(f'{value:.4g}' for value in ratio_values)}"
+    )
+
+
+def _weighted_stoichiometry_element_order(
+    elements: Iterable[str],
+) -> list[str]:
+    unique = set(elements)
+    if "Pb" in unique or "I" in unique:
+        ordered = [element for element in ("Pb", "I") if element in unique]
+        ordered.extend(
+            sorted(element for element in unique if element not in {"Pb", "I"})
+        )
+        return ordered
+    return sorted(unique)
 
 
 def format_stoich_for_axis(label: str) -> str:

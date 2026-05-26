@@ -18,6 +18,7 @@ import numpy as np
 from matplotlib import colormaps
 from matplotlib.colors import to_hex
 from PySide6.QtCore import (
+    QEvent,
     QEventLoop,
     QObject,
     QRect,
@@ -40,6 +41,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
     QColorDialog,
@@ -94,8 +96,21 @@ from saxshell.saxs.dream import (
     DreamRunSettings,
     SAXSDreamResultsLoader,
     SAXSDreamWorkflow,
+    distribution_guide_bounds,
+    dream_fit_q_bounds,
+    dream_output_q_bounds,
+    format_distribution_guide_value,
+    format_dream_q_bounds,
+    format_dream_search_filter_preset,
+    format_prior_preset_summary,
+    guide_clip_status,
     load_dream_settings,
     load_parameter_map,
+    prior_preset_status_summary,
+)
+from saxshell.saxs.dream.batch import (
+    DREAM_BATCH_MANIFEST_NAME,
+    load_dream_batch_manifest,
 )
 from saxshell.saxs.model_report import (
     DreamFilterReportView,
@@ -111,8 +126,10 @@ from saxshell.saxs.prefit import (
     PrefitParameterEntry,
     PrefitScaleRecommendation,
     SAXSPrefitWorkflow,
+    raise_for_negative_prefit_r_squared,
 )
 from saxshell.saxs.prefit.workflow import (
+    MOLAR_CONCENTRATION_PARAMETER_NAMES,
     SOLUTE_VOLUME_FRACTION_PARAMETER_NAMES,
     SOLVENT_VOLUME_FRACTION_PARAMETER_NAMES,
     SOLVENT_WEIGHT_PARAMETER_NAMES,
@@ -140,14 +157,23 @@ from saxshell.saxs.solution_scattering_estimator import (
 )
 from saxshell.saxs.stoichiometry import (
     build_stoichiometry_target,
+    estimate_weighted_formal_charge,
     evaluate_weighted_stoichiometry,
+    parse_stoich_label,
     stoichiometry_deviation_text,
     stoichiometry_ratio_text,
     stoichiometry_target_text,
 )
+from saxshell.saxs.stoichiometry_compensator import (
+    guess_single_atom_compensator_names,
+    template_uses_stoichiometry_compensator,
+)
 from saxshell.saxs.template_installation import (
     format_validation_report,
     install_template_candidate,
+)
+from saxshell.saxs.ui.aps_detector_stitch_widget import (
+    APSDetectorStitchToolWindow,
 )
 from saxshell.saxs.ui.branding import (
     build_saxshell_brand_widget,
@@ -180,6 +206,15 @@ PACKMOL_DOCKER_PRESETS_KEY = "packmol_docker_presets"
 MAX_RECENT_PROJECTS = 10
 PROJECT_LOAD_PREP_STEPS = 4
 PROJECT_LOAD_TOTAL_STEPS = 12
+PROJECT_SETTINGS_APPLY_TOTAL_STEPS = 9
+DISTRIBUTION_LOAD_LOCAL_STEPS = 3
+DISTRIBUTION_LOAD_PREP_STEPS = (
+    DISTRIBUTION_LOAD_LOCAL_STEPS + PROJECT_LOAD_PREP_STEPS
+)
+DISTRIBUTION_LOAD_TOTAL_STEPS = (
+    DISTRIBUTION_LOAD_PREP_STEPS + PROJECT_SETTINGS_APPLY_TOTAL_STEPS
+)
+PROJECT_DUPLICATE_TOTAL_STEPS = 6
 DEFAULT_WINDOW_PRESET_KEY = "laptop_14"
 REPO_ROOT = Path(__file__).resolve().parents[4]
 EQUIVALENT_SPHERE_MIX_TEMPLATE_NAMES = {
@@ -1074,6 +1109,7 @@ class SAXSMainWindow(QMainWindow):
     DREAM_REFRESH_VIOLIN = 2
     DREAM_REFRESH_SUMMARY = 3
     DREAM_REFRESH_FULL = 4
+    DREAM_SAVED_RUN_POLL_INTERVAL_MS = 5000
 
     def __init__(
         self,
@@ -1107,6 +1143,7 @@ class SAXSMainWindow(QMainWindow):
         self._progress_dialog: SAXSProgressDialog | None = None
         self._active_task_name: str | None = None
         self._active_task_settings: ProjectSettings | None = None
+        self._active_task_unit_label = "items"
         self._dream_task_thread: QThread | None = None
         self._dream_task_worker: SAXSDreamRunWorker | None = None
         self._dream_progress_dialog: SAXSProgressDialog | None = None
@@ -1116,6 +1153,7 @@ class SAXSMainWindow(QMainWindow):
         self._warn_on_large_prefit_parameter_count = True
         self._prefit_sequence_pending_manual_edits = False
         self._prefit_sequence_baseline_entries: list[PrefitParameterEntry] = []
+        self._prefit_fit_undo_entries: list[PrefitParameterEntry] | None = None
         self._syncing_template_controls = False
         self._prefit_missing_components_warning_shown = False
         self._updating_deprecated_template_visibility = False
@@ -1125,6 +1163,7 @@ class SAXSMainWindow(QMainWindow):
             self._load_console_autoscroll_setting()
         )
         self._ui_scale = 1.0
+        self._pending_auto_fit_tabs: set[str] = set()
         self.project_load_progress_received.connect(
             self._on_project_load_progress_received
         )
@@ -1145,6 +1184,9 @@ class SAXSMainWindow(QMainWindow):
         self._fluorescence_tool_window: (
             FluorescenceEstimateToolWindow | None
         ) = None
+        self._aps_detector_stitch_tool_window: (
+            APSDetectorStitchToolWindow | None
+        ) = None
         self._last_solution_scattering_estimate: (
             SolutionScatteringEstimate | None
         ) = None
@@ -1157,13 +1199,26 @@ class SAXSMainWindow(QMainWindow):
         self._prefit_cluster_geometry_sync_radii_type: str | None = None
         self._prefit_cluster_geometry_sync_ionic_radius_type: str | None = None
         self._pending_dream_refresh_scope = 0
+        self._last_saved_dream_runs_signature: tuple[
+            tuple[str, str],
+            ...,
+        ] = ()
         self._dream_refresh_timer = QTimer(self)
         self._dream_refresh_timer.setSingleShot(True)
         self._dream_refresh_timer.setInterval(self.DREAM_REFRESH_DELAY_MS)
         self._dream_refresh_timer.timeout.connect(
             self._flush_pending_dream_refresh
         )
+        self._dream_saved_run_poll_timer = QTimer(self)
+        self._dream_saved_run_poll_timer.setInterval(
+            self.DREAM_SAVED_RUN_POLL_INTERVAL_MS
+        )
+        self._dream_saved_run_poll_timer.timeout.connect(
+            self._refresh_external_dream_artifacts
+        )
+        self._dream_saved_run_poll_timer.start()
         self._build_ui()
+        self._install_value_wheel_guard()
         self._capture_scale_baselines(self)
         self._register_scale_shortcuts()
         self._apply_ui_scale(announce=False)
@@ -1178,10 +1233,68 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_tab.plot_evaluation(None)
             self.dream_tab.clear_plots()
 
+    def _install_value_wheel_guard(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        app.installEventFilter(self)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if self._should_suppress_value_wheel_event(watched, event):
+            event.ignore()
+            return True
+        return super().eventFilter(watched, event)
+
+    def _should_suppress_value_wheel_event(
+        self,
+        watched: QObject,
+        event: QEvent,
+    ) -> bool:
+        if event.type() != QEvent.Type.Wheel or not isinstance(
+            watched, QWidget
+        ):
+            return False
+        if not self._is_widget_in_main_ui(watched):
+            return False
+        control = self._wheel_guarded_value_control(watched)
+        return control is not None and control.isEnabled()
+
+    def _is_widget_in_main_ui(self, widget: QWidget) -> bool:
+        window = widget.window()
+        if window is self:
+            return True
+        if not isinstance(window, QDialog):
+            return False
+        current: QWidget | None = window
+        while current is not None:
+            if current is self:
+                return True
+            current = current.parentWidget()
+        return False
+
+    def _wheel_guarded_value_control(self, widget: QWidget) -> QWidget | None:
+        current: QWidget | None = widget
+        while current is not None:
+            if isinstance(current, QAbstractSpinBox):
+                return current
+            if isinstance(current, QComboBox):
+                view = current.view()
+                if view is not None and view.isVisible():
+                    return None
+                return current
+            if current is self:
+                return None
+            current = current.parentWidget()
+        return None
+
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXSShell")
         self.setWindowIcon(load_saxshell_icon())
-        self.resize(self._default_window_size())
+        self._loaded_default_window_size = self._default_window_size()
+        self._loaded_default_ui_scale = WINDOW_LAYOUT_PRESET_MAP[
+            DEFAULT_WINDOW_PRESET_KEY
+        ].ui_scale
+        self.resize(self._loaded_default_window_size)
 
         self._build_menu_bar()
         self.tabs = QTabWidget()
@@ -1209,6 +1322,7 @@ class SAXSMainWindow(QMainWindow):
         self.tabs.addTab(self.project_setup_tab, "Project Setup")
         self.tabs.addTab(self.prefit_tab, "SAXS Prefit")
         self.tabs.addTab(self.dream_tab, "SAXS DREAM Fit")
+        self.tabs.currentChanged.connect(self._on_main_tab_changed)
         self.setCentralWidget(self.tabs)
         self.statusBar().showMessage("Ready")
 
@@ -1250,6 +1364,12 @@ class SAXSMainWindow(QMainWindow):
         )
         self.project_setup_tab.load_distribution_requested.connect(
             self._load_saved_distribution
+        )
+        self.project_setup_tab.duplicate_distribution_requested.connect(
+            self._duplicate_saved_distribution
+        )
+        self.project_setup_tab.delete_distribution_requested.connect(
+            self._delete_saved_distribution
         )
         self.project_setup_tab.view_active_contrast_distribution_requested.connect(
             self._open_active_contrast_distribution_view
@@ -1313,7 +1433,15 @@ class SAXSMainWindow(QMainWindow):
         self.prefit_tab.update_model_requested.connect(
             self.update_prefit_model
         )
+        self.prefit_tab.fit_range_changed.connect(self.update_prefit_fit_range)
+        self.prefit_tab.charge_estimate_requested.connect(
+            self.estimate_prefit_charge_from_stoichiometry
+        )
+        self.prefit_tab.stoichiometry_compensator_settings_changed.connect(
+            self._on_prefit_stoichiometry_compensator_settings_changed
+        )
         self.prefit_tab.run_fit_requested.connect(self.run_prefit)
+        self.prefit_tab.undo_fit_requested.connect(self.undo_prefit_fit_step)
         self.prefit_tab.apply_recommended_scale_requested.connect(
             self.apply_recommended_scale_settings
         )
@@ -1392,9 +1520,6 @@ class SAXSMainWindow(QMainWindow):
         self.dream_tab.apply_filter_requested.connect(
             self._apply_dream_filter_settings
         )
-        self.dream_tab.visualization_settings_changed.connect(
-            self._on_dream_analysis_settings_changed
-        )
         self.dream_tab.results_settings_changed.connect(
             self._on_dream_analysis_settings_changed
         )
@@ -1442,6 +1567,15 @@ class SAXSMainWindow(QMainWindow):
         self.save_project_as_action.triggered.connect(self.save_project_as)
         self.file_menu.addAction(self.save_project_as_action)
 
+        self.duplicate_project_for_new_fit_action = QAction(
+            "Duplicate Project for New Fit...",
+            self,
+        )
+        self.duplicate_project_for_new_fit_action.triggered.connect(
+            self.duplicate_project_for_new_fit
+        )
+        self.file_menu.addAction(self.duplicate_project_for_new_fit_action)
+
         self.link_packmol_docker_action = QAction(
             "Link Packmol Docker Container...",
             self,
@@ -1477,6 +1611,17 @@ class SAXSMainWindow(QMainWindow):
             self._open_bondanalysis_tool
         )
         self.structure_analysis_menu.addAction(self.bondanalysis_action)
+
+        self.structure_distribution_browser_action = QAction(
+            "Open Structure Distribution Browser",
+            self,
+        )
+        self.structure_distribution_browser_action.triggered.connect(
+            self._open_structure_distribution_browser_tool
+        )
+        self.structure_analysis_menu.addAction(
+            self.structure_distribution_browser_action
+        )
 
         self.debye_waller_analysis_action = QAction(
             "Open Debye-Waller Analysis",
@@ -1554,6 +1699,17 @@ class SAXSMainWindow(QMainWindow):
             self.representativefinder_batch_queue_action
         )
 
+        self.bondanalysis_batch_queue_action = QAction(
+            "Open Bond Analysis Batch Queue",
+            self,
+        )
+        self.bondanalysis_batch_queue_action.triggered.connect(
+            self._open_bondanalysis_batch_queue_tool
+        )
+        self.batch_processing_menu.addAction(
+            self.bondanalysis_batch_queue_action
+        )
+
         self.pdf_batch_queue_action = QAction(
             "Open PDF Batch Queue",
             self,
@@ -1563,9 +1719,30 @@ class SAXSMainWindow(QMainWindow):
         )
         self.batch_processing_menu.addAction(self.pdf_batch_queue_action)
 
+        self.dream_backend_batch_queue_action = QAction(
+            "Open DREAM Backend Batch Queue (Beta)",
+            self,
+        )
+        self.dream_backend_batch_queue_action.triggered.connect(
+            self._open_dream_backend_batch_setup_tool
+        )
+        self.batch_processing_menu.addAction(
+            self.dream_backend_batch_queue_action
+        )
+
         self.fullrmc_action = QAction("Open RMC Setup (fullrmc)", self)
         self.fullrmc_action.triggered.connect(self._open_fullrmc_tool)
         self.pdf_menu.addAction(self.fullrmc_action)
+
+        self.spectroscopy_menu = self.tools_menu.addMenu("Spectroscopy")
+        self.uvvis_fitting_action = QAction(
+            "Open UV-Vis Peak Fitting",
+            self,
+        )
+        self.uvvis_fitting_action.triggered.connect(
+            self._open_uvvis_fitting_tool
+        )
+        self.spectroscopy_menu.addAction(self.uvvis_fitting_action)
 
         self.visualization_menu = self.tools_menu.addMenu("Visualization")
         self.structure_viewer_action = QAction(
@@ -1647,6 +1824,12 @@ class SAXSMainWindow(QMainWindow):
 
         self.xray_toolkit_menu = self.tools_menu.addMenu("X-ray Toolkit")
         self.estimation_menu = self.xray_toolkit_menu
+        self.aps_detector_stitch_action = QAction("APS Detector Stitch", self)
+        self.aps_detector_stitch_action.triggered.connect(
+            self._open_aps_detector_stitch_tool
+        )
+        self.xray_toolkit_menu.addAction(self.aps_detector_stitch_action)
+        self.xray_toolkit_menu.addSeparator()
         self.volume_fraction_action = QAction(
             "Open Volume Fraction Estimate", self
         )
@@ -1769,6 +1952,16 @@ class SAXSMainWindow(QMainWindow):
             self._apply_auto_window_layout_preset
         )
         self.window_presets_menu.addAction(self.auto_fit_window_action)
+        self.restore_default_window_size_action = QAction(
+            "Restore Loaded Default Size",
+            self,
+        )
+        self.restore_default_window_size_action.triggered.connect(
+            self._restore_loaded_default_window_size
+        )
+        self.window_presets_menu.addAction(
+            self.restore_default_window_size_action
+        )
         self.window_presets_menu.addSeparator()
         self.window_preset_actions: dict[str, QAction] = {}
         for preset in WINDOW_LAYOUT_PRESETS:
@@ -1885,13 +2078,54 @@ class SAXSMainWindow(QMainWindow):
         ):
             self._apply_scale_to_widget_tree(child)
 
-    def _current_available_geometry(self) -> QRect | None:
+    def _available_screens(self) -> list[object]:
+        app = QApplication.instance()
+        if app is None:
+            return []
+        screens = getattr(app, "screens", None)
+        if screens is None:
+            return []
+        return list(screens())
+
+    @staticmethod
+    def _screen_with_largest_window_overlap(
+        screens: list[object],
+        frame_geometry: QRect,
+    ) -> object | None:
+        if not frame_geometry.isValid() or frame_geometry.isNull():
+            return None
+        best_screen = None
+        best_area = 0
+        for screen in screens:
+            geometry = screen.geometry()
+            overlap = frame_geometry.intersected(geometry)
+            if overlap.isNull() or not overlap.isValid():
+                continue
+            area = overlap.width() * overlap.height()
+            if area > best_area:
+                best_area = area
+                best_screen = screen
+        return best_screen
+
+    def _current_window_screen(self) -> object | None:
+        screens = self._available_screens()
+        screen = self._screen_with_largest_window_overlap(
+            screens,
+            self.frameGeometry(),
+        )
+        if screen is not None:
+            return screen
+        handle = self.windowHandle()
+        if handle is not None and handle.screen() is not None:
+            return handle.screen()
         screen = self.screen()
-        if screen is None and self.windowHandle() is not None:
-            screen = self.windowHandle().screen()
-        if screen is None:
-            app = QApplication.instance()
-            screen = app.primaryScreen() if app is not None else None
+        if screen is not None:
+            return screen
+        app = QApplication.instance()
+        return app.primaryScreen() if app is not None else None
+
+    def _current_available_geometry(self) -> QRect | None:
+        screen = self._current_window_screen()
         return screen.availableGeometry() if screen is not None else None
 
     def _fit_window_size_to_current_screen(self, size: QSize) -> QSize:
@@ -1930,11 +2164,209 @@ class SAXSMainWindow(QMainWindow):
         )
         self.resize(target_size)
         self._set_ui_scale(preset.ui_scale)
+        self._pending_auto_fit_tabs = {
+            tab_attr
+            for tab_attr, _splitter in self._main_horizontal_splitters()
+        }
+        self._autoscale_main_horizontal_splitters()
+        QTimer.singleShot(0, self._autoscale_main_horizontal_splitters)
         self.statusBar().showMessage(
             "Applied window preset: "
             f"{preset.label} ({target_size.width()} x {target_size.height()}, "
             f"{int(round(preset.ui_scale * 100))}% scale)"
         )
+
+    def _restore_loaded_default_window_size(self) -> None:
+        default_size = getattr(self, "_loaded_default_window_size", None)
+        if not isinstance(default_size, QSize) or default_size.isEmpty():
+            default_size = self._default_window_size()
+            self._loaded_default_window_size = default_size
+        default_scale = float(
+            getattr(
+                self,
+                "_loaded_default_ui_scale",
+                WINDOW_LAYOUT_PRESET_MAP[DEFAULT_WINDOW_PRESET_KEY].ui_scale,
+            )
+        )
+        self.resize(default_size)
+        self._set_ui_scale(default_scale)
+        self._pending_auto_fit_tabs = {
+            tab_attr
+            for tab_attr, _splitter in self._main_horizontal_splitters()
+        }
+        self._autoscale_main_horizontal_splitters()
+        QTimer.singleShot(0, self._autoscale_main_horizontal_splitters)
+        self.statusBar().showMessage(
+            "Restored loaded default window size: "
+            f"{default_size.width()} x {default_size.height()}, "
+            f"{int(round(default_scale * 100))}% scale"
+        )
+
+    def _autoscale_main_horizontal_splitters(self) -> None:
+        for tab_attr, splitter in self._main_horizontal_splitters():
+            if (
+                self._autoscale_horizontal_splitter(splitter)
+                and splitter.isVisible()
+            ):
+                self._pending_auto_fit_tabs.discard(tab_attr)
+
+    def _main_horizontal_splitters(self) -> tuple[tuple[str, QSplitter], ...]:
+        splitters: list[tuple[str, QSplitter]] = []
+        for tab_attr, splitter_attr in (
+            ("project_setup_tab", "_pane_splitter"),
+            ("prefit_tab", "_pane_splitter"),
+            ("dream_tab", "_top_splitter"),
+        ):
+            tab = getattr(self, tab_attr, None)
+            splitter = getattr(tab, splitter_attr, None)
+            if isinstance(splitter, QSplitter):
+                splitters.append((tab_attr, splitter))
+        return tuple(splitters)
+
+    def _autoscale_pending_tab_splitter(self, index: int) -> None:
+        if not self._pending_auto_fit_tabs or not hasattr(self, "tabs"):
+            return
+        widget = self.tabs.widget(index)
+        for tab_attr, splitter in self._main_horizontal_splitters():
+            if tab_attr in self._pending_auto_fit_tabs and widget is getattr(
+                self, tab_attr, None
+            ):
+                self._autoscale_horizontal_splitter(splitter)
+                QTimer.singleShot(
+                    0,
+                    lambda tab_attr=tab_attr, splitter=splitter: (
+                        self._finish_pending_tab_splitter_autoscale(
+                            tab_attr,
+                            splitter,
+                        )
+                    ),
+                )
+                return
+
+    def _finish_pending_tab_splitter_autoscale(
+        self,
+        tab_attr: str,
+        splitter: QSplitter,
+    ) -> None:
+        if tab_attr not in self._pending_auto_fit_tabs:
+            return
+        if splitter.isVisible() and self._autoscale_horizontal_splitter(
+            splitter
+        ):
+            self._pending_auto_fit_tabs.discard(tab_attr)
+
+    def _autoscale_horizontal_splitter(self, splitter: QSplitter) -> bool:
+        if (
+            splitter.orientation() != Qt.Orientation.Horizontal
+            or splitter.count() < 2
+        ):
+            return False
+        total_width = self._splitter_usable_width(splitter)
+        handle_width = splitter.handleWidth() * max(0, splitter.count() - 1)
+        total_width = max(1, total_width - handle_width)
+        widgets = [splitter.widget(index) for index in range(splitter.count())]
+        minimum_widths = [
+            self._splitter_widget_minimum_width(widget) for widget in widgets
+        ]
+        preferred_widths = [
+            self._splitter_widget_preferred_width(widget) for widget in widgets
+        ]
+        sizes = self._balanced_splitter_sizes(
+            total_width,
+            minimum_widths,
+            preferred_widths,
+        )
+        if sizes:
+            splitter.setSizes(sizes)
+            return True
+        return False
+
+    def _splitter_usable_width(self, splitter: QSplitter) -> int:
+        widths = [splitter.width()]
+        if hasattr(self, "tabs"):
+            widths.append(self.tabs.contentsRect().width())
+        central_widget = self.centralWidget()
+        if central_widget is not None:
+            widths.append(central_widget.contentsRect().width())
+        widths.append(max(0, self.width() - 64))
+        return max(widths)
+
+    @staticmethod
+    def _splitter_widget_minimum_width(widget: QWidget) -> int:
+        return max(
+            widget.minimumSizeHint().width(),
+            widget.minimumWidth(),
+            1,
+        )
+
+    @staticmethod
+    def _splitter_widget_preferred_width(widget: QWidget) -> int:
+        if isinstance(widget, QScrollArea):
+            inner = widget.widget()
+            if inner is not None:
+                width = inner.sizeHint().width()
+                scrollbar = widget.verticalScrollBar()
+                if scrollbar is not None:
+                    width += scrollbar.sizeHint().width()
+                width += widget.frameWidth() * 2
+                return max(width, widget.minimumSizeHint().width(), 1)
+        return max(
+            widget.sizeHint().width(),
+            widget.minimumSizeHint().width(),
+            widget.minimumWidth(),
+            1,
+        )
+
+    @staticmethod
+    def _balanced_splitter_sizes(
+        total_width: int,
+        minimum_widths: list[int],
+        preferred_widths: list[int],
+    ) -> list[int]:
+        if not minimum_widths or len(minimum_widths) != len(preferred_widths):
+            return []
+        total_width = max(1, int(total_width))
+        minimum_widths = [max(1, int(width)) for width in minimum_widths]
+        preferred_widths = [
+            max(minimum_widths[index], int(width))
+            for index, width in enumerate(preferred_widths)
+        ]
+        minimum_total = sum(minimum_widths)
+        preferred_total = sum(preferred_widths)
+        if total_width <= minimum_total:
+            return minimum_widths
+        if preferred_total >= total_width:
+            flex_widths = [
+                max(0, preferred - minimum)
+                for minimum, preferred in zip(minimum_widths, preferred_widths)
+            ]
+            flex_total = sum(flex_widths)
+            if flex_total <= 0:
+                raw_sizes = list(minimum_widths)
+            else:
+                available_flex = total_width - minimum_total
+                raw_sizes = [
+                    minimum + (available_flex * flex / flex_total)
+                    for minimum, flex in zip(minimum_widths, flex_widths)
+                ]
+        else:
+            spare_width = total_width - preferred_total
+            extra_per_pane = spare_width / len(preferred_widths)
+            raw_sizes = [
+                preferred + extra_per_pane for preferred in preferred_widths
+            ]
+        return SAXSMainWindow._rounded_splitter_sizes(raw_sizes, total_width)
+
+    @staticmethod
+    def _rounded_splitter_sizes(
+        raw_sizes: list[float],
+        total_width: int,
+    ) -> list[int]:
+        sizes = [max(1, int(round(size))) for size in raw_sizes]
+        delta = int(total_width) - sum(sizes)
+        if sizes:
+            sizes[-1] = max(1, sizes[-1] + delta)
+        return sizes
 
     def _default_window_size(self) -> QSize:
         default_preset = WINDOW_LAYOUT_PRESET_MAP[DEFAULT_WINDOW_PRESET_KEY]
@@ -2127,6 +2559,8 @@ class SAXSMainWindow(QMainWindow):
         *,
         selected_dream_preset: str | None,
         progress_callback: Callable[[str], None] | None = None,
+        progress_offset: int = 0,
+        progress_total_steps: int = PROJECT_LOAD_TOTAL_STEPS,
     ) -> ProjectLoadPayload:
         result: ProjectLoadPayload | None = None
         failure_message: str | None = None
@@ -2143,8 +2577,8 @@ class SAXSMainWindow(QMainWindow):
                 return
             del total
             self.project_load_progress_received.emit(
-                processed,
-                PROJECT_LOAD_TOTAL_STEPS,
+                int(progress_offset) + processed,
+                progress_total_steps,
                 message,
                 message,
             )
@@ -2568,6 +3002,12 @@ class SAXSMainWindow(QMainWindow):
     def build_prior_weights(self) -> None:
         try:
             settings = self._settings_from_project_tab()
+            self._save_active_distribution_fit_settings()
+            settings = (
+                self.project_manager.settings_for_new_computed_distribution(
+                    settings
+                )
+            )
             self._save_settings(
                 settings,
                 status_message=(
@@ -2590,6 +3030,71 @@ class SAXSMainWindow(QMainWindow):
             )
         except Exception as exc:
             self._show_error("Create computed distribution failed", str(exc))
+
+    def _touch_active_distribution_metadata(
+        self,
+        settings: ProjectSettings | None = None,
+    ) -> None:
+        active_settings = settings or self.current_settings
+        if active_settings is None:
+            return
+        try:
+            self.project_manager.touch_saved_distribution(active_settings)
+        except Exception:
+            return
+
+    def _save_active_distribution_fit_settings(self) -> None:
+        if self.current_settings is None:
+            return
+        saved_any = False
+        if self.prefit_workflow is not None:
+            try:
+                self._sync_prefit_cluster_geometry_rows()
+            except Exception:
+                pass
+            try:
+                self._flush_prefit_sequence_pending_manual_updates(
+                    trigger="distribution_switch",
+                )
+            except Exception:
+                pass
+            try:
+                entries = self.prefit_tab.parameter_entries()
+                run_config = self.prefit_tab.run_config()
+                self.prefit_workflow.parameter_entries = entries
+                self.prefit_workflow.save_parameter_state(
+                    entries,
+                    method=run_config.method,
+                    max_nfev=run_config.max_nfev,
+                    autosave_prefits=(
+                        self.prefit_tab.autosave_checkbox.isChecked()
+                    ),
+                )
+                saved_any = True
+            except Exception as exc:
+                self.project_setup_tab.append_summary(
+                    "Could not auto-save the current Prefit settings before "
+                    f"switching computed distributions:\n{exc}"
+                )
+        if self.dream_workflow is not None:
+            try:
+                dream_settings = self.dream_tab.settings_payload()
+                if (
+                    not dream_settings.model_name
+                    and self.prefit_workflow is not None
+                ):
+                    dream_settings.model_name = (
+                        self.prefit_workflow.template_spec.name
+                    )
+                self.dream_workflow.save_settings(dream_settings)
+                saved_any = True
+            except Exception as exc:
+                self.project_setup_tab.append_summary(
+                    "Could not auto-save the current DREAM settings before "
+                    f"switching computed distributions:\n{exc}"
+                )
+        if saved_any:
+            self._touch_active_distribution_metadata()
 
     def install_model_template(self) -> None:
         try:
@@ -3148,6 +3653,101 @@ class SAXSMainWindow(QMainWindow):
         except Exception as exc:
             self._show_error("Save Project As failed", str(exc))
 
+    def duplicate_project_for_new_fit(self) -> None:
+        if self.current_settings is None:
+            self._show_error(
+                "Duplicate Project failed",
+                "Load or create a project first.",
+            )
+            return
+        try:
+            current_settings = self._settings_from_project_tab()
+            source_dir = (
+                Path(current_settings.project_dir).expanduser().resolve()
+            )
+            if not source_dir.is_dir():
+                raise ValueError(
+                    "The active project folder could not be found on disk."
+                )
+            self._save_settings(
+                current_settings,
+                status_message=(
+                    "Project saved before duplicating for a new fit"
+                ),
+            )
+            parent_dir = QFileDialog.getExistingDirectory(
+                self,
+                "Select destination parent folder",
+                str(source_dir.parent),
+            )
+            if not parent_dir:
+                self.statusBar().showMessage(
+                    "Duplicate Project for New Fit canceled"
+                )
+                return
+            project_name, accepted = QInputDialog.getText(
+                self,
+                "Duplicate Project for New Fit",
+                "New project folder name:",
+                text=f"{source_dir.name}_new_fit",
+            )
+            project_name = str(project_name).strip()
+            if not accepted or not project_name:
+                self.statusBar().showMessage(
+                    "Duplicate Project for New Fit canceled"
+                )
+                return
+            destination_dir = (
+                Path(parent_dir).expanduser().resolve() / project_name
+            )
+            self._start_project_task(
+                "duplicate_project_for_new_fit",
+                lambda progress: (
+                    self.project_manager.duplicate_project_for_new_fit(
+                        current_settings,
+                        destination_dir,
+                        project_name=project_name,
+                        progress_callback=progress,
+                    )
+                ),
+                start_message="Duplicating active project folder...",
+                settings=current_settings,
+                progress_total=PROJECT_DUPLICATE_TOTAL_STEPS,
+                unit_label="steps",
+                title="Duplicating SAXS Project",
+            )
+        except Exception as exc:
+            self._show_error("Duplicate Project failed", str(exc))
+
+    def _finish_duplicate_project_for_new_fit(
+        self,
+        new_settings: ProjectSettings,
+    ) -> None:
+        try:
+            destination_dir = Path(new_settings.project_dir).expanduser()
+            self.current_settings = new_settings
+            self._apply_project_settings_with_progress_popup(
+                new_settings,
+                title="Loading Duplicated Project",
+                start_message="Loading duplicated project...",
+                finished_message="Duplicated project loaded.",
+            )
+            self.tabs.setCurrentWidget(self.project_setup_tab)
+            self._remember_recent_project(new_settings.project_dir)
+            self.project_setup_tab.append_summary(
+                "Duplicated project for a new fit at "
+                f"{destination_dir}\n"
+                "Experimental data, saved Prefit states, and DREAM runs were "
+                "cleared; reusable cluster distributions and model "
+                "components were retained."
+            )
+            self.project_setup_tab.finish_activity_progress(
+                "Project duplicated for a new fit."
+            )
+            self.statusBar().showMessage("Project duplicated for a new fit")
+        except Exception as exc:
+            self._show_error("Load Duplicated Project failed", str(exc))
+
     def _start_project_task(
         self,
         task_name: str,
@@ -3155,6 +3755,9 @@ class SAXSMainWindow(QMainWindow):
         *,
         start_message: str,
         settings: ProjectSettings | None = None,
+        progress_total: int = 1,
+        unit_label: str = "items",
+        title: str | None = None,
     ) -> None:
         if self._task_thread is not None:
             self.statusBar().showMessage(
@@ -3164,6 +3767,7 @@ class SAXSMainWindow(QMainWindow):
 
         self._active_task_name = task_name
         self._active_task_settings = settings
+        self._active_task_unit_label = unit_label
         self._task_thread = QThread(self)
         self._task_worker = SAXSProjectTaskWorker(task_name, task_fn)
         self._task_worker.moveToThread(self._task_thread)
@@ -3175,8 +3779,17 @@ class SAXSMainWindow(QMainWindow):
         self._task_worker.failed.connect(self._task_thread.quit)
         self._task_thread.finished.connect(self._cleanup_task_thread)
 
-        self.project_setup_tab.start_activity_progress(1, start_message)
-        self._show_progress_dialog(1, start_message)
+        self.project_setup_tab.start_activity_progress(
+            progress_total,
+            start_message,
+            unit_label=unit_label,
+        )
+        self._show_progress_dialog(
+            progress_total,
+            start_message,
+            unit_label=unit_label,
+            title=title,
+        )
         self.statusBar().showMessage(start_message)
         self._task_thread.start()
 
@@ -3191,12 +3804,14 @@ class SAXSMainWindow(QMainWindow):
             processed,
             total,
             message,
+            unit_label=self._active_task_unit_label,
         )
         if self._progress_dialog is not None:
             self._progress_dialog.update_progress(
                 processed,
                 total,
                 message,
+                unit_label=self._active_task_unit_label,
             )
         self.statusBar().showMessage(message)
 
@@ -3320,6 +3935,14 @@ class SAXSMainWindow(QMainWindow):
                 "Computed-distribution creation complete."
             )
             self.statusBar().showMessage("Computed distribution created")
+        elif task_name == "duplicate_project_for_new_fit":
+            if isinstance(result, ProjectSettings):
+                self._finish_duplicate_project_for_new_fit(result)
+            else:
+                self._show_error(
+                    "Duplicate Project failed",
+                    "Project duplication returned an unexpected result.",
+                )
         self._close_progress_dialog()
 
     @Slot(str, str)
@@ -3338,6 +3961,7 @@ class SAXSMainWindow(QMainWindow):
             self._task_thread = None
         self._active_task_name = None
         self._active_task_settings = None
+        self._active_task_unit_label = "items"
 
     def _ensure_progress_dialog(self) -> SAXSProgressDialog:
         if self._progress_dialog is None:
@@ -3415,6 +4039,67 @@ class SAXSMainWindow(QMainWindow):
         self.statusBar().showMessage(message)
         QApplication.processEvents()
 
+    def _apply_project_settings_with_progress_popup(
+        self,
+        settings: ProjectSettings,
+        *,
+        title: str,
+        start_message: str,
+        finished_message: str,
+    ) -> None:
+        processed_steps = 0
+
+        def advance_step(message: str) -> None:
+            nonlocal processed_steps
+            processed_steps = min(
+                processed_steps + 1,
+                PROJECT_SETTINGS_APPLY_TOTAL_STEPS,
+            )
+            self.project_setup_tab.update_activity_progress(
+                processed_steps,
+                PROJECT_SETTINGS_APPLY_TOTAL_STEPS,
+                message,
+                unit_label="steps",
+            )
+            if self._progress_dialog is not None:
+                self._progress_dialog.update_progress(
+                    processed_steps,
+                    PROJECT_SETTINGS_APPLY_TOTAL_STEPS,
+                    message,
+                    unit_label="steps",
+                )
+            self.statusBar().showMessage(message)
+            QApplication.processEvents()
+
+        cursor_set = False
+        self.project_setup_tab.start_activity_progress(
+            PROJECT_SETTINGS_APPLY_TOTAL_STEPS,
+            start_message,
+            unit_label="steps",
+        )
+        self._show_progress_dialog(
+            PROJECT_SETTINGS_APPLY_TOTAL_STEPS,
+            start_message,
+            unit_label="steps",
+            title=title,
+        )
+        QApplication.processEvents()
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            cursor_set = True
+            self._apply_project_settings(
+                settings,
+                progress_callback=advance_step,
+            )
+            self.project_setup_tab.finish_activity_progress(finished_message)
+        except Exception:
+            self.project_setup_tab.finish_activity_progress("Progress: failed")
+            raise
+        finally:
+            if cursor_set:
+                QApplication.restoreOverrideCursor()
+            self._close_progress_dialog()
+
     def _append_project_load_output(self, message: str) -> None:
         stripped = str(message).strip()
         if not stripped:
@@ -3476,6 +4161,24 @@ class SAXSMainWindow(QMainWindow):
     def _close_dream_progress_dialog(self) -> None:
         if self._dream_progress_dialog is not None:
             self._dream_progress_dialog.close()
+
+    def _update_dream_progress_dialog(
+        self,
+        processed: int,
+        total: int,
+        message: str,
+        *,
+        unit_label: str = "steps",
+    ) -> None:
+        if self._dream_progress_dialog is not None:
+            self._dream_progress_dialog.update_progress(
+                processed,
+                total,
+                message,
+                unit_label=unit_label,
+            )
+        self.statusBar().showMessage(message)
+        QApplication.processEvents()
 
     def _start_dream_run_task(
         self,
@@ -3557,8 +4260,13 @@ class SAXSMainWindow(QMainWindow):
                 settings
             )
             self.dream_tab.set_settings(settings, preset_name=None)
+            self._apply_prefit_bounds_to_dream_fit_q_range()
         except Exception as exc:  # pragma: no cover - defensive UI logging
             assessment_error = str(exc)
+        self.dream_tab.set_violin_parameter_options(
+            self._last_results_loader.selectable_additional_parameter_names(),
+            selected_parameter=settings.violin_selected_parameter,
+        )
         self._refresh_saved_dream_runs(selected_run_dir=run_dir)
         self._refresh_loaded_dream_results()
         auto_export_paths: list[Path] = []
@@ -3603,6 +4311,10 @@ class SAXSMainWindow(QMainWindow):
         self.dream_tab.finish_progress("DREAM refinement complete.")
         self._close_dream_progress_dialog()
         self.dream_tab.run_button.setEnabled(True)
+        if self.dream_workflow is not None:
+            self._touch_active_distribution_metadata(
+                self.dream_workflow.settings
+            )
         if auto_export_paths:
             self.statusBar().showMessage(
                 "DREAM run complete; condensed exports saved"
@@ -3785,6 +4497,7 @@ class SAXSMainWindow(QMainWindow):
     def _refresh_prefit_volume_fraction_section(self) -> None:
         target = self._current_volume_fraction_target_details()
         solvent_weight_target = self._current_solvent_weight_target()
+        molar_concentration_target = self._current_molar_concentration_target()
         visible = self.prefit_workflow is not None
         self.prefit_tab.set_solute_volume_fraction_visible(visible)
         parameter_name = None
@@ -3797,8 +4510,87 @@ class SAXSMainWindow(QMainWindow):
             fraction_kind,
             fraction_source,
             solvent_weight_target,
+            molar_concentration_target,
         )
         self._sync_solution_scattering_tool_targets()
+
+    def _refresh_prefit_stoichiometry_compensator_section(self) -> None:
+        template_name = self._active_template_name()
+        if self.prefit_workflow is not None:
+            template_name = self.prefit_workflow.template_spec.name
+        visible = template_uses_stoichiometry_compensator(template_name)
+        self.prefit_tab.set_stoichiometry_compensator_visible(visible)
+        if not visible:
+            return
+
+        settings = (
+            self.prefit_workflow.settings
+            if self.prefit_workflow is not None
+            else self.current_settings
+        )
+        target_elements_text = (
+            ""
+            if settings is None
+            else str(
+                settings.stoichiometry_compensator_target_elements_text or ""
+            ).strip()
+        )
+        if not target_elements_text:
+            target_elements_text = "Pb, I"
+        target_ratio_text = (
+            ""
+            if settings is None
+            else str(
+                settings.stoichiometry_compensator_target_ratio_text or ""
+            ).strip()
+        )
+        selected_names = (
+            []
+            if settings is None
+            else [
+                str(name).strip()
+                for name in settings.stoichiometry_compensator_weight_names
+                if str(name).strip()
+            ]
+        )
+        parameter_entries = (
+            self.prefit_workflow.parameter_entries
+            if self.prefit_workflow is not None
+            else []
+        )
+        if not selected_names and parameter_entries:
+            selected_names = list(
+                guess_single_atom_compensator_names(
+                    tuple(
+                        (entry.name, entry.structure)
+                        for entry in parameter_entries
+                        if entry.name.startswith("w")
+                        and bool(getattr(entry, "active", True))
+                    ),
+                    tuple(
+                        self._stoichiometry_compensator_elements_from_text(
+                            target_elements_text
+                        )
+                    ),
+                )
+            )
+        self.prefit_tab.set_stoichiometry_compensator_settings(
+            target_elements_text=target_elements_text,
+            target_ratio_text=target_ratio_text,
+            compensator_weight_names=selected_names,
+            parameter_entries=parameter_entries,
+        )
+
+    @staticmethod
+    def _stoichiometry_compensator_elements_from_text(text: str) -> list[str]:
+        return [
+            token.strip()
+            for token in str(text or "")
+            .replace(":", ",")
+            .replace(";", ",")
+            .split(",")
+            if token.strip()
+        ]
 
     def _current_volume_fraction_target(self) -> tuple[str, str] | None:
         target = self._current_volume_fraction_target_details()
@@ -3820,6 +4612,11 @@ class SAXSMainWindow(QMainWindow):
             return None
         return self.prefit_workflow.solvent_weight_estimator_target()
 
+    def _current_molar_concentration_target(self) -> str | None:
+        if self.prefit_workflow is None:
+            return None
+        return self.prefit_workflow.molar_concentration_estimator_target()
+
     def _sync_solution_scattering_tool_targets(self) -> None:
         target = self._current_volume_fraction_target_details()
         if target is None:
@@ -3829,6 +4626,9 @@ class SAXSMainWindow(QMainWindow):
         else:
             parameter_name, fraction_kind, fraction_source = target
         solvent_weight_parameter = self._current_solvent_weight_target()
+        molar_concentration_parameter = (
+            self._current_molar_concentration_target()
+        )
         for window in (
             self._solute_volume_fraction_tool_window,
             self._number_density_tool_window,
@@ -3842,6 +4642,7 @@ class SAXSMainWindow(QMainWindow):
                 fraction_kind,
                 fraction_source,
                 solvent_weight_parameter,
+                molar_concentration_parameter,
             )
 
     def _apply_estimator_parameter_to_prefit(
@@ -3872,6 +4673,27 @@ class SAXSMainWindow(QMainWindow):
             maximum=maximum,
             vary=False,
         )
+
+    @staticmethod
+    def _solute_molar_concentration_from_solution_result(
+        solution_result,
+    ) -> float | None:
+        try:
+            moles_solute = float(solution_result.moles_solute)
+            volume_liters = float(solution_result.volume_solution_cm3) / 1000.0
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if (
+            not np.isfinite(moles_solute)
+            or not np.isfinite(volume_liters)
+            or moles_solute < 0.0
+            or volume_liters <= 0.0
+        ):
+            return None
+        concentration = moles_solute / volume_liters
+        if not np.isfinite(concentration) or concentration < 0.0:
+            return None
+        return concentration
 
     @Slot(object)
     def _on_solution_scattering_estimate_calculated(
@@ -4081,6 +4903,49 @@ class SAXSMainWindow(QMainWindow):
                     "background parameter such as solv_w or solvent_scale."
                 )
 
+            molar_concentration_target = (
+                self._current_molar_concentration_target()
+            )
+            solute_molar_concentration = (
+                self._solute_molar_concentration_from_solution_result(
+                    estimate_payload.solution_result
+                )
+            )
+            if (
+                molar_concentration_target is not None
+                and solute_molar_concentration is not None
+            ):
+                self._apply_estimator_parameter_to_prefit(
+                    molar_concentration_target,
+                    solute_molar_concentration,
+                )
+                applied_notes.append(
+                    f"Applied {molar_concentration_target} = "
+                    f"{solute_molar_concentration:.6g} mol/L from the "
+                    "computed solute concentration."
+                )
+                log_lines.extend(
+                    [
+                        (
+                            "Solute molar concentration target: "
+                            f"{molar_concentration_target}"
+                        ),
+                        (
+                            "Computed solute concentration: "
+                            f"{solute_molar_concentration:.6g} mol/L"
+                        ),
+                    ]
+                )
+                preview_changed = True
+            elif molar_concentration_target is not None and hasattr(
+                widget, "append_application_note"
+            ):
+                cast(object, widget).append_application_note(
+                    "Calculated solution-scattering estimates, but the "
+                    f"{molar_concentration_target} target could not be "
+                    "populated from the solution composition."
+                )
+
             if applied_notes and hasattr(widget, "append_application_note"):
                 cast(object, widget).append_application_note(
                     "\n".join(applied_notes)
@@ -4157,6 +5022,7 @@ class SAXSMainWindow(QMainWindow):
         self.prefit_tab.populate_parameter_table(
             self.prefit_workflow.parameter_entries
         )
+        self._clear_prefit_fit_undo()
         self._set_prefit_sequence_baseline(
             self.prefit_workflow.parameter_entries
         )
@@ -4201,6 +5067,45 @@ class SAXSMainWindow(QMainWindow):
             self._restore_prefit_cluster_geometry_view_from_workflow()
             self._load_prefit_preview()
             self._show_error("Invalid cluster geometry radii", str(exc))
+
+    def _on_prefit_stoichiometry_compensator_settings_changed(
+        self,
+    ) -> None:
+        if self.current_settings is None:
+            return
+        template_name = (
+            self.prefit_workflow.template_spec.name
+            if self.prefit_workflow is not None
+            else self._active_template_name()
+        )
+        if not template_uses_stoichiometry_compensator(template_name):
+            return
+        elements_text, ratio_text, selected_names = (
+            self.prefit_tab.stoichiometry_compensator_settings()
+        )
+        settings = ProjectSettings.from_dict(self.current_settings.to_dict())
+        settings.stoichiometry_compensator_target_elements_text = elements_text
+        settings.stoichiometry_compensator_target_ratio_text = ratio_text
+        settings.stoichiometry_compensator_weight_names = list(selected_names)
+        if self.prefit_workflow is not None:
+            workflow_settings = self.prefit_workflow.settings
+            workflow_settings.stoichiometry_compensator_target_elements_text = (
+                elements_text
+            )
+            workflow_settings.stoichiometry_compensator_target_ratio_text = (
+                ratio_text
+            )
+            workflow_settings.stoichiometry_compensator_weight_names = list(
+                selected_names
+            )
+        self._save_settings(
+            settings,
+            status_message=(
+                "Project auto-saved after stoichiometry compensator update"
+            ),
+        )
+        self._invalidate_dream_workflow_cache()
+        self._load_prefit_preview()
 
     def _on_prefit_cluster_geometry_radii_type_changed(
         self,
@@ -4339,6 +5244,7 @@ class SAXSMainWindow(QMainWindow):
         self._maybe_append_scale_recommendation(
             self.prefit_workflow.parameter_entries
         )
+        self._sync_dream_fit_q_range_from_prefit()
         return evaluation
 
     def compute_prefit_cluster_geometry(self) -> None:
@@ -4493,6 +5399,130 @@ class SAXSMainWindow(QMainWindow):
             self._load_prefit_preview()
             self._show_error("Update cluster geometry failed", str(exc))
 
+    def _sync_prefit_fit_range_from_tab(
+        self,
+        entries: list[PrefitParameterEntry] | None = None,
+    ) -> tuple[float, float] | None:
+        if self.prefit_workflow is None:
+            return None
+        fit_q_min, fit_q_max = self.prefit_tab.fit_q_range()
+        if fit_q_min is None or fit_q_max is None:
+            return None
+        resolved = self.prefit_workflow.set_prefit_fit_q_range(
+            fit_q_min,
+            fit_q_max,
+            parameter_entries=entries,
+        )
+        if self.current_settings is not None:
+            self.current_settings.prefit_fit_q_min = (
+                self.prefit_workflow.settings.prefit_fit_q_min
+            )
+            self.current_settings.prefit_fit_q_max = (
+                self.prefit_workflow.settings.prefit_fit_q_max
+            )
+        self._sync_dream_fit_q_range_from_prefit()
+        return resolved
+
+    def _active_prefit_fit_q_range_for_dream(
+        self,
+    ) -> tuple[float, float, float | None, float | None] | None:
+        if self.prefit_workflow is None:
+            return None
+        try:
+            if self.prefit_tab.fit_q_min_spin.isEnabled():
+                fit_q_min, fit_q_max = self.prefit_tab.fit_q_range()
+                if fit_q_min is None or fit_q_max is None:
+                    return None
+                return (
+                    float(fit_q_min),
+                    float(fit_q_max),
+                    float(self.prefit_tab.fit_q_min_spin.minimum()),
+                    float(self.prefit_tab.fit_q_max_spin.maximum()),
+                )
+            entries = self.prefit_tab.parameter_entries()
+            model_q_min, model_q_max = (
+                self.prefit_workflow.active_model_q_bounds(entries)
+            )
+            fit_q_min = self.prefit_workflow.settings.prefit_fit_q_min
+            fit_q_max = self.prefit_workflow.settings.prefit_fit_q_max
+            return (
+                float(model_q_min if fit_q_min is None else fit_q_min),
+                float(model_q_max if fit_q_max is None else fit_q_max),
+                float(model_q_min),
+                float(model_q_max),
+            )
+        except Exception:
+            return None
+
+    def _sync_dream_fit_q_range_from_prefit(
+        self, *, force: bool = False
+    ) -> None:
+        if (
+            not force
+            and self.dream_tab.dream_fit_q_range_user_modified()
+            and self.dream_tab.dream_fit_q_range()[0] is not None
+        ):
+            return
+        active_range = self._active_prefit_fit_q_range_for_dream()
+        if active_range is None:
+            return
+        fit_q_min, fit_q_max, model_q_min, model_q_max = active_range
+        self.dream_tab.set_dream_fit_q_range(
+            fit_q_min=fit_q_min,
+            fit_q_max=fit_q_max,
+            model_q_min=model_q_min,
+            model_q_max=model_q_max,
+        )
+
+    def _apply_prefit_bounds_to_dream_fit_q_range(self) -> None:
+        active_range = self._active_prefit_fit_q_range_for_dream()
+        if active_range is None:
+            return
+        current_q_min, current_q_max = self.dream_tab.dream_fit_q_range()
+        if current_q_min is None or current_q_max is None:
+            return
+        _fit_q_min, _fit_q_max, model_q_min, model_q_max = active_range
+        self.dream_tab.set_dream_fit_q_range(
+            fit_q_min=current_q_min,
+            fit_q_max=current_q_max,
+            model_q_min=model_q_min,
+            model_q_max=model_q_max,
+            mark_user_modified=self.dream_tab.dream_fit_q_range_user_modified(),
+        )
+
+    def update_prefit_fit_range(self, q_min: float, q_max: float) -> None:
+        if self.prefit_workflow is None:
+            return
+        try:
+            entries = self.prefit_tab.parameter_entries()
+            fit_q_min, fit_q_max = self.prefit_workflow.set_prefit_fit_q_range(
+                q_min,
+                q_max,
+                parameter_entries=entries,
+            )
+            if self.current_settings is not None:
+                self.current_settings.prefit_fit_q_min = (
+                    self.prefit_workflow.settings.prefit_fit_q_min
+                )
+                self.current_settings.prefit_fit_q_max = (
+                    self.prefit_workflow.settings.prefit_fit_q_max
+                )
+            self.prefit_workflow.parameter_entries = entries
+            evaluation = self.prefit_workflow.evaluate(entries)
+            self.prefit_tab.plot_evaluation(evaluation)
+            self.prefit_tab.set_summary_text(
+                self._format_prefit_summary(evaluation)
+            )
+            self._update_prefit_stoichiometry_status()
+            self._invalidate_dream_workflow_cache()
+            self._sync_dream_fit_q_range_from_prefit(force=True)
+            self.statusBar().showMessage(
+                "Active Prefit range set to "
+                f"{fit_q_min:.6g} to {fit_q_max:.6g} A^-1"
+            )
+        except Exception as exc:
+            self._show_error("Update Prefit fit range failed", str(exc))
+
     def update_prefit_model(self) -> None:
         if self.prefit_workflow is None:
             self._show_error(
@@ -4511,6 +5541,7 @@ class SAXSMainWindow(QMainWindow):
                 self.prefit_tab.populate_parameter_table(entries)
             else:
                 entries = self.prefit_tab.parameter_entries()
+            self._sync_prefit_fit_range_from_tab(entries)
             self.prefit_workflow.parameter_entries = entries
             evaluation = self.prefit_workflow.evaluate(entries)
             self.prefit_tab.plot_evaluation(evaluation)
@@ -4603,6 +5634,7 @@ class SAXSMainWindow(QMainWindow):
                 trigger="run_prefit",
             )
             entries = self.prefit_tab.parameter_entries()
+            self._sync_prefit_fit_range_from_tab(entries)
             starting_entries = self._copy_prefit_entries(entries)
             varying_parameter_names = (
                 self.prefit_workflow.grid_searchable_parameter_names(entries)
@@ -4651,7 +5683,9 @@ class SAXSMainWindow(QMainWindow):
                 method=config.method,
                 max_nfev=config.max_nfev,
             )
+            raise_for_negative_prefit_r_squared(result.r_squared)
             self.prefit_tab.populate_parameter_table(result.parameter_entries)
+            self._set_prefit_fit_undo_entries(starting_entries)
             self._set_prefit_sequence_baseline(result.parameter_entries)
             self.prefit_tab.plot_evaluation(result.evaluation)
             self.prefit_tab.append_log(
@@ -4716,10 +5750,57 @@ class SAXSMainWindow(QMainWindow):
                 },
                 parameter_entries=result.parameter_entries,
             )
+            if result.report_path is not None:
+                self._touch_active_distribution_metadata(
+                    self.prefit_workflow.settings
+                )
             self._load_dream_workflow()
             self.statusBar().showMessage("Prefit complete")
         except Exception as exc:
             self._show_error("Prefit failed", str(exc))
+
+    def undo_prefit_fit_step(self) -> None:
+        if self.prefit_workflow is None:
+            self._show_error(
+                "Undo Prefit unavailable",
+                "Build a project and load its SAXS components first.",
+            )
+            return
+        if not self._prefit_fit_undo_entries:
+            self.statusBar().showMessage("No Prefit fit step to undo")
+            return
+        try:
+            self._flush_prefit_sequence_pending_manual_updates(
+                trigger="undo_prefit_fit",
+            )
+            restored_entries = self._copy_prefit_entries(
+                self._prefit_fit_undo_entries
+            )
+            self.prefit_workflow.parameter_entries = restored_entries
+            self.prefit_tab.populate_parameter_table(restored_entries)
+            self._set_prefit_sequence_baseline(restored_entries)
+            evaluation = self.prefit_workflow.evaluate(restored_entries)
+            self.prefit_tab.plot_evaluation(evaluation)
+            self.prefit_tab.set_summary_text(
+                self._format_prefit_summary(evaluation)
+            )
+            self._clear_prefit_fit_undo()
+            self.prefit_tab.append_log(
+                "Undid most recent Prefit run.\n"
+                "Restored the parameter table to the values from before the "
+                "last successful fit."
+            )
+            self._append_prefit_sequence_event(
+                "prefit_run_undone",
+                "Restored the parameter table from before the most recent "
+                "Prefit refinement.",
+                parameter_entries=restored_entries,
+            )
+            self._update_prefit_stoichiometry_status()
+            self._load_dream_workflow()
+            self.statusBar().showMessage("Prefit fit step undone")
+        except Exception as exc:
+            self._show_error("Undo Prefit failed", str(exc))
 
     def save_prefit(self) -> None:
         if self.prefit_workflow is None:
@@ -4740,6 +5821,7 @@ class SAXSMainWindow(QMainWindow):
                 trigger="save_prefit",
             )
             entries = self.prefit_tab.parameter_entries()
+            self._sync_prefit_fit_range_from_tab(entries)
             evaluation = self.prefit_workflow.evaluate(entries)
             config = self.prefit_tab.run_config()
             report_path = self.prefit_workflow.save_fit(
@@ -4783,6 +5865,9 @@ class SAXSMainWindow(QMainWindow):
             )
             self._set_prefit_sequence_baseline(entries)
             self._load_dream_workflow()
+            self._touch_active_distribution_metadata(
+                self.prefit_workflow.settings
+            )
             self.statusBar().showMessage("Prefit saved")
         except Exception as exc:
             self._show_error("Save fit failed", str(exc))
@@ -4802,6 +5887,7 @@ class SAXSMainWindow(QMainWindow):
             return
         try:
             entries = self.prefit_tab.parameter_entries()
+            self._sync_prefit_fit_range_from_tab(entries)
             evaluation = self.prefit_workflow.evaluate(entries)
             config = self.prefit_tab.run_config()
             metadata = self._build_prefit_plot_export_metadata(
@@ -4868,6 +5954,10 @@ class SAXSMainWindow(QMainWindow):
                     else np.full_like(evaluation.q_values, np.nan)
                 )
             )
+            columns.append("active_fit_region")
+            matrix_columns.append(
+                SAXSPrefitWorkflow.evaluation_fit_mask(evaluation).astype(int)
+            )
             matrix = np.column_stack(matrix_columns)
             if destination.suffix.lower() == ".csv":
                 self._write_prefit_plot_csv(
@@ -4901,9 +5991,11 @@ class SAXSMainWindow(QMainWindow):
         self.prefit_workflow.parameter_entries = (
             self.prefit_workflow.load_template_reset_entries()
         )
+        self._clear_prefit_fit_undo()
         self.prefit_tab.populate_parameter_table(
             self.prefit_workflow.parameter_entries
         )
+        self._clear_prefit_fit_undo()
         self._set_prefit_sequence_baseline(
             self.prefit_workflow.parameter_entries
         )
@@ -4965,6 +6057,7 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_workflow.parameter_entries = (
                 self.prefit_tab.parameter_entries()
             )
+            self._clear_prefit_fit_undo()
             self._set_prefit_sequence_baseline(
                 self.prefit_workflow.parameter_entries
             )
@@ -5026,6 +6119,9 @@ class SAXSMainWindow(QMainWindow):
                 parameter_entries=entries,
             )
             self._set_prefit_sequence_baseline(entries)
+            self._touch_active_distribution_metadata(
+                self.prefit_workflow.settings
+            )
             self.statusBar().showMessage(
                 "Best prefit preset saved"
                 + (
@@ -5054,6 +6150,7 @@ class SAXSMainWindow(QMainWindow):
                     "No Best Prefit preset is saved for the active template."
                 )
             self.prefit_workflow.parameter_entries = entries
+            self._clear_prefit_fit_undo()
             self.prefit_tab.populate_parameter_table(entries)
             self._set_prefit_sequence_baseline(entries)
             self.prefit_tab.append_log(
@@ -5103,9 +6200,22 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_workflow.restore_cluster_geometry_table(
                 saved_state.cluster_geometry_table
             )
+            self.prefit_workflow.set_prefit_fit_q_range(
+                saved_state.fit_q_min,
+                saved_state.fit_q_max,
+                parameter_entries=saved_state.parameter_entries,
+            )
+            if self.current_settings is not None:
+                self.current_settings.prefit_fit_q_min = (
+                    self.prefit_workflow.settings.prefit_fit_q_min
+                )
+                self.current_settings.prefit_fit_q_max = (
+                    self.prefit_workflow.settings.prefit_fit_q_max
+                )
             self.prefit_workflow.parameter_entries = (
                 saved_state.parameter_entries
             )
+            self._clear_prefit_fit_undo()
             self.prefit_tab.populate_parameter_table(
                 saved_state.parameter_entries
             )
@@ -5181,6 +6291,7 @@ class SAXSMainWindow(QMainWindow):
                 DreamTab.ACTIVE_SETTINGS_LABEL,
             )
             self.dream_tab.set_settings(settings, preset_name=None)
+            self._apply_prefit_bounds_to_dream_fit_q_range()
             self._current_dream_preset_name = None
             self.dream_tab.append_log(
                 "Saved DREAM settings.\n"
@@ -5192,6 +6303,7 @@ class SAXSMainWindow(QMainWindow):
                     else "no named preset created"
                 )
             )
+            self._touch_active_distribution_metadata(workflow.settings)
             self.statusBar().showMessage("DREAM settings saved")
         except Exception as exc:
             self._show_error("Save DREAM settings failed", str(exc))
@@ -5201,9 +6313,14 @@ class SAXSMainWindow(QMainWindow):
             workflow = self._load_dream_workflow()
             has_saved_parameter_map = workflow.parameter_map_path.is_file()
             entries = workflow.load_parameter_map(persist_if_missing=False)
+            default_entries = workflow.create_default_parameter_map(
+                persist=False
+            )
             if self.distribution_window is None:
                 self.distribution_window = DistributionSetupWindow(
-                    entries, self
+                    entries,
+                    self,
+                    default_entries=default_entries,
                 )
                 self.distribution_window.saved.connect(
                     self._save_distribution_entries
@@ -5211,6 +6328,7 @@ class SAXSMainWindow(QMainWindow):
             self.distribution_window.load_entries(
                 entries,
                 has_existing_parameter_map=has_saved_parameter_map,
+                default_entries=default_entries,
             )
             self.distribution_window.show()
             self.distribution_window.raise_()
@@ -5219,16 +6337,54 @@ class SAXSMainWindow(QMainWindow):
             self._show_error("Open priors failed", str(exc))
 
     def write_dream_bundle(self) -> None:
+        progress_total = 5
+        progress_started = False
         try:
+            progress_started = True
+            self._show_dream_progress_dialog(
+                "Preparing DREAM runtime bundle...",
+                total=progress_total,
+                unit_label="steps",
+                title="Writing DREAM Runtime Bundle",
+            )
+            self._update_dream_progress_dialog(
+                1,
+                progress_total,
+                "Loading DREAM workflow...",
+            )
             workflow = self._load_dream_workflow()
+            self._update_dream_progress_dialog(
+                2,
+                progress_total,
+                "Loading DREAM settings and prior map...",
+            )
             settings = self.dream_tab.settings_payload()
             if not settings.model_name:
                 settings.model_name = self.prefit_workflow.template_spec.name
             entries = workflow.load_parameter_map()
+            self._update_dream_progress_dialog(
+                3,
+                progress_total,
+                "Validating DREAM prior map and filter settings...",
+            )
+            self._validate_dream_stoichiometry_filter_settings(
+                settings,
+                entries=entries,
+            )
             self._append_dream_vary_recommendation(entries)
+            self._update_dream_progress_dialog(
+                4,
+                progress_total,
+                "Writing DREAM runtime bundle files...",
+            )
             bundle = workflow.create_runtime_bundle(
                 settings=settings,
                 entries=entries,
+            )
+            self._update_dream_progress_dialog(
+                5,
+                progress_total,
+                "Refreshing DREAM runtime state...",
             )
             self._last_written_dream_bundle = bundle
             self.dream_tab.append_log(
@@ -5243,6 +6399,9 @@ class SAXSMainWindow(QMainWindow):
             self.statusBar().showMessage("DREAM runtime bundle written")
         except Exception as exc:
             self._show_error("Write DREAM bundle failed", str(exc))
+        finally:
+            if progress_started:
+                self._close_dream_progress_dialog()
 
     def preview_dream_runtime_bundle(self) -> None:
         try:
@@ -5473,6 +6632,19 @@ class SAXSMainWindow(QMainWindow):
             if not settings.model_name:
                 settings.model_name = self.prefit_workflow.template_spec.name
             entries = workflow.load_parameter_map()
+            try:
+                self._validate_dream_stoichiometry_filter_settings(
+                    settings,
+                    entries=entries,
+                )
+            except ValueError as exc:
+                message = str(exc)
+                self.dream_tab.append_log("Run DREAM blocked.\n" + message)
+                self._show_error("Stoichiometry filter incomplete", message)
+                self.statusBar().showMessage(
+                    "Complete the stoichiometry filter before running DREAM"
+                )
+                return
             if not self._dream_parameter_map_saved_in_session:
                 self.dream_tab.blink_edit_priors_button()
                 self.dream_tab.append_log(
@@ -5517,6 +6689,63 @@ class SAXSMainWindow(QMainWindow):
             self._start_dream_run_task(bundle, settings)
         except Exception as exc:
             self._show_error("Run DREAM failed", str(exc))
+
+    @staticmethod
+    def _validate_dream_stoichiometry_filter_settings(
+        settings: DreamRunSettings,
+        *,
+        entries: list[DreamParameterEntry] | None = None,
+    ) -> None:
+        if not settings.stoichiometry_filter_enabled:
+            return
+        try:
+            target = build_stoichiometry_target(
+                settings.stoichiometry_target_elements_text,
+                settings.stoichiometry_target_ratio_text,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "Stoichiometry filter is enabled, but the target is invalid. "
+                f"{exc}"
+            ) from exc
+        if target is None:
+            raise ValueError(
+                "Stoichiometry filter is enabled. Enter both target elements "
+                "and a target ratio before running DREAM."
+            )
+        tolerance = float(settings.stoichiometry_tolerance_percent)
+        if not np.isfinite(tolerance) or tolerance < 0.0:
+            raise ValueError(
+                "Stoichiometry filter tolerance must be a finite "
+                "non-negative percentage."
+            )
+        if entries is None:
+            return
+        weight_entries = [
+            entry
+            for entry in entries
+            if str(entry.param).startswith("w")
+            and str(entry.structure).strip()
+        ]
+        if not weight_entries:
+            raise ValueError(
+                "Stoichiometry filtering requires DREAM weight entries with "
+                "structure labels."
+            )
+        available_elements: set[str] = set()
+        for entry in weight_entries:
+            available_elements.update(parse_stoich_label(entry.structure))
+        missing_elements = [
+            element
+            for element in target.elements
+            if element not in available_elements
+        ]
+        if missing_elements:
+            raise ValueError(
+                "Stoichiometry target element(s) "
+                f"{', '.join(missing_elements)} do not appear in the DREAM "
+                "weight structure labels."
+            )
 
     def load_latest_results(self) -> None:
         try:
@@ -5624,6 +6853,10 @@ class SAXSMainWindow(QMainWindow):
                 if isinstance(entry, dict)
             ]
         self.dream_tab.set_parameter_map_entries(parameter_map_entries)
+        self.dream_tab.set_violin_parameter_options(
+            self._last_results_loader.selectable_additional_parameter_names(),
+            selected_parameter=display_settings.violin_selected_parameter,
+        )
         self._loaded_dream_run_dir = selected_run_dir
         self._refresh_saved_dream_runs(selected_run_dir=selected_run_dir)
         self._refresh_loaded_dream_results()
@@ -6033,6 +7266,7 @@ class SAXSMainWindow(QMainWindow):
             mode=self._effective_dream_violin_mode(settings),
             sample_source=settings.violin_sample_source,
             weight_order=settings.violin_weight_order,
+            selected_parameter=settings.violin_selected_parameter,
             **filter_kwargs,
         )
         plot_payload = self.dream_tab.prepare_violin_plot_payload(
@@ -6045,11 +7279,34 @@ class SAXSMainWindow(QMainWindow):
         self, summary: object
     ) -> list[dict[str, object]]:
         rows: list[dict[str, object]] = []
+        prior_lookup = self._dream_parameter_entry_lookup_for_report()
         for index, name in enumerate(summary.full_parameter_names):
+            prior_entry = prior_lookup.get(str(name))
+            guide_low = None
+            guide_high = None
+            guide_kind = "Unavailable"
+            clip_status = ""
+            if prior_entry is not None:
+                guide_low, guide_high, guide_kind = distribution_guide_bounds(
+                    prior_entry
+                )
+                clip_status = guide_clip_status(
+                    summary.bestfit_params[index],
+                    guide_low,
+                    guide_high,
+                )
             rows.append(
                 {
                     "name": str(name),
                     "selected_value": float(summary.bestfit_params[index]),
+                    "guide_low": (
+                        None if guide_low is None else float(guide_low)
+                    ),
+                    "guide_high": (
+                        None if guide_high is None else float(guide_high)
+                    ),
+                    "guide_kind": guide_kind,
+                    "guide_clip_status": clip_status,
                     "map_value": float(summary.map_params[index]),
                     "chain_mean_value": float(
                         summary.chain_mean_params[index]
@@ -6064,6 +7321,21 @@ class SAXSMainWindow(QMainWindow):
                 }
             )
         return rows
+
+    def _dream_parameter_entry_lookup_for_report(
+        self,
+    ) -> dict[str, DreamParameterEntry]:
+        if self._last_results_loader is None:
+            return {}
+        lookup: dict[str, DreamParameterEntry] = {}
+        for entry in self._last_results_loader.parameter_map_entries:
+            if not isinstance(entry, dict):
+                continue
+            parameter_entry = DreamParameterEntry.from_dict(dict(entry))
+            name = str(parameter_entry.param).strip()
+            if name and name not in lookup:
+                lookup[name] = parameter_entry
+        return lookup
 
     def _dream_screening_metrics_payload(
         self,
@@ -6190,6 +7462,50 @@ class SAXSMainWindow(QMainWindow):
             "parameter_summary": self._dream_parameter_summary_rows(summary),
         }
 
+    def _dream_search_preset_text_for_report(
+        self,
+        settings: DreamRunSettings,
+    ) -> str:
+        if self._last_results_loader is not None:
+            return self._last_results_loader.dream_search_preset_text()
+        return format_dream_search_filter_preset(settings.search_filter_preset)
+
+    def _dream_prior_preset_summary_text_for_report(self) -> str:
+        if self._last_results_loader is None:
+            return "Unavailable"
+        return format_prior_preset_summary(
+            self._last_results_loader.parameter_map_entries
+        )
+
+    def _dream_preset_summary_payload(
+        self,
+        settings: DreamRunSettings,
+    ) -> dict[str, object]:
+        if self._last_results_loader is not None:
+            search_preset = (
+                str(self._last_results_loader.search_filter_preset)
+                if self._last_results_loader.search_filter_preset_recorded
+                else ""
+            )
+            search_preset_text = (
+                self._last_results_loader.dream_search_preset_text()
+            )
+            prior_entries = self._last_results_loader.parameter_map_entries
+        else:
+            search_preset = str(settings.search_filter_preset)
+            search_preset_text = format_dream_search_filter_preset(
+                search_preset
+            )
+            prior_entries = []
+        return {
+            "dream_search_preset": search_preset,
+            "dream_search_preset_text": search_preset_text,
+            "prior_preset_summary": format_prior_preset_summary(prior_entries),
+            "prior_preset_statuses": prior_preset_status_summary(
+                prior_entries
+            ),
+        }
+
     def _dream_export_metadata_payload(
         self,
         *,
@@ -6219,6 +7535,7 @@ class SAXSMainWindow(QMainWindow):
             ),
             "data_files": [str(path) for path in data_paths],
             "dream_settings": settings.to_dict(),
+            "preset_summary": self._dream_preset_summary_payload(settings),
             "screening_metrics": self._dream_screening_metrics_payload(
                 settings,
                 summary,
@@ -6226,10 +7543,36 @@ class SAXSMainWindow(QMainWindow):
             "summary": self._dream_summary_payload(summary),
         }
         if model_plot is not None:
+            active_fit_mask = getattr(model_plot, "active_fit_mask", None)
+            fit_q_bounds = dream_fit_q_bounds(
+                model_plot.q_values,
+                active_fit_mask,
+            )
+            output_q_bounds = dream_output_q_bounds(model_plot.q_values)
+            fit_point_count = None
+            if active_fit_mask is not None:
+                mask = np.asarray(active_fit_mask, dtype=bool)
+                if mask.shape == np.asarray(model_plot.q_values).shape:
+                    fit_point_count = int(np.count_nonzero(mask))
             metadata["model_fit"] = {
                 "template_name": str(model_plot.template_name),
                 "bestfit_method": str(model_plot.bestfit_method),
                 "point_count": int(np.asarray(model_plot.q_values).size),
+                "fit_point_count": fit_point_count,
+                "fit_q_min": (
+                    None if fit_q_bounds is None else fit_q_bounds[0]
+                ),
+                "fit_q_max": (
+                    None if fit_q_bounds is None else fit_q_bounds[1]
+                ),
+                "fit_q_range": format_dream_q_bounds(fit_q_bounds),
+                "output_q_min": (
+                    None if output_q_bounds is None else output_q_bounds[0]
+                ),
+                "output_q_max": (
+                    None if output_q_bounds is None else output_q_bounds[1]
+                ),
+                "output_q_range": format_dream_q_bounds(output_q_bounds),
                 "includes_solvent_contribution": bool(
                     model_plot.solvent_contribution is not None
                 ),
@@ -6328,6 +7671,20 @@ class SAXSMainWindow(QMainWindow):
             ]
         )
         if model_plot is not None:
+            active_fit_mask = getattr(model_plot, "active_fit_mask", None)
+            fit_q_bounds = dream_fit_q_bounds(
+                model_plot.q_values,
+                active_fit_mask,
+            )
+            output_q_bounds = dream_output_q_bounds(model_plot.q_values)
+            fit_point_line = None
+            if active_fit_mask is not None:
+                mask = np.asarray(active_fit_mask, dtype=bool)
+                if mask.shape == np.asarray(model_plot.q_values).shape:
+                    fit_point_line = (
+                        f"  Fit points: {int(np.count_nonzero(mask))} / "
+                        f"{int(mask.size)}"
+                    )
             lines.extend(
                 [
                     "",
@@ -6338,8 +7695,18 @@ class SAXSMainWindow(QMainWindow):
                         f"{model_plot.mean_abs_residual:.6g}"
                     ),
                     f"  R^2: {model_plot.r_squared:.6g}",
+                    (
+                        "  Fit q-range: "
+                        f"{format_dream_q_bounds(fit_q_bounds)}"
+                    ),
+                    (
+                        "  Output q-range: "
+                        f"{format_dream_q_bounds(output_q_bounds)}"
+                    ),
                 ]
             )
+            if fit_point_line is not None:
+                lines.append(fit_point_line)
         if violin_plot is not None:
             lines.extend(
                 [
@@ -6443,6 +7810,19 @@ class SAXSMainWindow(QMainWindow):
                 dtype=float,
             )
         )
+        active_fit_region = (
+            np.asarray(model_plot.active_fit_mask, dtype=int)
+            if getattr(model_plot, "active_fit_mask", None) is not None
+            else np.ones_like(
+                np.asarray(model_plot.q_values, dtype=float),
+                dtype=int,
+            )
+        )
+        if active_fit_region.shape != np.asarray(model_plot.q_values).shape:
+            active_fit_region = np.ones_like(
+                np.asarray(model_plot.q_values, dtype=float),
+                dtype=int,
+            )
         np.savetxt(
             output_path,
             np.column_stack(
@@ -6452,12 +7832,13 @@ class SAXSMainWindow(QMainWindow):
                     model_plot.model_intensities,
                     solvent_contribution,
                     structure_factor,
+                    active_fit_region,
                 ]
             ),
             delimiter=",",
             header=(
                 "q,experimental_intensity,model_intensity,"
-                "solvent_contribution,structure_factor"
+                "solvent_contribution,structure_factor,active_fit_region"
             ),
             comments="",
         )
@@ -6883,6 +8264,11 @@ class SAXSMainWindow(QMainWindow):
                 model_plot.structure_factor_trace is not None
             ),
         )
+        dream_fit_bounds = dream_fit_q_bounds(
+            model_plot.q_values,
+            model_plot.active_fit_mask,
+        )
+        dream_output_bounds = dream_output_q_bounds(model_plot.q_values)
         output_summary_lines = [
             f"Report file: {output_path}",
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
@@ -6896,6 +8282,8 @@ class SAXSMainWindow(QMainWindow):
             f"DREAM RMSE: {model_plot.rmse:.6g}",
             f"DREAM Mean |res|: {model_plot.mean_abs_residual:.6g}",
             f"DREAM R^2: {model_plot.r_squared:.6g}",
+            f"Fit q-range: {format_dream_q_bounds(dream_fit_bounds)}",
+            f"Output q-range: {format_dream_q_bounds(dream_output_bounds)}",
         ]
         if (
             prefit_evaluation is not None
@@ -7575,6 +8963,9 @@ class SAXSMainWindow(QMainWindow):
                 mode=self._effective_dream_violin_mode(candidate_settings),
                 sample_source=candidate_settings.violin_sample_source,
                 weight_order=candidate_settings.violin_weight_order,
+                selected_parameter=(
+                    candidate_settings.violin_selected_parameter
+                ),
                 **filter_kwargs,
             )
             weights_violin_plot = self._last_results_loader.build_violin_data(
@@ -7654,7 +9045,14 @@ class SAXSMainWindow(QMainWindow):
 
     @staticmethod
     def _effective_dream_violin_mode(settings: DreamRunSettings) -> str:
-        if settings.violin_value_scale_mode == "weights_unit_interval":
+        if settings.violin_parameter_mode == "selected_additional_parameter":
+            return "selected_additional_parameter"
+        if settings.violin_value_scale_mode in {
+            "weights_unit_interval",
+            "structure_fraction_percent",
+            "atom_fraction_percent",
+            "total_atom_fraction_percent",
+        }:
             return "weights_only"
         if settings.violin_value_scale_mode == "normalized_all":
             return "all_parameters"
@@ -7881,6 +9279,8 @@ class SAXSMainWindow(QMainWindow):
         max_nfev: int,
     ) -> dict[str, object]:
         q_values = np.asarray(evaluation.q_values, dtype=float)
+        fit_mask = SAXSPrefitWorkflow.evaluation_fit_mask(evaluation)
+        fit_q_values = q_values[fit_mask]
         fit_metrics: dict[str, object]
         if (
             evaluation.residuals is None
@@ -7896,31 +9296,48 @@ class SAXSMainWindow(QMainWindow):
             }
         else:
             residuals = np.asarray(evaluation.residuals, dtype=float)
-            chi_square = float(np.sum(residuals**2))
-            dof = max(
-                len(q_values) - sum(1 for entry in entries if entry.vary),
-                1,
-            )
-            reduced_chi_square = chi_square / dof
             experimental = np.asarray(
                 evaluation.experimental_intensities,
                 dtype=float,
             )
-            ss_total = float(
-                np.sum((experimental - np.mean(experimental)) ** 2)
+            finite_mask = (
+                fit_mask & np.isfinite(residuals) & np.isfinite(experimental)
             )
-            fit_metrics = {
-                "mode": "fit",
-                "chi_square": chi_square,
-                "reduced_chi_square": reduced_chi_square,
-                "r_squared": (
-                    1.0 - chi_square / ss_total
-                    if ss_total > 0.0
-                    else float("nan")
-                ),
-                "residual_rms": float(np.sqrt(np.mean(residuals**2))),
-                "mean_absolute_residual": float(np.mean(np.abs(residuals))),
-            }
+            residuals = residuals[finite_mask]
+            experimental = experimental[finite_mask]
+            if residuals.size == 0:
+                fit_metrics = {
+                    "mode": "fit",
+                    "chi_square": None,
+                    "reduced_chi_square": None,
+                    "r_squared": None,
+                    "residual_rms": None,
+                    "mean_absolute_residual": None,
+                }
+            else:
+                chi_square = float(np.sum(residuals**2))
+                dof = max(
+                    len(residuals) - sum(1 for entry in entries if entry.vary),
+                    1,
+                )
+                reduced_chi_square = chi_square / dof
+                ss_total = float(
+                    np.sum((experimental - np.mean(experimental)) ** 2)
+                )
+                fit_metrics = {
+                    "mode": "fit",
+                    "chi_square": chi_square,
+                    "reduced_chi_square": reduced_chi_square,
+                    "r_squared": (
+                        1.0 - chi_square / ss_total
+                        if ss_total > 0.0
+                        else float("nan")
+                    ),
+                    "residual_rms": float(np.sqrt(np.mean(residuals**2))),
+                    "mean_absolute_residual": float(
+                        np.mean(np.abs(residuals))
+                    ),
+                }
         return {
             "exported_at": datetime.now().isoformat(),
             "project_dir": str(self.current_settings.project_dir),
@@ -7940,6 +9357,17 @@ class SAXSMainWindow(QMainWindow):
                 "point_count": int(len(q_values)),
                 "q_min": float(np.min(q_values)) if len(q_values) else None,
                 "q_max": float(np.max(q_values)) if len(q_values) else None,
+                "fit_point_count": int(len(fit_q_values)),
+                "fit_q_min": (
+                    None
+                    if evaluation.fit_q_min is None
+                    else float(evaluation.fit_q_min)
+                ),
+                "fit_q_max": (
+                    None
+                    if evaluation.fit_q_max is None
+                    else float(evaluation.fit_q_max)
+                ),
                 "includes_structure_factor": bool(
                     evaluation.structure_factor_trace is not None
                 ),
@@ -8194,6 +9622,7 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_workflow.parameter_entries
         )
         self._refresh_prefit_volume_fraction_section()
+        self._refresh_prefit_stoichiometry_compensator_section()
         self._refresh_prefit_cluster_geometry_section()
         if payload.evaluation is None:
             self.prefit_tab.plot_evaluation(None)
@@ -8293,6 +9722,7 @@ class SAXSMainWindow(QMainWindow):
             dream_count = self._distribution_dream_run_count(
                 record.distribution_dir
             )
+            display_label = self._distribution_attempt_label(record)
             readiness = []
             if record.component_artifacts_ready:
                 readiness.append("components")
@@ -8305,12 +9735,12 @@ class SAXSMainWindow(QMainWindow):
             )
             labels.append(
                 (
-                    f"{record.label}{readiness_text} | "
+                    f"{display_label}{readiness_text} | "
                     f"{self._distribution_dream_fit_text(dream_count)}",
                     record.distribution_id,
                 )
             )
-            active_distribution_labels[record.distribution_id] = record.label
+            active_distribution_labels[record.distribution_id] = display_label
             tooltips[record.distribution_id] = (
                 self._distribution_tooltip_for_record(record)
             )
@@ -8367,6 +9797,15 @@ class SAXSMainWindow(QMainWindow):
     def _distribution_time_text(value: str | None) -> str:
         text = str(value or "").strip()
         return text or "Unavailable"
+
+    def _distribution_attempt_label(self, record) -> str:
+        if record.attempt_index is None:
+            return record.label
+        created_text = self._distribution_time_text(record.created_at)
+        return (
+            f"Attempt {int(record.attempt_index):03d} | "
+            f"{created_text} | {record.label}"
+        )
 
     @staticmethod
     def _distribution_dream_fit_text(dream_count: int) -> str:
@@ -8441,8 +9880,14 @@ class SAXSMainWindow(QMainWindow):
         )
         return "\n".join(
             [
-                record.label,
+                self._distribution_attempt_label(record),
                 f"Distribution ID: {record.distribution_id}",
+                "Attempt index: "
+                + (
+                    str(record.attempt_index)
+                    if record.attempt_index is not None
+                    else "Legacy/deterministic"
+                ),
                 "Build mode: "
                 + component_build_mode_label(record.component_build_mode),
                 "Component source preference: "
@@ -8479,6 +9924,14 @@ class SAXSMainWindow(QMainWindow):
         return "\n".join(
             [
                 f"Distribution ID: {record.distribution_id}",
+                "Base distribution ID: "
+                + str(record.base_distribution_id or "Unavailable"),
+                "Attempt index: "
+                + (
+                    str(record.attempt_index)
+                    if record.attempt_index is not None
+                    else "Legacy/deterministic"
+                ),
                 "Template: " + str(record.template_name or "Unspecified"),
                 "Build mode: "
                 + component_build_mode_label(record.component_build_mode),
@@ -8691,7 +10144,19 @@ class SAXSMainWindow(QMainWindow):
             settings.use_representative_structures = bool(enabled)
             self._save_settings(settings)
             self.current_settings = settings
-            self._apply_project_settings(settings)
+            if enabled:
+                self._apply_project_settings_with_progress_popup(
+                    settings,
+                    title="Using Representative Structures",
+                    start_message=(
+                        "Switching to Representative Structures..."
+                    ),
+                    finished_message=(
+                        "Representative Structures mode enabled."
+                    ),
+                )
+            else:
+                self._apply_project_settings(settings)
             self.statusBar().showMessage(
                 "Use Representative Structures enabled"
                 if enabled
@@ -8731,27 +10196,228 @@ class SAXSMainWindow(QMainWindow):
     def _load_saved_distribution(self, distribution_id: str) -> None:
         if self.current_settings is None:
             return
+        distribution_id = str(distribution_id).strip()
+        if not distribution_id:
+            return
+        processed_steps = 0
+
+        def advance_step(
+            message: str,
+            *,
+            log_message: str | None = None,
+        ) -> None:
+            nonlocal processed_steps
+            processed_steps = min(
+                processed_steps + 1,
+                DISTRIBUTION_LOAD_TOTAL_STEPS,
+            )
+            self._update_project_load_progress(
+                processed_steps,
+                DISTRIBUTION_LOAD_TOTAL_STEPS,
+                message,
+                log_message=log_message,
+            )
+
+        cursor_set = False
+        self.project_setup_tab.start_activity_progress(
+            DISTRIBUTION_LOAD_TOTAL_STEPS,
+            "Loading computed distribution...",
+            unit_label="steps",
+        )
+        self._show_progress_dialog(
+            DISTRIBUTION_LOAD_TOTAL_STEPS,
+            "Loading computed distribution...",
+            unit_label="steps",
+            title="Loading Computed Distribution",
+        )
+        QApplication.processEvents()
         try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            cursor_set = True
+            self._save_active_distribution_fit_settings()
+            advance_step(
+                "Reading computed distribution metadata...",
+                log_message=(
+                    "Reading saved computed distribution metadata for "
+                    f"{distribution_id}."
+                ),
+            )
             record = self.project_manager.load_saved_distribution(
                 self.current_settings.project_dir,
                 distribution_id,
+            )
+            advance_step(
+                "Applying computed distribution settings...",
+                log_message=f"Loading computed distribution: {record.label}",
             )
             settings = self.project_manager.settings_for_saved_distribution(
                 self.current_settings.project_dir,
                 distribution_id,
                 base_settings=self._settings_from_project_tab(),
             )
+            advance_step(
+                "Saving active computed distribution...",
+                log_message=(
+                    "Saving the active computed distribution selection to "
+                    "the project file."
+                ),
+            )
             self._save_settings(settings)
-            self.current_settings = settings
-            self._apply_project_settings(settings)
-            self.project_setup_tab.append_summary(
+            payload = self._prepare_project_load_payload(
+                Path(settings.project_dir).expanduser().resolve(),
+                selected_dream_preset=(
+                    self.dream_tab.selected_settings_preset_name()
+                ),
+                progress_callback=lambda _message: None,
+                progress_offset=DISTRIBUTION_LOAD_LOCAL_STEPS,
+                progress_total_steps=DISTRIBUTION_LOAD_TOTAL_STEPS,
+            )
+            processed_steps = DISTRIBUTION_LOAD_PREP_STEPS
+            self._last_solution_scattering_estimate = None
+            self.current_settings = payload.settings
+            self._apply_project_settings(
+                payload.settings,
+                progress_callback=lambda message: advance_step(message),
+                log_callback=self._append_project_load_output,
+                prefit_payload=payload.prefit,
+                dream_payload=payload.dream,
+            )
+            self._append_project_load_output(
                 "Loaded computed distribution.\n"
                 f"Distribution: {record.label}\n"
                 f"Folder: {record.distribution_dir}"
             )
+            for message in payload.warnings:
+                self._append_project_load_output(message)
+            self.project_setup_tab.finish_activity_progress(
+                "Computed distribution loaded."
+            )
             self.statusBar().showMessage("Computed distribution loaded")
         except Exception as exc:
+            self.project_setup_tab.finish_activity_progress(
+                "Computed distribution load failed."
+            )
+            if cursor_set:
+                QApplication.restoreOverrideCursor()
+                cursor_set = False
             self._show_error("Load distribution failed", str(exc))
+        finally:
+            if cursor_set:
+                QApplication.restoreOverrideCursor()
+            self._close_progress_dialog()
+
+    @Slot(str)
+    def _duplicate_saved_distribution(self, distribution_id: str) -> None:
+        if self.current_settings is None:
+            return
+        distribution_id = str(distribution_id).strip()
+        if not distribution_id:
+            return
+        try:
+            self._save_active_distribution_fit_settings()
+            source_record = self.project_manager.load_saved_distribution(
+                self.current_settings.project_dir,
+                distribution_id,
+            )
+            base_settings = self._settings_from_project_tab()
+            new_record = self.project_manager.duplicate_saved_distribution(
+                self.current_settings.project_dir,
+                distribution_id,
+                base_settings=base_settings,
+            )
+            settings = self.project_manager.settings_for_saved_distribution(
+                self.current_settings.project_dir,
+                new_record.distribution_id,
+                base_settings=base_settings,
+            )
+            self._save_settings(
+                settings,
+                status_message=(
+                    "Project auto-saved after duplicating the computed "
+                    "distribution"
+                ),
+            )
+            self.current_settings = settings
+            self._apply_project_settings_with_progress_popup(
+                settings,
+                title="Duplicating Computed Distribution",
+                start_message="Loading duplicated computed distribution...",
+                finished_message="Duplicated computed distribution loaded.",
+            )
+            self.project_setup_tab.append_summary(
+                "Duplicated computed distribution settings.\n"
+                f"Source: {self._distribution_attempt_label(source_record)}\n"
+                f"New attempt: {self._distribution_attempt_label(new_record)}\n"
+                f"Folder: {new_record.distribution_dir}"
+            )
+            self.statusBar().showMessage("Computed distribution duplicated")
+        except Exception as exc:
+            self._show_error("Duplicate distribution failed", str(exc))
+
+    @Slot(str)
+    def _delete_saved_distribution(self, distribution_id: str) -> None:
+        if self.current_settings is None:
+            return
+        distribution_id = str(distribution_id).strip()
+        if not distribution_id:
+            return
+        try:
+            record = self.project_manager.load_saved_distribution(
+                self.current_settings.project_dir,
+                distribution_id,
+            )
+        except Exception as exc:
+            self._show_error("Delete distribution failed", str(exc))
+            return
+        response = QMessageBox.question(
+            self,
+            "Delete Computed Distribution?",
+            (
+                "Delete this computed distribution and its saved components, "
+                "prior weights, prefits, and DREAM fits?\n\n"
+                f"{self._distribution_attempt_label(record)}"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if response != QMessageBox.StandardButton.Yes:
+            return
+        current_artifact_paths = project_artifact_paths(
+            self.current_settings,
+        )
+        was_active = (
+            str(self.current_settings.active_distribution_id or "").strip()
+            == distribution_id
+            or str(current_artifact_paths.distribution_id or "").strip()
+            == distribution_id
+        )
+        try:
+            self.project_manager.delete_saved_distribution(
+                self.current_settings.project_dir,
+                distribution_id,
+            )
+            self.project_setup_tab.append_summary(
+                "Deleted computed distribution.\n"
+                f"Distribution: {self._distribution_attempt_label(record)}"
+            )
+            if was_active:
+                settings = self._settings_from_project_tab()
+                settings.active_distribution_id = None
+                self.project_manager.clear_distribution_fit_state(settings)
+                self._save_settings(
+                    settings,
+                    status_message=(
+                        "Project auto-saved after deleting the active "
+                        "computed distribution"
+                    ),
+                )
+                self.current_settings = settings
+                self._apply_project_settings(settings)
+            else:
+                self._refresh_saved_distributions(self.current_settings)
+            self.statusBar().showMessage("Computed distribution deleted")
+        except Exception as exc:
+            self._show_error("Delete distribution failed", str(exc))
 
     def _settings_from_project_tab(self) -> ProjectSettings:
         project_dir = self.project_setup_tab.project_dir()
@@ -8906,6 +10572,7 @@ class SAXSMainWindow(QMainWindow):
             self.prefit_workflow.parameter_entries
         )
         self._refresh_prefit_volume_fraction_section()
+        self._refresh_prefit_stoichiometry_compensator_section()
         self._refresh_prefit_cluster_geometry_section()
         self._load_prefit_preview()
         self.prefit_tab.set_log_text(self._format_prefit_console_intro())
@@ -8956,6 +10623,9 @@ class SAXSMainWindow(QMainWindow):
         solvent_weight_target = self._solvent_weight_target_for_template_spec(
             template_spec
         )
+        molar_concentration_target = (
+            self._molar_concentration_target_for_template_spec(template_spec)
+        )
         self.prefit_tab.set_solute_volume_fraction_visible(
             template_spec is not None
         )
@@ -8965,13 +10635,19 @@ class SAXSMainWindow(QMainWindow):
                 None,
                 "saxs_effective",
                 solvent_weight_target,
+                molar_concentration_target,
             )
         else:
             self.prefit_tab.set_solute_volume_fraction_target(
                 *target,
                 solvent_weight_target,
+                molar_concentration_target,
             )
         self._sync_solution_scattering_tool_targets()
+        self.prefit_tab.set_stoichiometry_compensator_visible(
+            template_uses_stoichiometry_compensator(selected_template)
+        )
+        self._refresh_prefit_stoichiometry_compensator_section()
         supports_cluster_geometry = bool(
             template_spec is not None
             and template_spec.cluster_geometry_support.supported
@@ -9037,6 +10713,25 @@ class SAXSMainWindow(QMainWindow):
                 return candidate
         return None
 
+    @staticmethod
+    def _molar_concentration_target_for_template_spec(
+        template_spec,
+    ) -> str | None:
+        if template_spec is None:
+            return None
+        support = template_spec.solution_scattering_support
+        if support.molar_concentration_parameter is not None:
+            return support.molar_concentration_parameter
+        parameter_names = {
+            str(parameter.name).strip()
+            for parameter in template_spec.parameters
+            if str(parameter.name).strip()
+        }
+        for candidate in MOLAR_CONCENTRATION_PARAMETER_NAMES:
+            if candidate in parameter_names:
+                return candidate
+        return None
+
     def _load_dream_workflow(self) -> SAXSDreamWorkflow:
         if self.current_settings is None:
             raise ValueError("No project is currently loaded.")
@@ -9074,8 +10769,12 @@ class SAXSMainWindow(QMainWindow):
                 selected_preset
             )
             self.dream_tab.set_settings(settings, preset_name=selected_preset)
+            if settings.fit_q_min is None or settings.fit_q_max is None:
+                self._sync_dream_fit_q_range_from_prefit()
+            else:
+                self._apply_prefit_bounds_to_dream_fit_q_range()
             self._active_dream_settings_snapshot = self._copy_dream_settings(
-                settings
+                self.dream_tab.settings_payload()
             )
             self._current_dream_preset_name = selected_preset
             try:
@@ -9102,53 +10801,143 @@ class SAXSMainWindow(QMainWindow):
         self._refresh_saved_dream_runs()
         return self.dream_workflow
 
+    def _dream_saved_run_record_for_dir(
+        self,
+        run_dir: str | Path,
+        *,
+        batch_label: str | None = None,
+    ) -> DreamSavedRunRecord | None:
+        resolved_run_dir = Path(run_dir).expanduser().resolve()
+        if not (
+            (resolved_run_dir / "dream_sampled_params.npy").is_file()
+            and (resolved_run_dir / "dream_log_ps.npy").is_file()
+        ):
+            return None
+        try:
+            settings = self._load_saved_dream_run_settings(resolved_run_dir)
+        except Exception:
+            settings = DreamRunSettings()
+        label_parts = [resolved_run_dir.name]
+        batch_text = str(batch_label or "").strip()
+        if batch_text:
+            label_parts.append(f"Batch: {batch_text}")
+        if (
+            settings.run_label.strip()
+            and settings.run_label.strip() != "dream"
+        ):
+            label_parts.append(settings.run_label.strip())
+        if settings.model_name:
+            label_parts.append(settings.model_name)
+        label_parts.append(
+            f"{settings.nchains} chains x {settings.niterations} iter"
+        )
+        return DreamSavedRunRecord(
+            run_dir=resolved_run_dir,
+            display_label=" | ".join(label_parts),
+        )
+
+    @staticmethod
+    def _dream_run_is_inside_runtime_dir(
+        run_dir: Path,
+        runtime_dir: Path,
+    ) -> bool:
+        try:
+            run_dir.resolve().relative_to(runtime_dir.resolve())
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
+    def _saved_dream_runs_signature(
+        records: list[DreamSavedRunRecord],
+    ) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            (str(record.run_dir.resolve()), record.display_label)
+            for record in records
+        )
+
     def _list_saved_dream_runs(self) -> list[DreamSavedRunRecord]:
         if self.current_settings is None:
             return []
-        runtime_dir = project_artifact_paths(
-            self.current_settings
-        ).dream_runtime_dir
-        if not runtime_dir.is_dir():
-            return []
-        records: list[DreamSavedRunRecord] = []
-        run_dirs = sorted(
-            runtime_dir.glob("dream_*"), key=lambda path: path.name
+        artifact_paths = project_artifact_paths(self.current_settings)
+        runtime_dir = artifact_paths.dream_runtime_dir
+        records_by_dir: dict[Path, DreamSavedRunRecord] = {}
+        run_dirs = (
+            sorted(runtime_dir.glob("dream_*"), key=lambda path: path.name)
+            if runtime_dir.is_dir()
+            else []
         )
         for run_dir in reversed(run_dirs):
-            if not (
-                (run_dir / "dream_sampled_params.npy").is_file()
-                and (run_dir / "dream_log_ps.npy").is_file()
-            ):
+            record = self._dream_saved_run_record_for_dir(run_dir)
+            if record is None:
                 continue
-            try:
-                settings = self._load_saved_dream_run_settings(run_dir)
-            except Exception:
-                settings = DreamRunSettings()
-            label_parts = [run_dir.name]
-            if (
-                settings.run_label.strip()
-                and settings.run_label.strip() != "dream"
-            ):
-                label_parts.append(settings.run_label.strip())
-            if settings.model_name:
-                label_parts.append(settings.model_name)
-            label_parts.append(
-                f"{settings.nchains} chains x {settings.niterations} iter"
+            records_by_dir[record.run_dir] = record
+
+        batch_root = artifact_paths.dream_dir / "backend_run_sets"
+        if batch_root.is_dir():
+            manifest_paths = sorted(
+                batch_root.glob(f"*/{DREAM_BATCH_MANIFEST_NAME}")
             )
-            records.append(
-                DreamSavedRunRecord(
-                    run_dir=run_dir,
-                    display_label=" | ".join(label_parts),
-                )
-            )
-        return records
+            for manifest_path in manifest_paths:
+                try:
+                    run_set = load_dream_batch_manifest(manifest_path)
+                except Exception:
+                    continue
+                for item in run_set.queue_items:
+                    if item.status != "completed":
+                        continue
+                    run_dir = Path(item.run_dir).expanduser().resolve()
+                    if not self._dream_run_is_inside_runtime_dir(
+                        run_dir,
+                        runtime_dir,
+                    ):
+                        continue
+                    record = self._dream_saved_run_record_for_dir(
+                        run_dir,
+                        batch_label=run_set.label,
+                    )
+                    if record is None:
+                        continue
+                    records_by_dir[record.run_dir] = record
+        return sorted(
+            records_by_dir.values(),
+            key=lambda record: record.run_dir.name,
+            reverse=True,
+        )
+
+    def _refresh_external_dream_artifacts(self) -> None:
+        if self.current_settings is None:
+            return
+        if not hasattr(self, "tabs"):
+            return
+        if self.tabs.currentWidget() is not self.dream_tab:
+            return
+        records = self._list_saved_dream_runs()
+        signature = self._saved_dream_runs_signature(records)
+        if signature == self._last_saved_dream_runs_signature:
+            return
+        self._refresh_saved_dream_runs(records=records)
+
+    def _on_main_tab_changed(self, index: int) -> None:
+        self._autoscale_pending_tab_splitter(index)
+        if self.current_settings is None:
+            return
+        widget = self.tabs.widget(index)
+        if widget is self.dream_tab:
+            self._refresh_saved_dream_runs()
 
     def _refresh_saved_dream_runs(
         self,
         *,
         selected_run_dir: str | Path | None = None,
+        records: list[DreamSavedRunRecord] | None = None,
     ) -> None:
-        records = self._list_saved_dream_runs()
+        active_records = (
+            records if records is not None else self._list_saved_dream_runs()
+        )
+        self._last_saved_dream_runs_signature = (
+            self._saved_dream_runs_signature(active_records)
+        )
         selected_value: str | None = None
         if selected_run_dir is not None:
             selected_value = str(Path(selected_run_dir).resolve())
@@ -9157,7 +10946,7 @@ class SAXSMainWindow(QMainWindow):
         self.dream_tab.set_available_saved_runs(
             [
                 (record.display_label, str(record.run_dir))
-                for record in records
+                for record in active_records
             ],
             selected_run_dir=selected_value,
         )
@@ -9589,6 +11378,19 @@ class SAXSMainWindow(QMainWindow):
             for entry in entries
         ]
 
+    def _set_prefit_fit_undo_entries(
+        self,
+        entries: list[PrefitParameterEntry],
+    ) -> None:
+        self._prefit_fit_undo_entries = self._copy_prefit_entries(entries)
+        self.prefit_tab.set_fit_undo_available(
+            bool(self._prefit_fit_undo_entries)
+        )
+
+    def _clear_prefit_fit_undo(self) -> None:
+        self._prefit_fit_undo_entries = None
+        self.prefit_tab.set_fit_undo_available(False)
+
     def _set_prefit_sequence_baseline(
         self,
         entries: list[PrefitParameterEntry] | None,
@@ -9632,6 +11434,7 @@ class SAXSMainWindow(QMainWindow):
                 (entry.structure, float(entry.value))
                 for entry in entries
                 if str(entry.name).startswith("w")
+                and bool(getattr(entry, "active", True))
             ],
             target,
         )
@@ -9651,7 +11454,103 @@ class SAXSMainWindow(QMainWindow):
             f"{stoichiometry_deviation_text(evaluation)}"
         )
 
+    def estimate_prefit_charge_from_stoichiometry(self) -> None:
+        if self.prefit_workflow is None:
+            self._show_error(
+                "Charge estimate unavailable",
+                "Build or load a SAXS project before estimating charge.",
+            )
+            return
+        charge_row = self.prefit_tab.find_parameter_row("charge")
+        if charge_row < 0:
+            self._show_error(
+                "Charge estimate unavailable",
+                "The active Prefit template does not expose a charge parameter.",
+            )
+            return
+        try:
+            entries = self.prefit_tab.parameter_entries()
+        except Exception as exc:
+            self._show_error("Charge estimate failed", str(exc))
+            return
+        structure_weights = [
+            (entry.structure, float(entry.value))
+            for entry in entries
+            if entry.category == "weight" or str(entry.name).startswith("w")
+            if bool(getattr(entry, "active", True))
+        ]
+        estimate = estimate_weighted_formal_charge(structure_weights)
+        if not estimate.is_valid or not any(
+            component.counts for component in estimate.components
+        ):
+            self._show_error(
+                "Charge estimate failed",
+                "No positive-weight stoichiometry labels were available in "
+                "the Prefit component weights.",
+            )
+            return
+        recommended = float(estimate.absolute_weighted_mean_charge_e or 0.0)
+        try:
+            minimum = float(
+                self.prefit_tab.parameter_table.item(charge_row, 5).text()
+            )
+            maximum = float(
+                self.prefit_tab.parameter_table.item(charge_row, 6).text()
+            )
+        except Exception:
+            minimum = 0.0
+            maximum = float("inf")
+        applied = min(max(recommended, minimum), maximum)
+        self.prefit_tab.set_parameter_row("charge", value=applied)
+        updated_entries = self.prefit_tab.parameter_entries()
+        self.prefit_workflow.parameter_entries = updated_entries
+        self.prefit_tab.parameter_table_edited.emit()
+
+        signed = float(estimate.weighted_mean_signed_charge_e or 0.0)
+        mean_abs = float(estimate.weighted_mean_absolute_charge_e or 0.0)
+        status_text = f"Applied {applied:.4g} e"
+        if abs(applied - recommended) > 1.0e-12:
+            status_text += f" (bounded from {recommended:.4g} e)"
+        self.prefit_tab.set_charge_estimate_status_text(status_text)
+        log_lines = [
+            "Estimated charged-sphere charge from component stoichiometry.",
+            "Assumed formal charges: Pb=+2, I=-1, Cs=+1, MA=+1, FA=+1.",
+            f"Weighted mean signed charge: {signed:.6g} e",
+            f"Mean absolute component charge: {mean_abs:.6g} e",
+            f"Applied charge parameter: {applied:.6g} e",
+        ]
+        if estimate.unassigned_species:
+            log_lines.append(
+                "Unassigned species treated as neutral: "
+                + ", ".join(estimate.unassigned_species)
+            )
+        if recommended <= 1.0e-12:
+            log_lines.append(
+                "The weighted formal-charge estimate is neutral; the charged "
+                "RMSA template still requires a positive charge parameter."
+            )
+        elif mean_abs > recommended + 1.0e-9:
+            log_lines.append(
+                "Signed charge cancellation is present; inspect the mean "
+                "absolute component charge if mixed charge signs are expected."
+            )
+        self.prefit_tab.append_log("\n".join(log_lines))
+        self._append_prefit_sequence_event(
+            "charge_estimate_applied",
+            "Applied a stoichiometry-based Prefit charge estimate.",
+            details={
+                "weighted_mean_signed_charge_e": signed,
+                "weighted_mean_absolute_charge_e": mean_abs,
+                "applied_charge_e": applied,
+                "unassigned_species": list(estimate.unassigned_species),
+            },
+            parameter_entries=updated_entries,
+        )
+        self._load_prefit_preview()
+        self.statusBar().showMessage("Stoichiometry charge estimate applied")
+
     def _on_prefit_parameter_table_edited(self) -> None:
+        self._clear_prefit_fit_undo()
         self._prefit_sequence_pending_manual_edits = True
         self._update_prefit_stoichiometry_status()
 
@@ -9750,9 +11649,34 @@ class SAXSMainWindow(QMainWindow):
         return change_records
 
     def _save_distribution_entries(self, entries: list) -> None:
+        progress_total = 3
+        progress_started = False
         try:
+            progress_started = True
+            self._show_dream_progress_dialog(
+                "Saving DREAM prior parameter map...",
+                total=progress_total,
+                unit_label="steps",
+                title="Saving DREAM Prior Map",
+            )
+            self._update_dream_progress_dialog(
+                1,
+                progress_total,
+                "Loading DREAM workflow...",
+            )
             workflow = self._load_dream_workflow()
+            self._update_dream_progress_dialog(
+                2,
+                progress_total,
+                "Writing DREAM prior parameter map...",
+            )
             workflow.save_parameter_map(entries)
+            entries = workflow.load_parameter_map(persist_if_missing=False)
+            self._update_dream_progress_dialog(
+                3,
+                progress_total,
+                "Refreshing DREAM prior map state...",
+            )
             self._dream_parameter_map_saved_in_session = True
             self._invalidate_written_dream_bundle()
             self._last_dream_constraint_warning_signature = None
@@ -9763,8 +11687,12 @@ class SAXSMainWindow(QMainWindow):
                 "bundle with these priors."
             )
             self._append_dream_vary_recommendation(entries)
+            self._touch_active_distribution_metadata(workflow.settings)
         except Exception as exc:
             self._show_error("Save priors failed", str(exc))
+        finally:
+            if progress_started:
+                self._close_dream_progress_dialog()
 
     def _sync_dream_parameter_map_from_prefit(
         self,
@@ -9985,6 +11913,10 @@ class SAXSMainWindow(QMainWindow):
                     preset_name
                 )
             self.dream_tab.set_settings(settings, preset_name=preset_name)
+            if settings.fit_q_min is None or settings.fit_q_max is None:
+                self._sync_dream_fit_q_range_from_prefit()
+            else:
+                self._apply_prefit_bounds_to_dream_fit_q_range()
             self._current_dream_preset_name = preset_name
             self._invalidate_written_dream_bundle()
             self.dream_tab.append_log(
@@ -10011,7 +11943,10 @@ class SAXSMainWindow(QMainWindow):
             )
             self.dream_tab.set_filter_dirty(False)
             return
-        self._refresh_loaded_dream_results(scope=self.DREAM_REFRESH_FULL)
+        self._refresh_loaded_dream_results(
+            scope=self.DREAM_REFRESH_FULL,
+            show_filter_progress=True,
+        )
 
     @staticmethod
     def _copy_dream_settings(
@@ -10287,6 +12222,7 @@ class SAXSMainWindow(QMainWindow):
         has_project = self.current_settings is not None
         self.save_project_action.setEnabled(has_project)
         self.save_project_as_action.setEnabled(has_project)
+        self.duplicate_project_for_new_fit_action.setEnabled(has_project)
         self.link_packmol_docker_action.setEnabled(has_project)
 
     def _remap_copied_project_paths(
@@ -11104,6 +13040,71 @@ class SAXSMainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Opened bond analysis")
 
+    def _open_bondanalysis_batch_queue_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "bondanalysis_batch_queue",
+            "Bond analysis batch queue",
+        ):
+            return
+        from saxshell.bondanalysis.ui.batch_queue_window import (
+            BondAnalysisBatchQueueWindow,
+        )
+
+        settings = self._active_project_launch_settings()
+        project_dir = None
+        clusters_dir = None
+        if settings is not None:
+            project_dir = Path(settings.project_dir).resolve()
+            clusters_dir = settings.resolved_clusters_dir
+        window = BondAnalysisBatchQueueWindow(
+            initial_project_dir=project_dir,
+            initial_clusters_dir=clusters_dir,
+        )
+        window.show()
+        window.raise_()
+        self._track_child_tool_window(
+            window,
+            single_instance_key="bondanalysis_batch_queue",
+        )
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                f"Opened bond analysis batch queue for {project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened bond analysis batch queue")
+
+    def _open_structure_distribution_browser_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "structure_distribution_browser",
+            "Structure distribution browser",
+        ):
+            return
+        from saxshell.structure_distributions.ui.main_window import (
+            StructureDistributionBrowserWindow,
+        )
+
+        settings = self._active_project_launch_settings()
+        project_dir = None
+        if settings is not None:
+            project_dir = Path(settings.project_dir).resolve()
+        window = StructureDistributionBrowserWindow(
+            initial_project_dir=project_dir,
+        )
+        window.show()
+        window.raise_()
+        self._track_child_tool_window(
+            window,
+            single_instance_key="structure_distribution_browser",
+        )
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                "Opened structure distribution browser for " f"{project_dir}"
+            )
+        else:
+            self.statusBar().showMessage(
+                "Opened structure distribution browser"
+            )
+
     def _open_debye_waller_analysis_tool(self) -> None:
         if self._focus_single_instance_child_tool_window(
             "debye_waller_analysis",
@@ -11394,6 +13395,23 @@ class SAXSMainWindow(QMainWindow):
         self._track_child_tool_window(window)
         self.statusBar().showMessage("Opened experimental data overlay")
 
+    def _open_uvvis_fitting_tool(self) -> None:
+        if self._focus_single_instance_child_tool_window(
+            "uvvisfit",
+            "UV-Vis peak fitting",
+        ):
+            return
+        from saxshell.uvvis_fitting.ui.main_window import (
+            launch_uvvis_fitting_ui,
+        )
+
+        window = launch_uvvis_fitting_ui()
+        self._track_child_tool_window(
+            window,
+            single_instance_key="uvvisfit",
+        )
+        self.statusBar().showMessage("Opened UV-Vis peak fitting")
+
     def _open_solvent_shell_builder_tool(self) -> None:
         if self._focus_single_instance_child_tool_window(
             "solvent_shell_builder",
@@ -11539,6 +13557,86 @@ class SAXSMainWindow(QMainWindow):
             )
         else:
             self.statusBar().showMessage("Opened representative CLI setup")
+
+    def _open_dream_batch_cli_setup_tool(self) -> None:
+        self._open_dream_backend_batch_setup_tool()
+
+    def _active_prefit_parameter_entries_for_batch_setup(
+        self,
+    ) -> list[PrefitParameterEntry] | None:
+        if self.prefit_workflow is None:
+            return None
+        try:
+            entries = self.prefit_tab.parameter_entries()
+        except Exception:
+            entries = self.prefit_workflow.parameter_entries
+        return self._copy_prefit_entries(entries)
+
+    def _sync_dream_backend_batch_setup_prefit(
+        self,
+        window: object,
+        entries: list[PrefitParameterEntry] | None,
+        fit_q_range: (
+            tuple[float, float, float | None, float | None] | None
+        ) = None,
+    ) -> None:
+        entries_setter = getattr(
+            window,
+            "set_active_prefit_parameter_entries",
+            None,
+        )
+        if entries is not None and callable(entries_setter):
+            entries_setter(entries)
+        range_setter = getattr(window, "set_active_prefit_fit_q_range", None)
+        if callable(range_setter) and fit_q_range is not None:
+            range_setter(*fit_q_range)
+
+    def _open_dream_backend_batch_setup_tool(self) -> None:
+        from saxshell.saxs.ui.dream_batch_window import (
+            launch_dream_batch_run_file_ui,
+        )
+
+        project_dir = None
+        active_prefit_entries = None
+        active_fit_q_range = None
+        if self.current_settings is not None:
+            self._save_active_distribution_fit_settings()
+            project_dir = Path(self.current_settings.project_dir).resolve()
+            active_prefit_entries = (
+                self._active_prefit_parameter_entries_for_batch_setup()
+            )
+            active_fit_q_range = self._active_prefit_fit_q_range_for_dream()
+        existing_window = self._single_instance_child_tool_windows.get(
+            "dream_backend_batch_setup"
+        )
+        if (
+            existing_window is not None
+            and self._focus_single_instance_child_tool_window(
+                "dream_backend_batch_setup",
+                "DREAM backend batch setup",
+            )
+        ):
+            self._sync_dream_backend_batch_setup_prefit(
+                existing_window,
+                active_prefit_entries,
+                active_fit_q_range,
+            )
+            return
+        window = launch_dream_batch_run_file_ui(
+            initial_project_dir=project_dir,
+            initial_prefit_parameter_entries=active_prefit_entries,
+            initial_fit_q_range=active_fit_q_range,
+        )
+        self._track_child_tool_window(
+            window,
+            single_instance_key="dream_backend_batch_setup",
+        )
+        if project_dir is not None:
+            self.statusBar().showMessage(
+                "Opened DREAM backend batch setup for " f"{project_dir}"
+            )
+        else:
+            self.statusBar().showMessage("Opened DREAM backend batch setup")
 
     def _open_contrast_mode_tool(
         self,
@@ -11973,6 +14071,28 @@ class SAXSMainWindow(QMainWindow):
             status_message="Opened fluorescence estimate",
         )
 
+    def _open_aps_detector_stitch_tool(self) -> None:
+        if self._aps_detector_stitch_tool_window is not None:
+            self._aps_detector_stitch_tool_window.show()
+            self._aps_detector_stitch_tool_window.raise_()
+            self._aps_detector_stitch_tool_window.activateWindow()
+            self.statusBar().showMessage("Opened APS Detector Stitch")
+            return
+
+        window = APSDetectorStitchToolWindow()
+        self._aps_detector_stitch_tool_window = window
+        window.destroyed.connect(
+            lambda *_args: setattr(
+                self,
+                "_aps_detector_stitch_tool_window",
+                None,
+            )
+        )
+        window.show()
+        window.raise_()
+        self._track_child_tool_window(window)
+        self.statusBar().showMessage("Opened APS Detector Stitch")
+
     def _show_placeholder_tool_message(self, tool_name: str) -> None:
         QMessageBox.information(
             self,
@@ -12307,12 +14427,65 @@ class SAXSMainWindow(QMainWindow):
         self,
         *,
         scope: int | None = None,
+        show_filter_progress: bool = False,
     ) -> None:
         if self._last_results_loader is None:
             return
         refresh_scope = (
             int(scope) if scope is not None else self.DREAM_REFRESH_FULL
         )
+        filter_progress_total = 4
+        filter_progress_step = 0
+        if show_filter_progress:
+            self.dream_tab.begin_filter_progress(
+                filter_progress_total,
+                "Applying DREAM filters...",
+            )
+            self._show_dream_progress_dialog(
+                "Applying DREAM filters...",
+                total=filter_progress_total,
+                unit_label="steps",
+                title="Applying DREAM Filter",
+            )
+            QApplication.processEvents()
+
+        def advance_filter_progress(message: str) -> None:
+            nonlocal filter_progress_step
+            if not show_filter_progress:
+                return
+            filter_progress_step = min(
+                filter_progress_step + 1,
+                filter_progress_total,
+            )
+            self.dream_tab.update_filter_progress(
+                filter_progress_step,
+                filter_progress_total,
+                message,
+            )
+            self._update_dream_progress_dialog(
+                filter_progress_step,
+                filter_progress_total,
+                message,
+                unit_label="steps",
+            )
+            QApplication.processEvents()
+
+        def finish_filter_progress(message: str) -> None:
+            if not show_filter_progress:
+                return
+            self.dream_tab.finish_filter_progress(
+                message,
+                total=filter_progress_total,
+            )
+            self._update_dream_progress_dialog(
+                filter_progress_total,
+                filter_progress_total,
+                message,
+                unit_label="steps",
+            )
+            QApplication.processEvents()
+            self._close_dream_progress_dialog()
+
         try:
             settings = self.dream_tab.settings_payload()
             loader = self._last_results_loader
@@ -12330,17 +14503,20 @@ class SAXSMainWindow(QMainWindow):
             )
             self._refresh_dream_filter_status()
             self.dream_tab.set_filter_dirty(False)
+            advance_filter_progress("Updated DREAM posterior summary.")
             if refresh_scope <= self.DREAM_REFRESH_STYLE:
                 if self.dream_tab.current_violin_plot_data() is None:
                     violin_plot = loader.build_violin_data(
                         mode=self._effective_dream_violin_mode(settings),
                         sample_source=settings.violin_sample_source,
                         weight_order=settings.violin_weight_order,
+                        selected_parameter=settings.violin_selected_parameter,
                         **filter_kwargs,
                     )
                     self.dream_tab.plot_violin_plot(summary, violin_plot)
                 else:
                     self.dream_tab.redraw_current_violin_plot()
+                finish_filter_progress("DREAM filter applied.")
                 return
             if refresh_scope == self.DREAM_REFRESH_SUMMARY:
                 violin_plot = self.dream_tab.current_violin_plot_data()
@@ -12349,32 +14525,48 @@ class SAXSMainWindow(QMainWindow):
                         mode=self._effective_dream_violin_mode(settings),
                         sample_source=settings.violin_sample_source,
                         weight_order=settings.violin_weight_order,
+                        selected_parameter=settings.violin_selected_parameter,
                         **filter_kwargs,
                     )
                 self.dream_tab.plot_violin_plot(summary, violin_plot)
+                advance_filter_progress("Updated DREAM violin data.")
+                finish_filter_progress("DREAM filter applied.")
                 return
             if refresh_scope == self.DREAM_REFRESH_VIOLIN:
                 violin_plot = loader.build_violin_data(
                     mode=self._effective_dream_violin_mode(settings),
                     sample_source=settings.violin_sample_source,
                     weight_order=settings.violin_weight_order,
+                    selected_parameter=settings.violin_selected_parameter,
                     **filter_kwargs,
                 )
                 self.dream_tab.plot_violin_plot(summary, violin_plot)
+                advance_filter_progress("Updated DREAM violin data.")
+                finish_filter_progress("DREAM filter applied.")
                 return
             model_plot = loader.build_model_fit_data(
                 bestfit_method=settings.bestfit_method,
                 **filter_kwargs,
             )
+            advance_filter_progress("Updated DREAM model fit.")
             violin_plot = loader.build_violin_data(
                 mode=self._effective_dream_violin_mode(settings),
                 sample_source=settings.violin_sample_source,
                 weight_order=settings.violin_weight_order,
+                selected_parameter=settings.violin_selected_parameter,
                 **filter_kwargs,
             )
+            advance_filter_progress("Updated DREAM violin data.")
             self.dream_tab.plot_model_fit(model_plot)
             self.dream_tab.plot_violin_plot(summary, violin_plot)
+            advance_filter_progress("Redrew DREAM filter plots.")
+            finish_filter_progress("DREAM filter applied.")
         except Exception as exc:
+            if show_filter_progress:
+                finish_filter_progress("DREAM filter apply failed.")
+                self.dream_tab.set_filter_dirty(
+                    self.dream_tab.filter_settings_dirty()
+                )
             self._show_error("Render DREAM results failed", str(exc))
 
     @staticmethod
@@ -12734,6 +14926,10 @@ class SAXSMainWindow(QMainWindow):
             "less_aggressive": "Less Aggressive",
             "medium": "Medium",
             "more_aggressive": "More Aggressive",
+            "legacy_gui_default": "Legacy GUI Default",
+            "legacy_saxs_notebook": "Legacy SAXS Notebook",
+            "legacy_kwhite_long": "Legacy KWhite Long",
+            "legacy_tchaney_production": "Legacy TChaney Production",
             "custom": "Custom",
             "all_post_burnin": "All Post-burnin Samples",
             "top_percent_logp": "Top % by Log-posterior",
@@ -12762,6 +14958,14 @@ class SAXSMainWindow(QMainWindow):
     ) -> str:
         lines = [
             f"Run directory: {summary.run_dir}",
+            (
+                "DREAM search preset: "
+                f"{self._dream_search_preset_text_for_report(settings)}"
+            ),
+            (
+                "Prior presets: "
+                f"{self._dream_prior_preset_summary_text_for_report()}"
+            ),
             f"Best-fit method: {summary.bestfit_method}",
             (
                 "Posterior filter: "
@@ -12811,9 +15015,15 @@ class SAXSMainWindow(QMainWindow):
                 "Posterior summary:",
             ]
         )
+        prior_lookup = self._dream_parameter_entry_lookup_for_report()
         for index, name in enumerate(summary.full_parameter_names):
+            guide_text = self._dream_parameter_guide_text(
+                prior_lookup.get(str(name)),
+                summary.bestfit_params[index],
+            )
             lines.append(
                 f"{name}: selected={summary.bestfit_params[index]:.6g}, "
+                f"{guide_text}, "
                 f"MAP={summary.map_params[index]:.6g}, "
                 f"chain_mean={summary.chain_mean_params[index]:.6g}, "
                 f"median={summary.median_params[index]:.6g}, "
@@ -12823,6 +15033,24 @@ class SAXSMainWindow(QMainWindow):
                 f"{summary.interval_high_values[index]:.6g}"
             )
         return "\n".join(lines)
+
+    def _dream_parameter_guide_text(
+        self,
+        entry: DreamParameterEntry | None,
+        value: object,
+    ) -> str:
+        if entry is None:
+            return "guide_low=n/a, guide_high=n/a"
+        guide_low, guide_high, _guide_kind = distribution_guide_bounds(entry)
+        clip_status = guide_clip_status(value, guide_low, guide_high)
+        clip_suffix = f", guide_clip={clip_status}" if clip_status else ""
+        return (
+            "guide_low="
+            f"{format_distribution_guide_value(guide_low)}, "
+            "guide_high="
+            f"{format_distribution_guide_value(guide_high)}"
+            f"{clip_suffix}"
+        )
 
     def _format_dream_console_intro(self) -> str:
         if self.prefit_workflow is None:
@@ -13006,6 +15234,9 @@ class SAXSMainWindow(QMainWindow):
         merged.violin_value_scale_mode = (
             current_settings.violin_value_scale_mode
         )
+        merged.violin_selected_parameter = (
+            current_settings.violin_selected_parameter
+        )
         merged.stoichiometry_target_elements_text = (
             current_settings.stoichiometry_target_elements_text
         )
@@ -13097,11 +15328,31 @@ class SAXSMainWindow(QMainWindow):
                 f"{len(q_values)} evenly spaced q-points between "
                 f"{float(q_values.min()):.6g} and {float(q_values.max()):.6g}."
             )
+        fit_range_text = ""
+        if evaluation is not None and q_values.size:
+            fit_mask = SAXSPrefitWorkflow.evaluation_fit_mask(evaluation)
+            fit_points = int(np.count_nonzero(fit_mask))
+            fit_q_min = (
+                float(evaluation.fit_q_min)
+                if evaluation.fit_q_min is not None
+                else float(q_values.min())
+            )
+            fit_q_max = (
+                float(evaluation.fit_q_max)
+                if evaluation.fit_q_max is not None
+                else float(q_values.max())
+            )
+            fit_range_text = (
+                "Active Prefit fit range: "
+                f"{fit_q_min:.6g} to {fit_q_max:.6g} A^-1 "
+                f"({fit_points} points).\n"
+            )
         excluded = ", ".join(settings.exclude_elements) or "None"
         return (
             "Prefit workflow loaded.\n"
             f"Template: {self.prefit_workflow.template_spec.name}\n"
             f"{grid_text}\n"
+            f"{fit_range_text}"
             f"Excluded elements: {excluded}\n"
             "Project presets: template-default reset is available"
             + (
@@ -13139,13 +15390,36 @@ class SAXSMainWindow(QMainWindow):
         if self.prefit_workflow is None:
             return "Prefit summary is not available."
         q_values = np.asarray(evaluation.q_values, dtype=float)
+        fit_mask = SAXSPrefitWorkflow.evaluation_fit_mask(evaluation)
+        fit_point_count = int(np.count_nonzero(fit_mask))
+        fit_q_min = (
+            float(evaluation.fit_q_min)
+            if evaluation.fit_q_min is not None
+            else (float(q_values.min()) if q_values.size else None)
+        )
+        fit_q_max = (
+            float(evaluation.fit_q_max)
+            if evaluation.fit_q_max is not None
+            else (float(q_values.max()) if q_values.size else None)
+        )
         lines = [
             "Prefit summary:",
             f"Template: {self.prefit_workflow.template_spec.name}",
-            f"Points: {len(q_values)}",
+            f"Model points: {len(q_values)}",
             (
-                f"q-range: {float(q_values.min()):.6g} to "
+                f"Model q-range: {float(q_values.min()):.6g} to "
                 f"{float(q_values.max()):.6g}"
+                if q_values.size
+                else "Model q-range: unavailable"
+            ),
+            f"Fit points: {fit_point_count}",
+            (
+                "Active fit q-range: unavailable"
+                if fit_q_min is None or fit_q_max is None
+                else (
+                    f"Active fit q-range: {fit_q_min:.6g} to "
+                    f"{fit_q_max:.6g}"
+                )
             ),
             f"Configured minimizer: {self.prefit_tab.run_config().method}",
             f"Configured max nfev: {self.prefit_tab.run_config().max_nfev}",
@@ -13170,12 +15444,21 @@ class SAXSMainWindow(QMainWindow):
             )
         else:
             residuals = np.asarray(evaluation.residuals, dtype=float)
-            rms_residual = float(np.sqrt(np.mean(residuals**2)))
-            mean_abs_residual = float(np.mean(np.abs(residuals)))
-            lines[4:4] = [
-                f"Residual RMS: {rms_residual:.6g}",
-                f"Mean |residual|: {mean_abs_residual:.6g}",
-            ]
+            experimental = np.asarray(
+                evaluation.experimental_intensities,
+                dtype=float,
+            )
+            finite_mask = (
+                fit_mask & np.isfinite(residuals) & np.isfinite(experimental)
+            )
+            residuals = residuals[finite_mask]
+            if residuals.size:
+                rms_residual = float(np.sqrt(np.mean(residuals**2)))
+                mean_abs_residual = float(np.mean(np.abs(residuals)))
+                lines[6:6] = [
+                    f"Residual RMS: {rms_residual:.6g}",
+                    f"Mean |residual|: {mean_abs_residual:.6g}",
+                ]
         if fit_result is not None:
             lines.extend(
                 [

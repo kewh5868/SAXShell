@@ -1,0 +1,18 @@
+{
+  "display_name": "pyDREAM MonoSQ Normalized (Stoichiometry Compensator, Experimental)",
+  "description": "pyDREAM MonoSQ Normalized (Stoichiometry Compensator, Experimental)\n\nPurpose:\nTesting-stage MonoSQ variant for Pb/I workflows where selected single-atom component traces are used as stoichiometry compensators instead of ordinary sampled mixture weights. Existing MonoSQ templates are unchanged.\n\nStructure Factor:\nMonodisperse hard-sphere structure factor evaluated with calc_monodisperse_sq using the Percus-Yevick approximation. eff_r controls the effective hard-sphere radius and vol_frac controls the packing term.\n\nForm Factor:\nThe model begins with the ordinary weighted mixture of MD-derived SAXS component profiles, but any component selected as a stoichiometry compensator is recomputed from the non-compensator weights before model evaluation. For Pb/I systems this allows a single-atom I- trace to supply the iodine needed to meet a configured target ratio while behaving mostly like a flat background contribution.\n\nModel Equation:\nGiven non-compensator weights w_i, the template solves non-negative compensator weights c_j such that the component stoichiometry totals best match the configured target ratio. It then evaluates:\nI_raw(q) = sum_i w_i I_i(q) S_HS(q; eff_r, vol_frac) + sum_j c_j I_j(q) S_HS(q; eff_r, vol_frac) + solv_w * I_solv(q)\nI_model(q) = scale * I_raw(q) + offset\n\nLikelihood Convention:\nThe pyDREAM likelihood compares the unmodified experimental intensity values directly against I_model(q), with a point-normalized Gaussian log-likelihood. scale and offset are applied only inside the forward model.\n\nTemplate-Specific Setup:\nThe Prefit tab exposes a Stoichiometry Compensator section for this template. Configure target elements and ratio, then choose the weight parameters that should be recomputed as compensators. The Auto Guess action selects single-atom target-element components, which is intended to pick I-only traces when present.\n\nModel Parameters:\nw1, w2, ..., wN: Relative contribution of each MD-derived component profile. Selected compensator weights are recomputed by the model and should remain fixed in DREAM.\nsolv_w: Solvent-background multiplier applied to the solvent trace before the model scale is applied using the user-configured Prefit/DREAM bounds.\noffset: Additive model baseline applied after the model scale.\neff_r: Effective hard-sphere radius used in the structure-factor calculation.\nvol_frac: Hard-sphere packing fraction used in the Percus-Yevick structure factor.\nscale: Multiplicative factor applied to the raw model curve.",
+  "capabilities": {
+    "solution_scattering_estimator": {
+      "volume_fraction_target": {
+        "parameter": "vol_frac",
+        "fraction_kind": "solute",
+        "source": "physical"
+      },
+      "solvent_contribution_scale_mode": "global_scale"
+    },
+    "prefit": {
+      "auto_apply_autoscale_on_load": true,
+      "autoscale_bounds_mode": "adaptive"
+    }
+  }
+}

@@ -214,6 +214,8 @@ class ProjectSetupTab(QWidget):
     build_prior_weights_requested = Signal()
     install_model_requested = Signal()
     load_distribution_requested = Signal(str)
+    duplicate_distribution_requested = Signal(str)
+    delete_distribution_requested = Signal(str)
     view_active_contrast_distribution_requested = Signal()
     template_selection_changed = Signal(str)
     change_template_requested = Signal(str)
@@ -689,6 +691,24 @@ class ProjectSetupTab(QWidget):
         self.load_distribution_button.clicked.connect(
             self._emit_load_distribution_requested
         )
+        self.duplicate_distribution_button = QPushButton("Duplicate")
+        self.duplicate_distribution_button.setEnabled(False)
+        self.duplicate_distribution_button.setToolTip(
+            "Create a new computed distribution attempt with the selected "
+            "distribution's settings and reusable artifacts."
+        )
+        self.duplicate_distribution_button.clicked.connect(
+            self._emit_duplicate_distribution_requested
+        )
+        self.delete_distribution_button = QPushButton("Delete")
+        self.delete_distribution_button.setEnabled(False)
+        self.delete_distribution_button.setToolTip(
+            "Delete the selected computed distribution and its saved "
+            "components, prefits, and DREAM fits."
+        )
+        self.delete_distribution_button.clicked.connect(
+            self._emit_delete_distribution_requested
+        )
         header_layout.addRow(
             "Computed distribution",
             self._distribution_row(),
@@ -944,6 +964,8 @@ class ProjectSetupTab(QWidget):
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.addWidget(self.computed_distribution_combo, stretch=1)
         top_layout.addWidget(self.load_distribution_button)
+        top_layout.addWidget(self.duplicate_distribution_button)
+        top_layout.addWidget(self.delete_distribution_button)
         layout.addWidget(top_row)
 
         active_row = QWidget()
@@ -1315,6 +1337,16 @@ class ProjectSetupTab(QWidget):
             selected and self.computed_distribution_combo.count() > 0
         )
         self.load_distribution_button.setEnabled(
+            selected
+            and self.computed_distribution_combo.count() > 0
+            and self.selected_distribution_id() is not None
+        )
+        self.duplicate_distribution_button.setEnabled(
+            selected
+            and self.computed_distribution_combo.count() > 0
+            and self.selected_distribution_id() is not None
+        )
+        self.delete_distribution_button.setEnabled(
             selected
             and self.computed_distribution_combo.count() > 0
             and self.selected_distribution_id() is not None
@@ -1708,6 +1740,14 @@ class ProjectSetupTab(QWidget):
             and self.computed_distribution_combo.count() > 0
         )
         self.load_distribution_button.setEnabled(
+            self.model_group.isEnabled()
+            and self.selected_distribution_id() is not None
+        )
+        self.duplicate_distribution_button.setEnabled(
+            self.model_group.isEnabled()
+            and self.selected_distribution_id() is not None
+        )
+        self.delete_distribution_button.setEnabled(
             self.model_group.isEnabled()
             and self.selected_distribution_id() is not None
         )
@@ -5427,6 +5467,16 @@ class ProjectSetupTab(QWidget):
         distribution_id = self.selected_distribution_id()
         if distribution_id is not None:
             self.load_distribution_requested.emit(distribution_id)
+
+    def _emit_duplicate_distribution_requested(self) -> None:
+        distribution_id = self.selected_distribution_id()
+        if distribution_id is not None:
+            self.duplicate_distribution_requested.emit(distribution_id)
+
+    def _emit_delete_distribution_requested(self) -> None:
+        distribution_id = self.selected_distribution_id()
+        if distribution_id is not None:
+            self.delete_distribution_requested.emit(distribution_id)
 
     def _sync_available_element_selection(self) -> None:
         excluded = set(self.exclude_elements())

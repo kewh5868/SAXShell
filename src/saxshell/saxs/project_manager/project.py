@@ -42,6 +42,7 @@ from saxshell.saxs.debye import (
     scan_structure_element_counts,
     scan_structure_elements,
 )
+from saxshell.saxs.stoichiometry import sort_stoich_labels
 
 from .prior_plot import export_prior_plot_data
 
@@ -86,6 +87,8 @@ def component_source_mode_label(value: object) -> str:
 class ProjectPaths:
     project_dir: Path
     project_file: Path
+    analysis_dir: Path
+    structure_distribution_store_dir: Path
     saved_distributions_dir: Path
     experimental_data_dir: Path
     scattering_components_dir: Path
@@ -107,6 +110,10 @@ def build_project_paths(project_dir: str | Path) -> ProjectPaths:
     return ProjectPaths(
         project_dir=project_dir,
         project_file=project_dir / "saxs_project.json",
+        analysis_dir=project_dir / "analysis",
+        structure_distribution_store_dir=(
+            project_dir / "analysis" / "structure_distributions"
+        ),
         saved_distributions_dir=project_dir / "saved_distributions",
         experimental_data_dir=project_dir / "experimental_data",
         scattering_components_dir=project_dir / "scattering_components",
@@ -377,6 +384,8 @@ class SavedDistributionRecord:
     metadata_path: Path
     created_at: str | None = None
     updated_at: str | None = None
+    base_distribution_id: str | None = None
+    attempt_index: int | None = None
     template_name: str | None = None
     component_build_mode: str = COMPONENT_BUILD_MODE_NO_CONTRAST
     use_predicted_structure_weights: bool = False
@@ -681,6 +690,8 @@ class ProjectSettings:
     solvent_error_column: int | None = None
     q_min: float | None = None
     q_max: float | None = None
+    prefit_fit_q_min: float | None = None
+    prefit_fit_q_max: float | None = None
     use_experimental_grid: bool = True
     q_points: int | None = None
     available_elements: list[str] = field(default_factory=list)
@@ -698,6 +709,7 @@ class ProjectSettings:
     solvent_trace_color: str = "#008000"
     prior_plot_state: dict[str, object] = field(default_factory=dict)
     runtime_bundle_opener: str | None = None
+    active_distribution_id: str | None = None
     template_reset_template: str | None = None
     template_reset_parameter_entries: list[dict[str, object]] = field(
         default_factory=list
@@ -718,6 +730,11 @@ class ProjectSettings:
         default_factory=PowerPointExportSettings
     )
     prior_histogram_x_axis_order: list[list[str]] = field(default_factory=list)
+    stoichiometry_compensator_target_elements_text: str = ""
+    stoichiometry_compensator_target_ratio_text: str = ""
+    stoichiometry_compensator_weight_names: list[str] = field(
+        default_factory=list
+    )
 
     @property
     def resolved_project_dir(self) -> Path:
@@ -814,6 +831,9 @@ class ProjectSettings:
         payload["runtime_bundle_opener"] = _optional_str(
             self.runtime_bundle_opener
         )
+        payload["active_distribution_id"] = _optional_str(
+            self.active_distribution_id
+        )
         payload["template_reset_parameter_entries"] = [
             dict(entry) for entry in self.template_reset_parameter_entries
         ]
@@ -864,6 +884,17 @@ class ProjectSettings:
         payload["component_build_mode"] = normalize_component_build_mode(
             payload.get("component_build_mode")
         )
+        payload["stoichiometry_compensator_target_elements_text"] = str(
+            self.stoichiometry_compensator_target_elements_text
+        ).strip()
+        payload["stoichiometry_compensator_target_ratio_text"] = str(
+            self.stoichiometry_compensator_target_ratio_text
+        ).strip()
+        payload["stoichiometry_compensator_weight_names"] = [
+            str(name).strip()
+            for name in self.stoichiometry_compensator_weight_names
+            if str(name).strip()
+        ]
         return payload
 
     @classmethod
@@ -938,6 +969,8 @@ class ProjectSettings:
             ),
             q_min=_optional_float(payload.get("q_min")),
             q_max=_optional_float(payload.get("q_max")),
+            prefit_fit_q_min=_optional_float(payload.get("prefit_fit_q_min")),
+            prefit_fit_q_max=_optional_float(payload.get("prefit_fit_q_max")),
             use_experimental_grid=bool(
                 payload.get(
                     "use_experimental_grid",
@@ -987,6 +1020,9 @@ class ProjectSettings:
             runtime_bundle_opener=_optional_str(
                 payload.get("runtime_bundle_opener")
             ),
+            active_distribution_id=_optional_str(
+                payload.get("active_distribution_id")
+            ),
             template_reset_template=_optional_str(
                 payload.get("template_reset_template")
             ),
@@ -1021,7 +1057,43 @@ class ProjectSettings:
             prior_histogram_x_axis_order=_normalized_prior_x_axis_order(
                 payload.get("prior_histogram_x_axis_order", [])
             ),
+            stoichiometry_compensator_target_elements_text=str(
+                payload.get(
+                    "stoichiometry_compensator_target_elements_text",
+                    "",
+                )
+                or ""
+            ).strip(),
+            stoichiometry_compensator_target_ratio_text=str(
+                payload.get(
+                    "stoichiometry_compensator_target_ratio_text",
+                    "",
+                )
+                or ""
+            ).strip(),
+            stoichiometry_compensator_weight_names=_normalized_text_list(
+                payload.get(
+                    "stoichiometry_compensator_weight_names",
+                    [],
+                )
+            ),
         )
+
+
+def _normalized_text_list(raw: object) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        candidates = [raw]
+    elif isinstance(raw, (list, tuple, set)):
+        candidates = list(raw)
+    else:
+        return []
+    return [
+        str(candidate).strip()
+        for candidate in candidates
+        if str(candidate).strip()
+    ]
 
 
 def _normalized_prior_x_axis_order(raw: object) -> list[list[str]]:
@@ -1032,6 +1104,60 @@ def _normalized_prior_x_axis_order(raw: object) -> list[list[str]]:
         if isinstance(entry, (list, tuple)) and len(entry) >= 2:
             result.append([str(entry[0]), str(entry[1])])
     return result
+
+
+def _normalized_component_order(raw: object) -> list[dict[str, object]]:
+    if not isinstance(raw, list):
+        return []
+    result: list[dict[str, object]] = []
+    for index, entry in enumerate(raw):
+        if isinstance(entry, dict):
+            structure = str(entry.get("structure", "")).strip()
+            motif = str(entry.get("motif", "no_motif")).strip() or "no_motif"
+            if not structure:
+                continue
+            order_index = _optional_int(entry.get("order_index"))
+            payload = {
+                "order_index": index if order_index is None else order_index,
+                "parameter": str(
+                    entry.get("parameter", entry.get("param", f"w{index}"))
+                ).strip()
+                or f"w{index}",
+                "structure": structure,
+                "motif": motif,
+            }
+            profile_file = _optional_str(entry.get("profile_file"))
+            if profile_file is not None:
+                payload["profile_file"] = profile_file
+            result.append(payload)
+            continue
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            structure = str(entry[0]).strip()
+            motif = str(entry[1]).strip() or "no_motif"
+            if not structure:
+                continue
+            result.append(
+                {
+                    "order_index": index,
+                    "parameter": f"w{index}",
+                    "structure": structure,
+                    "motif": motif,
+                }
+            )
+    return sorted(
+        result,
+        key=lambda payload: int(payload.get("order_index", 0)),
+    )
+
+
+def _component_order_key(
+    payload: dict[str, object],
+) -> tuple[str, str] | None:
+    structure = str(payload.get("structure", "")).strip()
+    motif = str(payload.get("motif", "no_motif")).strip() or "no_motif"
+    if not structure:
+        return None
+    return structure, motif
 
 
 def _normalized_json_object(raw: object) -> dict[str, object]:
@@ -1078,6 +1204,40 @@ def distribution_id_for_settings(settings: ProjectSettings) -> str:
     return _distribution_id_for_settings(
         settings,
         include_template=True,
+    )
+
+
+_DISTRIBUTION_ATTEMPT_RE = re.compile(
+    r"^(?P<base>.+)__created-(?P<timestamp>\d{8}-\d{6})__idx-(?P<index>\d+)$"
+)
+
+
+def _distribution_attempt_components(
+    distribution_id: object,
+) -> tuple[str | None, int | None]:
+    text = str(distribution_id or "").strip()
+    if not text:
+        return None, None
+    match = _DISTRIBUTION_ATTEMPT_RE.fullmatch(text)
+    if match is None:
+        return None, None
+    try:
+        attempt_index = int(match.group("index"))
+    except ValueError:
+        attempt_index = None
+    return match.group("base"), attempt_index
+
+
+def _distribution_attempt_id(
+    base_distribution_id: str,
+    *,
+    created_at: datetime,
+    attempt_index: int,
+) -> str:
+    timestamp = created_at.strftime("%Y%m%d-%H%M%S")
+    return (
+        f"{base_distribution_id}__created-{timestamp}"
+        f"__idx-{int(attempt_index):03d}"
     )
 
 
@@ -1190,30 +1350,45 @@ def project_artifact_paths(
 ) -> ProjectArtifactPaths:
     paths = build_project_paths(settings.project_dir)
     normalized_mode = str(storage_mode).strip().lower() or "auto"
+    active_distribution_id = _optional_str(
+        getattr(settings, "active_distribution_id", None)
+    )
     use_distribution_storage = normalized_mode == "distribution" or (
         normalized_mode == "auto"
-        and _project_has_saved_distributions(paths.project_dir)
+        and (
+            active_distribution_id is not None
+            or _project_has_saved_distributions(paths.project_dir)
+        )
     )
     root_dir = paths.project_dir
     distribution_id: str | None = None
     distribution_metadata_file: Path | None = None
     uses_distribution_storage = False
     if use_distribution_storage:
-        distribution_id_candidates = _distribution_id_candidates_for_settings(
-            settings
-        )
-        desired_distribution_id = distribution_id_candidates[0]
-        distribution_id = desired_distribution_id
-        root_dir = paths.saved_distributions_dir / desired_distribution_id
-        if allow_legacy_fallback and not root_dir.exists():
-            for legacy_distribution_id in distribution_id_candidates[1:]:
-                legacy_root_dir = (
-                    paths.saved_distributions_dir / legacy_distribution_id
-                )
-                if legacy_root_dir.exists():
-                    distribution_id = legacy_distribution_id
-                    root_dir = legacy_root_dir
-                    break
+        if active_distribution_id is not None:
+            distribution_id = active_distribution_id
+            root_dir = paths.saved_distributions_dir / active_distribution_id
+        else:
+            distribution_id_candidates = (
+                _distribution_id_candidates_for_settings(settings)
+            )
+            desired_distribution_id = distribution_id_candidates[0]
+            distribution_id = desired_distribution_id
+            root_dir = paths.saved_distributions_dir / desired_distribution_id
+            if allow_legacy_fallback and not root_dir.exists():
+                # Legacy saved-distribution folders were keyed before template
+                # and component-build-mode became part of the signature. Keep
+                # this fallback so older projects load while new shared
+                # structure distributions live under
+                # analysis/structure_distributions/.
+                for legacy_distribution_id in distribution_id_candidates[1:]:
+                    legacy_root_dir = (
+                        paths.saved_distributions_dir / legacy_distribution_id
+                    )
+                    if legacy_root_dir.exists():
+                        distribution_id = legacy_distribution_id
+                        root_dir = legacy_root_dir
+                        break
         distribution_metadata_file = root_dir / "distribution.json"
         uses_distribution_storage = True
     includes_predicted_structures = bool(
@@ -1433,6 +1608,15 @@ def _distribution_metadata_from_payload(
     built_component_source_mode = (
         _distribution_built_component_source_mode_from_payload(payload)
     )
+    parsed_base_id, parsed_attempt_index = _distribution_attempt_components(
+        distribution_id
+    )
+    base_distribution_id = (
+        _optional_str(payload.get("base_distribution_id")) or parsed_base_id
+    )
+    attempt_index = _optional_int(payload.get("attempt_index"))
+    if attempt_index is None:
+        attempt_index = parsed_attempt_index
     use_representative_structures = bool(
         payload.get("use_representative_structures", False)
     )
@@ -1445,6 +1629,8 @@ def _distribution_metadata_from_payload(
         metadata_path=metadata_path,
         created_at=_optional_str(payload.get("created_at")),
         updated_at=_optional_str(payload.get("updated_at")),
+        base_distribution_id=base_distribution_id,
+        attempt_index=attempt_index,
         template_name=_optional_str(payload.get("template_name")),
         component_build_mode=normalize_component_build_mode(
             payload.get("component_build_mode")
@@ -1874,6 +2060,9 @@ class SAXSProjectManager:
         project_dir_or_file: str | Path,
     ) -> ProjectSettings:
         candidate = Path(project_dir_or_file).expanduser().resolve()
+        selected_project_dir = (
+            candidate.parent if candidate.name.endswith(".json") else candidate
+        )
         project_file = (
             candidate
             if candidate.name.endswith(".json")
@@ -1881,8 +2070,227 @@ class SAXSProjectManager:
         )
         payload = json.loads(project_file.read_text(encoding="utf-8"))
         settings = ProjectSettings.from_dict(payload)
+        self._normalize_loaded_project_settings(
+            settings,
+            selected_project_dir=selected_project_dir,
+        )
         self.ensure_project_dirs(build_project_paths(settings.project_dir))
         return settings
+
+    def _normalize_loaded_project_settings(
+        self,
+        settings: ProjectSettings,
+        *,
+        selected_project_dir: Path,
+    ) -> None:
+        selected_project_dir = selected_project_dir.expanduser().resolve()
+        stored_project_dir = settings.resolved_project_dir
+        if stored_project_dir != selected_project_dir:
+            settings.project_dir = str(selected_project_dir)
+            self._remap_copied_project_paths(
+                settings,
+                old_project_dir=stored_project_dir,
+                new_project_dir=selected_project_dir,
+            )
+        else:
+            self._restore_internal_staged_paths(
+                settings,
+                selected_project_dir,
+            )
+        self._restore_active_distribution_id(settings)
+
+    def _restore_active_distribution_id(
+        self,
+        settings: ProjectSettings,
+    ) -> None:
+        saved_dir = build_project_paths(
+            settings.project_dir
+        ).saved_distributions_dir
+        active_distribution_id = _optional_str(settings.active_distribution_id)
+        if active_distribution_id is not None:
+            metadata_path = (
+                saved_dir / active_distribution_id / "distribution.json"
+            )
+            if metadata_path.is_file():
+                return
+            settings.active_distribution_id = None
+
+        artifact_paths = project_artifact_paths(
+            settings,
+            storage_mode="distribution",
+        )
+        distribution_id = _optional_str(artifact_paths.distribution_id)
+        if (
+            distribution_id is not None
+            and artifact_paths.distribution_metadata_file is not None
+            and artifact_paths.distribution_metadata_file.is_file()
+        ):
+            settings.active_distribution_id = distribution_id
+            return
+        fallback_distribution_id = self._best_matching_saved_distribution_id(
+            settings
+        )
+        if fallback_distribution_id is not None:
+            settings.active_distribution_id = fallback_distribution_id
+
+    def _best_matching_saved_distribution_id(
+        self,
+        settings: ProjectSettings,
+    ) -> str | None:
+        matches = [
+            record
+            for record in self.list_saved_distributions(settings.project_dir)
+            if self._saved_distribution_matches_settings(record, settings)
+        ]
+        for ready_records in (
+            [
+                record
+                for record in matches
+                if record.component_artifacts_ready
+                and record.prior_artifacts_ready
+            ],
+            [record for record in matches if record.component_artifacts_ready],
+            [record for record in matches if record.prior_artifacts_ready],
+            matches,
+        ):
+            if ready_records:
+                return ready_records[0].distribution_id
+        return None
+
+    @staticmethod
+    def _saved_distribution_matches_settings(
+        record: SavedDistributionRecord,
+        settings: ProjectSettings,
+    ) -> bool:
+        if record.use_predicted_structure_weights != bool(
+            settings.use_predicted_structure_weights
+        ):
+            return False
+        if record.component_build_mode != normalize_component_build_mode(
+            settings.component_build_mode
+        ):
+            return False
+        selected_template = _optional_str(settings.selected_model_template)
+        if (
+            record.template_name is not None
+            and selected_template is not None
+            and record.template_name != selected_template
+        ):
+            return False
+        if tuple(record.exclude_elements) != tuple(
+            _normalized_elements(settings.exclude_elements)
+        ):
+            return False
+        if bool(record.use_experimental_grid) != bool(
+            settings.use_experimental_grid
+        ):
+            return False
+        if not record.use_experimental_grid and _optional_int(
+            record.q_points
+        ) != _optional_int(settings.q_points):
+            return False
+        if not SAXSProjectManager._optional_floats_match(
+            record.q_min,
+            settings.q_min,
+        ):
+            return False
+        if not SAXSProjectManager._optional_floats_match(
+            record.q_max,
+            settings.q_max,
+        ):
+            return False
+        if (
+            record.built_component_source_mode is not None
+            and record.built_component_source_mode
+            != component_source_mode_for_settings(settings)
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _optional_floats_match(
+        left: object,
+        right: object,
+    ) -> bool:
+        left_value = _optional_float(left)
+        right_value = _optional_float(right)
+        if left_value is None or right_value is None:
+            return left_value is None and right_value is None
+        tolerance = max(
+            1e-12,
+            1e-9 * max(abs(left_value), abs(right_value), 1.0),
+        )
+        return abs(left_value - right_value) <= tolerance
+
+    def duplicate_project_for_new_fit(
+        self,
+        source_settings: ProjectSettings,
+        destination_dir: str | Path,
+        *,
+        project_name: str | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> ProjectSettings:
+        """Copy a project while clearing dataset-specific fit state."""
+        total_steps = 6
+
+        def report(processed: int, message: str) -> None:
+            if progress_callback is not None:
+                progress_callback(processed, total_steps, message)
+
+        report(1, "Validating duplicate project destination...")
+        source_settings = ProjectSettings.from_dict(source_settings.to_dict())
+        source_dir = source_settings.resolved_project_dir
+        if not source_dir.is_dir():
+            raise ValueError(
+                "The active project folder could not be found on disk."
+            )
+        destination = Path(destination_dir).expanduser().resolve()
+        if destination == source_dir or source_dir in destination.parents:
+            raise ValueError(
+                "Choose a duplicate project destination outside the active "
+                "project folder."
+            )
+        if destination.exists():
+            raise FileExistsError(
+                "The duplicate project destination already exists. Choose a "
+                "new folder name."
+            )
+
+        source_artifact_paths = project_artifact_paths(source_settings)
+        report(2, "Copying active project folder...")
+        shutil.copytree(source_dir, destination)
+
+        report(3, "Remapping duplicated project settings...")
+        duplicated_settings = ProjectSettings.from_dict(
+            source_settings.to_dict()
+        )
+        duplicated_project_name = str(project_name or "").strip()
+        duplicated_settings.project_name = (
+            duplicated_project_name or destination.name
+        )
+        duplicated_settings.project_dir = str(destination)
+        self._remap_copied_project_paths(
+            duplicated_settings,
+            old_project_dir=source_dir,
+            new_project_dir=destination,
+        )
+        self._clear_fit_state_for_duplicate(duplicated_settings)
+
+        report(4, "Clearing previous fit state from duplicate...")
+        self._clear_fit_artifacts_for_duplicate(destination)
+        report(5, "Preserving reusable distribution artifacts...")
+        self._copy_active_distribution_for_duplicate(
+            source_artifact_paths=source_artifact_paths,
+            source_project_dir=source_dir,
+            destination_project_dir=destination,
+            duplicated_settings=duplicated_settings,
+        )
+        report(6, "Saving duplicated project settings...")
+        self.save_project(
+            duplicated_settings,
+            refresh_registered_paths=False,
+        )
+        return duplicated_settings
 
     def registered_folder_warnings(
         self,
@@ -1950,9 +2358,283 @@ class SAXSProjectManager:
         )
         return paths.project_file
 
+    @staticmethod
+    def _clear_fit_state_for_duplicate(settings: ProjectSettings) -> None:
+        settings.experimental_data_path = None
+        settings.copied_experimental_data_file = None
+        settings.solvent_data_path = None
+        settings.copied_solvent_data_file = None
+        settings.experimental_header_rows = 0
+        settings.experimental_q_column = None
+        settings.experimental_intensity_column = None
+        settings.experimental_error_column = None
+        settings.solvent_header_rows = 0
+        settings.solvent_q_column = None
+        settings.solvent_intensity_column = None
+        settings.solvent_error_column = None
+        settings.best_prefit_template = None
+        settings.best_prefit_parameter_entries = []
+        settings.dream_favorite_selection = None
+        settings.dream_favorite_history = []
+
+    def _copy_active_distribution_for_duplicate(
+        self,
+        *,
+        source_artifact_paths: ProjectArtifactPaths,
+        source_project_dir: Path,
+        destination_project_dir: Path,
+        duplicated_settings: ProjectSettings,
+    ) -> None:
+        copied_source_root = self._remapped_project_path(
+            source_artifact_paths.root_dir,
+            old_project_dir=source_project_dir,
+            new_project_dir=destination_project_dir,
+        )
+        if copied_source_root is None or not copied_source_root.exists():
+            return
+
+        target_artifact_paths = project_artifact_paths(
+            duplicated_settings,
+            storage_mode="distribution",
+            allow_legacy_fallback=False,
+        )
+        if target_artifact_paths.distribution_metadata_file is None:
+            return
+        if (
+            copied_source_root.resolve()
+            != target_artifact_paths.root_dir.resolve()
+        ):
+            self.ensure_artifact_dirs(target_artifact_paths)
+            self._copy_distribution_artifacts(
+                source_root=copied_source_root,
+                target_artifact_paths=target_artifact_paths,
+                include_predicted_structures=bool(
+                    source_artifact_paths.includes_predicted_structures
+                ),
+            )
+            self._copy_cluster_geometry_metadata_for_duplicate(
+                source_root=copied_source_root,
+                target_artifact_paths=target_artifact_paths,
+            )
+        self._write_distribution_metadata(
+            duplicated_settings,
+            artifact_paths=target_artifact_paths,
+        )
+
+    @staticmethod
+    def _copy_cluster_geometry_metadata_for_duplicate(
+        *,
+        source_root: Path,
+        target_artifact_paths: ProjectArtifactPaths,
+    ) -> None:
+        source_prefit_dir = source_root / "prefit"
+        if not source_prefit_dir.is_dir():
+            return
+        target_artifact_paths.prefit_dir.mkdir(parents=True, exist_ok=True)
+        for filename in (
+            "cluster_geometry_metadata.json",
+            "cluster_geometry_metadata_predicted_structures.json",
+        ):
+            source_path = source_prefit_dir / filename
+            if source_path.is_file():
+                shutil.copy2(
+                    source_path,
+                    target_artifact_paths.prefit_dir / filename,
+                )
+
+    @classmethod
+    def _clear_fit_artifacts_for_duplicate(cls, project_dir: Path) -> None:
+        paths = build_project_paths(project_dir)
+        cls._clear_directory_contents(paths.experimental_data_dir)
+        cls._clear_directory_contents(paths.exported_results_dir)
+        cls._clear_directory_contents(paths.reports_dir)
+        cls._clear_prefit_fit_artifacts(paths.prefit_dir)
+        cls._clear_dream_fit_artifacts(paths.dream_dir)
+
+        # The shared StructureDistributionStore is deliberately not cleared
+        # when duplicating a project for a new fit. It belongs to the reusable
+        # cluster-geometry layer, not the experimental-data fit state.
+        saved_distributions_dir = paths.saved_distributions_dir
+        if saved_distributions_dir.is_dir():
+            for distribution_dir in saved_distributions_dir.iterdir():
+                if not distribution_dir.is_dir():
+                    continue
+                cls._clear_prefit_fit_artifacts(distribution_dir / "prefit")
+                cls._clear_dream_fit_artifacts(distribution_dir / "dream")
+
+    @staticmethod
+    def _clear_directory_contents(directory: Path) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        for child in directory.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+
+    @staticmethod
+    def _clear_prefit_fit_artifacts(prefit_dir: Path) -> None:
+        prefit_dir.mkdir(parents=True, exist_ok=True)
+        preserved_files = {
+            "cluster_geometry_metadata.json",
+            "cluster_geometry_metadata_predicted_structures.json",
+        }
+        fit_files = {
+            "latest_prefit_curve.txt",
+            "pd_prefit_params.json",
+            "prefit_sequence_history.json",
+            "prefit_state.json",
+        }
+        for child in prefit_dir.iterdir():
+            if child.is_dir():
+                if (
+                    child.name.startswith("prefit_")
+                    or (child / "prefit_state.json").is_file()
+                ):
+                    shutil.rmtree(child)
+                continue
+            if child.name in preserved_files:
+                continue
+            if child.name in fit_files:
+                child.unlink()
+
+    @staticmethod
+    def _clear_dream_fit_artifacts(dream_dir: Path) -> None:
+        if dream_dir.exists():
+            shutil.rmtree(dream_dir)
+        (dream_dir / "runtime_scripts").mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def _remap_copied_project_paths(
+        cls,
+        settings: ProjectSettings,
+        *,
+        old_project_dir: Path,
+        new_project_dir: Path,
+    ) -> None:
+        for attribute in (
+            "experimental_data_path",
+            "copied_experimental_data_file",
+            "solvent_data_path",
+            "copied_solvent_data_file",
+            "frames_dir",
+            "pdb_frames_dir",
+            "clusters_dir",
+            "trajectory_file",
+            "topology_file",
+            "energy_file",
+        ):
+            current_value = getattr(settings, attribute)
+            if not current_value:
+                continue
+            remapped = cls._remap_if_within_project(
+                current_value,
+                old_project_dir=old_project_dir,
+                new_project_dir=new_project_dir,
+            )
+            setattr(settings, attribute, remapped)
+        cls._restore_internal_staged_paths(settings, new_project_dir)
+
+    @classmethod
+    def _restore_internal_staged_paths(
+        cls,
+        settings: ProjectSettings,
+        project_dir: Path,
+    ) -> None:
+        experimental_dir = (project_dir / "experimental_data").resolve()
+        cls._restore_internal_staged_file(
+            settings,
+            copied_attribute="copied_experimental_data_file",
+            source_attribute="experimental_data_path",
+            experimental_dir=experimental_dir,
+        )
+        cls._restore_internal_staged_file(
+            settings,
+            copied_attribute="copied_solvent_data_file",
+            source_attribute="solvent_data_path",
+            experimental_dir=experimental_dir,
+        )
+
+    @classmethod
+    def _restore_internal_staged_file(
+        cls,
+        settings: ProjectSettings,
+        *,
+        copied_attribute: str,
+        source_attribute: str,
+        experimental_dir: Path,
+    ) -> None:
+        copied_value = _optional_str(getattr(settings, copied_attribute))
+        source_value = _optional_str(getattr(settings, source_attribute))
+        if copied_value is not None and cls._path_text_is_file(copied_value):
+            return
+        for path_text in (copied_value, source_value):
+            filename = cls._portable_path_name(path_text)
+            if not filename:
+                continue
+            candidate = experimental_dir / filename
+            if candidate.is_file():
+                setattr(settings, copied_attribute, str(candidate.resolve()))
+                return
+        if copied_value or not source_value:
+            return
+        try:
+            source_path = Path(source_value).expanduser().resolve()
+        except Exception:
+            return
+        if experimental_dir in source_path.parents and source_path.is_file():
+            setattr(settings, copied_attribute, str(source_path))
+
+    @staticmethod
+    def _path_text_is_file(path_text: str) -> bool:
+        try:
+            return Path(path_text).expanduser().is_file()
+        except Exception:
+            return False
+
+    @staticmethod
+    def _portable_path_name(path_text: str | None) -> str:
+        text = str(path_text or "").strip().rstrip("\\/")
+        if not text:
+            return ""
+        return re.split(r"[\\/]+", text)[-1]
+
+    @classmethod
+    def _remap_if_within_project(
+        cls,
+        path_text: str,
+        *,
+        old_project_dir: Path,
+        new_project_dir: Path,
+    ) -> str:
+        remapped = cls._remapped_project_path(
+            Path(path_text).expanduser(),
+            old_project_dir=old_project_dir,
+            new_project_dir=new_project_dir,
+        )
+        return path_text if remapped is None else str(remapped)
+
+    @staticmethod
+    def _remapped_project_path(
+        path: Path,
+        *,
+        old_project_dir: Path,
+        new_project_dir: Path,
+    ) -> Path | None:
+        try:
+            relative = (
+                path.expanduser()
+                .resolve()
+                .relative_to(old_project_dir.resolve())
+            )
+        except Exception:
+            return None
+        return (new_project_dir / relative).resolve()
+
     def ensure_project_dirs(self, paths: ProjectPaths) -> None:
         for directory in (
             paths.project_dir,
+            paths.analysis_dir,
+            paths.structure_distribution_store_dir,
             paths.saved_distributions_dir,
             paths.experimental_data_dir,
             paths.scattering_components_dir,
@@ -2453,6 +3135,161 @@ class SAXSProjectManager:
             )
         return record
 
+    def delete_saved_distribution(
+        self,
+        project_dir: str | Path,
+        distribution_id: str,
+    ) -> None:
+        distribution_id = str(distribution_id).strip()
+        if not distribution_id:
+            raise ValueError("Select a computed distribution to delete.")
+        saved_dir = build_project_paths(project_dir).saved_distributions_dir
+        distribution_dir = saved_dir / distribution_id
+        try:
+            saved_root = saved_dir.resolve()
+            resolved_distribution_dir = distribution_dir.resolve()
+        except FileNotFoundError:
+            resolved_distribution_dir = distribution_dir
+            saved_root = saved_dir.resolve()
+        if saved_root not in resolved_distribution_dir.parents:
+            raise ValueError("The computed distribution path is invalid.")
+        if not distribution_dir.is_dir():
+            raise FileNotFoundError(
+                f"No saved distribution folder was found for {distribution_id}."
+            )
+        shutil.rmtree(distribution_dir)
+
+    def settings_for_new_computed_distribution(
+        self,
+        settings: ProjectSettings,
+    ) -> ProjectSettings:
+        working_settings = ProjectSettings.from_dict(settings.to_dict())
+        base_distribution_id = distribution_id_for_settings(working_settings)
+        saved_dir = build_project_paths(
+            working_settings.project_dir
+        ).saved_distributions_dir
+        created_at = datetime.now()
+        attempt_index = self._next_distribution_attempt_index(
+            saved_dir,
+            base_distribution_id,
+        )
+        while True:
+            distribution_id = _distribution_attempt_id(
+                base_distribution_id,
+                created_at=created_at,
+                attempt_index=attempt_index,
+            )
+            if not (saved_dir / distribution_id).exists():
+                break
+            attempt_index += 1
+        working_settings.active_distribution_id = distribution_id
+        self.clear_distribution_fit_state(working_settings)
+        return working_settings
+
+    def duplicate_saved_distribution(
+        self,
+        project_dir: str | Path,
+        source_distribution_id: str,
+        *,
+        base_settings: ProjectSettings | None = None,
+    ) -> SavedDistributionRecord:
+        source_record = self.load_saved_distribution(
+            project_dir,
+            source_distribution_id,
+        )
+        target_settings = self.settings_for_saved_distribution(
+            project_dir,
+            source_distribution_id,
+            base_settings=base_settings,
+        )
+        target_settings = self.settings_for_new_computed_distribution(
+            target_settings
+        )
+        target_artifact_paths = project_artifact_paths(
+            target_settings,
+            storage_mode="distribution",
+            allow_legacy_fallback=False,
+        )
+        if target_artifact_paths.distribution_id is None:
+            raise ValueError(
+                "The duplicated distribution path could not be resolved."
+            )
+        if target_artifact_paths.distribution_metadata_file is None:
+            raise ValueError(
+                "The duplicated distribution metadata path is unavailable."
+            )
+
+        self.ensure_project_dirs(build_project_paths(project_dir))
+        self.ensure_artifact_dirs(target_artifact_paths)
+        self._copy_distribution_artifacts(
+            source_root=source_record.distribution_dir,
+            target_artifact_paths=target_artifact_paths,
+            include_predicted_structures=bool(
+                source_record.use_predicted_structure_weights
+            ),
+        )
+        self._copy_cluster_geometry_metadata_for_duplicate(
+            source_root=source_record.distribution_dir,
+            target_artifact_paths=target_artifact_paths,
+        )
+        self._clear_prefit_fit_artifacts(target_artifact_paths.prefit_dir)
+        self._clear_dream_fit_artifacts(target_artifact_paths.dream_dir)
+        self._write_distribution_metadata(
+            target_settings,
+            artifact_paths=target_artifact_paths,
+        )
+        return self.load_saved_distribution(
+            project_dir,
+            target_artifact_paths.distribution_id,
+        )
+
+    @staticmethod
+    def clear_distribution_fit_state(settings: ProjectSettings) -> None:
+        settings.best_prefit_template = None
+        settings.best_prefit_parameter_entries = []
+        settings.dream_favorite_selection = None
+        settings.dream_favorite_history = []
+
+    def touch_saved_distribution(
+        self,
+        settings: ProjectSettings,
+    ) -> None:
+        artifact_paths = project_artifact_paths(
+            settings,
+            storage_mode="distribution",
+            allow_legacy_fallback=False,
+        )
+        if (
+            artifact_paths.distribution_id is None
+            or artifact_paths.distribution_metadata_file is None
+            or not artifact_paths.distribution_metadata_file.is_file()
+        ):
+            return
+        self._write_distribution_metadata(
+            settings,
+            artifact_paths=artifact_paths,
+        )
+
+    def _next_distribution_attempt_index(
+        self,
+        saved_dir: Path,
+        base_distribution_id: str,
+    ) -> int:
+        max_index = 0
+        if saved_dir.is_dir():
+            for record in self.list_saved_distributions(saved_dir.parent):
+                if record.base_distribution_id == base_distribution_id:
+                    max_index = max(max_index, int(record.attempt_index or 0))
+            for distribution_dir in saved_dir.iterdir():
+                if not distribution_dir.is_dir():
+                    continue
+                parsed_base_id, parsed_index = (
+                    _distribution_attempt_components(distribution_dir.name)
+                )
+                if parsed_base_id == base_distribution_id:
+                    max_index = max(max_index, int(parsed_index or 0))
+        return max_index + 1
+
     def settings_for_saved_distribution(
         self,
         project_dir: str | Path,
@@ -2485,6 +3322,8 @@ class SAXSProjectManager:
         working_settings.component_build_mode = record.component_build_mode
         if record.template_name is not None:
             working_settings.selected_model_template = record.template_name
+        working_settings.active_distribution_id = record.distribution_id
+        self.clear_distribution_fit_state(working_settings)
         return working_settings
 
     def clone_distribution_for_template(
@@ -2508,6 +3347,7 @@ class SAXSProjectManager:
             base_settings=base_settings,
         )
         target_settings.selected_model_template = normalized_template
+        target_settings.active_distribution_id = None
         target_artifact_paths = project_artifact_paths(
             target_settings,
             storage_mode="distribution",
@@ -2866,6 +3706,11 @@ class SAXSProjectManager:
             )
             settings.cluster_inventory_rows = cluster_rows
 
+        component_entries = self._ordered_component_entries_for_distribution(
+            settings,
+            component_entries,
+            artifact_paths=artifact_paths,
+        )
         model_map_path = artifact_paths.component_map_file
         self._write_component_map(model_map_path, component_entries)
         self._write_distribution_metadata(
@@ -2963,6 +3808,11 @@ class SAXSProjectManager:
                 progress_callback=progress_callback,
                 log_callback=log_callback,
             )
+        )
+        component_entries = self._ordered_component_entries_for_distribution(
+            settings,
+            component_entries,
+            artifact_paths=artifact_paths,
         )
         model_map_path = artifact_paths.component_map_file
         self._write_component_map(model_map_path, component_entries)
@@ -3142,6 +3992,11 @@ class SAXSProjectManager:
             artifact_paths=artifact_paths,
             cluster_inventory=cluster_inventory,
         )
+        component_entries = self._ordered_component_entries_for_distribution(
+            settings,
+            component_entries,
+            artifact_paths=artifact_paths,
+        )
         md_prior_weights_path = artifact_paths.prior_weights_file
         prior_plot_data_path = artifact_paths.prior_plot_data_file
         cluster_rows = list(cluster_inventory.cluster_rows)
@@ -3187,6 +4042,7 @@ class SAXSProjectManager:
                 available_elements=cluster_inventory.available_elements,
                 q_values=q_values,
                 settings=settings,
+                artifact_paths=artifact_paths,
             )
             settings.available_elements = sorted(
                 {
@@ -3290,9 +4146,20 @@ class SAXSProjectManager:
                         existing
                     )
                 )
+        base_distribution_id = distribution_id_for_settings(settings)
+        parsed_base_id, parsed_attempt_index = (
+            _distribution_attempt_components(artifact_paths.distribution_id)
+        )
+        if parsed_base_id is not None:
+            base_distribution_id = parsed_base_id
+        attempt_index = _optional_int(existing.get("attempt_index"))
+        if attempt_index is None:
+            attempt_index = parsed_attempt_index
         payload = {
             "schema_version": 2,
             "distribution_id": artifact_paths.distribution_id,
+            "base_distribution_id": base_distribution_id,
+            "attempt_index": attempt_index,
             "label": distribution_label_for_settings(settings),
             "created_at": created_at,
             "updated_at": now,
@@ -3324,6 +4191,11 @@ class SAXSProjectManager:
             "prior_artifacts_ready": prior_ready,
             "built_component_source_mode": resolved_component_source_mode,
         }
+        component_order = self._load_component_order_from_artifacts(
+            artifact_paths
+        )
+        if component_order:
+            payload["component_order"] = component_order
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         metadata_path.write_text(
             json.dumps(payload, indent=2) + "\n",
@@ -3615,6 +4487,310 @@ class SAXSProjectManager:
             artifact_paths=artifact_paths,
             cluster_bins=cluster_inventory.cluster_bins,
         )
+
+    def lock_distribution_component_order(
+        self,
+        settings: ProjectSettings,
+        *,
+        artifact_paths: ProjectArtifactPaths | None = None,
+    ) -> list[dict[str, object]]:
+        active_artifact_paths = artifact_paths or project_artifact_paths(
+            settings
+        )
+        locked_order = self._load_component_order_from_artifacts(
+            active_artifact_paths
+        )
+        if locked_order:
+            return locked_order
+
+        component_entries = self._component_entries_from_component_artifacts(
+            active_artifact_paths
+        )
+        if not component_entries:
+            return []
+
+        ordered_entries = self._ordered_component_entries_for_distribution(
+            settings,
+            component_entries,
+            artifact_paths=None,
+        )
+        component_order = self._component_order_payload(ordered_entries)
+        self._write_component_order_to_artifacts(
+            active_artifact_paths,
+            component_order,
+            ordered_entries,
+        )
+        self._write_distribution_metadata(
+            settings,
+            artifact_paths=active_artifact_paths,
+        )
+        return component_order
+
+    def _ordered_component_entries_for_distribution(
+        self,
+        settings: ProjectSettings,
+        component_entries: list[ProjectComponentEntry],
+        *,
+        artifact_paths: ProjectArtifactPaths | None,
+    ) -> list[ProjectComponentEntry]:
+        if not component_entries:
+            return []
+        locked_order = (
+            self._load_component_order_from_artifacts(artifact_paths)
+            if artifact_paths is not None
+            else []
+        )
+        if locked_order:
+            return self._apply_component_order(
+                component_entries,
+                locked_order,
+                settings=settings,
+            )
+
+        custom_order = _normalized_prior_x_axis_order(
+            settings.prior_histogram_x_axis_order
+        )
+        available_structures = {entry.structure for entry in component_entries}
+        if custom_order:
+            ordered_structures = [
+                raw_label
+                for raw_label, _display_label in custom_order
+                if raw_label in available_structures
+            ]
+            ordered_set = set(ordered_structures)
+            ordered_structures.extend(
+                label
+                for label in sort_stoich_labels(available_structures)
+                if label not in ordered_set
+            )
+        else:
+            ordered_structures = sort_stoich_labels(available_structures)
+        return self._apply_structure_order(
+            component_entries,
+            ordered_structures,
+        )
+
+    def _apply_component_order(
+        self,
+        component_entries: list[ProjectComponentEntry],
+        component_order: list[dict[str, object]],
+        *,
+        settings: ProjectSettings,
+    ) -> list[ProjectComponentEntry]:
+        order_lookup: dict[tuple[str, str], int] = {}
+        for index, payload in enumerate(component_order):
+            key = _component_order_key(payload)
+            if key is not None and key not in order_lookup:
+                order_lookup[key] = index
+        fallback_entries = self._ordered_component_entries_for_distribution(
+            settings,
+            component_entries,
+            artifact_paths=None,
+        )
+        fallback_lookup = {
+            (entry.structure, entry.motif): index
+            for index, entry in enumerate(fallback_entries)
+        }
+        return sorted(
+            component_entries,
+            key=lambda entry: (
+                order_lookup.get(
+                    (entry.structure, entry.motif),
+                    len(order_lookup)
+                    + fallback_lookup.get((entry.structure, entry.motif), 0),
+                ),
+                _natural_sort_key(entry.structure),
+                _natural_sort_key(entry.motif),
+            ),
+        )
+
+    @staticmethod
+    def _apply_structure_order(
+        component_entries: list[ProjectComponentEntry],
+        ordered_structures: list[str],
+    ) -> list[ProjectComponentEntry]:
+        structure_order = {
+            structure: index
+            for index, structure in enumerate(ordered_structures)
+        }
+        return [
+            entry
+            for _index, entry in sorted(
+                enumerate(component_entries),
+                key=lambda item: (
+                    structure_order.get(
+                        item[1].structure,
+                        len(structure_order),
+                    ),
+                    _natural_sort_key(item[1].motif),
+                    item[0],
+                ),
+            )
+        ]
+
+    def _component_entries_from_component_artifacts(
+        self,
+        artifact_paths: ProjectArtifactPaths,
+    ) -> list[ProjectComponentEntry]:
+        map_payload: dict[str, object] = {}
+        prior_payload: dict[str, object] = {}
+        if artifact_paths.component_map_file.is_file():
+            try:
+                map_payload = json.loads(
+                    artifact_paths.component_map_file.read_text(
+                        encoding="utf-8"
+                    )
+                )
+            except Exception:
+                map_payload = {}
+        if artifact_paths.prior_weights_file.is_file():
+            try:
+                prior_payload = json.loads(
+                    artifact_paths.prior_weights_file.read_text(
+                        encoding="utf-8"
+                    )
+                )
+            except Exception:
+                prior_payload = {}
+
+        saxs_map = map_payload.get("saxs_map", {})
+        if not isinstance(saxs_map, dict):
+            saxs_map = {}
+        structures = prior_payload.get("structures", {})
+        if not isinstance(structures, dict):
+            structures = {}
+
+        ordered_keys: list[tuple[str, str, str]] = []
+        for item in self._load_component_order_from_payloads(
+            map_payload,
+            prior_payload,
+        ):
+            key = _component_order_key(item)
+            if key is None:
+                continue
+            structure, motif = key
+            profile_file = str(item.get("profile_file", "")).strip()
+            if not profile_file:
+                motif_map = saxs_map.get(structure, {})
+                if not isinstance(motif_map, dict):
+                    motif_map = {}
+                profile_file = str(motif_map.get(motif, "")).strip()
+            if profile_file:
+                ordered_keys.append((structure, motif, profile_file))
+
+        seen = {(structure, motif) for structure, motif, _file in ordered_keys}
+        for structure, raw_motif_map in saxs_map.items():
+            if not isinstance(raw_motif_map, dict):
+                continue
+            for motif, profile_file in raw_motif_map.items():
+                key = (str(structure), str(motif))
+                if key in seen:
+                    continue
+                ordered_keys.append(
+                    (key[0], key[1], str(profile_file).strip())
+                )
+                seen.add(key)
+
+        entries: list[ProjectComponentEntry] = []
+        for structure, motif, profile_file in ordered_keys:
+            structure_payload = structures.get(structure, {})
+            if not isinstance(structure_payload, dict):
+                structure_payload = {}
+            motif_payload = structure_payload.get(motif, {})
+            if not isinstance(motif_payload, dict):
+                motif_payload = {}
+            entries.append(
+                ProjectComponentEntry(
+                    structure=structure,
+                    motif=motif,
+                    file_count=max(
+                        int(_optional_int(motif_payload.get("count")) or 0),
+                        0,
+                    ),
+                    representative=_optional_str(
+                        motif_payload.get("representative")
+                    ),
+                    profile_file=profile_file,
+                    source_dir=str(motif_payload.get("source_dir", "")),
+                )
+            )
+        return entries
+
+    def _load_component_order_from_artifacts(
+        self,
+        artifact_paths: ProjectArtifactPaths | None,
+    ) -> list[dict[str, object]]:
+        if artifact_paths is None:
+            return []
+        payloads: list[dict[str, object]] = []
+        for path in (
+            artifact_paths.component_map_file,
+            artifact_paths.prior_weights_file,
+            artifact_paths.distribution_metadata_file,
+        ):
+            if path is None or not path.is_file():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                payloads.append(payload)
+        return self._load_component_order_from_payloads(*payloads)
+
+    @staticmethod
+    def _load_component_order_from_payloads(
+        *payloads: dict[str, object],
+    ) -> list[dict[str, object]]:
+        for payload in payloads:
+            order = _normalized_component_order(
+                payload.get("component_order", [])
+            )
+            if order:
+                return order
+        return []
+
+    @staticmethod
+    def _component_order_payload(
+        component_entries: list[ProjectComponentEntry],
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "order_index": index,
+                "parameter": f"w{index}",
+                "structure": entry.structure,
+                "motif": entry.motif,
+                "profile_file": entry.profile_file,
+            }
+            for index, entry in enumerate(component_entries)
+        ]
+
+    def _write_component_order_to_artifacts(
+        self,
+        artifact_paths: ProjectArtifactPaths,
+        component_order: list[dict[str, object]],
+        component_entries: list[ProjectComponentEntry],
+    ) -> None:
+        if artifact_paths.component_map_file.is_file():
+            self._write_component_map(
+                artifact_paths.component_map_file,
+                component_entries,
+            )
+        if artifact_paths.prior_weights_file.is_file():
+            try:
+                payload = json.loads(
+                    artifact_paths.prior_weights_file.read_text(
+                        encoding="utf-8"
+                    )
+                )
+            except Exception:
+                payload = {}
+            if isinstance(payload, dict):
+                payload["component_order"] = component_order
+                artifact_paths.prior_weights_file.write_text(
+                    json.dumps(payload, indent=2) + "\n",
+                    encoding="utf-8",
+                )
 
     def _component_entries_from_averaged_components(
         self,
@@ -4087,6 +5263,9 @@ class SAXSProjectManager:
                 "qmax": float(q_values.max()),
                 "points": int(q_values.size),
             },
+            "component_order": self._component_order_payload(
+                component_entries
+            ),
             "structures": {},
         }
         structures_payload: dict[str, dict[str, object]] = {}
@@ -4182,7 +5361,12 @@ class SAXSProjectManager:
     ) -> None:
         model_map_path.write_text(
             json.dumps(
-                {"saxs_map": self._component_map_payload(component_entries)},
+                {
+                    "component_order": self._component_order_payload(
+                        component_entries
+                    ),
+                    "saxs_map": self._component_map_payload(component_entries),
+                },
                 indent=2,
             )
             + "\n",
@@ -4710,6 +5894,7 @@ class SAXSProjectManager:
         available_elements: list[str],
         q_values: np.ndarray,
         settings: ProjectSettings,
+        artifact_paths: ProjectArtifactPaths,
     ) -> tuple[list[dict[str, object]], list[str], Path, int]:
         cluster_inventory = _ClusterInventory(
             cluster_bins=cluster_bins,
@@ -4747,6 +5932,7 @@ class SAXSProjectManager:
             "value_kind": "normalized_weight",
             "includes_predicted_structures": True,
             "prediction_dataset_file": str(loaded_dataset.dataset_file),
+            "component_order": [],
             "structures": {},
         }
         structures_payload: dict[str, dict[str, object]] = {}
@@ -4823,6 +6009,46 @@ class SAXSProjectManager:
                     _predicted_secondary_atom_distributions(prediction)
                 ),
             }
+        ordered_component_entries = (
+            self._component_entries_from_component_artifacts(artifact_paths)
+        )
+        if not ordered_component_entries:
+            predicted_entries = [
+                ProjectComponentEntry(
+                    structure=str(payload_entry["prediction"].label),
+                    motif=str(payload_entry["motif"]),
+                    file_count=1,
+                    representative=(
+                        ""
+                        if payload_entry["source_path"] is None
+                        else payload_entry["source_path"].name
+                    ),
+                    profile_file=self._component_profile_filename(
+                        str(payload_entry["prediction"].label),
+                        str(payload_entry["motif"]),
+                    ),
+                    source_dir=(
+                        ""
+                        if payload_entry["source_path"] is None
+                        else str(payload_entry["source_path"].parent)
+                    ),
+                )
+                for payload_entry in predicted_payloads
+            ]
+            ordered_component_entries = [
+                *component_entries,
+                *predicted_entries,
+            ]
+        ordered_component_entries = (
+            self._ordered_component_entries_for_distribution(
+                settings,
+                ordered_component_entries,
+                artifact_paths=artifact_paths,
+            )
+        )
+        payload["component_order"] = self._component_order_payload(
+            ordered_component_entries
+        )
         payload["structures"] = structures_payload
         md_prior_weights_path.write_text(
             json.dumps(payload, indent=2) + "\n",
