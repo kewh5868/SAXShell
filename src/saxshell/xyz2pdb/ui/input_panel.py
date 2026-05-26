@@ -16,6 +16,35 @@ from PySide6.QtWidgets import (
 )
 
 
+def xyz_input_convention_warning_message(
+    input_path: Path | None,
+) -> str | None:
+    if input_path is None:
+        return None
+    path = Path(input_path).expanduser()
+    issues: list[str] = []
+    if path.name.lower().endswith("pos-1.xyz"):
+        issues.append(
+            "The selected file looks like a raw trajectory file "
+            "(*pos-1.xyz)."
+        )
+    working_folder = path.parent if path.suffix.lower() == ".xyz" else path
+    if not working_folder.name.lower().startswith("splitxyz"):
+        issues.append(
+            "The selected XYZ input is not in a folder named splitxyz* "
+            f"(current folder: {working_folder.name or working_folder})."
+        )
+    if not issues:
+        return None
+    return (
+        "This input may not be ready for XYZ -> PDB conversion:\n\n"
+        + "\n".join(f"- {issue}" for issue in issues)
+        + "\n\nXYZ -> PDB expects split single-frame XYZ files, usually "
+        "inside a folder such as splitxyz_f0fs. Use the trajectory splitting "
+        "workflow first unless this input has already been prepared."
+    )
+
+
 class XYZToPDBInputPanel(QGroupBox):
     """Panel for selecting XYZ input and analyzing one sample frame."""
 

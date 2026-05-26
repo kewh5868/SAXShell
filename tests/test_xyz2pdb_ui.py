@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QSplitter,
 )
 
+import saxshell.xyz2pdb.ui.batch_queue_window as batch_queue_module
 from saxshell.saxs.project_manager import SAXSProjectManager
 from saxshell.structure import PDBAtom, PDBStructure
 from saxshell.xyz2pdb.mapping_workflow import (
@@ -340,9 +341,176 @@ def test_xyz2pdb_batch_queue_prefills_project_xyz_reference_and_elements(
         widget.reference_combo.itemData(index)
         for index in range(widget.reference_combo.count())
     } == {"pbi"}
+    assert widget.molecule_residue_edit.text() == "PBI"
+    assert widget.tight_scale_spin.value() == pytest.approx(85.0)
+    assert widget.relaxed_scale_spin.value() == pytest.approx(135.0)
+    assert widget.max_missing_h_spin.value() == 0
+    assert widget.molecule_table.horizontalHeaderItem(2).text() == "Bonds"
+    assert widget.bond_table.horizontalHeaderItem(2).text() == "Ref (A)"
+    assert widget.bond_table.horizontalHeaderItem(3).text() == "Tolerance (%)"
+    assert widget.bond_table.item(0, 2).text() == "1.000"
+    assert widget.bond_table.item(0, 3).text() == "18.00"
+    assert widget.bond_table.item(0, 4).text() == "0.847"
+    assert widget.bond_table.item(0, 5).text() == "1.153"
+    assert widget.bond_table.item(0, 6).text() == "0.757"
+    assert widget.bond_table.item(0, 7).text() == "1.243"
     assert "Elements: I x1, O x1, Pb x1" in (
         widget.analysis_summary_label.text()
     )
+    assert "Target PDB folder: xyz2pdb_splitxyz_f0fs" in (
+        widget.analysis_summary_label.text()
+    )
+    assert str(tmp_path / "xyz2pdb_splitxyz_f0fs") in (
+        widget.analysis_summary_label.text()
+    )
+    window.close()
+
+
+def test_xyz2pdb_batch_queue_reference_selection_updates_residue(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    refs_dir = tmp_path / "references"
+    refs_dir.mkdir()
+    _write_reference_pdb(refs_dir / "pbi.pdb")
+    _write_ocn_source_pdb(refs_dir / "ocn.pdb")
+    window = XYZToPDBBatchQueueWindow(reference_library_dir=refs_dir)
+    widget = window.add_queue_item(
+        XYZToPDBBatchItem(
+            item_id="batch-item",
+            reference_library_dir=refs_dir,
+        )
+    )
+
+    widget.reference_combo.setCurrentIndex(
+        widget.reference_combo.findData("pbi")
+    )
+    assert widget.molecule_residue_edit.text() == "PBI"
+
+    widget.molecule_residue_edit.setText("ALT")
+    widget.reference_combo.setCurrentIndex(
+        widget.reference_combo.findData("ocn")
+    )
+
+    assert widget.molecule_residue_edit.text() == "OCN"
+    assert widget.bond_table.rowCount() == 2
+    assert widget.bond_table.item(0, 2).text() == "1.200"
+    assert widget.angle_table.rowCount() == 1
+    assert widget.angle_table.item(0, 1).text() == "C1"
+    assert widget.angle_table.item(0, 3).text() == "180.000"
+    window.close()
+
+
+def test_xyz2pdb_batch_queue_preserves_reference_bond_tolerances(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    refs_dir = tmp_path / "references"
+    refs_dir.mkdir()
+    _write_reference_pdb(refs_dir / "pbi.pdb")
+    window = XYZToPDBBatchQueueWindow(reference_library_dir=refs_dir)
+    widget = window.add_queue_item(
+        XYZToPDBBatchItem(
+            item_id="batch-item",
+            reference_library_dir=refs_dir,
+        )
+    )
+
+    widget.bond_table.item(0, 3).setText("20.00")
+    widget.tight_scale_spin.setValue(100.0)
+    widget.relaxed_scale_spin.setValue(200.0)
+    widget.max_missing_h_spin.setValue(1)
+    widget._add_molecule()
+    molecule = widget.item().molecule_inputs[0]
+
+    assert widget.molecule_table.item(0, 2).text() == "1"
+    assert widget.molecule_table.item(0, 3).text() == "100.0%"
+    assert widget.molecule_table.item(0, 4).text() == "200.0%"
+    assert widget.molecule_table.item(0, 5).text() == "1"
+    assert molecule.reference_name == "pbi"
+    assert molecule.residue_name == "PBI"
+    assert molecule.bond_tolerances[0].tolerance == pytest.approx(20.0)
+    assert molecule.tight_pass_scale == pytest.approx(1.0)
+    assert molecule.relaxed_pass_scale == pytest.approx(2.0)
+    assert molecule.max_missing_hydrogens == 1
+    window.close()
+
+
+def test_xyz2pdb_batch_queue_shows_progress_dialog_for_multiple_project_load(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_a = tmp_path / "project_a"
+    project_b = tmp_path / "project_b"
+    project_a.mkdir()
+    project_b.mkdir()
+    window = XYZToPDBBatchQueueWindow()
+    monkeypatch.setattr(
+        batch_queue_module,
+        "_choose_existing_directories",
+        lambda *_args, **_kwargs: (project_a.resolve(), project_b.resolve()),
+    )
+    dialogs: list[object] = []
+
+    class FakeProgressDialog:
+        def __init__(self, label, cancel_text, minimum, maximum, parent):
+            del cancel_text, parent
+            self.labels = [label]
+            self.values: list[int] = []
+            self.minimum = minimum
+            self.maximum = maximum
+            self.closed = False
+            self.shown = False
+            dialogs.append(self)
+
+        def setWindowTitle(self, title):
+            self.title = title
+
+        def setWindowModality(self, modality):
+            self.modality = modality
+
+        def setMinimumDuration(self, duration):
+            self.minimum_duration = duration
+
+        def setAutoClose(self, enabled):
+            self.auto_close = enabled
+
+        def setAutoReset(self, enabled):
+            self.auto_reset = enabled
+
+        def setValue(self, value):
+            self.values.append(value)
+
+        def show(self):
+            self.shown = True
+
+        def setLabelText(self, label):
+            self.labels.append(label)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        batch_queue_module,
+        "QProgressDialog",
+        FakeProgressDialog,
+    )
+
+    window._choose_projects_to_add()
+
+    assert len(dialogs) == 1
+    dialog = dialogs[0]
+    assert dialog.maximum == 2
+    assert dialog.shown is True
+    assert dialog.closed is True
+    assert dialog.values[-1] == 2
+    assert any("project_a" in label for label in dialog.labels)
+    assert any("project_b" in label for label in dialog.labels)
+    assert window.queue_list.count() == 2
     window.close()
 
 
@@ -391,6 +559,8 @@ def test_xyz2pdb_batch_worker_exports_and_registers_pdb_folder(
     failures: list[tuple[str, str]] = []
     finished_items: list[tuple[str, XYZToPDBBatchResult]] = []
     finished_batches: list[list[XYZToPDBBatchResult]] = []
+    logs: list[str] = []
+    progress_messages: list[tuple[str, int, int, str]] = []
     worker.failed.connect(
         lambda item_id, message: failures.append((item_id, message))
     )
@@ -398,6 +568,12 @@ def test_xyz2pdb_batch_worker_exports_and_registers_pdb_folder(
         lambda item_id, result: finished_items.append((item_id, result))
     )
     worker.finished.connect(finished_batches.append)
+    worker.log.connect(logs.append)
+    worker.item_progress.connect(
+        lambda item_id, processed, total, message: progress_messages.append(
+            (item_id, processed, total, message)
+        )
+    )
 
     worker.run()
 
@@ -413,6 +589,17 @@ def test_xyz2pdb_batch_worker_exports_and_registers_pdb_folder(
     assert saved_settings.resolved_pdb_frames_dir == result.output_dir
     assert saved_settings.pdb_frames_dir_snapshot is not None
     assert finished_batches == [[result]]
+    assert any(
+        "Target PDB folder: xyz2pdb_splitxyz_f0fs" in message
+        for message in logs
+    )
+    assert any("Registered PDB frames folder" in message for message in logs)
+    assert progress_messages[0] == (
+        "job-1",
+        0,
+        1,
+        "Target PDB folder: xyz2pdb_splitxyz_f0fs",
+    )
 
 
 def test_xyz2pdb_batch_queue_emits_registered_pdb_folder(qapp, tmp_path):
@@ -453,6 +640,118 @@ def test_xyz2pdb_batch_queue_emits_registered_pdb_folder(qapp, tmp_path):
     ]
     assert widget.status_label.text() == "Complete"
     window.close()
+
+
+def test_xyz2pdb_batch_queue_logs_active_project_progress(qapp, tmp_path):
+    del qapp
+    project_dir = tmp_path / "saxs_project"
+    SAXSProjectManager().create_project(project_dir)
+    input_dir = tmp_path / "splitxyz_f0fs"
+    input_dir.mkdir()
+
+    window = XYZToPDBBatchQueueWindow()
+    widget = window.add_queue_item(
+        XYZToPDBBatchItem(
+            item_id="job-1",
+            project_dir=project_dir,
+            input_path=input_dir,
+        )
+    )
+
+    window._on_item_progress(
+        widget.item_id,
+        1,
+        3,
+        "Mapping template from frame_0000.xyz...",
+    )
+
+    assert widget.status_label.text() == (
+        "Mapping template from frame_0000.xyz..."
+    )
+    assert widget.progress_bar.maximum() == 3
+    assert widget.progress_bar.value() == 1
+    assert window.queue_status_label.text() == (
+        "[saxs_project] 1/3: Mapping template from frame_0000.xyz..."
+    )
+    assert "Mapping template from frame_0000.xyz..." in (
+        window.console.toPlainText()
+    )
+    assert window.statusBar().currentMessage() == (
+        "Mapping template from frame_0000.xyz..."
+    )
+    window.close()
+
+
+def test_xyz2pdb_batch_queue_throttles_large_progress_logs(qapp, tmp_path):
+    del qapp
+    project_dir = tmp_path / "saxs_project"
+    SAXSProjectManager().create_project(project_dir)
+    input_dir = tmp_path / "splitxyz_f0fs"
+    input_dir.mkdir()
+
+    window = XYZToPDBBatchQueueWindow()
+    widget = window.add_queue_item(
+        XYZToPDBBatchItem(
+            item_id="job-1",
+            project_dir=project_dir,
+            input_path=input_dir,
+        )
+    )
+
+    for index in range(1, 101):
+        window._on_item_progress(
+            widget.item_id,
+            index,
+            100,
+            f"[{index}/100] Wrote frame_{index:04d}.xyz",
+        )
+
+    text = window.console.toPlainText()
+    assert window.console.document().maximumBlockCount() == (
+        batch_queue_module._BATCH_CONSOLE_MAX_BLOCKS
+    )
+    assert "[saxs_project] 1/100" in text
+    assert "[saxs_project] 2/100" not in text
+    assert "[saxs_project] 5/100" in text
+    assert "[saxs_project] 100/100" in text
+    assert window.queue_status_label.text() == (
+        "[saxs_project] 100/100: [100/100] Wrote frame_0100.xyz"
+    )
+    assert widget.progress_bar.value() == 100
+    window.close()
+
+
+def test_xyz2pdb_batch_queue_console_log_is_bounded(qapp):
+    window = XYZToPDBBatchQueueWindow()
+    window.show()
+    qapp.processEvents()
+
+    for index in range(batch_queue_module._BATCH_CONSOLE_MAX_BLOCKS + 25):
+        window._append_log(f"line {index}")
+    qapp.processEvents()
+
+    assert window.console.document().blockCount() == (
+        batch_queue_module._BATCH_CONSOLE_MAX_BLOCKS
+    )
+    text = window.console.toPlainText()
+    assert "line 0" not in text
+    assert f"line {batch_queue_module._BATCH_CONSOLE_MAX_BLOCKS + 24}" in text
+    window.close()
+
+
+def test_xyz2pdb_batch_worker_filters_dense_progress_logs():
+    assert batch_queue_module._should_emit_batch_log_message(
+        "[1/100] frame_0001.xyz"
+    )
+    assert not batch_queue_module._should_emit_batch_log_message(
+        "[2/100] frame_0002.xyz"
+    )
+    assert batch_queue_module._should_emit_batch_log_message(
+        "[5/100] frame_0005.xyz"
+    )
+    assert batch_queue_module._should_emit_batch_log_message(
+        "Template mapping counts: PBI 1"
+    )
 
 
 def test_xyz2pdb_run_file_window_builds_project_config(qapp, tmp_path):
@@ -506,7 +805,9 @@ def test_main_window_native_mapping_flow_estimates_and_reports_export_progress_w
     refs_dir.mkdir()
     _write_reference_pdb(refs_dir / "pbi.pdb")
 
-    input_xyz = tmp_path / "input.xyz"
+    splitxyz_dir = tmp_path / "splitxyz_f0fs"
+    splitxyz_dir.mkdir()
+    input_xyz = splitxyz_dir / "frame_0000.xyz"
     _write_xyz(input_xyz, i_x=1.0, oxygen_x=2.0)
 
     window = XYZToPDBMainWindow(reference_library_dir=refs_dir)
@@ -568,6 +869,68 @@ def test_main_window_native_mapping_flow_estimates_and_reports_export_progress_w
     window._set_export_running(True)
     assert window.export_panel.export_button.isEnabled() is False
     assert window.export_panel.cancel_button.isEnabled() is True
+    window.close()
+
+
+def test_xyz2pdb_analyze_input_warns_for_raw_or_unsplit_xyz(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    refs_dir = tmp_path / "references"
+    refs_dir.mkdir()
+    _write_reference_pdb(refs_dir / "pbi.pdb")
+    input_xyz = tmp_path / "calc-pos-1.xyz"
+    _write_xyz(input_xyz, i_x=1.0, oxygen_x=2.0)
+    window = XYZToPDBMainWindow(reference_library_dir=refs_dir)
+    window.input_panel.input_edit.setText(str(input_xyz))
+    warnings: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+
+    window.inspect_input()
+
+    assert len(warnings) == 1
+    assert warnings[0][0] == "Check XYZ input"
+    assert "*pos-1.xyz" in warnings[0][1]
+    assert "folder named splitxyz*" in warnings[0][1]
+    assert "Sample atoms: 3" in window.input_panel.summary_box.toPlainText()
+    window.close()
+
+
+def test_xyz2pdb_batch_analyze_input_warns_for_unsplit_xyz(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    input_xyz = tmp_path / "frame_0000.xyz"
+    _write_xyz(input_xyz, i_x=1.0, oxygen_x=2.0)
+    window = XYZToPDBBatchQueueWindow(reference_library_dir=tmp_path)
+    widget = window.add_queue_item(
+        XYZToPDBBatchItem(
+            item_id="batch-item",
+            input_path=input_xyz,
+            reference_library_dir=tmp_path,
+        )
+    )
+    warnings: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+
+    widget._analyze_from_button()
+
+    assert len(warnings) == 1
+    assert warnings[0][0] == "Check XYZ input"
+    assert "folder named splitxyz*" in warnings[0][1]
+    assert "Target PDB folder" in widget.analysis_summary_label.text()
     window.close()
 
 

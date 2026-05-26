@@ -26,6 +26,10 @@ from saxshell.saxs.contrast.descriptors import (
 )
 from saxshell.saxs.debye import load_structure_file, scan_structure_elements
 from saxshell.saxs.stoichiometry import parse_stoich_label
+from saxshell.structure_distributions import (
+    StructureDistributionStore,
+    application_structure_distribution_store_dir,
+)
 
 _STRUCTURE_SUFFIXES = {".pdb", ".xyz"}
 _DEFAULT_QUANTILES = tuple(np.linspace(0.0, 1.0, 11).tolist())
@@ -1011,6 +1015,18 @@ def analyze_representative_structure_folder(
         else suggest_representativefinder_output_dir(resolved_input_dir)
     )
     resolved_output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_project_dir = (
+        None
+        if project_dir is None
+        else Path(project_dir).expanduser().resolve()
+    )
+    distribution_store = StructureDistributionStore(
+        application_structure_distribution_store_dir(
+            project_dir=resolved_project_dir,
+            output_dir=resolved_output_dir,
+            application="representativefinder",
+        )
+    )
     analyzer = BondAnalyzer(
         bond_pairs=settings.bond_pairs,
         angle_triplets=settings.angle_triplets,
@@ -1033,11 +1049,6 @@ def analyze_representative_structure_folder(
         candidate_count,
     )
     processed_work = 0
-    resolved_project_dir = (
-        None
-        if project_dir is None
-        else Path(project_dir).expanduser().resolve()
-    )
 
     single_atom_structures = _inspect_single_atom_candidate_entries(
         candidates_to_measure,
@@ -1051,6 +1062,7 @@ def analyze_representative_structure_folder(
             _measure_candidate_entries(
                 candidates_to_measure,
                 analyzer=analyzer,
+                distribution_store=distribution_store,
                 include_parsed_structure=settings.solvent_weight > 0.0,
                 parallel_workers=parallel_workers,
                 progress_callback=progress_callback,
@@ -1070,6 +1082,7 @@ def analyze_representative_structure_folder(
             total_work,
             "Inspected single-atom candidate structure files.",
         )
+    distribution_store.flush()
     measured_candidates = [
         measured.candidate for measured in measured_structures
     ]
@@ -1705,6 +1718,7 @@ def _measure_candidate_entries(
     entries: tuple[RepresentativeFinderFolderCandidate, ...],
     *,
     analyzer: BondAnalyzer,
+    distribution_store: StructureDistributionStore,
     include_parsed_structure: bool,
     parallel_workers: int,
     progress_callback: RepresentativeFinderProgressCallback | None,
@@ -1731,6 +1745,7 @@ def _measure_candidate_entries(
                     relative_label=entry.relative_label,
                     motif_label=entry.motif_label,
                     analyzer=analyzer,
+                    distribution_store=distribution_store,
                     include_parsed_structure=include_parsed_structure,
                 )
             except Exception as exc:
@@ -1796,6 +1811,7 @@ def _measure_candidate_entries(
                         relative_label=entry.relative_label,
                         motif_label=entry.motif_label,
                         analyzer=analyzer,
+                        distribution_store=distribution_store,
                         include_parsed_structure=include_parsed_structure,
                     )
                 ] = (index, entry)
@@ -3134,14 +3150,29 @@ def _measure_candidate_structure_file(
     motif_label: str,
     analyzer: BondAnalyzer,
     include_parsed_structure: bool,
+    distribution_store: StructureDistributionStore | None = None,
 ) -> _MeasuredCandidateStructure:
     coordinates, elements = load_structure_file(file_path)
     coordinates_array = np.asarray(coordinates, dtype=float)
     normalized_elements = tuple(str(element).strip() for element in elements)
-    bond_values, angle_values = analyzer.measure_structure_data(
+    active_store = distribution_store or StructureDistributionStore(
+        application_structure_distribution_store_dir(
+            output_dir=file_path.parent,
+            application="representativefinder",
+        )
+    )
+    measurement = active_store.measure_structure_data(
+        file_path,
         coordinates_array,
         normalized_elements,
+        bond_pairs=analyzer.bond_pairs,
+        angle_triplets=analyzer.angle_triplets,
+        relative_label=relative_label,
+        motif_label=motif_label,
+        autosave=distribution_store is None,
     )
+    bond_values = measurement.bond_values
+    angle_values = measurement.angle_values
     element_counts = Counter(normalized_elements)
     parsed_structure = None
     if include_parsed_structure:

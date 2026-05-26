@@ -46,6 +46,9 @@ from saxshell.representativefinder import (
 from saxshell.representativefinder.cli import (
     main as representativefinder_cli_main,
 )
+from saxshell.representativefinder.ui import (
+    batch_queue_window as batch_queue_module,
+)
 from saxshell.representativefinder.ui.batch_queue_window import (
     RepresentativeFinderBatchJob,
     RepresentativeFinderBatchQueueWindow,
@@ -1299,7 +1302,7 @@ def test_representativefinder_batch_queue_prefills_project_clusters_and_all_mode
         "SAXSHELL_BONDANALYSIS_PRESETS_PATH",
         str(tmp_path / "bondanalysis_presets.json"),
     )
-    project_dir = tmp_path / "project"
+    project_dir = tmp_path / "project_dmf"
     root_dir, _pb_dir, _sn_dir = _build_multi_stoichiometry_root(tmp_path)
     manager = SAXSProjectManager()
     settings = manager.create_project(project_dir)
@@ -1320,8 +1323,152 @@ def test_representativefinder_batch_queue_prefills_project_clusters_and_all_mode
     assert (
         widget.analysis_mode_label.text() == "All Discovered Stoichiometries"
     )
-    assert window.preset_combo.count() >= 1
+    assert window.analysis_mode_batch_label.text() == (
+        "All Discovered Stoichiometries"
+    )
+    assert widget.preset_combo.currentData() == "DMF"
+    assert "Preset: DMF" in widget.item_settings_label.text()
+    assert "All stoichiometries" in widget.item_settings_label.text()
+    assert "Available presets" in window.preset_summary_label.text()
 
+    window.close()
+
+
+def test_representativefinder_batch_queue_uses_per_project_presets(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    monkeypatch.setenv(
+        "SAXSHELL_BONDANALYSIS_PRESETS_PATH",
+        str(tmp_path / "bondanalysis_presets.json"),
+    )
+    root_dir, _pb_dir, _sn_dir = _build_multi_stoichiometry_root(tmp_path)
+    manager = SAXSProjectManager()
+    project_dirs = (
+        tmp_path / "project_dmf",
+        tmp_path / "project_dmso",
+    )
+    for project_dir in project_dirs:
+        settings = manager.create_project(project_dir)
+        settings.clusters_dir = str(root_dir.resolve())
+        manager.save_project(settings)
+
+    window = RepresentativeFinderBatchQueueWindow()
+    monkeypatch.setattr(
+        batch_queue_module,
+        "_choose_existing_directories",
+        lambda *_args, **_kwargs: tuple(
+            project_dir.resolve() for project_dir in project_dirs
+        ),
+    )
+
+    window._choose_projects_to_add()
+
+    assert window.queue_list.count() == 2
+    widgets = [
+        window.queue_list.itemWidget(window.queue_list.item(row))
+        for row in range(window.queue_list.count())
+    ]
+    assert [widget.preset_combo.currentData() for widget in widgets] == [
+        "DMF",
+        "DMSO",
+    ]
+    entries = window.queue_jobs_in_order()
+    dmf_pairs = {
+        (pair.atom1, pair.atom2)
+        for pair in entries[0][1].config.settings.bond_pairs
+    }
+    dmso_pairs = {
+        (pair.atom1, pair.atom2)
+        for pair in entries[1][1].config.settings.bond_pairs
+    }
+    assert ("Pb", "N") in dmf_pairs
+    assert ("Pb", "S") in dmso_pairs
+    assert entries[0][1].config.analysis_mode == "all"
+    assert entries[1][1].config.analysis_mode == "all"
+
+    window.close()
+
+
+def test_representativefinder_batch_queue_shows_progress_dialog_for_multiple_project_load(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    monkeypatch.setenv(
+        "SAXSHELL_BONDANALYSIS_PRESETS_PATH",
+        str(tmp_path / "bondanalysis_presets.json"),
+    )
+    project_a = tmp_path / "project_a"
+    project_b = tmp_path / "project_b"
+    project_a.mkdir()
+    project_b.mkdir()
+    window = RepresentativeFinderBatchQueueWindow()
+    monkeypatch.setattr(
+        batch_queue_module,
+        "_choose_existing_directories",
+        lambda *_args, **_kwargs: (project_a.resolve(), project_b.resolve()),
+    )
+    dialogs: list[object] = []
+
+    class FakeProgressDialog:
+        def __init__(self, label, cancel_text, minimum, maximum, parent):
+            del cancel_text, parent
+            self.labels = [label]
+            self.values: list[int] = []
+            self.minimum = minimum
+            self.maximum = maximum
+            self.closed = False
+            self.shown = False
+            dialogs.append(self)
+
+        def setWindowTitle(self, title):
+            self.title = title
+
+        def setWindowModality(self, modality):
+            self.modality = modality
+
+        def setMinimumDuration(self, duration):
+            self.minimum_duration = duration
+
+        def setAutoClose(self, enabled):
+            self.auto_close = enabled
+
+        def setAutoReset(self, enabled):
+            self.auto_reset = enabled
+
+        def setValue(self, value):
+            self.values.append(value)
+
+        def show(self):
+            self.shown = True
+
+        def setLabelText(self, label):
+            self.labels.append(label)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        batch_queue_module,
+        "QProgressDialog",
+        FakeProgressDialog,
+    )
+
+    window._choose_projects_to_add()
+
+    assert len(dialogs) == 1
+    dialog = dialogs[0]
+    assert dialog.maximum == 2
+    assert dialog.shown is True
+    assert dialog.closed is True
+    assert dialog.values[-1] == 2
+    assert any("project_a" in label for label in dialog.labels)
+    assert any("project_b" in label for label in dialog.labels)
+    assert window.queue_list.count() == 2
     window.close()
 
 
