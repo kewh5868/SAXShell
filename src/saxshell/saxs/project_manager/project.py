@@ -5226,17 +5226,14 @@ def _is_comment_metadata_line(line: str) -> bool:
 def _tokens_look_like_column_labels(tokens: list[str]) -> bool:
     if len(tokens) < 2:
         return False
-    normalized = [
-        re.sub(r"[^a-z0-9]+", "", token.lower()) for token in tokens
-    ]
+    normalized = [re.sub(r"[^a-z0-9]+", "", token.lower()) for token in tokens]
     if all(not token for token in normalized):
         return False
     if _tokens_look_numeric(tokens):
         return False
     keywords = ("q", "iq", "intensity", "error", "sigma", "uncert")
     return any(
-        any(keyword in token for keyword in keywords)
-        for token in normalized
+        any(keyword in token for keyword in keywords) for token in normalized
     )
 
 
