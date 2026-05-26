@@ -37,6 +37,10 @@ from saxshell.saxs.project_manager import (
     load_experimental_data_file,
 )
 from saxshell.structure import AtomTypeDefinitions, PDBAtom, PDBStructure
+from saxshell.structure_distributions import (
+    StructureDistributionStore,
+    application_structure_distribution_store_dir,
+)
 from saxshell.xyz2pdb import list_reference_library, resolve_reference_path
 from saxshell.xyz2pdb.workflow import (
     rotation_matrix_about_axis,
@@ -420,6 +424,9 @@ class ClusterDynamicsMLWorkflow:
         self._cached_frames_input_format: str | None = None
         self._cached_resolved_pdb_shell_references: (
             tuple[_ResolvedPDBShellReference, ...] | None
+        ) = None
+        self._structure_distribution_store: (
+            StructureDistributionStore | None
         ) = None
 
     def preview_selection(self) -> ClusterDynamicsMLPreview:
@@ -1712,6 +1719,7 @@ class ClusterDynamicsMLWorkflow:
     ) -> list[DebyeWallerPairEstimate]:
         tracked_elements = self._tracked_structure_elements()
         node_elements = set(self._atom_type_elements("node"))
+        distribution_store = self._distribution_store()
         estimates: list[DebyeWallerPairEstimate] = []
         for observation in training_observations:
             pair_samples: dict[tuple[str, str], list[np.ndarray]] = (
@@ -1730,16 +1738,22 @@ class ClusterDynamicsMLWorkflow:
                 )
                 if filtered is None:
                     continue
-                filtered_coords, filtered_elements = filtered
-                distance_map = _first_shell_pair_distances_by_element(
-                    filtered_coords,
-                    filtered_elements,
-                    node_elements=node_elements,
-                    pair_cutoff_definitions=self.pair_cutoff_definitions,
+                distance_map = (
+                    distribution_store.measure_cutoff_pair_distances(
+                        structure_path,
+                        pair_cutoff_definitions=self.pair_cutoff_definitions,
+                        node_elements=tuple(sorted(node_elements)),
+                        allowed_elements=tuple(sorted(tracked_elements)),
+                        include_node_scaffold=True,
+                        cluster_label=observation.label,
+                        relative_label=structure_path.name,
+                        autosave=False,
+                    )
                 )
-                for pair_key, distances in distance_map.items():
+                for pair_key, distances in distance_map.pair_distances.items():
                     if distances.size > 0:
                         pair_samples[pair_key].append(distances)
+            distribution_store.flush()
             for pair_key, samples in sorted(pair_samples.items()):
                 if len(samples) < 2:
                     continue
@@ -3122,6 +3136,18 @@ class ClusterDynamicsMLWorkflow:
         if representative_path is not None and representative_path.is_file():
             return [representative_path]
         return []
+
+    def _distribution_store(self) -> StructureDistributionStore:
+        if self._structure_distribution_store is not None:
+            return self._structure_distribution_store
+        self._structure_distribution_store = StructureDistributionStore(
+            application_structure_distribution_store_dir(
+                project_dir=self.project_dir,
+                output_dir=self.clusters_dir or self.frames_dir,
+                application="clusterdynamicsml",
+            )
+        )
+        return self._structure_distribution_store
 
     def _collect_training_geometry_statistics(
         self,

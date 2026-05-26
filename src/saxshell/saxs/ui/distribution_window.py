@@ -34,10 +34,16 @@ from scipy import stats
 
 from saxshell.saxs.dream import BASE_DISTRIBUTIONS, DreamParameterEntry
 
+LEGACY_MD_WEIGHT_SMART_PRIOR_MODE = "legacy_md_weights"
+LEGACY_MD_WEIGHT_LOGNORM_SHAPE = 1.0
+LEGACY_MD_WEIGHT_SCALE_EPSILON = 1e-6
+
 SMART_PRIOR_PRESET_ITEMS: tuple[tuple[str, str], ...] = (
     ("Very Strict", "very_strict"),
     ("Strict", "strict"),
     ("Proportional (Current Default)", "proportional"),
+    ("Rounded Guides", "rounded_guides"),
+    ("Legacy MD Weights", LEGACY_MD_WEIGHT_SMART_PRIOR_MODE),
     ("Lenient", "lenient"),
     ("Very Lenient", "very_lenient"),
     ("Strict Small / Lenient Large", "strict_small_lenient_large"),
@@ -48,6 +54,8 @@ SMART_PRIOR_INDIVIDUAL_STATUS_ITEMS: tuple[tuple[str, str], ...] = (
     ("Very Strict", "very_strict"),
     ("Strict", "strict"),
     ("Proportional", "proportional"),
+    ("Rounded Guides", "rounded_guides"),
+    ("Legacy MD Weights", LEGACY_MD_WEIGHT_SMART_PRIOR_MODE),
     ("Lenient", "lenient"),
     ("Very Lenient", "very_lenient"),
 )
@@ -300,6 +308,8 @@ class DistributionSetupWindow(QMainWindow):
         self,
         entries: list[DreamParameterEntry],
         parent: QWidget | None = None,
+        *,
+        default_entries: list[DreamParameterEntry] | None = None,
     ) -> None:
         super().__init__(parent)
         self._entries = entries
@@ -308,6 +318,7 @@ class DistributionSetupWindow(QMainWindow):
         self._suppress_vary_warning = False
         self._suppress_status_change = False
         self._reset_entries: list[DreamParameterEntry] = []
+        self._program_default_entries: list[DreamParameterEntry] = []
         self._weight_preview_window: WeightDistributionPreviewWindow | None = (
             None
         )
@@ -323,7 +334,7 @@ class DistributionSetupWindow(QMainWindow):
             self._flush_interactive_drag_preview
         )
         self._build_ui()
-        self.load_entries(entries)
+        self.load_entries(entries, default_entries=default_entries)
 
     def _build_ui(self) -> None:
         self.setWindowTitle("SAXS DREAM Prior Setup")
@@ -400,7 +411,9 @@ class DistributionSetupWindow(QMainWindow):
         guide_tooltip = (
             "Practical prior bounds for the current distribution. "
             "Bounded priors use their exact support, while unbounded priors "
-            "use a central 99.73% interval (Gaussian 3sigma equivalent)."
+            "use a central 99.73% interval (Gaussian 3sigma equivalent). "
+            "Generated DREAM bundles reject sampled values outside these "
+            "bounds."
         )
         low_header = self.table.horizontalHeaderItem(GUIDE_LOW_COLUMN)
         if low_header is not None:
@@ -440,6 +453,17 @@ class DistributionSetupWindow(QMainWindow):
             lambda: self._set_all_vary(False)
         )
         button_row.addWidget(self.set_all_vary_off_button)
+        self.reset_all_priors_button = QPushButton("Reset All Priors")
+        self.reset_all_priors_button.setToolTip(
+            "Reset every prior row to the program-generated default "
+            "parameter map from when the editor opened, including values, "
+            "vary flags, distributions, distribution parameters, and "
+            "smart-prior status."
+        )
+        self.reset_all_priors_button.clicked.connect(
+            self._reset_all_priors_to_baseline
+        )
+        button_row.addWidget(self.reset_all_priors_button)
         save_button = QPushButton("Save Parameter Map")
         save_button.clicked.connect(self._emit_saved)
         button_row.addWidget(save_button)
@@ -527,6 +551,7 @@ class DistributionSetupWindow(QMainWindow):
         *,
         has_existing_parameter_map: bool | None = None,
         update_reset_entries: bool = True,
+        default_entries: list[DreamParameterEntry] | None = None,
     ) -> None:
         if has_existing_parameter_map is not None:
             self._has_existing_parameter_map = bool(has_existing_parameter_map)
@@ -534,6 +559,15 @@ class DistributionSetupWindow(QMainWindow):
         normalized_entries = [
             self._normalized_entry_copy(entry) for entry in entries
         ]
+        if default_entries is not None:
+            self._program_default_entries = [
+                self._normalized_entry_copy(entry) for entry in default_entries
+            ]
+        elif not self._program_default_entries:
+            self._program_default_entries = [
+                self._normalized_entry_copy(entry)
+                for entry in normalized_entries
+            ]
         self._plot_window_state = None
         self._pending_drag_preview = None
         self._interactive_preview_timer.stop()
@@ -640,16 +674,23 @@ class DistributionSetupWindow(QMainWindow):
         params_item = self.table.item(row, 7)
         status_value = self._row_smart_status(row)
         value = float(value_item.text()) if value_item is not None else 0.0
+        param_name = self.table.item(row, 3).text()
         params = self._normalize_distribution_params(
             distribution,
             self._parse_params(params_item.text() if params_item else "{}"),
             value,
         )
+        if self._is_weight_parameter(param_name):
+            params = self._nonnegative_weight_distribution_params(
+                distribution,
+                params,
+                value=value,
+            )
         return DreamParameterEntry(
             structure=self.table.item(row, 0).text(),
             motif=self.table.item(row, 1).text(),
             param_type=self.table.item(row, 2).text(),
-            param=self.table.item(row, 3).text(),
+            param=param_name,
             value=value,
             vary=(
                 vary_widget.isChecked()
@@ -670,19 +711,28 @@ class DistributionSetupWindow(QMainWindow):
         self,
         entry: DreamParameterEntry,
     ) -> DreamParameterEntry:
+        distribution = str(entry.distribution)
+        value = float(entry.value)
+        params = self._normalize_distribution_params(
+            distribution,
+            dict(entry.dist_params),
+            value,
+        )
+        if self._is_weight_parameter(entry.param):
+            params = self._nonnegative_weight_distribution_params(
+                distribution,
+                params,
+                value=value,
+            )
         return DreamParameterEntry(
             structure=str(entry.structure),
             motif=str(entry.motif),
             param_type=str(entry.param_type),
             param=str(entry.param),
-            value=float(entry.value),
+            value=value,
             vary=bool(entry.vary),
-            distribution=str(entry.distribution),
-            dist_params=self._normalize_distribution_params(
-                str(entry.distribution),
-                dict(entry.dist_params),
-                float(entry.value),
-            ),
+            distribution=distribution,
+            dist_params=params,
             smart_preset_status=self._normalized_smart_status(
                 getattr(entry, "smart_preset_status", "custom")
             ),
@@ -747,6 +797,15 @@ class DistributionSetupWindow(QMainWindow):
 
     def _on_distribution_changed(self, row: int) -> None:
         entry = self._entry_from_row(row)
+        if self._is_weight_parameter(entry.param):
+            entry.dist_params = self._nonnegative_weight_distribution_params(
+                entry.distribution,
+                _distribution_defaults_for_value(
+                    entry.distribution,
+                    entry.value,
+                ),
+                value=entry.value,
+            )
         self.table.blockSignals(True)
         self.table.item(row, 7).setText(
             json.dumps(entry.dist_params, sort_keys=True)
@@ -799,6 +858,42 @@ class DistributionSetupWindow(QMainWindow):
         self.console.append(
             "Reset prior row to the loaded/saved baseline: "
             f"{self._row_status_label(row)}."
+        )
+
+    def _reset_all_priors_to_baseline(self) -> None:
+        if not self._program_default_entries:
+            QMessageBox.warning(
+                self,
+                "Reset priors failed",
+                "No program-default prior entries are available to restore.",
+            )
+            return
+        if len(self._program_default_entries) != self.table.rowCount():
+            QMessageBox.warning(
+                self,
+                "Reset priors failed",
+                (
+                    "The program-default prior baseline does not match the "
+                    "current parameter table."
+                ),
+            )
+            return
+        current_row = self.table.currentRow()
+        for row, entry in enumerate(self._program_default_entries):
+            self._apply_entry_to_row(row, entry)
+        if current_row < 0 and self.table.rowCount() > 0:
+            current_row = 0
+            self.table.setCurrentCell(current_row, 0)
+        if 0 <= current_row < self.table.rowCount():
+            self._plot_entry(
+                self._entry_from_row(current_row),
+                row=current_row,
+                force_rescale=True,
+            )
+        self.table.resizeColumnsToContents()
+        self.console.append(
+            "Reset all priors to the program-generated defaults, including "
+            "distributions."
         )
 
     def _apply_entry_to_row(
@@ -1602,7 +1697,7 @@ class DistributionSetupWindow(QMainWindow):
             )
             params["loc"] = center_value - scale_value
         updated_entry.dist_params = params
-        return updated_entry
+        return cls._entry_with_nonnegative_weight_prior(updated_entry)
 
     @classmethod
     def _width_drag_adjusted_entry(
@@ -1664,7 +1759,59 @@ class DistributionSetupWindow(QMainWindow):
                 INTERACTIVE_MAX_LOGNORM_SHAPE,
             )
         updated_entry.dist_params = params
-        return updated_entry
+        return cls._entry_with_nonnegative_weight_prior(updated_entry)
+
+    @classmethod
+    def _guide_bounds_adjusted_entry(
+        cls,
+        entry: DreamParameterEntry,
+        *,
+        guide_low: float,
+        guide_high: float,
+    ) -> DreamParameterEntry:
+        bounded_low = float(guide_low)
+        bounded_high = float(guide_high)
+        if not np.isfinite(bounded_low) or not np.isfinite(bounded_high):
+            raise ValueError("Guide bounds must be finite values.")
+        if bounded_high <= bounded_low:
+            raise ValueError("Guide high must be greater than guide low.")
+
+        updated_entry = DreamParameterEntry.from_dict(entry.to_dict())
+        params = copy.deepcopy(dict(updated_entry.dist_params))
+        span = bounded_high - bounded_low
+        if updated_entry.distribution == "norm":
+            params["loc"] = (bounded_low + bounded_high) / 2.0
+            params["scale"] = max(
+                span / (2.0 * GUIDE_INTERVAL_SIGMA),
+                INTERACTIVE_PARAMETER_EPSILON,
+            )
+        elif updated_entry.distribution == "uniform":
+            params["loc"] = bounded_low
+            params["scale"] = max(span, INTERACTIVE_PARAMETER_EPSILON)
+        elif updated_entry.distribution == "lognorm":
+            shape_value = min(
+                max(
+                    float(params.get("s", INTERACTIVE_PARAMETER_EPSILON)),
+                    INTERACTIVE_PARAMETER_EPSILON,
+                ),
+                INTERACTIVE_MAX_LOGNORM_SHAPE,
+            )
+            low_multiplier = math.exp(-GUIDE_INTERVAL_SIGMA * shape_value)
+            high_multiplier = math.exp(GUIDE_INTERVAL_SIGMA * shape_value)
+            scale_value = max(
+                span / (high_multiplier - low_multiplier),
+                INTERACTIVE_PARAMETER_EPSILON,
+            )
+            params["loc"] = bounded_low - scale_value * low_multiplier
+            params["scale"] = scale_value
+            params["s"] = shape_value
+        else:
+            raise ValueError(
+                "Guide bounds can only be edited for norm, uniform, and "
+                "lognorm priors."
+            )
+        updated_entry.dist_params = params
+        return cls._entry_with_nonnegative_weight_prior(updated_entry)
 
     @classmethod
     def _peak_drag_adjusted_entry(
@@ -1715,14 +1862,16 @@ class DistributionSetupWindow(QMainWindow):
                 INTERACTIVE_MAX_LOGNORM_SHAPE,
             )
         updated_entry.dist_params = params
-        return updated_entry
+        return cls._entry_with_nonnegative_weight_prior(updated_entry)
 
     @staticmethod
     def _interactive_width_handle_positions(
         entry: DreamParameterEntry,
     ) -> tuple[float | None, float | None]:
-        center_value = float(entry.value)
         if entry.distribution == "norm":
+            center_value = float(
+                entry.dist_params.get("loc", float(entry.value))
+            )
             sigma = max(
                 float(
                     entry.dist_params.get(
@@ -1734,6 +1883,9 @@ class DistributionSetupWindow(QMainWindow):
             spread = GUIDE_INTERVAL_SIGMA * sigma
             return center_value - spread, center_value + spread
         if entry.distribution == "uniform":
+            support_low = float(
+                entry.dist_params.get("loc", float(entry.value))
+            )
             width = max(
                 float(
                     entry.dist_params.get(
@@ -1742,8 +1894,9 @@ class DistributionSetupWindow(QMainWindow):
                 ),
                 INTERACTIVE_PARAMETER_EPSILON,
             )
-            return center_value - width / 2.0, center_value + width / 2.0
+            return support_low, support_low + width
         if entry.distribution == "lognorm":
+            loc_value = float(entry.dist_params.get("loc", 0.0))
             scale_value = max(
                 float(
                     entry.dist_params.get(
@@ -1759,12 +1912,10 @@ class DistributionSetupWindow(QMainWindow):
                 INTERACTIVE_PARAMETER_EPSILON,
             )
             return (
-                center_value
-                + scale_value
-                * (math.exp(-GUIDE_INTERVAL_SIGMA * shape_value) - 1.0),
-                center_value
-                + scale_value
-                * (math.exp(GUIDE_INTERVAL_SIGMA * shape_value) - 1.0),
+                loc_value
+                + scale_value * math.exp(-GUIDE_INTERVAL_SIGMA * shape_value),
+                loc_value
+                + scale_value * math.exp(GUIDE_INTERVAL_SIGMA * shape_value),
             )
         return None, None
 
@@ -1795,6 +1946,24 @@ class DistributionSetupWindow(QMainWindow):
                     factor=factor,
                 )
                 entry.smart_preset_status = preset_mode
+            return updated_entries
+
+        if preset_mode == "rounded_guides":
+            for row_index, entry in enumerate(updated_entries):
+                if row_groups[row_index] not in target_groups:
+                    continue
+                updated_entries[row_index] = (
+                    self._rounded_guide_adjusted_entry(entry)
+                )
+            return updated_entries
+
+        if preset_mode == LEGACY_MD_WEIGHT_SMART_PRIOR_MODE:
+            for row_index, entry in enumerate(updated_entries):
+                if row_groups[row_index] not in target_groups:
+                    continue
+                updated_entries[row_index] = (
+                    self._legacy_md_weight_adjusted_entry(entry)
+                )
             return updated_entries
 
         weight_radius_map = self._weight_radius_map(updated_entries)
@@ -1854,6 +2023,67 @@ class DistributionSetupWindow(QMainWindow):
                 "proportional",
             )
         return updated_entries
+
+    @classmethod
+    def _rounded_guide_adjusted_entry(
+        cls,
+        entry: DreamParameterEntry,
+    ) -> DreamParameterEntry:
+        entry_copy = DreamParameterEntry.from_dict(entry.to_dict())
+        try:
+            guide_low, guide_high, _guide_kind = _distribution_guide_bounds(
+                entry_copy
+            )
+        except Exception:
+            return entry_copy
+        if guide_low is None or guide_high is None:
+            return entry_copy
+        low = float(guide_low)
+        high = float(guide_high)
+        if not np.isfinite(low) or not np.isfinite(high):
+            return entry_copy
+        target_low = 0.0 if low < 0.02 else math.floor(low * 100.0) / 100.0
+        if 0.02 < high < 0.10:
+            target_high = 0.10
+        else:
+            target_high = math.ceil(high * 100.0) / 100.0
+        if target_high <= target_low:
+            target_high = target_low + 0.01
+        try:
+            entry_copy = cls._guide_bounds_adjusted_entry(
+                entry_copy,
+                guide_low=target_low,
+                guide_high=target_high,
+            )
+            entry_copy.smart_preset_status = "rounded_guides"
+        except Exception:
+            entry_copy.smart_preset_status = "custom"
+        return entry_copy
+
+    @classmethod
+    def _legacy_md_weight_adjusted_entry(
+        cls,
+        entry: DreamParameterEntry,
+    ) -> DreamParameterEntry:
+        entry_copy = DreamParameterEntry.from_dict(entry.to_dict())
+        if not cls._is_weight_parameter(entry_copy.param):
+            return entry_copy
+        scale_value = max(
+            float(entry_copy.value),
+            LEGACY_MD_WEIGHT_SCALE_EPSILON,
+        )
+        entry_copy.distribution = "lognorm"
+        entry_copy.dist_params = cls._nonnegative_weight_distribution_params(
+            "lognorm",
+            {
+                "loc": 0.0,
+                "scale": scale_value,
+                "s": LEGACY_MD_WEIGHT_LOGNORM_SHAPE,
+            },
+            value=entry_copy.value,
+        )
+        entry_copy.smart_preset_status = LEGACY_MD_WEIGHT_SMART_PRIOR_MODE
+        return entry_copy
 
     def _on_smart_status_changed(
         self,
@@ -2011,8 +2241,9 @@ class DistributionSetupWindow(QMainWindow):
             return structure
         return param or f"row {row + 1}"
 
-    @staticmethod
+    @classmethod
     def _adjust_distribution_params(
+        cls,
         entry: DreamParameterEntry,
         *,
         factor: float,
@@ -2024,20 +2255,23 @@ class DistributionSetupWindow(QMainWindow):
             params["s"] = max(
                 float(params.get("s", epsilon)) * bounded_factor, epsilon
             )
-            return params
-        if entry.distribution == "norm":
+        elif entry.distribution == "norm":
             params["scale"] = max(
                 float(params.get("scale", epsilon)) * bounded_factor,
                 epsilon,
             )
-            return params
-        if entry.distribution == "uniform":
+        elif entry.distribution == "uniform":
             current_scale = max(float(params.get("scale", epsilon)), epsilon)
             center = float(params.get("loc", 0.0)) + current_scale / 2.0
             updated_scale = max(current_scale * bounded_factor, epsilon)
             params["scale"] = updated_scale
             params["loc"] = center - updated_scale / 2.0
-            return params
+        if cls._entry_requires_nonnegative_weight_prior(entry):
+            return cls._nonnegative_weight_distribution_params(
+                entry.distribution,
+                params,
+                value=entry.value,
+            )
         return params
 
     @classmethod
@@ -2095,6 +2329,78 @@ class DistributionSetupWindow(QMainWindow):
         if re.fullmatch(r"w\d+", param_name):
             return param_name
         return None
+
+    @staticmethod
+    def _is_weight_parameter(param_name: str) -> bool:
+        return re.fullmatch(r"w\d+", str(param_name).strip()) is not None
+
+    @classmethod
+    def _entry_requires_nonnegative_weight_prior(
+        cls,
+        entry: DreamParameterEntry,
+    ) -> bool:
+        return cls._is_weight_parameter(entry.param)
+
+    @classmethod
+    def _entry_with_nonnegative_weight_prior(
+        cls,
+        entry: DreamParameterEntry,
+    ) -> DreamParameterEntry:
+        if not cls._entry_requires_nonnegative_weight_prior(entry):
+            return entry
+        entry.dist_params = cls._nonnegative_weight_distribution_params(
+            entry.distribution,
+            entry.dist_params,
+            value=entry.value,
+        )
+        return entry
+
+    @staticmethod
+    def _nonnegative_weight_distribution_params(
+        distribution: str,
+        params: dict[str, float],
+        *,
+        value: float,
+    ) -> dict[str, float]:
+        updated = {
+            str(key): float(param_value)
+            for key, param_value in dict(params).items()
+        }
+        epsilon = INTERACTIVE_PARAMETER_EPSILON
+        if distribution == "uniform":
+            loc_value = float(updated.get("loc", 0.0))
+            scale_value = max(float(updated.get("scale", epsilon)), epsilon)
+            upper_value = loc_value + scale_value
+            if loc_value < 0.0:
+                updated["loc"] = 0.0
+                updated["scale"] = max(
+                    upper_value,
+                    float(value),
+                    epsilon,
+                )
+            else:
+                updated["scale"] = scale_value
+            return updated
+        if distribution == "norm":
+            loc_value = max(
+                float(updated.get("loc", float(value))),
+                GUIDE_INTERVAL_SIGMA * epsilon,
+            )
+            scale_value = max(float(updated.get("scale", epsilon)), epsilon)
+            updated["loc"] = loc_value
+            updated["scale"] = min(
+                scale_value,
+                max(loc_value / GUIDE_INTERVAL_SIGMA, epsilon),
+            )
+            return updated
+        if distribution == "lognorm":
+            loc_value = max(float(updated.get("loc", 0.0)), 0.0)
+            scale_value = max(float(updated.get("scale", epsilon)), epsilon)
+            updated["s"] = max(float(updated.get("s", epsilon)), epsilon)
+            updated["loc"] = loc_value
+            updated["scale"] = scale_value
+            return updated
+        return updated
 
     @staticmethod
     def _is_effective_radius_parameter(param_name: str) -> bool:
@@ -2168,17 +2474,26 @@ class DistributionSetupWindow(QMainWindow):
         guide_item = self.table.item(row, column)
         guide_text = "" if guide_item is None else guide_item.text().strip()
         guide_label = "low" if column == GUIDE_LOW_COLUMN else "high"
-        handle_kind = (
-            "left_width" if column == GUIDE_LOW_COLUMN else "right_width"
-        )
         try:
             target_value = float(guide_text)
             entry = self._entry_from_row(row)
-            updated_entry = self._width_drag_adjusted_entry(
-                entry,
-                handle_kind=handle_kind,
-                target_x=target_value,
+            current_low, current_high, _guide_kind = (
+                _distribution_guide_bounds(entry)
             )
+            if current_low is None or current_high is None:
+                raise ValueError("Current guide bounds are unavailable.")
+            if column == GUIDE_LOW_COLUMN:
+                updated_entry = self._guide_bounds_adjusted_entry(
+                    entry,
+                    guide_low=target_value,
+                    guide_high=current_high,
+                )
+            else:
+                updated_entry = self._guide_bounds_adjusted_entry(
+                    entry,
+                    guide_low=current_low,
+                    guide_high=target_value,
+                )
         except Exception as exc:
             self._refresh_distribution_guides_for_row(
                 row,
@@ -2395,6 +2710,16 @@ def _expand_plot_limits(
     return bounded_low - padding, bounded_high + padding
 
 
+def distribution_guide_bounds(
+    entry: DreamParameterEntry,
+) -> tuple[float | None, float | None, str]:
+    return _distribution_guide_bounds(entry)
+
+
+def format_distribution_guide_value(value: float) -> str:
+    return _format_distribution_guide_value(value)
+
+
 def _distribution_guide_bounds(
     entry: DreamParameterEntry,
 ) -> tuple[float | None, float | None, str]:
@@ -2432,10 +2757,20 @@ def _distribution_guide_bounds(
             )
         if np.isfinite(guide_low) and np.isfinite(guide_high):
             if guide_low <= guide_high:
+                guide_kind = "Central 99.73% interval (3sigma equivalent)"
+                if _lognormal_weight_uses_zero_lower_bound(
+                    entry,
+                    support_low,
+                ):
+                    guide_low = 0.0
+                    guide_kind = (
+                        "Zero lower support with central 99.73% upper "
+                        "interval"
+                    )
                 return (
                     guide_low,
                     guide_high,
-                    "Central 99.73% interval (3sigma equivalent)",
+                    guide_kind,
                 )
     except Exception:
         pass
@@ -2448,6 +2783,19 @@ def _distribution_guide_bounds(
         if domain_low <= domain_high:
             return domain_low, domain_high, "Preview domain fallback"
     return None, None, "Unavailable"
+
+
+def _lognormal_weight_uses_zero_lower_bound(
+    entry: DreamParameterEntry,
+    support_low: float,
+) -> bool:
+    param_name = str(entry.param).strip()
+    return bool(
+        entry.distribution == "lognorm"
+        and re.fullmatch(r"w\d+", param_name)
+        and np.isfinite(support_low)
+        and float(support_low) <= 0.0
+    )
 
 
 def _format_distribution_guide_value(value: float) -> str:

@@ -19,6 +19,13 @@ from saxshell.saxs.dream import (
     DreamRunSettings,
     DreamSummary,
     DreamViolinPlotData,
+    distribution_guide_bounds,
+    dream_fit_q_bounds,
+    dream_output_q_bounds,
+    format_distribution_guide_value,
+    format_dream_q_bounds,
+    guide_clip_status,
+    guide_clip_status_label,
 )
 from saxshell.saxs.prefit import PrefitEvaluation, PrefitParameterEntry
 from saxshell.saxs.prefit.cluster_geometry import ClusterGeometryMetadataRow
@@ -39,6 +46,9 @@ _TABLE_WIDTH_INCHES = 12.43
 _TABLE_HEIGHT_INCHES = 5.32
 _TABLE_NOTE_TOP_INCHES = 6.88
 _THICK_RULE_HEIGHT_INCHES = 0.06
+_GUIDE_LOW_CLIP_COLOR = "#dbeafe"
+_GUIDE_HIGH_CLIP_COLOR = "#ffedd5"
+_FIT_Q_RANGE_SHADE_COLOR = "#fef3c7"
 _TEXT_WRAP_FULL = 98
 _TEXT_WRAP_HALF = 43
 _TEXT_WRAP_SIDE = 37
@@ -142,6 +152,12 @@ class DreamModelReportContext:
     dream_filter_views: tuple[DreamFilterReportView, ...]
     output_summary_lines: tuple[str, ...]
     directory_lines: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ReportTableCell:
+    text: object
+    fill_color: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +267,7 @@ def export_dream_model_report_pptx(
             context.dream_settings,
             context.dream_summary,
             context.dream_model_plot,
+            context.dream_parameter_map_entries,
         ),
         max_lines=_TEXT_LINES_SIDE,
         wrap_at=_TEXT_WRAP_SIDE,
@@ -664,6 +681,57 @@ def export_dream_model_report_pptx(
         rule.fill.fore_color.rgb = _rgb_color(export_settings.table_rule_color)
         rule.line.fill.background()
 
+    def add_guide_clip_legend(
+        slide,
+        *,
+        left: float,
+        top: float,
+    ) -> None:
+        add_text_block(
+            slide,
+            left=left,
+            top=top,
+            width=2.3,
+            height=0.2,
+            lines=["Guide clipping legend"],
+            font_size=9.5,
+            bold_first=True,
+        )
+        legend_items = [
+            (
+                "Guide Low clipping",
+                _GUIDE_LOW_CLIP_COLOR,
+                "selected value is at/below Guide Low",
+            ),
+            (
+                "Guide High clipping",
+                _GUIDE_HIGH_CLIP_COLOR,
+                "selected value is at/above Guide High",
+            ),
+        ]
+        y = top + 0.26
+        for label, color, detail in legend_items:
+            shape = slide.shapes.add_shape(
+                MSO_AUTO_SHAPE_TYPE.RECTANGLE,
+                Inches(left),
+                Inches(y + 0.02),
+                Inches(0.18),
+                Inches(0.13),
+            )
+            shape.fill.solid()
+            shape.fill.fore_color.rgb = _rgb_color(color)
+            shape.line.color.rgb = _rgb_color("#808080")
+            add_text_block(
+                slide,
+                left=left + 0.24,
+                top=y,
+                width=5.0,
+                height=0.2,
+                lines=[f"{label}: {detail}"],
+                font_size=8.7,
+            )
+            y += 0.24
+
     def style_table_cell(
         cell,
         *,
@@ -699,7 +767,7 @@ def export_dream_model_report_pptx(
     def add_table_slides(
         title: str,
         columns: list[str],
-        rows: list[list[str]],
+        rows: list[list[object]],
         *,
         rows_per_slide: int = 12,
         subtitle: str | None = None,
@@ -770,11 +838,12 @@ def export_dream_model_report_pptx(
                     else export_settings.table_odd_row_fill
                 )
                 for column_index, value in enumerate(row):
+                    cell_fill = _table_cell_fill_color(value) or row_fill
                     style_table_cell(
                         table.cell(row_index, column_index),
-                        text=str(value),
+                        text=_table_cell_text(value),
                         font_size=10,
-                        fill_color=row_fill,
+                        fill_color=cell_fill,
                     )
             if note and chunk_index == len(chunks):
                 add_text_block(
@@ -946,6 +1015,7 @@ def export_dream_model_report_pptx(
         )[0],
         font_size=15,
     )
+    add_guide_clip_legend(slide, left=0.6, top=6.45)
     register_slide("SAXS Model Report")
 
     if context.model_context_lines or model_detail_lines:
@@ -1142,13 +1212,28 @@ def export_dream_model_report_pptx(
                 "Structure",
                 "Motif",
                 "Value",
+                "Guide Low",
+                "Guide High",
+                "Guide Clip",
                 "Vary",
                 "Distribution",
                 "Distribution Params",
             ],
             dream_prior_rows,
             rows_per_slide=11,
-            column_width_weights=[1.2, 1.0, 0.9, 0.9, 0.78, 0.72, 1.08, 2.3],
+            column_width_weights=[
+                1.05,
+                0.8,
+                0.8,
+                0.8,
+                0.68,
+                0.72,
+                0.72,
+                0.75,
+                0.55,
+                0.9,
+                1.75,
+            ],
         )
 
     if (
@@ -1337,9 +1422,9 @@ def _chunked(values: Sequence[object], size: int) -> list[list[object]]:
 
 
 def _table_row_chunks(
-    rows: Sequence[list[str]],
+    rows: Sequence[list[object]],
     rows_per_slide: int,
-) -> list[list[list[str]]]:
+) -> list[list[list[object]]]:
     if rows_per_slide <= 0:
         raise ValueError("rows_per_slide must be positive")
     if not rows:
@@ -1389,7 +1474,7 @@ def _page_title(title: str, page_index: int, total_pages: int) -> str:
 
 def _resolve_column_widths(
     columns: Sequence[str],
-    rows: Sequence[Sequence[str]],
+    rows: Sequence[Sequence[object]],
     *,
     total_width: float,
     column_width_weights: Sequence[float] | None = None,
@@ -1405,7 +1490,10 @@ def _resolve_column_widths(
             for row in rows:
                 if column_index >= len(row):
                     continue
-                max_length = max(max_length, len(str(row[column_index])))
+                max_length = max(
+                    max_length,
+                    len(_table_cell_text(row[column_index])),
+                )
             weights.append(max(0.8, min(float(max_length) ** 0.78, 3.2)))
     if len(weights) != len(columns):
         raise ValueError("column width weights must match the column count")
@@ -1413,6 +1501,18 @@ def _resolve_column_widths(
     widths = [weight * scale for weight in weights]
     widths[-1] += total_width - sum(widths)
     return widths
+
+
+def _table_cell_text(value: object) -> str:
+    if isinstance(value, _ReportTableCell):
+        return str(value.text)
+    return str(value)
+
+
+def _table_cell_fill_color(value: object) -> str | None:
+    if isinstance(value, _ReportTableCell):
+        return value.fill_color
+    return None
 
 
 def _fit_image_in_box(
@@ -1677,12 +1777,28 @@ def _render_prefit_plot(
     return _save_figure(figure, output_path)
 
 
+def _dream_fit_point_text(model_plot: DreamModelPlotData) -> str:
+    q_values = np.asarray(model_plot.q_values, dtype=float)
+    fit_mask = getattr(model_plot, "active_fit_mask", None)
+    if fit_mask is None:
+        return f"Fit points: {q_values.size} / {q_values.size}"
+    mask = np.asarray(fit_mask, dtype=bool)
+    if mask.shape != q_values.shape:
+        return f"Fit points: {q_values.size} / {q_values.size}"
+    return f"Fit points: {int(np.count_nonzero(mask))} / {int(mask.size)}"
+
+
 def _render_dream_model_plot(
     model_plot: DreamModelPlotData,
     output_path: Path,
     *,
     settings: PowerPointExportSettings,
 ) -> Path:
+    fit_q_bounds = dream_fit_q_bounds(
+        model_plot.q_values,
+        model_plot.active_fit_mask,
+    )
+    output_q_bounds = dream_output_q_bounds(model_plot.q_values)
     with _report_figure_context(settings):
         figure = Figure(figsize=(7.6, 4.95))
         grid = figure.add_gridspec(2, 1, height_ratios=[3, 1])
@@ -1712,14 +1828,19 @@ def _render_dream_model_plot(
                 f"RMSE: {model_plot.rmse:.6g}",
                 ("Mean |res|: " f"{model_plot.mean_abs_residual:.6g}"),
                 f"R^2: {model_plot.r_squared:.6g}",
+                _dream_fit_point_text(model_plot),
+                f"Fit q-range: {format_dream_q_bounds(fit_q_bounds)}",
+                f"Output q-range: {format_dream_q_bounds(output_q_bounds)}",
             ],
             show_legend=True,
+            fit_q_bounds=fit_q_bounds,
             settings=settings,
         )
         residuals = np.asarray(
             model_plot.model_intensities - model_plot.experimental_intensities,
             dtype=float,
         )
+        _shade_fit_q_range(bottom_axis, fit_q_bounds)
         bottom_axis.axhline(0.0, color="#6b7280", linewidth=1.0)
         bottom_axis.plot(
             np.asarray(model_plot.q_values, dtype=float),
@@ -1814,6 +1935,10 @@ def _render_filter_fit_comparison(
                 show_legend=False,
                 compact=True,
                 dream_output_style=True,
+                fit_q_bounds=dream_fit_q_bounds(
+                    view.model_plot.q_values,
+                    view.model_plot.active_fit_mask,
+                ),
                 settings=settings,
             )
         for axis in axes_flat[len(filter_views) :]:
@@ -1938,6 +2063,7 @@ def _draw_model_fit_axis(
     show_legend: bool,
     compact: bool = False,
     dream_output_style: bool = False,
+    fit_q_bounds: tuple[float, float] | None = None,
     settings: PowerPointExportSettings,
 ) -> None:
     q_values = np.asarray(q_values, dtype=float)
@@ -1964,6 +2090,10 @@ def _draw_model_fit_axis(
         if dream_output_style
         else settings.structure_factor_color
     )
+    fit_span = _shade_fit_q_range(axis, fit_q_bounds)
+    if show_legend and fit_span is not None:
+        legend_lines.append(fit_span)
+        legend_labels.append("Fit q-range")
     if experimental is not None:
         experimental = np.asarray(experimental, dtype=float)
         artist = axis.scatter(
@@ -2052,6 +2182,28 @@ def _draw_model_fit_axis(
             framealpha=0.92,
         )
     axis.set_xlabel("q (1/A)")
+
+
+def _shade_fit_q_range(
+    axis,
+    bounds: tuple[float, float] | None,
+) -> object | None:
+    if bounds is None:
+        return None
+    q_min, q_max = bounds
+    if not np.isfinite(q_min) or not np.isfinite(q_max):
+        return None
+    if q_max < q_min:
+        q_min, q_max = q_max, q_min
+    if q_max == q_min:
+        return None
+    return axis.axvspan(
+        q_min,
+        q_max,
+        color=_FIT_Q_RANGE_SHADE_COLOR,
+        alpha=0.35,
+        zorder=0,
+    )
 
 
 def _draw_violin_axis(
@@ -2621,7 +2773,23 @@ def _prefit_metric_lines(evaluation: PrefitEvaluation) -> list[str]:
         ]
     experimental = np.asarray(evaluation.experimental_intensities, dtype=float)
     model = np.asarray(evaluation.model_intensities, dtype=float)
-    residuals = np.asarray(model - experimental, dtype=float)
+    residuals = np.asarray(evaluation.residuals, dtype=float)
+    fit_mask = np.ones(residuals.shape, dtype=bool)
+    if evaluation.fit_mask is not None:
+        candidate_mask = np.asarray(evaluation.fit_mask, dtype=bool)
+        if candidate_mask.shape == residuals.shape:
+            fit_mask &= candidate_mask
+    fit_mask &= (
+        np.isfinite(residuals) & np.isfinite(experimental) & np.isfinite(model)
+    )
+    if not np.any(fit_mask):
+        return [
+            "RMSE: unavailable",
+            "Mean |res|: unavailable",
+            "R^2: unavailable",
+        ]
+    experimental = experimental[fit_mask]
+    residuals = residuals[fit_mask]
     rmse = float(np.sqrt(np.mean(residuals**2)))
     mean_abs = float(np.mean(np.abs(residuals)))
     mean_experimental = float(np.mean(experimental))
@@ -2816,6 +2984,7 @@ def _dream_settings_lines(
         f"nchains: {settings.nchains}",
         f"niterations: {settings.niterations}",
         f"burn-in (%): {settings.burnin_percent}",
+        f"requested fit q-range: {_settings_requested_fit_q_range_text(settings)}",
         f"nseedchains: {settings.nseedchains}",
         f"crossover burn-in: {settings.crossover_burnin}",
         f"run label: {settings.run_label}",
@@ -2828,6 +2997,22 @@ def _dream_settings_lines(
             f"{'on' if settings.auto_select_best_posterior_filter else 'off'}"
         ),
     ]
+
+
+def _settings_requested_fit_q_range_text(settings: DreamRunSettings) -> str:
+    if settings.fit_q_min is None and settings.fit_q_max is None:
+        return "full computed q-range"
+    q_min = (
+        "minimum"
+        if settings.fit_q_min is None
+        else f"{settings.fit_q_min:.6g}"
+    )
+    q_max = (
+        "maximum"
+        if settings.fit_q_max is None
+        else f"{settings.fit_q_max:.6g}"
+    )
+    return f"{q_min} to {q_max}"
 
 
 def _dream_assessment_lines(
@@ -2863,12 +3048,20 @@ def _dream_assessment_lines(
 
 def _dream_prior_rows(
     entries: tuple[DreamParameterEntry, ...],
-) -> list[list[str]]:
-    rows: list[list[str]] = []
+) -> list[list[object]]:
+    rows: list[list[object]] = []
     for entry in entries:
         dist_params = ", ".join(
             f"{key}={float(value):.6g}"
             for key, value in sorted(entry.dist_params.items())
+        )
+        guide_low_cell, guide_high_cell, clip_label = _guide_cells_for_value(
+            entry,
+            entry.value,
+        )
+        clip_status = guide_clip_status(
+            entry.value,
+            *distribution_guide_bounds(entry)[:2],
         )
         rows.append(
             [
@@ -2876,7 +3069,13 @@ def _dream_prior_rows(
                 str(entry.param_type),
                 str(entry.structure or "-"),
                 str(entry.motif or "-"),
-                f"{float(entry.value):.6g}",
+                _highlight_value_for_clip(
+                    f"{float(entry.value):.6g}",
+                    clip_status,
+                ),
+                guide_low_cell,
+                guide_high_cell,
+                clip_label,
                 "Yes" if entry.vary else "No",
                 str(entry.distribution),
                 dist_params,
@@ -2885,11 +3084,53 @@ def _dream_prior_rows(
     return rows
 
 
+def _guide_cells_for_value(
+    entry: DreamParameterEntry | None,
+    value: object,
+) -> tuple[object, object, str]:
+    if entry is None:
+        return "n/a", "n/a", ""
+    guide_low, guide_high, _guide_kind = distribution_guide_bounds(entry)
+    clip_status = guide_clip_status(value, guide_low, guide_high)
+    fill_color = _guide_clip_fill_color(clip_status)
+    low_text = format_distribution_guide_value(guide_low)
+    high_text = format_distribution_guide_value(guide_high)
+    low_cell: object = low_text
+    high_cell: object = high_text
+    if clip_status == "low":
+        low_cell = _ReportTableCell(low_text, fill_color)
+    elif clip_status == "high":
+        high_cell = _ReportTableCell(high_text, fill_color)
+    return low_cell, high_cell, guide_clip_status_label(clip_status)
+
+
+def _highlight_value_for_clip(value: object, clip_status: str) -> object:
+    fill_color = _guide_clip_fill_color(clip_status)
+    if not fill_color:
+        return value
+    return _ReportTableCell(value, fill_color)
+
+
+def _guide_clip_fill_color(status: object) -> str | None:
+    normalized = str(status or "").strip().lower()
+    if normalized == "low":
+        return _GUIDE_LOW_CLIP_COLOR
+    if normalized == "high":
+        return _GUIDE_HIGH_CLIP_COLOR
+    return None
+
+
 def _dream_output_lines(
     settings: DreamRunSettings,
     summary: DreamSummary,
     model_plot: DreamModelPlotData,
+    parameter_map_entries: tuple[DreamParameterEntry, ...] = (),
 ) -> list[str]:
+    fit_q_bounds = dream_fit_q_bounds(
+        model_plot.q_values,
+        model_plot.active_fit_mask,
+    )
+    output_q_bounds = dream_output_q_bounds(model_plot.q_values)
     lines = [
         f"Template: {model_plot.template_name}",
         f"Best-fit method: {settings.bestfit_method}",
@@ -2898,6 +3139,8 @@ def _dream_output_lines(
         f"RMSE: {model_plot.rmse:.6g}",
         f"Mean |res|: {model_plot.mean_abs_residual:.6g}",
         f"R^2: {model_plot.r_squared:.6g}",
+        f"Fit q-range: {format_dream_q_bounds(fit_q_bounds)}",
+        f"Output q-range: {format_dream_q_bounds(output_q_bounds)}",
         (
             "Credible interval: "
             f"{summary.credible_interval_low:g} - "
@@ -2908,10 +3151,20 @@ def _dream_output_lines(
             f"{', '.join(summary.active_parameter_names) or 'None'}"
         ),
     ]
+    prior_lookup = {
+        str(entry.param): entry
+        for entry in parameter_map_entries
+        if str(entry.param).strip()
+    }
     for index, name in enumerate(summary.full_parameter_names[:10]):
+        guide_text = _parameter_guide_text(
+            prior_lookup.get(str(name)),
+            summary.bestfit_params[index],
+        )
         lines.append(
             f"{name}: {float(summary.bestfit_params[index]):.6g} "
-            f"(p{summary.credible_interval_low:g}="
+            f"({guide_text}; "
+            f"p{summary.credible_interval_low:g}="
             f"{float(summary.interval_low_values[index]):.6g}, "
             f"p{summary.credible_interval_high:g}="
             f"{float(summary.interval_high_values[index]):.6g})"
@@ -2921,6 +3174,24 @@ def _dream_output_lines(
             f"... {len(summary.full_parameter_names) - 10} additional parameters"
         )
     return lines
+
+
+def _parameter_guide_text(
+    entry: DreamParameterEntry | None,
+    value: object,
+) -> str:
+    if entry is None:
+        return "guide_low=n/a, guide_high=n/a"
+    guide_low, guide_high, _guide_kind = distribution_guide_bounds(entry)
+    clip_status = guide_clip_status(value, guide_low, guide_high)
+    clip_suffix = f", guide_clip={clip_status}" if clip_status else ""
+    return (
+        "guide_low="
+        f"{format_distribution_guide_value(guide_low)}, "
+        "guide_high="
+        f"{format_distribution_guide_value(guide_high)}"
+        f"{clip_suffix}"
+    )
 
 
 def _describe_posterior_filter(settings: DreamRunSettings) -> str:

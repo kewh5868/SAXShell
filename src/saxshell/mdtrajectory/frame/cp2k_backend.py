@@ -38,6 +38,8 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
         topology_file: str | Path | None = None,
         *,
         include_restart_duplicates: bool = False,
+        frame_timestep_fs: float | None = None,
+        use_inferred_frame_times: bool = False,
     ) -> None:
         super().__init__(input_file=input_file, topology_file=topology_file)
         suffix = self.input_file.suffix.lower()
@@ -47,6 +49,10 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
             )
         self.file_type = suffix.lstrip(".")
         self.include_restart_duplicates = bool(include_restart_duplicates)
+        self.frame_timestep_fs = (
+            None if frame_timestep_fs is None else float(frame_timestep_fs)
+        )
+        self.use_inferred_frame_times = bool(use_inferred_frame_times)
         self._raw_frame_count: int | None = None
         self._duplicate_source_frame_count: int = 0
 
@@ -58,6 +64,7 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
             "n_frames": len(frame_metadata),
             "include_restart_duplicates": self.include_restart_duplicates,
         }
+        summary.update(self._time_summary(frame_metadata))
         if self._raw_frame_count is not None and (
             self._raw_frame_count != len(frame_metadata)
             or self._duplicate_source_frame_count
@@ -161,6 +168,10 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
                         line,
                         fallback_index=fallback_index,
                     )
+                    time_fs, time_inferred = self._frame_time_for(
+                        frame_index,
+                        self._parse_time_from_header(line),
+                    )
                     raw_frame_count += 1
                     if (
                         source_index is not None
@@ -171,7 +182,8 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
                         seen_source_indices.add(source_index)
                     frame = FrameMetadata(
                         frame_index=frame_index,
-                        time_fs=self._parse_time_from_header(line),
+                        time_fs=time_fs,
+                        time_inferred=time_inferred,
                     )
                     if self.include_restart_duplicates:
                         frames_with_duplicates.append(frame)
@@ -189,7 +201,7 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
                 comment = handle.readline()
                 if not comment:
                     break
-                time_val = (
+                parsed_time = (
                     None
                     if not comment
                     else self._parse_time_from_metadata(comment)
@@ -204,6 +216,10 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
                     comment,
                     fallback_index=fallback_index,
                 )
+                time_val, time_inferred = self._frame_time_for(
+                    frame_index,
+                    parsed_time,
+                )
                 raw_frame_count += 1
                 if (
                     source_index is not None
@@ -215,6 +231,7 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
                 frame = FrameMetadata(
                     frame_index=frame_index,
                     time_fs=time_val,
+                    time_inferred=time_inferred,
                 )
                 if self.include_restart_duplicates:
                     frames_with_duplicates.append(frame)
@@ -276,6 +293,10 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
                         line,
                         fallback_index=fallback_index,
                     )
+                    time_fs, time_inferred = self._frame_time_for(
+                        frame_index,
+                        self._parse_time_from_header(line),
+                    )
                     raw_frame_count += 1
                     if (
                         source_index is not None
@@ -289,7 +310,8 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
                         file_type="xyz",
                         atom_count=atom_count,
                         lines=[line, *atom_lines],
-                        time_fs=self._parse_time_from_header(line),
+                        time_fs=time_fs,
+                        time_inferred=time_inferred,
                     )
                     if self.include_restart_duplicates:
                         frames_with_duplicates.append(frame)
@@ -317,6 +339,10 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
                     comment,
                     fallback_index=fallback_index,
                 )
+                time_fs, time_inferred = self._frame_time_for(
+                    frame_index,
+                    self._parse_time_from_metadata(comment),
+                )
                 raw_frame_count += 1
                 if (
                     source_index is not None
@@ -330,7 +356,8 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
                     file_type="xyz",
                     atom_count=atom_count,
                     lines=[comment, *atom_lines],
-                    time_fs=self._parse_time_from_metadata(comment),
+                    time_fs=time_fs,
+                    time_inferred=time_inferred,
                 )
                 if self.include_restart_duplicates:
                     frames_with_duplicates.append(frame)
@@ -395,6 +422,72 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
             pass
         return None
 
+    def _frame_time_for(
+        self,
+        frame_index: int,
+        parsed_time_fs: float | None,
+    ) -> tuple[float | None, bool]:
+        if self.frame_timestep_fs is None:
+            return parsed_time_fs, False
+        if self.use_inferred_frame_times or parsed_time_fs is None:
+            return float(frame_index) * self.frame_timestep_fs, True
+        return parsed_time_fs, False
+
+    def _time_summary(
+        self,
+        frame_metadata: list[FrameMetadata],
+    ) -> dict[str, object]:
+        time_metadata_frames = sum(
+            frame.time_fs is not None for frame in frame_metadata
+        )
+        source_time_metadata_frames = sum(
+            frame.time_fs is not None and not frame.time_inferred
+            for frame in frame_metadata
+        )
+        inferred_time_frames = sum(
+            frame.time_inferred for frame in frame_metadata
+        )
+        return {
+            "time_metadata_frames": time_metadata_frames,
+            "source_time_metadata_frames": source_time_metadata_frames,
+            "inferred_time_frames": inferred_time_frames,
+            "detected_frame_timestep_fs": (
+                self._detect_source_frame_timestep(frame_metadata)
+            ),
+            "frame_timestep_fs": self.frame_timestep_fs,
+            "frame_timestep_mode": (
+                "manual" if self.use_inferred_frame_times else "auto"
+            ),
+        }
+
+    @staticmethod
+    def _detect_source_frame_timestep(
+        frame_metadata: list[FrameMetadata],
+    ) -> float | None:
+        source_frames = [
+            frame
+            for frame in frame_metadata
+            if frame.time_fs is not None and not frame.time_inferred
+        ]
+        if len(source_frames) < 2:
+            return None
+        step_values: list[float] = []
+        for previous, current in zip(source_frames, source_frames[1:]):
+            frame_delta = int(current.frame_index) - int(previous.frame_index)
+            if frame_delta <= 0:
+                continue
+            time_delta = float(current.time_fs) - float(previous.time_fs)
+            if time_delta <= 0.0:
+                continue
+            step_values.append(time_delta / frame_delta)
+        if not step_values:
+            return None
+        step_values.sort()
+        midpoint = len(step_values) // 2
+        if len(step_values) % 2:
+            return float(step_values[midpoint])
+        return float((step_values[midpoint - 1] + step_values[midpoint]) / 2.0)
+
     def _estimate_frame_count_pdb(self) -> int:
         count = 0
         with self.input_file.open("r") as handle:
@@ -410,8 +503,16 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
             for line in handle:
                 if not line.startswith("MODEL"):
                     continue
+                time_fs, time_inferred = self._frame_time_for(
+                    frame_idx,
+                    None,
+                )
                 frames.append(
-                    FrameMetadata(frame_index=frame_idx, time_fs=None)
+                    FrameMetadata(
+                        frame_index=frame_idx,
+                        time_fs=time_fs,
+                        time_inferred=time_inferred,
+                    )
                 )
                 frame_idx += 1
         return frames
@@ -430,13 +531,18 @@ class CP2KTrajectoryBackend(TrajectoryBackend):
                 if line.startswith("ENDMDL") or line.startswith("END"):
                     if buffer:
                         buffer.append(line)
+                        time_fs, time_inferred = self._frame_time_for(
+                            frame_idx,
+                            None,
+                        )
                         frames.append(
                             FrameRecord(
                                 frame_index=frame_idx,
                                 file_type="pdb",
                                 atom_count=None,
                                 lines=buffer.copy(),
-                                time_fs=None,
+                                time_fs=time_fs,
+                                time_inferred=time_inferred,
                             )
                         )
                         frame_idx += 1

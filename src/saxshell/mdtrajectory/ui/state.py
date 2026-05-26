@@ -16,6 +16,8 @@ class MDTrajectoryAppState:
     start: int | None = None
     stop: int | None = None
     stride: int = 1
+    frame_timestep_fs: float = 0.5
+    use_manual_frame_timestep: bool = False
 
     temp_target_k: float = 300.0
     temp_tol_k: float = 1.0

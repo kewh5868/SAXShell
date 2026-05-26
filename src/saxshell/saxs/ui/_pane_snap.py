@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QObject, Qt
-from PySide6.QtWidgets import QApplication, QScrollArea, QSplitter, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QScrollArea,
+    QSplitter,
+    QToolBar,
+    QWidget,
+)
 
 
 class PaneSnapFilter(QObject):
@@ -60,6 +66,8 @@ class PaneSnapFilter(QObject):
         if left_widget is None or right_widget is None:
             return False
         if event.type() == QEvent.Type.MouseButtonPress:
+            if self._is_descendant_of_type(watched, QToolBar):
+                return False
             if self._is_descendant(watched, left_widget):
                 self._snap_to(0)
             elif self._is_descendant(watched, right_widget):
@@ -75,6 +83,15 @@ class PaneSnapFilter(QObject):
         w: QObject | None = widget
         while w is not None:
             if w is ancestor:
+                return True
+            w = w.parent()
+        return False
+
+    @staticmethod
+    def _is_descendant_of_type(widget: QObject, widget_type: type) -> bool:
+        w: QObject | None = widget
+        while w is not None:
+            if isinstance(w, widget_type):
                 return True
             w = w.parent()
         return False

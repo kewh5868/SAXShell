@@ -12,6 +12,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 6.16,
       "solvent_density_g_per_ml": 0.944
     },
     "PbI2 - DMF - 0.297 M": {
@@ -26,6 +27,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 6.16,
       "solvent_density_g_per_ml": 0.944
     },
     "PbI2 - DMF - 0.099 M": {
@@ -40,6 +42,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 6.16,
       "solvent_density_g_per_ml": 0.944
     },
     "PbI2 - DMF - 0.07 M": {
@@ -54,6 +57,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 6.16,
       "solvent_density_g_per_ml": 0.944
     },
     "PbI2 - DMF - 0.05 M": {
@@ -68,6 +72,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 6.16,
       "solvent_density_g_per_ml": 0.944
     },
     "PbI2 - DMF - 0.01 M": {
@@ -82,6 +87,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 6.16,
       "solvent_density_g_per_ml": 0.944
     },
     "PbI2 - DMF - 0.005 M": {
@@ -96,6 +102,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 6.16,
       "solvent_density_g_per_ml": 0.944
     },
     "PbI2 - DMSO - 1.043 M": {
@@ -110,6 +117,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 6.16,
       "solvent_density_g_per_ml": 1.1
     },
     "PbI2 - DMSO - 0.786 M": {
@@ -124,6 +132,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 6.16,
       "solvent_density_g_per_ml": 1.1
     },
     "PbI2 - DMSO - 0.483 M": {
@@ -138,6 +147,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 6.16,
       "solvent_density_g_per_ml": 1.1
     },
     "PbI2 - DMSO - 0.405 M": {
@@ -152,6 +162,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 6.16,
       "solvent_density_g_per_ml": 1.1
     },
     "PbI2 - DMSO - 0.101 M": {
@@ -166,6 +177,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 6.16,
       "solvent_density_g_per_ml": 1.1
     },
     "PbI2 - DMSO - 0.05 M": {
@@ -180,6 +192,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 6.16,
       "solvent_density_g_per_ml": 1.1
     },
     "PbI2 - DMSO - 0.01 M": {
@@ -194,6 +207,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 6.16,
       "solvent_density_g_per_ml": 1.1
     },
     "PbI2 - DMSO - 0.005 M": {
@@ -208,6 +222,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 6.16,
       "solvent_density_g_per_ml": 1.1
     },
     "MAPbI3 - DMF - 0.92 M": {
@@ -222,6 +237,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.16,
       "solvent_density_g_per_ml": 0.944
     },
     "MAPbI3 - DMF - 0.494 M": {
@@ -236,6 +252,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.16,
       "solvent_density_g_per_ml": 0.944
     },
     "MAPbI3 - DMF - 0.278 M": {
@@ -250,6 +267,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.16,
       "solvent_density_g_per_ml": 0.944
     },
     "MAPbI3 - DMF - 0.103 M": {
@@ -264,6 +282,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.16,
       "solvent_density_g_per_ml": 0.944
     },
     "MAPbI3 - DMF - 0.051 M": {
@@ -278,6 +297,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.16,
       "solvent_density_g_per_ml": 0.944
     },
     "MAPbI3 - DMF - 0.01 M": {
@@ -292,6 +312,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.16,
       "solvent_density_g_per_ml": 0.944
     },
     "MAPbI3 - DMF - 0.005 M": {
@@ -306,6 +327,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.16,
       "solvent_density_g_per_ml": 0.944
     },
     "MA3PbI5 - DMF - 0.93 M": {
@@ -320,6 +342,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.09,
       "solvent_density_g_per_ml": 0.944
     },
     "MA3PbI5 - DMF - 0.476 M": {
@@ -334,6 +357,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.09,
       "solvent_density_g_per_ml": 0.944
     },
     "MA3PbI5 - DMF - 0.266 M": {
@@ -348,6 +372,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.09,
       "solvent_density_g_per_ml": 0.944
     },
     "MA3PbI5 - DMF - 0.104 M": {
@@ -362,6 +387,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.09,
       "solvent_density_g_per_ml": 0.944
     },
     "MA3PbI5 - DMF - 0.049 M": {
@@ -376,6 +402,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.09,
       "solvent_density_g_per_ml": 0.944
     },
     "MA3PbI5 - DMF - 0.01 M": {
@@ -390,6 +417,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.09,
       "solvent_density_g_per_ml": 0.944
     },
     "MA3PbI5 - DMF - 0.005 M": {
@@ -404,6 +432,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.09,
       "solvent_density_g_per_ml": 0.944
     },
     "MAPbI3 - DMSO - 0.89 M": {
@@ -418,6 +447,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.16,
       "notes": "1 mmol/mL",
       "solvent_density_g_per_ml": 1.1
     },
@@ -433,6 +463,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.16,
       "notes": "0.5 mmol/mL",
       "solvent_density_g_per_ml": 1.1
     },
@@ -448,6 +479,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.16,
       "notes": "0.3 mmol/mL",
       "solvent_density_g_per_ml": 1.1
     },
@@ -463,6 +495,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.16,
       "notes": "0.2 mmol/mL; density estimate",
       "solvent_density_g_per_ml": 1.1
     },
@@ -478,6 +511,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.16,
       "notes": "0.1 mmol/mL",
       "solvent_density_g_per_ml": 1.1
     },
@@ -493,6 +527,7 @@
         "molarity_element": "Pb"
       },
       "solute_molecule_count": 1,
+      "solute_density_g_per_ml": 4.16,
       "notes": "0.05 mmol/mL; density estimate",
       "solvent_density_g_per_ml": 1.1
     }

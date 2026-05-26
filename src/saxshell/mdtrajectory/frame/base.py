@@ -11,6 +11,7 @@ class FrameMetadata:
 
     frame_index: int
     time_fs: float | None = None
+    time_inferred: bool = False
 
 
 @dataclass(slots=True)
@@ -22,6 +23,7 @@ class FrameRecord:
     atom_count: int | None
     lines: list[str]
     time_fs: float | None = None
+    time_inferred: bool = False
 
 
 class TrajectoryBackend(ABC):

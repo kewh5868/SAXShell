@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,6 +24,9 @@ from saxshell.fullrmc.representatives import (
     save_representative_selection_metadata,
 )
 from saxshell.fullrmc.solution_properties import SolutionPropertiesSettings
+from saxshell.fullrmc.solution_property_presets import (
+    default_solution_property_presets,
+)
 from saxshell.saxs._model_templates import (
     load_template_module,
     load_template_spec,
@@ -234,6 +238,65 @@ def _write_predicted_structure_artifacts(
         encoding="utf-8",
     )
     return dataset_file
+
+
+def test_load_project_rebases_stale_project_dir_and_restores_distribution(
+    tmp_path,
+):
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    artifact_paths = project_artifact_paths(
+        settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+    manager.ensure_artifact_dirs(artifact_paths)
+    shutil.copytree(
+        paths.scattering_components_dir,
+        artifact_paths.component_dir,
+        dirs_exist_ok=True,
+    )
+    shutil.copy2(
+        paths.project_dir / "md_saxs_map.json",
+        artifact_paths.component_map_file,
+    )
+    shutil.copy2(
+        paths.project_dir / "md_prior_weights.json",
+        artifact_paths.prior_weights_file,
+    )
+    manager._write_distribution_metadata(
+        settings,
+        artifact_paths=artifact_paths,
+    )
+
+    stale_project_dir = tmp_path / "old_location" / project_dir.name
+    stale_experimental_path = (
+        stale_project_dir / "experimental_data" / "exp_demo.txt"
+    )
+    payload = json.loads(paths.project_file.read_text(encoding="utf-8"))
+    payload["project_dir"] = str(stale_project_dir)
+    payload["experimental_data_path"] = str(stale_experimental_path)
+    payload["copied_experimental_data_file"] = str(stale_experimental_path)
+    payload.pop("active_distribution_id", None)
+    paths.project_file.write_text(
+        json.dumps(payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    loaded = manager.load_project(project_dir)
+    loaded_artifacts = project_artifact_paths(loaded)
+
+    assert loaded.project_dir == str(project_dir.resolve())
+    assert loaded.experimental_data_path == str(
+        (paths.experimental_data_dir / "exp_demo.txt").resolve()
+    )
+    assert loaded.copied_experimental_data_file == str(
+        (paths.experimental_data_dir / "exp_demo.txt").resolve()
+    )
+    assert loaded.active_distribution_id == artifact_paths.distribution_id
+    assert loaded_artifacts.component_map_file.is_file()
+    assert manager.component_artifacts_match_settings(loaded)
 
 
 def _build_poly_lma_geometry_project(
@@ -1760,7 +1823,9 @@ def test_scaled_solvent_monosq_prefit_evaluates_scaled_solvent_contribution(
     entries = workflow.load_parameter_entries()
     for entry in entries:
         if entry.name == "solv_w":
-            entry.value = 0.5
+            entry.value = 2.5
+            entry.minimum = 0.0
+            entry.maximum = 5.0
         if entry.name == "scale":
             entry.value = 2e-3
 
@@ -1771,7 +1836,7 @@ def test_scaled_solvent_monosq_prefit_evaluates_scaled_solvent_contribution(
     assert np.allclose(evaluation.solvent_intensities, solvent_intensity)
     assert np.allclose(
         evaluation.solvent_contribution,
-        solvent_intensity * 0.5 * 2e-3,
+        solvent_intensity * 2.5 * 2e-3,
     )
 
 
@@ -1918,7 +1983,7 @@ def test_solute_volume_fraction_estimate_uses_component_densities():
     assert "Solute mass / density: 2.000000 g / 2.0000 g/mL" in summary
     assert "Solvent mass / density: 8.000000 g / 1.0000 g/mL" in summary
     assert "Estimated solute volume: 1.000 cm^3" in summary
-    assert "Estimated solvent volume: 8.000 cm^3" in summary
+    assert "Neat-solvent diagnostic volume: 8.000 cm^3" in summary
 
 
 def test_solute_volume_fraction_molarity_mode_does_not_require_solute_density():
@@ -1949,6 +2014,148 @@ def test_solute_volume_fraction_molarity_mode_does_not_require_solute_density():
     assert "Solute volume from solvent-density closure" in summary
     assert "Solvent mass / density:" in summary
     assert "solute density was not required" in summary.lower()
+
+
+def test_solute_volume_fraction_molarity_mode_prefers_solute_density():
+    preset = default_solution_property_presets()["MAPbI3 - DMF - 0.005 M"]
+
+    estimate = calculate_solute_volume_fraction_estimate(
+        SoluteVolumeFractionSettings(
+            solution=preset.settings,
+            solute_density_g_per_ml=preset.solute_density_g_per_ml,
+            solvent_density_g_per_ml=preset.solvent_density_g_per_ml,
+        )
+    )
+
+    assert preset.solute_density_g_per_ml == pytest.approx(4.16)
+    assert estimate.calculation_method == "solute_density"
+    assert estimate.solute_volume_cm3 == pytest.approx(
+        estimate.solution_result.mass_solute / preset.solute_density_g_per_ml
+    )
+    assert estimate.solute_volume_fraction == pytest.approx(
+        estimate.solute_volume_cm3
+        / estimate.solution_result.volume_solution_cm3
+    )
+    assert estimate.solvent_volume_fraction == pytest.approx(
+        1.0 - estimate.solute_volume_fraction
+    )
+    assert estimate.additive_to_solution_volume_ratio is not None
+    assert estimate.additive_to_solution_volume_ratio > 1.0
+
+
+def test_solute_volume_fraction_pbii_dmf_preset_compares_methods():
+    preset = default_solution_property_presets()["PbI2 - DMF - 0.49 M"]
+
+    solute_density_estimate = calculate_solute_volume_fraction_estimate(
+        SoluteVolumeFractionSettings(
+            solution=preset.settings,
+            solute_density_g_per_ml=preset.solute_density_g_per_ml,
+            solvent_density_g_per_ml=preset.solvent_density_g_per_ml,
+        )
+    )
+    closure_estimate = calculate_solute_volume_fraction_estimate(
+        SoluteVolumeFractionSettings(
+            solution=preset.settings,
+            solute_density_g_per_ml=None,
+            solvent_density_g_per_ml=preset.solvent_density_g_per_ml,
+        )
+    )
+
+    assert preset.solute_density_g_per_ml == pytest.approx(6.16)
+    assert preset.solvent_density_g_per_ml == pytest.approx(0.944)
+    assert (
+        solute_density_estimate.solution_result.mass_solute
+        == pytest.approx(225.8949)
+    )
+    assert solute_density_estimate.calculation_method == "solute_density"
+    assert solute_density_estimate.solute_volume_cm3 == pytest.approx(36.67125)
+    assert solute_density_estimate.solute_volume_fraction == pytest.approx(
+        0.03667125
+    )
+    assert (
+        solute_density_estimate.additive_to_solution_volume_ratio
+        == pytest.approx(1.0092402118644068)
+    )
+    assert closure_estimate.calculation_method == "solvent_density_closure"
+    assert closure_estimate.solute_volume_fraction == pytest.approx(
+        0.02743103813559321
+    )
+    assert closure_estimate.solute_volume_fraction != pytest.approx(
+        solute_density_estimate.solute_volume_fraction
+    )
+
+
+def test_solute_volume_fraction_matches_known_volume_percent_example():
+    ethanol_density_g_per_ml = 0.789
+    ethanol_molar_mass_g_per_mol = 46.06844
+    target_volume_fraction = 40.0 / 240.0
+    ethanol_molarity = (
+        target_volume_fraction
+        * 1000.0
+        * ethanol_density_g_per_ml
+        / ethanol_molar_mass_g_per_mol
+    )
+
+    estimate = calculate_solute_volume_fraction_estimate(
+        SoluteVolumeFractionSettings(
+            solution=SolutionPropertiesSettings(
+                mode="molarity_per_liter",
+                solution_density=0.96,
+                solute_stoich="C2H6O",
+                solvent_stoich="H2O",
+                molar_mass_solute=ethanol_molar_mass_g_per_mol,
+                molar_mass_solvent=18.01528,
+                molarity=ethanol_molarity,
+                molarity_element="O",
+            ),
+            solute_density_g_per_ml=ethanol_density_g_per_ml,
+            solvent_density_g_per_ml=None,
+        )
+    )
+
+    assert estimate.calculation_method == "solute_density"
+    assert estimate.solution_result.volume_solution_cm3 == pytest.approx(
+        1000.0
+    )
+    assert estimate.solute_volume_fraction == pytest.approx(
+        target_volume_fraction
+    )
+
+
+def test_builtin_solution_presets_compute_solute_volume_fraction():
+    failures: list[str] = []
+
+    for name, preset in default_solution_property_presets().items():
+        if preset.solute_density_g_per_ml is None:
+            failures.append(f"{name}: missing solute density")
+            continue
+        try:
+            estimate = calculate_solute_volume_fraction_estimate(
+                SoluteVolumeFractionSettings(
+                    solution=preset.settings,
+                    solute_density_g_per_ml=preset.solute_density_g_per_ml,
+                    solvent_density_g_per_ml=preset.solvent_density_g_per_ml,
+                )
+            )
+        except ValueError as exc:
+            failures.append(f"{name}: {exc}")
+            continue
+        if not (0.0 < estimate.solute_volume_fraction < 1.0):
+            failures.append(
+                f"{name}: solute fraction "
+                f"{estimate.solute_volume_fraction:.6g}"
+            )
+        solvent_fraction_delta = abs(
+            estimate.solvent_volume_fraction
+            - (1.0 - estimate.solute_volume_fraction)
+        )
+        if solvent_fraction_delta > 1e-12:
+            failures.append(
+                f"{name}: solvent fraction "
+                f"{estimate.solvent_volume_fraction:.6g}"
+            )
+
+    assert failures == []
 
 
 def test_poly_lma_prefit_workflow_exposes_solute_volume_fraction_target(
@@ -1996,6 +2203,9 @@ def test_scaled_solvent_monosq_prefit_exposes_physical_vol_frac_target(
     assert (
         spec.solution_scattering_support.solvent_contribution_scale_mode
         == "global_scale"
+    )
+    assert (
+        spec.solution_scattering_support.molar_concentration_parameter is None
     )
     assert spec.prefit_support.auto_apply_autoscale_on_load
     assert spec.prefit_support.autoscale_bounds_mode == "adaptive"
@@ -2248,6 +2458,49 @@ def test_run_prefit_preserves_manual_parameter_values_outside_old_bounds(
     assert fitted_entry.minimum <= 0.9
 
 
+def test_run_prefit_rejects_negative_r_squared_fit_result(
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    workflow = SAXSPrefitWorkflow(project_dir)
+    workflow.settings.autosave_prefits = True
+    starting_values = {
+        entry.name: float(entry.value) for entry in workflow.parameter_entries
+    }
+
+    class FakeResult:
+        def __init__(self, params):
+            self.params = params
+            self.nfev = 1
+
+    def fake_minimize(objective, params, method, max_nfev):
+        del objective, method, max_nfev
+        params["offset"].set(value=30.0)
+        return FakeResult(params)
+
+    monkeypatch.setattr(prefit_workflow_module, "minimize", fake_minimize)
+    monkeypatch.setattr(
+        prefit_workflow_module,
+        "fit_report",
+        lambda _result: pytest.fail(
+            "negative-R^2 fits should not be accepted"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="R\\^2 is negative"):
+        workflow.run_fit(
+            workflow.load_parameter_entries(),
+            method="leastsq",
+            max_nfev=50,
+        )
+
+    assert {
+        entry.name: float(entry.value) for entry in workflow.parameter_entries
+    } == starting_values
+    assert not (paths.prefit_dir / "prefit_state.json").exists()
+
+
 def test_prefit_workflow_uses_reduced_saved_q_range_without_rebuild(tmp_path):
     project_dir, _paths = _build_minimal_saxs_project(tmp_path)
     manager = SAXSProjectManager()
@@ -2265,6 +2518,57 @@ def test_prefit_workflow_uses_reduced_saved_q_range_without_rebuild(tmp_path):
     )
     assert len(evaluation.experimental_intensities) == 3
     assert len(evaluation.model_intensities) == 3
+
+
+def test_prefit_workflow_uses_active_fit_q_range_without_rebuild(
+    tmp_path,
+    monkeypatch,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    workflow = SAXSPrefitWorkflow(project_dir)
+    entries = workflow.load_parameter_entries()
+    for entry in entries:
+        entry.vary = False
+
+    workflow.set_prefit_fit_q_range(
+        0.11,
+        0.21,
+        parameter_entries=entries,
+    )
+    evaluation = workflow.evaluate(entries)
+    expected_q = np.linspace(0.05, 0.3, 8)
+    expected_mask = (expected_q >= 0.11) & (expected_q <= 0.21)
+
+    assert np.allclose(evaluation.q_values, expected_q)
+    assert np.array_equal(evaluation.fit_mask, expected_mask)
+    assert np.count_nonzero(np.isfinite(evaluation.residuals)) == 3
+    assert np.all(np.isnan(evaluation.residuals[~expected_mask]))
+
+    recorded: dict[str, int] = {}
+
+    def fake_minimize(objective, params, *, method="leastsq", max_nfev=10000):
+        del method, max_nfev
+        residuals = objective(params)
+        recorded["residual_count"] = len(residuals)
+        return SimpleNamespace(params=params, nfev=1)
+
+    monkeypatch.setattr(prefit_workflow_module, "minimize", fake_minimize)
+    monkeypatch.setattr(
+        prefit_workflow_module, "fit_report", lambda _result: "fake"
+    )
+    monkeypatch.setattr(
+        prefit_workflow_module,
+        "raise_for_negative_prefit_r_squared",
+        lambda _r_squared: None,
+    )
+
+    result = workflow.run_fit(entries, method="leastsq", max_nfev=50)
+
+    assert recorded["residual_count"] == 2 * int(
+        np.count_nonzero(expected_mask)
+    )
+    assert np.allclose(result.evaluation.q_values, expected_q)
+    assert np.array_equal(result.evaluation.fit_mask, expected_mask)
 
 
 def test_prefit_workflow_snaps_tiny_q_range_edge_mismatch_without_rebuild(
@@ -2417,7 +2721,7 @@ def test_poly_lma_prefit_evaluates_structure_factor_trace(tmp_path):
     )
 
 
-def test_poly_lma_prefit_clamps_saved_solvent_weight_bounds(tmp_path):
+def test_poly_lma_prefit_preserves_saved_solvent_weight_bounds(tmp_path):
     project_dir, _paths, _effective_radius = _build_poly_lma_geometry_project(
         tmp_path
     )
@@ -2440,9 +2744,9 @@ def test_poly_lma_prefit_clamps_saved_solvent_weight_bounds(tmp_path):
         if entry.name == "solvent_scale"
     )
 
-    assert solvent_entry.value == pytest.approx(1.0)
+    assert solvent_entry.value == pytest.approx(1.6)
     assert solvent_entry.minimum == pytest.approx(0.0)
-    assert solvent_entry.maximum == pytest.approx(1.0)
+    assert solvent_entry.maximum == pytest.approx(5.0)
 
 
 def test_saxs_prefit_workflow_persists_template_reset_and_best_prefit(

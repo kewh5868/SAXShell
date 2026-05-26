@@ -1,36 +1,160 @@
-from .distributions import (
-    BASE_DISTRIBUTIONS,
-    DreamParameterEntry,
-    build_default_parameter_map,
-    load_parameter_map,
-    save_parameter_map,
-)
-from .results import (
-    DreamModelPlotData,
-    DreamSummary,
-    DreamViolinPlotData,
-    SAXSDreamResultsLoader,
-)
-from .runtime import DreamRunBundle, SAXSDreamWorkflow
-from .settings import (
-    DreamRunSettings,
-    load_dream_settings,
-    save_dream_settings,
-)
+from __future__ import annotations
+
+from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .batch import (
+        DEFAULT_DREAM_BATCH_CONDA_ENV,
+        DREAM_BATCH_COMPARISON_NAME,
+        DreamBatchFilterSet,
+        DreamBatchQueueItem,
+        DreamBatchRunSet,
+        DreamBatchRunSetManager,
+        command_text_for_run_set,
+        run_dream_batch_manifest,
+    )
+    from .distributions import (
+        BASE_DISTRIBUTIONS,
+        DREAM_PRIOR_PRESET_STATUS_LABELS,
+        DreamParameterEntry,
+        build_default_parameter_map,
+        distribution_guide_bounds,
+        format_distribution_guide_value,
+        format_prior_preset_summary,
+        guide_clip_status,
+        guide_clip_status_label,
+        load_parameter_map,
+        normalize_prior_preset_status,
+        prior_preset_status_counts,
+        prior_preset_status_label,
+        prior_preset_status_summary,
+        save_parameter_map,
+    )
+    from .results import (
+        DreamFitParameterValue,
+        DreamModelPlotData,
+        DreamSummary,
+        DreamViolinPlotData,
+        SAXSDreamResultsLoader,
+        dream_fit_q_bounds,
+        dream_output_q_bounds,
+        format_dream_q_bounds,
+    )
+    from .runtime import DreamRunBundle, SAXSDreamWorkflow
+    from .settings import (
+        DREAM_SAMPLER_SETTING_NAMES,
+        DREAM_SEARCH_FILTER_PRESET_LABELS,
+        DREAM_SEARCH_FILTER_PRESETS,
+        DreamRunSettings,
+        PosteriorFilterSettings,
+        dream_run_settings_to_dict,
+        dream_search_filter_preset_label,
+        format_dream_search_filter_preset,
+        load_dream_settings,
+        normalize_dream_search_filter_preset,
+        save_dream_settings,
+    )
 
 __all__ = [
     "BASE_DISTRIBUTIONS",
+    "DEFAULT_DREAM_BATCH_CONDA_ENV",
+    "DREAM_PRIOR_PRESET_STATUS_LABELS",
+    "DREAM_BATCH_COMPARISON_NAME",
+    "DREAM_SAMPLER_SETTING_NAMES",
+    "DREAM_SEARCH_FILTER_PRESET_LABELS",
+    "DREAM_SEARCH_FILTER_PRESETS",
+    "DreamBatchFilterSet",
+    "DreamBatchQueueItem",
+    "DreamBatchRunSet",
+    "DreamBatchRunSetManager",
     "DreamParameterEntry",
+    "DreamFitParameterValue",
     "DreamModelPlotData",
     "DreamRunBundle",
     "DreamRunSettings",
     "DreamSummary",
     "DreamViolinPlotData",
+    "PosteriorFilterSettings",
     "SAXSDreamResultsLoader",
     "SAXSDreamWorkflow",
     "build_default_parameter_map",
+    "command_text_for_run_set",
+    "distribution_guide_bounds",
+    "dream_fit_q_bounds",
+    "dream_output_q_bounds",
+    "dream_search_filter_preset_label",
+    "dream_run_settings_to_dict",
+    "format_distribution_guide_value",
+    "format_dream_q_bounds",
+    "format_dream_search_filter_preset",
+    "format_prior_preset_summary",
+    "guide_clip_status",
+    "guide_clip_status_label",
     "load_dream_settings",
     "load_parameter_map",
+    "normalize_dream_search_filter_preset",
+    "normalize_prior_preset_status",
+    "prior_preset_status_counts",
+    "prior_preset_status_label",
+    "prior_preset_status_summary",
+    "run_dream_batch_manifest",
     "save_dream_settings",
     "save_parameter_map",
 ]
+
+_LAZY_EXPORTS = {
+    "BASE_DISTRIBUTIONS": "saxshell.saxs.dream.distributions",
+    "DEFAULT_DREAM_BATCH_CONDA_ENV": "saxshell.saxs.dream.batch",
+    "DREAM_BATCH_COMPARISON_NAME": "saxshell.saxs.dream.batch",
+    "DREAM_PRIOR_PRESET_STATUS_LABELS": ("saxshell.saxs.dream.distributions"),
+    "DREAM_SAMPLER_SETTING_NAMES": "saxshell.saxs.dream.settings",
+    "DREAM_SEARCH_FILTER_PRESET_LABELS": "saxshell.saxs.dream.settings",
+    "DREAM_SEARCH_FILTER_PRESETS": "saxshell.saxs.dream.settings",
+    "DreamBatchFilterSet": "saxshell.saxs.dream.batch",
+    "DreamBatchQueueItem": "saxshell.saxs.dream.batch",
+    "DreamBatchRunSet": "saxshell.saxs.dream.batch",
+    "DreamBatchRunSetManager": "saxshell.saxs.dream.batch",
+    "DreamParameterEntry": "saxshell.saxs.dream.distributions",
+    "DreamFitParameterValue": "saxshell.saxs.dream.results",
+    "DreamModelPlotData": "saxshell.saxs.dream.results",
+    "DreamRunBundle": "saxshell.saxs.dream.runtime",
+    "DreamRunSettings": "saxshell.saxs.dream.settings",
+    "DreamSummary": "saxshell.saxs.dream.results",
+    "DreamViolinPlotData": "saxshell.saxs.dream.results",
+    "PosteriorFilterSettings": "saxshell.saxs.dream.settings",
+    "SAXSDreamResultsLoader": "saxshell.saxs.dream.results",
+    "SAXSDreamWorkflow": "saxshell.saxs.dream.runtime",
+    "build_default_parameter_map": ("saxshell.saxs.dream.distributions"),
+    "command_text_for_run_set": "saxshell.saxs.dream.batch",
+    "distribution_guide_bounds": "saxshell.saxs.dream.distributions",
+    "dream_fit_q_bounds": "saxshell.saxs.dream.results",
+    "dream_output_q_bounds": "saxshell.saxs.dream.results",
+    "dream_search_filter_preset_label": "saxshell.saxs.dream.settings",
+    "dream_run_settings_to_dict": "saxshell.saxs.dream.settings",
+    "format_distribution_guide_value": ("saxshell.saxs.dream.distributions"),
+    "format_dream_q_bounds": "saxshell.saxs.dream.results",
+    "format_dream_search_filter_preset": "saxshell.saxs.dream.settings",
+    "format_prior_preset_summary": "saxshell.saxs.dream.distributions",
+    "guide_clip_status": "saxshell.saxs.dream.distributions",
+    "guide_clip_status_label": "saxshell.saxs.dream.distributions",
+    "load_dream_settings": "saxshell.saxs.dream.settings",
+    "load_parameter_map": "saxshell.saxs.dream.distributions",
+    "normalize_dream_search_filter_preset": "saxshell.saxs.dream.settings",
+    "normalize_prior_preset_status": "saxshell.saxs.dream.distributions",
+    "prior_preset_status_counts": "saxshell.saxs.dream.distributions",
+    "prior_preset_status_label": "saxshell.saxs.dream.distributions",
+    "prior_preset_status_summary": "saxshell.saxs.dream.distributions",
+    "run_dream_batch_manifest": "saxshell.saxs.dream.batch",
+    "save_dream_settings": "saxshell.saxs.dream.settings",
+    "save_parameter_map": "saxshell.saxs.dream.distributions",
+}
+
+
+def __getattr__(name: str) -> object:
+    module_name = _LAZY_EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module_name), name)
+    globals()[name] = value
+    return value

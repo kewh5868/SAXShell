@@ -161,7 +161,7 @@ def _full_params_to_param_dict(full_params):
 
 
 def _bounded_solvent_weight(value):
-    return float(np.clip(float(value), 0.0, 1.0))
+    return float(value)
 
 
 def _effective_structure_factor_profile(

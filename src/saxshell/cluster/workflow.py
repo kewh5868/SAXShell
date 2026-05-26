@@ -47,11 +47,13 @@ def example_pair_cutoff_definitions() -> PairCutoffDefinitions:
 
 
 def suggest_output_dir(frames_dir: str | Path) -> Path:
-    """Suggest a new cluster output directory beside the frames
-    folder."""
+    """Suggest a new cluster output directory near the frames folder."""
     source_path = Path(frames_dir)
     folder_name = _base_output_dir_name(source_path)
-    return next_available_output_dir(source_path.parent, folder_name)
+    return next_available_output_dir(
+        _suggested_output_parent_dir(source_path),
+        folder_name,
+    )
 
 
 def next_available_output_dir(parent_dir: Path, folder_name: str) -> Path:
@@ -83,6 +85,19 @@ def _base_output_dir_name(frames_dir: Path) -> str:
     if not folder_label:
         folder_label = "frames"
     return f"clusters_{folder_label}"
+
+
+def _suggested_output_parent_dir(frames_dir: Path) -> Path:
+    parent_dir = frames_dir.parent
+    if _is_nested_xyz2pdb_output(frames_dir):
+        return parent_dir.parent
+    return parent_dir
+
+
+def _is_nested_xyz2pdb_output(frames_dir: Path) -> bool:
+    return frames_dir.name.casefold().startswith(
+        "xyz2pdb_"
+    ) and frames_dir.parent.name.casefold().startswith("splitxyz")
 
 
 def _coerce_box_dimensions(

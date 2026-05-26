@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from .cutoff_analysis import SteadyStateResult
 
 ExportProgressCallback = Callable[[int, int, str], None]
+DEFAULT_FRAME_TIMESTEP_FS = 0.5
 
 
 @dataclass(slots=True)
@@ -32,6 +33,10 @@ class FrameSelectionPreview:
     first_time_fs: float | None
     last_time_fs: float | None
     time_metadata_frames: int
+    source_time_metadata_frames: int = 0
+    inferred_time_frames: int = 0
+    frame_timestep_fs: float | None = None
+    detected_frame_timestep_fs: float | None = None
 
 
 class TrajectoryManager:
@@ -44,6 +49,8 @@ class TrajectoryManager:
         backend: str = "auto",
         *,
         include_restart_duplicates: bool = False,
+        frame_timestep_fs: float | None = None,
+        use_inferred_frame_times: bool = False,
     ) -> None:
         self.input_file = Path(input_file)
         self.topology_file = (
@@ -51,6 +58,8 @@ class TrajectoryManager:
         )
         self.backend_name = backend
         self.include_restart_duplicates = bool(include_restart_duplicates)
+        self.frame_timestep_fs = _normalize_frame_timestep(frame_timestep_fs)
+        self.use_inferred_frame_times = bool(use_inferred_frame_times)
         self.backend = self._build_backend()
         self.frames: list[FrameRecord] | None = None
 
@@ -62,6 +71,8 @@ class TrajectoryManager:
                 input_file=self.input_file,
                 topology_file=self.topology_file,
                 include_restart_duplicates=self.include_restart_duplicates,
+                frame_timestep_fs=self.frame_timestep_fs,
+                use_inferred_frame_times=self.use_inferred_frame_times,
             )
 
         if self.backend_name == "auto":
@@ -72,6 +83,8 @@ class TrajectoryManager:
                     include_restart_duplicates=(
                         self.include_restart_duplicates
                     ),
+                    frame_timestep_fs=self.frame_timestep_fs,
+                    use_inferred_frame_times=self.use_inferred_frame_times,
                 )
 
         raise ValueError(
@@ -86,6 +99,30 @@ class TrajectoryManager:
         if self.include_restart_duplicates == include_restart_duplicates:
             return
         self.include_restart_duplicates = include_restart_duplicates
+        self.backend = self._build_backend()
+        self.frames = None
+
+    def set_frame_timestep(
+        self,
+        frame_timestep_fs: float | None,
+        *,
+        use_inferred_frame_times: bool | None = None,
+    ) -> None:
+        """Update the manual/fallback frame timestep and reload
+        metadata."""
+        normalized_timestep = _normalize_frame_timestep(frame_timestep_fs)
+        inferred_mode = (
+            self.use_inferred_frame_times
+            if use_inferred_frame_times is None
+            else bool(use_inferred_frame_times)
+        )
+        if (
+            self.frame_timestep_fs == normalized_timestep
+            and self.use_inferred_frame_times == inferred_mode
+        ):
+            return
+        self.frame_timestep_fs = normalized_timestep
+        self.use_inferred_frame_times = inferred_mode
         self.backend = self._build_backend()
         self.frames = None
 
@@ -172,6 +209,17 @@ class TrajectoryManager:
             time_metadata_frames=sum(
                 frame.time_fs is not None for frame in frame_metadata
             ),
+            source_time_metadata_frames=sum(
+                frame.time_fs is not None and not frame.time_inferred
+                for frame in frame_metadata
+            ),
+            inferred_time_frames=sum(
+                frame.time_inferred for frame in frame_metadata
+            ),
+            frame_timestep_fs=self.frame_timestep_fs,
+            detected_frame_timestep_fs=(
+                _detect_frame_timestep_from_metadata(frame_metadata)
+            ),
         )
 
     def export_frames(
@@ -256,6 +304,7 @@ class CP2KFrameExtractionWorkflow:
             input_file=self.trajectory_file,
             backend="cp2k",
             include_restart_duplicates=include_restart_duplicates,
+            frame_timestep_fs=DEFAULT_FRAME_TIMESTEP_FS,
         )
         self.energy_data: CP2KEnergyData | None = None
         self.steady_state: SteadyStateResult | None = None
@@ -325,3 +374,42 @@ class CP2KFrameExtractionWorkflow:
             min_time_fs=min_time_fs,
             post_cutoff_stride=post_cutoff_stride,
         )
+
+
+def _normalize_frame_timestep(
+    frame_timestep_fs: float | None,
+) -> float | None:
+    if frame_timestep_fs is None:
+        return None
+    value = float(frame_timestep_fs)
+    if value <= 0.0:
+        raise ValueError("Frame timestep must be greater than zero.")
+    return value
+
+
+def _detect_frame_timestep_from_metadata(
+    frame_metadata: list[FrameMetadata],
+) -> float | None:
+    source_frames = [
+        frame
+        for frame in frame_metadata
+        if frame.time_fs is not None and not frame.time_inferred
+    ]
+    if len(source_frames) < 2:
+        return None
+    step_values: list[float] = []
+    for previous, current in zip(source_frames, source_frames[1:]):
+        frame_delta = int(current.frame_index) - int(previous.frame_index)
+        if frame_delta <= 0:
+            continue
+        time_delta = float(current.time_fs) - float(previous.time_fs)
+        if time_delta <= 0.0:
+            continue
+        step_values.append(time_delta / frame_delta)
+    if not step_values:
+        return None
+    step_values.sort()
+    midpoint = len(step_values) // 2
+    if len(step_values) % 2:
+        return float(step_values[midpoint])
+    return float((step_values[midpoint - 1] + step_values[midpoint]) / 2.0)

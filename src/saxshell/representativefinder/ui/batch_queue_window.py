@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QSizePolicy,
     QTextEdit,
@@ -154,6 +155,34 @@ def _settings_from_preset(
     )
 
 
+_ANALYSIS_MODE_LABEL = "All Discovered Stoichiometries"
+_AUTOMATIC_PRESET_NAMES = ("DMSO", "DMF")
+
+
+def _preset_display_label(name: str, preset: BondAnalysisPreset) -> str:
+    return f"{name} (Built-in)" if preset.builtin else name
+
+
+def _bondanalysis_preset_name_for_project(
+    project_dir: Path,
+    *,
+    project_name: str | None = None,
+) -> str | None:
+    search_text = " ".join(
+        part
+        for part in (
+            project_name,
+            project_dir.name,
+            str(project_dir),
+        )
+        if part
+    ).casefold()
+    for preset_name in _AUTOMATIC_PRESET_NAMES:
+        if preset_name.casefold() in search_text:
+            return preset_name
+    return None
+
+
 @dataclass(slots=True, frozen=True)
 class RepresentativeFinderBatchJob:
     project_dir: Path
@@ -178,6 +207,7 @@ class RepresentativeFinderBatchItem:
     project_dir: Path | None = None
     clusters_dir: Path | None = None
     output_dir: Path | None = None
+    bondanalysis_preset_name: str | None = None
 
     def display_name(self) -> str:
         if self.project_dir is not None:
@@ -196,11 +226,18 @@ def _queue_item_from_project_defaults(
     item = RepresentativeFinderBatchItem(
         item_id=item_id or _new_item_id(),
         project_dir=resolved_project_dir,
+        bondanalysis_preset_name=_bondanalysis_preset_name_for_project(
+            resolved_project_dir
+        ),
     )
     try:
         settings = SAXSProjectManager().load_project(resolved_project_dir)
     except Exception:
         return item
+    preset_name = _bondanalysis_preset_name_for_project(
+        resolved_project_dir,
+        project_name=settings.project_name,
+    )
     clusters_dir = settings.resolved_clusters_dir
     output_dir = None
     if clusters_dir is not None and clusters_dir.is_dir():
@@ -211,7 +248,12 @@ def _queue_item_from_project_defaults(
             )
         except Exception:
             output_dir = None
-    return replace(item, clusters_dir=clusters_dir, output_dir=output_dir)
+    return replace(
+        item,
+        clusters_dir=clusters_dir,
+        output_dir=output_dir,
+        bondanalysis_preset_name=preset_name or item.bondanalysis_preset_name,
+    )
 
 
 class RepresentativeFinderBatchItemWidget(QFrame):
@@ -223,12 +265,15 @@ class RepresentativeFinderBatchItemWidget(QFrame):
         self,
         item: RepresentativeFinderBatchItem,
         *,
+        presets: dict[str, BondAnalysisPreset] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._item = item
         self._loading = False
         self._selected = False
+        self._order_number: int | None = None
+        self._presets: dict[str, BondAnalysisPreset] = dict(presets or {})
         self._last_suggested_output_dir: Path | None = None
         self._build_ui()
         self._load_item(item)
@@ -247,17 +292,21 @@ class RepresentativeFinderBatchItemWidget(QFrame):
             project_dir=_optional_path(self.project_dir_edit.text()),
             clusters_dir=_optional_path(self.clusters_dir_edit.text()),
             output_dir=_optional_path(self.output_dir_edit.text()),
+            bondanalysis_preset_name=self._selected_preset_name(),
         )
         self._refresh_header()
         self._refresh_project_reference()
         return self._item
 
-    def job(
-        self,
-        *,
-        settings: RepresentativeFinderSettings,
-    ) -> RepresentativeFinderBatchJob:
+    def job(self) -> RepresentativeFinderBatchJob:
         self.collect_item()
+        preset = self._selected_preset()
+        if preset is None:
+            raise ValueError(
+                "Choose a bondanalysis preset for "
+                f"{self._item.display_name()}."
+            )
+        settings = _settings_from_preset(preset)
         project_dir = _required_project_dir(self.project_dir_edit.text())
         clusters_dir = _required_clusters_dir(self.clusters_dir_edit.text())
         output_dir = _optional_path(
@@ -277,6 +326,45 @@ class RepresentativeFinderBatchItemWidget(QFrame):
             output_dir=output_dir,
             config=config,
         )
+
+    def set_presets(
+        self,
+        presets: dict[str, BondAnalysisPreset],
+        *,
+        selected_name: str | None = None,
+    ) -> None:
+        current_name = (
+            selected_name
+            or self._selected_preset_name()
+            or self._item.bondanalysis_preset_name
+        )
+        self._presets = dict(presets)
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        selected_index = -1
+        for index, name in enumerate(ordered_preset_names(self._presets)):
+            preset = self._presets[name]
+            self.preset_combo.addItem(
+                _preset_display_label(name, preset),
+                name,
+            )
+            if name == current_name:
+                selected_index = index
+        if selected_index < 0 and self.preset_combo.count() > 0:
+            selected_index = 0
+        if selected_index >= 0:
+            self.preset_combo.setCurrentIndex(selected_index)
+        self.preset_combo.blockSignals(False)
+        self._item = replace(
+            self._item,
+            bondanalysis_preset_name=self._selected_preset_name()
+            or current_name,
+        )
+        self._refresh_header()
+
+    def set_order_number(self, order_number: int | None) -> None:
+        self._order_number = order_number
+        self._refresh_header()
 
     def set_locked(self, locked: bool) -> None:
         self.settings_group.setEnabled(not locked)
@@ -336,6 +424,10 @@ class RepresentativeFinderBatchItemWidget(QFrame):
         self.title_label = QLabel("New representative analysis")
         self.title_label.setStyleSheet("font-weight: 600;")
         header.addWidget(self.title_label, stretch=1)
+        self.item_settings_label = QLabel()
+        self.item_settings_label.setMinimumWidth(330)
+        self.item_settings_label.setStyleSheet("color: #4b5563;")
+        header.addWidget(self.item_settings_label)
         self.status_label = QLabel("Ready")
         self.status_label.setMinimumWidth(190)
         header.addWidget(self.status_label)
@@ -394,7 +486,10 @@ class RepresentativeFinderBatchItemWidget(QFrame):
             "Output root",
             self._path_row(self.output_dir_edit, self._choose_output_dir),
         )
-        self.analysis_mode_label = QLabel("All Discovered Stoichiometries")
+        self.preset_combo = QComboBox()
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        form.addRow("Bondanalysis preset", self.preset_combo)
+        self.analysis_mode_label = QLabel(_ANALYSIS_MODE_LABEL)
         form.addRow("Analysis mode", self.analysis_mode_label)
         settings_layout.addLayout(form)
 
@@ -410,6 +505,7 @@ class RepresentativeFinderBatchItemWidget(QFrame):
 
     def _load_item(self, item: RepresentativeFinderBatchItem) -> None:
         self._loading = True
+        self._item = item
         self.project_dir_edit.setText(
             "" if item.project_dir is None else str(item.project_dir)
         )
@@ -421,6 +517,10 @@ class RepresentativeFinderBatchItemWidget(QFrame):
         )
         if item.output_dir is not None:
             self._last_suggested_output_dir = item.output_dir
+        self.set_presets(
+            self._presets,
+            selected_name=item.bondanalysis_preset_name,
+        )
         self._loading = False
         self._refresh_header()
         self._refresh_project_reference()
@@ -504,6 +604,8 @@ class RepresentativeFinderBatchItemWidget(QFrame):
         if item.output_dir is not None:
             self.output_dir_edit.setText(str(item.output_dir))
             self._last_suggested_output_dir = item.output_dir
+        if item.bondanalysis_preset_name is not None:
+            self._select_preset_name(item.bondanalysis_preset_name)
         self._validate_quietly()
         self._on_editor_changed()
 
@@ -560,8 +662,44 @@ class RepresentativeFinderBatchItemWidget(QFrame):
             self._refresh_project_reference()
         self.settings_changed.emit(self.item_id)
 
+    def _on_preset_changed(self, *_args) -> None:
+        self._on_editor_changed()
+
+    def _selected_preset_name(self) -> str | None:
+        if not hasattr(self, "preset_combo"):
+            return None
+        payload = self.preset_combo.currentData()
+        return None if payload is None else str(payload)
+
+    def _selected_preset(self) -> BondAnalysisPreset | None:
+        preset_name = self._selected_preset_name()
+        if preset_name is None:
+            return None
+        return self._presets.get(preset_name)
+
+    def _select_preset_name(self, preset_name: str) -> bool:
+        index = self.preset_combo.findData(preset_name)
+        if index < 0:
+            return False
+        self.preset_combo.setCurrentIndex(index)
+        return True
+
     def _refresh_header(self) -> None:
-        self.title_label.setText(self._item.display_name())
+        title = self._item.display_name()
+        if self._order_number is not None:
+            title = f"{self._order_number}. {title}"
+        self.title_label.setText(title)
+        preset_name = self._selected_preset_name()
+        preset_text = (
+            f"Preset: {preset_name}"
+            if preset_name is not None
+            else "Preset: choose preset"
+        )
+        summary = f"{preset_text} | Mode: All stoichiometries"
+        self.item_settings_label.setText(summary)
+        self.item_settings_label.setToolTip(
+            f"{preset_text}\nAnalysis mode: {_ANALYSIS_MODE_LABEL}"
+        )
 
     def _refresh_project_reference(self) -> None:
         self.project_reference_label.setText(
@@ -736,6 +874,7 @@ class RepresentativeFinderBatchQueueWindow(QMainWindow):
         self.queue_list.addItem(list_item)
         widget = RepresentativeFinderBatchItemWidget(
             resolved_item,
+            presets=self._presets,
             parent=self.queue_list,
         )
         widget.settings_changed.connect(self._on_item_settings_changed)
@@ -751,16 +890,12 @@ class RepresentativeFinderBatchQueueWindow(QMainWindow):
     def queue_jobs_in_order(
         self,
     ) -> list[tuple[str, RepresentativeFinderBatchJob]]:
-        preset = self._selected_preset()
-        if preset is None:
-            raise ValueError("Choose a bondanalysis preset before running.")
-        settings = _settings_from_preset(preset)
         entries: list[tuple[str, RepresentativeFinderBatchJob]] = []
         for row in range(self.queue_list.count()):
             list_item = self.queue_list.item(row)
             item_id = str(list_item.data(Qt.ItemDataRole.UserRole))
             widget = self._widgets_by_id[item_id]
-            entries.append((item_id, widget.job(settings=settings)))
+            entries.append((item_id, widget.job()))
         return entries
 
     def _build_ui(self) -> None:
@@ -786,20 +921,23 @@ class RepresentativeFinderBatchQueueWindow(QMainWindow):
         preset_group = QGroupBox("Batch Settings")
         preset_layout = QFormLayout(preset_group)
         preset_row = QHBoxLayout()
-        self.preset_combo = QComboBox()
-        self.preset_combo.currentIndexChanged.connect(
-            lambda _index: self._refresh_preset_summary()
+        preset_note_label = QLabel(
+            "Each queued project keeps its own Bondanalysis preset. Projects "
+            "with DMF or DMSO in the project name are auto-selected when "
+            "loaded."
         )
-        preset_row.addWidget(self.preset_combo, stretch=1)
+        preset_note_label.setWordWrap(True)
+        preset_row.addWidget(preset_note_label, stretch=1)
         self.reload_presets_button = QPushButton("Reload Presets")
         self.reload_presets_button.clicked.connect(self._reload_presets)
         preset_row.addWidget(self.reload_presets_button)
         preset_widget = QWidget()
         preset_widget.setLayout(preset_row)
-        preset_layout.addRow("Bondanalysis preset", preset_widget)
+        preset_layout.addRow("Bondanalysis presets", preset_widget)
+        self.analysis_mode_batch_label = QLabel(_ANALYSIS_MODE_LABEL)
         preset_layout.addRow(
             "Analysis mode",
-            QLabel("All Discovered Stoichiometries"),
+            self.analysis_mode_batch_label,
         )
         self.preset_summary_label = QLabel()
         self.preset_summary_label.setWordWrap(True)
@@ -850,46 +988,29 @@ class RepresentativeFinderBatchQueueWindow(QMainWindow):
         self.statusBar().showMessage("Ready")
 
     def _reload_presets(self) -> None:
-        current_name = self._selected_preset_name()
         self._presets = load_presets()
-        self.preset_combo.blockSignals(True)
-        self.preset_combo.clear()
-        selected_index = 0
-        for index, name in enumerate(ordered_preset_names(self._presets)):
-            preset = self._presets[name]
-            label = f"{name} (Built-in)" if preset.builtin else name
-            self.preset_combo.addItem(label, name)
-            if name == current_name:
-                selected_index = index
-        if self.preset_combo.count() > 0:
-            self.preset_combo.setCurrentIndex(selected_index)
-        self.preset_combo.blockSignals(False)
+        if hasattr(self, "queue_list"):
+            for widget in self._widgets_by_id.values():
+                widget.set_presets(self._presets)
         self._refresh_preset_summary()
 
-    def _selected_preset_name(self) -> str | None:
-        if not hasattr(self, "preset_combo"):
-            return None
-        payload = self.preset_combo.currentData()
-        return None if payload is None else str(payload)
-
-    def _selected_preset(self) -> BondAnalysisPreset | None:
-        preset_name = self._selected_preset_name()
-        if preset_name is None:
-            return None
-        return self._presets.get(preset_name)
-
     def _refresh_preset_summary(self) -> None:
-        preset = self._selected_preset()
-        if preset is None:
+        preset_names = ordered_preset_names(self._presets)
+        if not preset_names:
             self.preset_summary_label.setText(
-                "No bondanalysis preset is selected."
+                "No Bondanalysis presets are available. Reload presets after "
+                "creating or restoring the preset file."
             )
             return
+        preset_labels = [
+            _preset_display_label(name, self._presets[name])
+            for name in preset_names
+        ]
         self.preset_summary_label.setText(
-            f"Using {preset.name}: {len(preset.bond_pairs)} bond pair(s), "
-            f"{len(preset.angle_triplets)} angle triplet(s). Advanced "
-            "representative scoring and solvent shell builder settings use "
-            "their defaults."
+            "Available presets: "
+            + ", ".join(preset_labels)
+            + ". Advanced representative scoring and solvent shell builder "
+            "settings use their defaults for each project."
         )
 
     def _add_current_project(self) -> None:
@@ -933,8 +1054,51 @@ class RepresentativeFinderBatchQueueWindow(QMainWindow):
         )
         if not selected_dirs:
             return
-        for project_dir in selected_dirs:
-            self.add_queue_item(_queue_item_from_project_defaults(project_dir))
+        progress_dialog = self._project_load_progress_dialog(
+            len(selected_dirs)
+        )
+        try:
+            for index, project_dir in enumerate(selected_dirs, start=1):
+                if progress_dialog is not None:
+                    progress_dialog.setLabelText(
+                        "Loading representative analysis project "
+                        f"{index}/{len(selected_dirs)}:\n{project_dir}"
+                    )
+                    progress_dialog.setValue(index - 1)
+                    QApplication.processEvents()
+                self.add_queue_item(
+                    _queue_item_from_project_defaults(project_dir)
+                )
+                if progress_dialog is not None:
+                    progress_dialog.setValue(index)
+                    QApplication.processEvents()
+        finally:
+            if progress_dialog is not None:
+                progress_dialog.setValue(len(selected_dirs))
+                progress_dialog.close()
+
+    def _project_load_progress_dialog(
+        self,
+        project_count: int,
+    ) -> QProgressDialog | None:
+        if project_count <= 1:
+            return None
+        dialog = QProgressDialog(
+            "Loading selected representative analysis projects...",
+            None,
+            0,
+            project_count,
+            self,
+        )
+        dialog.setWindowTitle("Loading Representative Analysis Projects")
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setValue(0)
+        dialog.show()
+        QApplication.processEvents()
+        return dialog
 
     def _on_item_settings_changed(self, _item_id: str) -> None:
         self._refresh_order_labels()
@@ -946,9 +1110,7 @@ class RepresentativeFinderBatchQueueWindow(QMainWindow):
             widget = self._widgets_by_id.get(item_id)
             if widget is None:
                 continue
-            widget.title_label.setText(
-                f"{row + 1}. {widget.item().display_name()}"
-            )
+            widget.set_order_number(row + 1)
             list_item.setSizeHint(widget.sizeHint())
         self._refresh_item_selection_styles()
 
@@ -985,7 +1147,6 @@ class RepresentativeFinderBatchQueueWindow(QMainWindow):
         self.add_current_button.setEnabled(not running)
         self.add_project_button.setEnabled(not running)
         self.reload_presets_button.setEnabled(not running)
-        self.preset_combo.setEnabled(not running)
         self.run_button.setEnabled(not running)
         self.cancel_button.setEnabled(running)
         self.queue_list.setDragEnabled(not running)

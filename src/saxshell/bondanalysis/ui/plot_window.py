@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import numpy as np
@@ -308,6 +309,8 @@ class BondAnalysisPlotTab(QWidget):
             ]
             or [np.array([0.0, 1.0], dtype=float)]
         )
+        if self.plot_request.category == "coordination":
+            return 1.0
         value_range = float(np.max(combined_values) - np.min(combined_values))
         if value_range <= 0:
             return 0.1
@@ -380,6 +383,14 @@ class BondAnalysisPlotTab(QWidget):
         bin_size = max(self.bin_size_spin.value(), 1e-6)
         value_min = float(np.min(values))
         value_max = float(np.max(values))
+        if self.plot_request.category == "coordination":
+            left = math.floor(value_min) - 0.5
+            right = math.ceil(value_max) + 0.5
+            step = max(bin_size, 1.0)
+            edges = np.arange(left, right + step, step)
+            if edges.size < 2:
+                return np.array([left, right], dtype=float)
+            return edges
         if np.isclose(value_min, value_max):
             half_width = bin_size / 2.0
             return np.array([value_min - half_width, value_min + half_width])
@@ -394,20 +405,33 @@ class BondAnalysisPlotTab(QWidget):
     def _distribution_stats(
         values: np.ndarray, edges: np.ndarray
     ) -> dict[str, float]:
+        if values.size == 0:
+            return {
+                "mean": 0.0,
+                "median": 0.0,
+                "mode": 0.0,
+            }
         mean_value = float(np.mean(values))
         median_value = float(np.median(values))
-        counts, histogram_edges = np.histogram(values, bins=edges)
-        if counts.size == 0:
-            mode_value = mean_value
-        else:
-            peak_index = int(np.argmax(counts))
-            mode_value = float(
-                0.5
-                * (
-                    histogram_edges[peak_index]
-                    + histogram_edges[peak_index + 1]
-                )
+        if np.all(np.isclose(values, np.round(values))):
+            unique_values, unique_counts = np.unique(
+                values, return_counts=True
             )
+            peak_count = int(np.max(unique_counts))
+            mode_value = float(unique_values[unique_counts == peak_count][0])
+        else:
+            counts, histogram_edges = np.histogram(values, bins=edges)
+            if counts.size == 0:
+                mode_value = mean_value
+            else:
+                peak_index = int(np.argmax(counts))
+                mode_value = float(
+                    0.5
+                    * (
+                        histogram_edges[peak_index]
+                        + histogram_edges[peak_index + 1]
+                    )
+                )
         return {
             "mean": mean_value,
             "median": median_value,

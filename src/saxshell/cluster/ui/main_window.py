@@ -4,7 +4,6 @@ import argparse
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from re import sub
 from time import monotonic
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
@@ -29,6 +28,9 @@ from saxshell.cluster import (
     format_search_mode_label,
     frame_folder_label,
     frame_output_suffix,
+)
+from saxshell.cluster import (
+    suggest_output_dir as suggest_cluster_workflow_output_dir,
 )
 from saxshell.cluster.ui.definitions_panel import ClusterDefinitionsPanel
 from saxshell.cluster.ui.export_panel import ClusterExportPanel
@@ -1373,11 +1375,8 @@ def _format_tqdm_meter(
 
 
 def suggest_cluster_output_dir(frames_dir: str | Path) -> Path:
-    """Suggest a new cluster output directory beside the frames
-    folder."""
-    source_path = Path(frames_dir)
-    folder_name = _base_output_dir_name(source_path)
-    return next_available_output_dir(source_path.parent, folder_name)
+    """Suggest a new cluster output directory near the frames folder."""
+    return suggest_cluster_workflow_output_dir(frames_dir)
 
 
 def next_available_output_dir(parent_dir: Path, folder_name: str) -> Path:
@@ -1393,13 +1392,6 @@ def next_available_output_dir(parent_dir: Path, folder_name: str) -> Path:
         if not candidate.exists():
             return candidate
         index += 1
-
-
-def _base_output_dir_name(frames_dir: Path) -> str:
-    folder_label = sub(r"[^0-9A-Za-z]+", "_", frames_dir.name).strip("_")
-    if not folder_label:
-        folder_label = "frames"
-    return f"clusters_{folder_label}"
 
 
 def launch_cluster_ui(

@@ -35,7 +35,7 @@ class ClusterExtractionPreset:
     save_state_frequency: int = DEFAULT_SAVE_STATE_FREQUENCY
     default_cutoff: float | None = None
     shell_growth_levels: tuple[int, ...] = ()
-    shared_shells: bool = False
+    shared_shells: bool = True
     smart_solvation_shells: bool = True
     include_shell_atoms_in_stoichiometry: bool = False
     builtin: bool = False
@@ -104,7 +104,7 @@ class ClusterExtractionPreset:
             shell_growth_levels=_normalize_shell_growth_levels(
                 options_payload.get("shell_growth_levels")
             ),
-            shared_shells=bool(options_payload.get("shared_shells", False)),
+            shared_shells=bool(options_payload.get("shared_shells", True)),
             smart_solvation_shells=bool(
                 options_payload.get("smart_solvation_shells", True)
             ),

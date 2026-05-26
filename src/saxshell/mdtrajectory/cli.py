@@ -6,6 +6,7 @@ from pathlib import Path
 
 from saxshell.version import __version__
 
+from .frame.manager import DEFAULT_FRAME_TIMESTEP_FS
 from .workflow import (
     MDTrajectoryAssertionResult,
     MDTrajectoryExportResult,
@@ -165,6 +166,23 @@ def _add_common_input_arguments(parser: argparse.ArgumentParser) -> None:
         type=Path,
         help="Optional CP2K .ener file for cutoff analysis.",
     )
+    parser.add_argument(
+        "--frame-timestep-fs",
+        type=float,
+        default=DEFAULT_FRAME_TIMESTEP_FS,
+        help=(
+            "Fallback frame timestep in femtoseconds when trajectory frames "
+            f"do not include source times. Default: {DEFAULT_FRAME_TIMESTEP_FS:g}."
+        ),
+    )
+    parser.add_argument(
+        "--manual-frame-timestep",
+        action="store_true",
+        help=(
+            "Use --frame-timestep-fs for all frame times instead of source "
+            "trajectory time metadata."
+        ),
+    )
 
 
 def _add_selection_arguments(parser: argparse.ArgumentParser) -> None:
@@ -180,9 +198,11 @@ def _add_selection_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--stride",
+        "--frame-interval",
+        dest="stride",
         type=int,
         default=1,
-        help="Keep every Nth frame. Default: 1.",
+        help="Frame interval: keep every Nth frame. Default: 1.",
     )
 
 
@@ -277,6 +297,16 @@ def _build_workflow(args: argparse.Namespace) -> MDTrajectoryWorkflow:
             "include_restart_duplicates",
             False,
         ),
+        frame_timestep_fs=getattr(
+            args,
+            "frame_timestep_fs",
+            DEFAULT_FRAME_TIMESTEP_FS,
+        ),
+        use_inferred_frame_times=getattr(
+            args,
+            "manual_frame_timestep",
+            False,
+        ),
     )
 
 
@@ -347,6 +377,16 @@ def _handle_inspect(args: argparse.Namespace) -> int:
                 f"{energy_data.time_min_fs:.3f} fs to "
                 f"{energy_data.time_max_fs:.3f} fs",
             ]
+        )
+    detected_timestep = summary.get("detected_frame_timestep_fs")
+    if detected_timestep is not None:
+        lines.append(
+            f"Detected frame timestep: {float(detected_timestep):.6g} fs"
+        )
+    elif summary.get("frame_timestep_fs") is not None:
+        lines.append(
+            "Fallback frame timestep: "
+            f"{float(summary['frame_timestep_fs']):.6g} fs"
         )
     print("\n".join(lines))
     return 0
@@ -429,7 +469,7 @@ def _format_selection_result(selection: MDTrajectorySelectionResult) -> str:
         f"Trajectory frames: {preview.total_frames}",
         f"Start: {preview.start}",
         f"Stop: {preview.stop}",
-        f"Stride: {preview.stride}",
+        f"Frame interval: {preview.stride}",
         f"Time-tagged frames: {preview.time_metadata_frames}",
         "Restart duplicate frames: "
         f"{'included' if selection.include_restart_duplicates else 'skipped'}",

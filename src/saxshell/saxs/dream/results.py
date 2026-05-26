@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +10,19 @@ from saxshell.saxs._model_templates import (
     load_template_module,
     load_template_spec,
 )
-from saxshell.saxs.prefit import ClusterGeometryMetadataTable
+from saxshell.saxs.dream.distributions import (
+    DreamParameterEntry,
+    distribution_guide_bounds,
+    format_distribution_guide_value,
+    format_prior_preset_summary,
+    guide_clip_status,
+    prior_preset_status_summary,
+)
+from saxshell.saxs.dream.settings import (
+    format_dream_search_filter_preset,
+    normalize_dream_search_filter_preset,
+)
+from saxshell.saxs.prefit.cluster_geometry import ClusterGeometryMetadataTable
 from saxshell.saxs.stoichiometry import (
     StoichiometryEvaluation,
     StoichiometryTarget,
@@ -18,6 +30,15 @@ from saxshell.saxs.stoichiometry import (
     evaluate_weighted_stoichiometry,
     parse_stoich_label,
     stoich_sort_key,
+    weighted_stoichiometry_text,
+)
+from saxshell.saxs.stoichiometry_compensator import (
+    STOICH_COMPENSATOR_BASE_WEIGHTS_INPUT,
+    STOICH_COMPENSATOR_MASK_INPUT,
+    STOICH_COMPONENT_COUNTS_INPUT,
+    STOICH_TARGET_RATIO_INPUT,
+    compute_compensated_weights,
+    template_uses_stoichiometry_compensator,
 )
 
 
@@ -48,6 +69,16 @@ class DreamSummary:
 
 
 @dataclass(slots=True)
+class DreamFitParameterValue:
+    name: str
+    value: float
+    varied: bool
+    structure: str = ""
+    motif: str = ""
+    param_type: str = ""
+
+
+@dataclass(slots=True)
 class DreamModelPlotData:
     q_values: np.ndarray
     experimental_intensities: np.ndarray
@@ -59,6 +90,9 @@ class DreamModelPlotData:
     rmse: float
     mean_abs_residual: float
     r_squared: float
+    active_fit_mask: np.ndarray | None = None
+    fit_parameters: list[DreamFitParameterValue] = field(default_factory=list)
+    fitted_stoichiometry_text: str | None = None
 
 
 @dataclass(slots=True)
@@ -70,6 +104,42 @@ class DreamViolinPlotData:
     sample_source: str
     sample_count: int
     weight_order: str
+
+
+def dream_fit_q_bounds(
+    q_values: object,
+    active_fit_mask: object | None,
+) -> tuple[float, float] | None:
+    q_array = np.asarray(q_values, dtype=float).reshape(-1)
+    finite = np.isfinite(q_array)
+    if not np.any(finite):
+        return None
+    mask = None
+    if active_fit_mask is not None:
+        candidate = np.asarray(active_fit_mask, dtype=bool).reshape(-1)
+        if candidate.shape == q_array.shape and np.any(candidate & finite):
+            mask = candidate & finite
+    if mask is None:
+        mask = finite
+    selected_q = q_array[mask]
+    if selected_q.size == 0:
+        return None
+    return float(np.min(selected_q)), float(np.max(selected_q))
+
+
+def dream_output_q_bounds(q_values: object) -> tuple[float, float] | None:
+    q_array = np.asarray(q_values, dtype=float).reshape(-1)
+    finite = np.isfinite(q_array)
+    if not np.any(finite):
+        return None
+    finite_q = q_array[finite]
+    return float(np.min(finite_q)), float(np.max(finite_q))
+
+
+def format_dream_q_bounds(bounds: tuple[float, float] | None) -> str:
+    if bounds is None:
+        return "Unavailable"
+    return f"{bounds[0]:.6g} to {bounds[1]:.6g}"
 
 
 @dataclass(slots=True)
@@ -113,6 +183,10 @@ class SAXSDreamResultsLoader:
             if burnin_percent is not None
             else settings.get("burnin_percent", 20)
         )
+        self.search_filter_preset_recorded = "search_filter_preset" in settings
+        self.search_filter_preset = normalize_dream_search_filter_preset(
+            settings.get("search_filter_preset", "")
+        )
         self.sampled_params = self._normalize_sampled_params(
             np.load(self.run_dir / "dream_sampled_params.npy"),
             active_count=len(
@@ -139,27 +213,58 @@ class SAXSDreamResultsLoader:
         self.parameter_map_entries = list(
             self.metadata.get("parameter_map", [])
         )
+        self.parameter_components = list(
+            self.metadata.get("parameter_components", [])
+        )
         self.active_parameter_names = [
             str(entry.get("param", "")) for entry in self.active_entries
         ]
         self.template_name = str(
             self.metadata.get("template_name", "")
         ).strip()
-        self.q_values = np.asarray(
+        self.fit_q_values = np.asarray(
             self.metadata.get("q_values", []),
             dtype=float,
         )
-        self.experimental_intensities = np.asarray(
+        self.fit_experimental_intensities = np.asarray(
             self.metadata.get("experimental_intensities", []),
+            dtype=float,
+        )
+        self.fit_theoretical_intensities = [
+            np.asarray(values, dtype=float)
+            for values in self.metadata.get("theoretical_intensities", [])
+        ]
+        self.fit_solvent_intensities = np.asarray(
+            self.metadata.get("solvent_intensities", []),
+            dtype=float,
+        )
+        self.q_values = np.asarray(
+            self.metadata.get("output_q_values", self.fit_q_values),
+            dtype=float,
+        )
+        self.experimental_intensities = np.asarray(
+            self.metadata.get(
+                "output_experimental_intensities",
+                self.fit_experimental_intensities,
+            ),
             dtype=float,
         )
         self.theoretical_intensities = [
             np.asarray(values, dtype=float)
-            for values in self.metadata.get("theoretical_intensities", [])
+            for values in self.metadata.get(
+                "output_theoretical_intensities",
+                self.fit_theoretical_intensities,
+            )
         ]
         self.solvent_intensities = np.asarray(
-            self.metadata.get("solvent_intensities", []),
+            self.metadata.get(
+                "output_solvent_intensities",
+                self.fit_solvent_intensities,
+            ),
             dtype=float,
+        )
+        self.output_fit_mask = self._normalize_output_fit_mask(
+            self.metadata.get("output_fit_mask")
         )
         self.template_runtime_inputs = {
             str(name): np.asarray(values, dtype=float)
@@ -200,6 +305,33 @@ class SAXSDreamResultsLoader:
         ] = {}
         self._apply_burnin()
 
+    def _normalize_output_fit_mask(self, value: object) -> np.ndarray:
+        q_values = np.asarray(self.q_values, dtype=float)
+        if q_values.size == 0:
+            return np.zeros(0, dtype=bool)
+        if value is not None:
+            mask = np.asarray(value, dtype=bool)
+            if mask.shape == q_values.shape:
+                return mask
+        if self.fit_q_values.shape == q_values.shape and np.allclose(
+            self.fit_q_values,
+            q_values,
+            equal_nan=True,
+        ):
+            return np.ones(q_values.shape, dtype=bool)
+        fit_range = self.metadata.get("prefit_fit_q_range", {})
+        if isinstance(fit_range, dict):
+            q_min = fit_range.get("q_min")
+            q_max = fit_range.get("q_max")
+            try:
+                lower = float(np.min(q_values) if q_min is None else q_min)
+                upper = float(np.max(q_values) if q_max is None else q_max)
+            except (TypeError, ValueError):
+                lower = float(np.min(q_values))
+                upper = float(np.max(q_values))
+            return (q_values >= lower) & (q_values <= upper)
+        return np.ones(q_values.shape, dtype=bool)
+
     def _apply_burnin(self) -> None:
         n_iter = int(self.sampled_params.shape[1])
         burn_idx = int(n_iter * self.burnin_percent / 100)
@@ -217,7 +349,7 @@ class SAXSDreamResultsLoader:
             active_params,
             dtype=float,
         )
-        return full
+        return self._apply_stoichiometry_compensation_to_full_params(full)
 
     def get_summary(
         self,
@@ -382,13 +514,29 @@ class SAXSDreamResultsLoader:
             model_intensities - self.experimental_intensities,
             dtype=float,
         )
-        rmse = float(np.sqrt(np.mean(residuals**2)))
-        mean_abs_residual = float(np.mean(np.abs(residuals)))
-        experimental_mean = float(np.mean(self.experimental_intensities))
-        total_sum_squares = float(
-            np.sum((self.experimental_intensities - experimental_mean) ** 2)
+        metric_mask = np.asarray(self.output_fit_mask, dtype=bool)
+        if metric_mask.shape != residuals.shape:
+            metric_mask = np.ones(residuals.shape, dtype=bool)
+        metric_mask &= (
+            np.isfinite(residuals)
+            & np.isfinite(self.experimental_intensities)
+            & np.isfinite(model_intensities)
         )
-        residual_sum_squares = float(np.sum(residuals**2))
+        if not np.any(metric_mask):
+            metric_mask = (
+                np.isfinite(residuals)
+                & np.isfinite(self.experimental_intensities)
+                & np.isfinite(model_intensities)
+            )
+        metric_residuals = residuals[metric_mask]
+        metric_experimental = self.experimental_intensities[metric_mask]
+        rmse = float(np.sqrt(np.mean(metric_residuals**2)))
+        mean_abs_residual = float(np.mean(np.abs(metric_residuals)))
+        experimental_mean = float(np.mean(metric_experimental))
+        total_sum_squares = float(
+            np.sum((metric_experimental - experimental_mean) ** 2)
+        )
+        residual_sum_squares = float(np.sum(metric_residuals**2))
         r_squared = (
             float(1.0 - (residual_sum_squares / total_sum_squares))
             if total_sum_squares > 0.0
@@ -405,6 +553,11 @@ class SAXSDreamResultsLoader:
             rmse=rmse,
             mean_abs_residual=mean_abs_residual,
             r_squared=r_squared,
+            active_fit_mask=np.asarray(self.output_fit_mask, dtype=bool),
+            fit_parameters=self._fit_parameter_values(summary.bestfit_params),
+            fitted_stoichiometry_text=self._fitted_stoichiometry_text(
+                summary.bestfit_params
+            ),
         )
         self._model_plot_cache[cache_key] = plot_data
         return plot_data
@@ -420,6 +573,7 @@ class SAXSDreamResultsLoader:
         credible_interval_high: float = 84.0,
         sample_source: str = "filtered_posterior",
         weight_order: str = "weight_index",
+        selected_parameter: str | None = None,
         stoichiometry_target_elements_text: str = "",
         stoichiometry_target_ratio_text: str = "",
         stoichiometry_filter_enabled: bool = False,
@@ -432,6 +586,7 @@ class SAXSDreamResultsLoader:
             int(posterior_top_n),
             str(sample_source),
             str(weight_order),
+            str(selected_parameter or "").strip(),
             str(stoichiometry_target_elements_text).strip(),
             str(stoichiometry_target_ratio_text).strip(),
             bool(stoichiometry_filter_enabled),
@@ -485,6 +640,14 @@ class SAXSDreamResultsLoader:
                         and not self._is_effective_radius_parameter(name)
                     ),
                 )
+            elif mode == "selected_additional_parameter":
+                selected_name = self._selected_additional_parameter_name(
+                    selected_parameter
+                )
+                names, samples = self._select_columns(
+                    full_samples,
+                    include=lambda name: name == selected_name,
+                )
             elif mode == "fit_parameters":
                 names, samples = self._select_columns(
                     full_samples,
@@ -496,7 +659,8 @@ class SAXSDreamResultsLoader:
                     f"{mode}. Expected one of "
                     "'varying_parameters', 'all_parameters', "
                     "'weights_only', 'effective_radii_only', "
-                    "'additional_parameters_only', or 'fit_parameters'."
+                    "'additional_parameters_only', "
+                    "'selected_additional_parameter', or 'fit_parameters'."
                 )
         names, samples = self._ordered_violin_columns(
             names,
@@ -516,6 +680,24 @@ class SAXSDreamResultsLoader:
         )
         self._violin_data_cache[cache_key] = violin_data
         return violin_data
+
+    def selectable_additional_parameter_names(self) -> list[str]:
+        return [
+            str(name)
+            for name in self.full_parameter_names
+            if self._is_additional_parameter_name(str(name))
+        ]
+
+    def dream_search_preset_text(self) -> str:
+        if not self.search_filter_preset_recorded:
+            return "Unavailable"
+        return format_dream_search_filter_preset(self.search_filter_preset)
+
+    def prior_preset_summary_text(self) -> str:
+        return format_prior_preset_summary(self.parameter_map_entries)
+
+    def prior_preset_summary_payload(self) -> list[dict[str, object]]:
+        return prior_preset_status_summary(self.parameter_map_entries)
 
     def save_statistics_report(
         self,
@@ -546,9 +728,15 @@ class SAXSDreamResultsLoader:
             stoichiometry_filter_enabled=stoichiometry_filter_enabled,
             stoichiometry_tolerance_percent=stoichiometry_tolerance_percent,
         )
+        fit_q_bounds = dream_fit_q_bounds(self.q_values, self.output_fit_mask)
+        output_q_bounds = dream_output_q_bounds(self.q_values)
         lines = [
             f"Run directory: {self.run_dir}",
             f"Burn-in (%): {self.burnin_percent}",
+            f"DREAM search preset: {self.dream_search_preset_text()}",
+            f"Prior presets: {self.prior_preset_summary_text()}",
+            f"Fit q-range: {format_dream_q_bounds(fit_q_bounds)}",
+            f"Output q-range: {format_dream_q_bounds(output_q_bounds)}",
             f"Best-fit method: {bestfit_method}",
             f"Posterior filter: {summary.posterior_filter_mode}",
             f"Posterior samples kept: {summary.posterior_sample_count}",
@@ -606,10 +794,16 @@ class SAXSDreamResultsLoader:
                     f"top {posterior_top_n} samples by log-posterior"
                 ),
             )
+        prior_lookup = self._parameter_map_entry_lookup_by_name()
         for index, name in enumerate(summary.full_parameter_names):
+            guide_text = self._parameter_guide_text(
+                prior_lookup.get(str(name)),
+                summary.bestfit_params[index],
+            )
             lines.append(
                 f"  {name}: "
                 f"selected={summary.bestfit_params[index]:.6g}, "
+                f"{guide_text}, "
                 f"MAP={summary.map_params[index]:.6g}, "
                 f"chain_mean={summary.chain_mean_params[index]:.6g}, "
                 f"median={summary.median_params[index]:.6g}, "
@@ -621,6 +815,37 @@ class SAXSDreamResultsLoader:
         report_path = Path(output_path)
         report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return report_path
+
+    def _parameter_map_entry_lookup_by_name(
+        self,
+    ) -> dict[str, DreamParameterEntry]:
+        lookup: dict[str, DreamParameterEntry] = {}
+        for entry in self.parameter_map_entries:
+            if not isinstance(entry, dict):
+                continue
+            parameter_entry = DreamParameterEntry.from_dict(dict(entry))
+            name = str(parameter_entry.param).strip()
+            if name and name not in lookup:
+                lookup[name] = parameter_entry
+        return lookup
+
+    def _parameter_guide_text(
+        self,
+        entry: DreamParameterEntry | None,
+        value: object,
+    ) -> str:
+        if entry is None:
+            return "guide_low=n/a, guide_high=n/a"
+        guide_low, guide_high, _guide_kind = distribution_guide_bounds(entry)
+        clip_status = guide_clip_status(value, guide_low, guide_high)
+        clip_suffix = f", guide_clip={clip_status}" if clip_status else ""
+        return (
+            "guide_low="
+            f"{format_distribution_guide_value(guide_low)}, "
+            "guide_high="
+            f"{format_distribution_guide_value(guide_high)}"
+            f"{clip_suffix}"
+        )
 
     def _evaluate_solvent_contribution(
         self,
@@ -1011,11 +1236,128 @@ class SAXSDreamResultsLoader:
         if parameter_indices.size == 0 or not structures:
             return None
         full_values = np.asarray(params_full, dtype=float)
+        full_values = self._apply_stoichiometry_compensation_to_full_params(
+            full_values
+        )
         weights = np.maximum(full_values[parameter_indices], 0.0)
         return evaluate_weighted_stoichiometry(
             zip(structures, weights.tolist(), strict=False),
             target,
         )
+
+    def _apply_stoichiometry_compensation_to_full_params(
+        self,
+        params_full: np.ndarray,
+    ) -> np.ndarray:
+        full_values = np.asarray(params_full, dtype=float).reshape(-1).copy()
+        if not template_uses_stoichiometry_compensator(self.template_name):
+            return full_values
+        inputs = self.template_runtime_inputs
+        required_names = (
+            STOICH_TARGET_RATIO_INPUT,
+            STOICH_COMPONENT_COUNTS_INPUT,
+            STOICH_COMPENSATOR_MASK_INPUT,
+            STOICH_COMPENSATOR_BASE_WEIGHTS_INPUT,
+        )
+        if any(name not in inputs for name in required_names):
+            return full_values
+        component_counts = np.asarray(
+            inputs[STOICH_COMPONENT_COUNTS_INPUT],
+            dtype=float,
+        )
+        if component_counts.ndim != 2 or component_counts.shape[0] <= 0:
+            return full_values
+        weight_indices = self._stoichiometry_compensation_weight_indices(
+            component_counts.shape[0]
+        )
+        if weight_indices is None:
+            return full_values
+        adjusted_weights = compute_compensated_weights(
+            full_values[weight_indices],
+            target_ratio=np.asarray(
+                inputs[STOICH_TARGET_RATIO_INPUT],
+                dtype=float,
+            ),
+            component_counts=component_counts,
+            compensator_mask=np.asarray(
+                inputs[STOICH_COMPENSATOR_MASK_INPUT],
+                dtype=float,
+            ),
+            compensator_base_weights=np.asarray(
+                inputs[STOICH_COMPENSATOR_BASE_WEIGHTS_INPUT],
+                dtype=float,
+            ),
+        )
+        full_values[weight_indices] = adjusted_weights
+        return full_values
+
+    def _stoichiometry_compensation_weight_indices(
+        self,
+        expected_count: int,
+    ) -> np.ndarray | None:
+        weighted_indices: list[tuple[int, int]] = []
+        for index, parameter_name in enumerate(self.full_parameter_names):
+            name = str(parameter_name).strip()
+            if not name.startswith("w") or not name[1:].isdigit():
+                continue
+            weighted_indices.append((int(name[1:]), index))
+        weighted_indices.sort()
+        if len(weighted_indices) != int(expected_count):
+            return None
+        return np.asarray(
+            [index for _weight_index, index in weighted_indices],
+            dtype=int,
+        )
+
+    def _fitted_stoichiometry_text(
+        self,
+        params_full: np.ndarray,
+    ) -> str | None:
+        full_values = self._apply_stoichiometry_compensation_to_full_params(
+            np.asarray(params_full, dtype=float)
+        )
+        return weighted_stoichiometry_text(
+            (
+                (
+                    str(
+                        self._parameter_entry_lookup.get(
+                            str(parameter_name),
+                            {},
+                        ).get("structure", "")
+                    ),
+                    float(full_values[index]),
+                )
+                for index, parameter_name in enumerate(
+                    self.full_parameter_names
+                )
+                if str(parameter_name).startswith("w")
+                and index < full_values.size
+            )
+        )
+
+    def _fit_parameter_values(
+        self,
+        params_full: np.ndarray,
+    ) -> list[DreamFitParameterValue]:
+        full_values = np.asarray(params_full, dtype=float).reshape(-1)
+        active_names = {str(name) for name in self.active_parameter_names}
+        rows: list[DreamFitParameterValue] = []
+        for index, parameter_name in enumerate(self.full_parameter_names):
+            name = str(parameter_name).strip()
+            if not name or index >= full_values.size:
+                continue
+            entry = self._parameter_entry_lookup.get(name, {})
+            rows.append(
+                DreamFitParameterValue(
+                    name=name,
+                    value=float(full_values[index]),
+                    varied=name in active_names,
+                    structure=str(entry.get("structure", "")).strip(),
+                    motif=str(entry.get("motif", "")).strip(),
+                    param_type=str(entry.get("param_type", "")).strip(),
+                )
+            )
+        return rows
 
     def _stoichiometry_filter_mask(
         self,
@@ -1094,6 +1436,30 @@ class SAXSDreamResultsLoader:
             return names, np.zeros((full_samples.shape[0], 0), dtype=float)
         return names, full_samples[:, indices]
 
+    def _selected_additional_parameter_name(
+        self,
+        selected_parameter: str | None,
+    ) -> str:
+        available_names = self.selectable_additional_parameter_names()
+        if not available_names:
+            raise ValueError(
+                "No additional DREAM fit parameters are available for the "
+                "selected violin data mode."
+            )
+        requested_name = str(selected_parameter or "").strip()
+        if requested_name in available_names:
+            return requested_name
+        return available_names[0]
+
+    @classmethod
+    def _is_additional_parameter_name(cls, name: str) -> bool:
+        parameter_name = str(name).strip()
+        return bool(
+            parameter_name
+            and not parameter_name.startswith("w")
+            and not cls._is_effective_radius_parameter(parameter_name)
+        )
+
     def _ordered_violin_columns(
         self,
         parameter_names: list[str],
@@ -1161,14 +1527,31 @@ class SAXSDreamResultsLoader:
 
     def _build_parameter_entry_lookup(self) -> dict[str, dict[str, object]]:
         lookup: dict[str, dict[str, object]] = {}
+        for component in self.parameter_components:
+            name = str(component.get("param", "")).strip()
+            if not name:
+                continue
+            lookup[name] = dict(component)
+
+        def merge_entry(entry: dict[str, object]) -> None:
+            name = str(entry.get("param", "")).strip()
+            if not name:
+                return
+            component = dict(lookup.get(name, {}))
+            merged = dict(component)
+            merged.update(entry)
+            component_structure = str(component.get("structure", "")).strip()
+            component_motif = str(component.get("motif", "")).strip()
+            if component_structure:
+                merged["structure"] = component_structure
+            if component_motif:
+                merged["motif"] = component_motif
+            lookup[name] = merged
+
         for entry in self.parameter_map_entries:
-            name = str(entry.get("param", "")).strip()
-            if name and name not in lookup:
-                lookup[name] = dict(entry)
+            merge_entry(dict(entry))
         for entry in self.active_entries:
-            name = str(entry.get("param", "")).strip()
-            if name and name not in lookup:
-                lookup[name] = dict(entry)
+            merge_entry(dict(entry))
         return lookup
 
     @staticmethod
@@ -1227,4 +1610,7 @@ __all__ = [
     "DreamSummary",
     "DreamViolinPlotData",
     "SAXSDreamResultsLoader",
+    "dream_fit_q_bounds",
+    "dream_output_q_bounds",
+    "format_dream_q_bounds",
 ]

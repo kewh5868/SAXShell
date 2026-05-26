@@ -15,13 +15,6 @@ from saxshell.saxs._model_templates import (
     load_template_module,
     load_template_spec,
 )
-from saxshell.saxs.dream import SAXSDreamWorkflow
-from saxshell.saxs.prefit import (
-    ClusterGeometryMetadataRow,
-    ClusterGeometryMetadataTable,
-    SAXSPrefitWorkflow,
-    save_cluster_geometry_metadata,
-)
 from saxshell.saxs.project_manager import (
     SAXSProjectManager,
     build_project_paths,
@@ -444,6 +437,12 @@ def _build_validation_project(
             refresh_registered_paths=False,
         )
         if spec.cluster_geometry_support.supported:
+            from saxshell.saxs.prefit.cluster_geometry import (
+                ClusterGeometryMetadataRow,
+                ClusterGeometryMetadataTable,
+                save_cluster_geometry_metadata,
+            )
+
             save_cluster_geometry_metadata(
                 paths.cluster_geometry_metadata_file,
                 ClusterGeometryMetadataTable(
@@ -531,6 +530,8 @@ def _run_prefit_validation(
     template_dir: Path,
 ) -> None:
     try:
+        from saxshell.saxs.prefit.workflow import SAXSPrefitWorkflow
+
         workflow = SAXSPrefitWorkflow(
             project_dir,
             template_name=spec.name,
@@ -574,6 +575,8 @@ def _run_cluster_geometry_constraint_validation(
     )
 
     try:
+        from saxshell.saxs.prefit.workflow import SAXSPrefitWorkflow
+
         workflow = SAXSPrefitWorkflow(
             project_dir,
             template_name=spec.name,
@@ -678,6 +681,9 @@ def _run_dream_validation(
     template_dir: Path,
 ) -> None:
     try:
+        from saxshell.saxs.dream.runtime import SAXSDreamWorkflow
+        from saxshell.saxs.prefit.workflow import SAXSPrefitWorkflow
+
         prefit = SAXSPrefitWorkflow(project_dir, template_dir=template_dir)
         prefit.save_fit(prefit.parameter_entries)
 

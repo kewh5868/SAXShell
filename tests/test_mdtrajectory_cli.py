@@ -216,6 +216,35 @@ def test_mdtrajectory_cli_export_runs_complete_headless_workflow(
     ]
 
 
+def test_mdtrajectory_cli_reports_detected_timestep_and_frame_interval(
+    tmp_path,
+    capsys,
+):
+    trajectory_file = tmp_path / "traj.xyz"
+    _write_uniform_time_xyz(
+        trajectory_file,
+        n_frames=4,
+        timestep_fs=25.0,
+    )
+
+    inspect_code = mdtrajectory_main(["inspect", str(trajectory_file)])
+    preview_code = mdtrajectory_main(
+        [
+            "preview",
+            str(trajectory_file),
+            "--frame-interval",
+            "2",
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert inspect_code == 0
+    assert preview_code == 0
+    assert "Detected frame timestep: 25 fs" in captured.out
+    assert "Frame interval: 2" in captured.out
+
+
 def test_mdtrajectory_cli_export_can_include_restart_duplicates(
     tmp_path,
     capsys,

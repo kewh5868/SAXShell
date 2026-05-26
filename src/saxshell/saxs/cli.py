@@ -6,11 +6,32 @@ from pathlib import Path
 from saxshell.version import __version__
 
 from ._model_templates import list_template_specs
-from .template_installation import (
-    format_validation_report,
-    install_template_candidate,
-    validate_template_candidate,
-)
+
+
+def format_validation_report(result: object) -> str:
+    from .template_installation import (
+        format_validation_report as format_report,
+    )
+
+    return format_report(result)
+
+
+def install_template_candidate(*args: object, **kwargs: object) -> object:
+    from .template_installation import install_template_candidate as install
+
+    return install(*args, **kwargs)
+
+
+def validate_template_candidate(*args: object, **kwargs: object) -> object:
+    from .template_installation import validate_template_candidate as validate
+
+    return validate(*args, **kwargs)
+
+
+def run_dream_batch_manifest(manifest_path: Path) -> object:
+    from .dream.batch import run_dream_batch_manifest as run_manifest
+
+    return run_manifest(manifest_path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -83,7 +104,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--template-dir",
         type=Path,
         default=None,
-        help="Destination template directory. Defaults to the bundled template folder.",
+        help=(
+            "Destination template directory. Defaults to the bundled "
+            "template folder."
+        ),
     )
     install_parser.add_argument(
         "--force",
@@ -91,6 +115,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Overwrite an existing installed template with the same name.",
     )
     install_parser.set_defaults(handler=_handle_templates_install)
+
+    dream_batch_parser = subparsers.add_parser(
+        "dream-batch",
+        help="Run or inspect generated SAXS DREAM backend batch run sets.",
+    )
+    dream_batch_parser.set_defaults(handler=_handle_dream_batch)
+    dream_batch_subparsers = dream_batch_parser.add_subparsers(
+        dest="dream_batch_command"
+    )
+    dream_batch_run_parser = dream_batch_subparsers.add_parser(
+        "run",
+        help="Execute a generated DREAM backend batch manifest.",
+    )
+    dream_batch_run_parser.add_argument(
+        "manifest_path",
+        type=Path,
+        help="Path to dream_backend_run_set.json.",
+    )
+    dream_batch_run_parser.set_defaults(handler=_handle_dream_batch_run)
+    dream_batch_setup_parser = dream_batch_subparsers.add_parser(
+        "setup-ui",
+        help="Launch the DREAM backend batch CLI setup window.",
+    )
+    dream_batch_setup_parser.add_argument(
+        "project_dir",
+        nargs="?",
+        type=Path,
+        help="Optional SAXSShell project directory to open.",
+    )
+    dream_batch_setup_parser.set_defaults(handler=_handle_dream_batch_setup_ui)
     return parser
 
 
@@ -143,6 +197,32 @@ def _handle_templates_install(args: argparse.Namespace) -> int:
     print(f"Installed template: {installed.installed_template_path}")
     if installed.installed_metadata_path is not None:
         print(f"Installed metadata: {installed.installed_metadata_path}")
+    return 0
+
+
+def _handle_dream_batch(args: argparse.Namespace) -> int:
+    if getattr(args, "dream_batch_command", None) is None:
+        raise ValueError("Choose a dream-batch subcommand.")
+    return int(args.handler(args))
+
+
+def _handle_dream_batch_run(args: argparse.Namespace) -> int:
+    run_dream_batch_manifest(args.manifest_path)
+    return 0
+
+
+def _handle_dream_batch_setup_ui(args: argparse.Namespace) -> int:
+    from PySide6.QtWidgets import QApplication
+
+    from .ui.dream_batch_window import launch_dream_batch_run_file_ui
+
+    owns_app = QApplication.instance() is None
+    launch_dream_batch_run_file_ui(
+        initial_project_dir=getattr(args, "project_dir", None)
+    )
+    app = QApplication.instance()
+    if owns_app and app is not None:
+        return int(app.exec())
     return 0
 
 

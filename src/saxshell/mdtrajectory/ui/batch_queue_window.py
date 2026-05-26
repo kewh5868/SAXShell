@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from saxshell.mdtrajectory.frame.manager import DEFAULT_FRAME_TIMESTEP_FS
 from saxshell.mdtrajectory.workflow import MDTrajectoryWorkflow
 from saxshell.saxs.project_manager import (
     SAXSProjectManager,
@@ -131,6 +132,8 @@ class MDTrajectoryBatchJob:
     energy_file: Path
     output_dir: Path | None = None
     cutoff_fs: float = DEFAULT_TIME_CUTOFF_FS
+    frame_timestep_fs: float = DEFAULT_FRAME_TIMESTEP_FS
+    use_manual_frame_timestep: bool = False
     include_restart_duplicates: bool = False
 
 
@@ -141,6 +144,8 @@ class MDTrajectoryBatchResult:
     written_count: int
     selected_frames: int
     cutoff_fs: float
+    frame_timestep_fs: float = DEFAULT_FRAME_TIMESTEP_FS
+    use_manual_frame_timestep: bool = False
     metadata_file: Path | None = None
     include_restart_duplicates: bool = False
 
@@ -154,6 +159,8 @@ class MDTrajectoryBatchItem:
     energy_file: Path | None = None
     output_dir: Path | None = None
     cutoff_fs: float = DEFAULT_TIME_CUTOFF_FS
+    frame_timestep_fs: float = DEFAULT_FRAME_TIMESTEP_FS
+    use_manual_frame_timestep: bool = False
     include_restart_duplicates: bool = False
 
     def display_name(self) -> str:
@@ -191,6 +198,9 @@ class MDTrajectoryBatchItem:
         cutoff_fs = float(self.cutoff_fs)
         if cutoff_fs < 0.0:
             raise ValueError("Time cutoff must be zero or greater.")
+        frame_timestep_fs = float(self.frame_timestep_fs)
+        if frame_timestep_fs <= 0.0:
+            raise ValueError("Frame timestep must be greater than zero.")
         return MDTrajectoryBatchJob(
             project_dir=project_dir,
             trajectory_file=trajectory_file,
@@ -198,6 +208,8 @@ class MDTrajectoryBatchItem:
             energy_file=energy_file,
             output_dir=output_dir,
             cutoff_fs=cutoff_fs,
+            frame_timestep_fs=frame_timestep_fs,
+            use_manual_frame_timestep=self.use_manual_frame_timestep,
             include_restart_duplicates=self.include_restart_duplicates,
         )
 
@@ -261,6 +273,8 @@ class MDTrajectoryBatchItemWidget(QFrame):
             energy_file=_optional_path(self.energy_file_edit.text()),
             output_dir=_optional_path(self.output_dir_edit.text()),
             cutoff_fs=float(self.cutoff_spin.value()),
+            frame_timestep_fs=float(self.timestep_spin.value()),
+            use_manual_frame_timestep=(not self.auto_timestep_box.isChecked()),
             include_restart_duplicates=(
                 self.include_restart_duplicates_box.isChecked()
             ),
@@ -306,6 +320,8 @@ class MDTrajectoryBatchItemWidget(QFrame):
             topology_file=job.topology_file,
             energy_file=job.energy_file,
             include_restart_duplicates=job.include_restart_duplicates,
+            frame_timestep_fs=job.frame_timestep_fs,
+            use_inferred_frame_times=job.use_manual_frame_timestep,
         )
         current_output_dir = _optional_path(self.output_dir_edit.text())
         use_suggested_output_dir = (
@@ -319,6 +335,10 @@ class MDTrajectoryBatchItemWidget(QFrame):
                 None if use_suggested_output_dir else current_output_dir
             ),
         )
+        detected_timestep = selection.preview.detected_frame_timestep_fs
+        if detected_timestep is not None and not job.use_manual_frame_timestep:
+            self._set_timestep_value(float(detected_timestep))
+            job = replace(job, frame_timestep_fs=float(detected_timestep))
         if use_suggested_output_dir:
             self._last_suggested_output_dir = selection.output_dir.resolve()
             self.output_dir_edit.setText(str(selection.output_dir))
@@ -329,6 +349,9 @@ class MDTrajectoryBatchItemWidget(QFrame):
             f"{preview.total_frames}",
             f"Output folder: {selection.output_dir}",
             f"Applied cutoff: {job.cutoff_fs:g} fs",
+            "Frame timestep: "
+            f"{job.frame_timestep_fs:g} fs "
+            f"({'manual' if job.use_manual_frame_timestep else 'auto'})",
             "Restart duplicate frames: "
             f"{'included' if job.include_restart_duplicates else 'skipped'}",
         ]
@@ -476,6 +499,27 @@ class MDTrajectoryBatchItemWidget(QFrame):
         self.cutoff_spin.valueChanged.connect(self._on_editor_changed)
         form.addRow("Time cutoff", self.cutoff_spin)
 
+        self.auto_timestep_box = QCheckBox(
+            "Auto-calculate frame timestep from trajectory"
+        )
+        self.auto_timestep_box.setChecked(True)
+        self.auto_timestep_box.setToolTip(
+            "Use trajectory time metadata when available. The frame "
+            "timestep field is updated during preview and used as a "
+            "fallback when the trajectory has no frame times."
+        )
+        self.auto_timestep_box.toggled.connect(self._on_editor_changed)
+        form.addRow("", self.auto_timestep_box)
+
+        self.timestep_spin = QDoubleSpinBox()
+        self.timestep_spin.setRange(1.0e-9, 1.0e12)
+        self.timestep_spin.setDecimals(6)
+        self.timestep_spin.setSingleStep(0.5)
+        self.timestep_spin.setSuffix(" fs")
+        self.timestep_spin.setValue(DEFAULT_FRAME_TIMESTEP_FS)
+        self.timestep_spin.valueChanged.connect(self._handle_timestep_changed)
+        form.addRow("Frame timestep", self.timestep_spin)
+
         self.include_restart_duplicates_box = QCheckBox(
             "Include duplicate restart frames"
         )
@@ -515,12 +559,22 @@ class MDTrajectoryBatchItemWidget(QFrame):
         if item.output_dir is not None:
             self._last_suggested_output_dir = item.output_dir.resolve()
         self.cutoff_spin.setValue(float(item.cutoff_fs))
+        self._set_timestep_value(float(item.frame_timestep_fs))
+        self.auto_timestep_box.setChecked(not item.use_manual_frame_timestep)
         self.include_restart_duplicates_box.setChecked(
             item.include_restart_duplicates
         )
         self._loading = False
         self._refresh_header()
         self._refresh_project_reference()
+
+    def _set_timestep_value(self, value: float) -> None:
+        was_loading = self._loading
+        self._loading = True
+        try:
+            self.timestep_spin.setValue(float(value))
+        finally:
+            self._loading = was_loading
 
     def _set_settings_visible(self, visible: bool) -> None:
         self.settings_group.setVisible(bool(visible))
@@ -558,6 +612,10 @@ class MDTrajectoryBatchItemWidget(QFrame):
                     item_id=self.item_id,
                 ),
                 cutoff_fs=float(self.cutoff_spin.value()),
+                frame_timestep_fs=float(self.timestep_spin.value()),
+                use_manual_frame_timestep=(
+                    not self.auto_timestep_box.isChecked()
+                ),
                 include_restart_duplicates=(
                     self.include_restart_duplicates_box.isChecked()
                 ),
@@ -633,6 +691,13 @@ class MDTrajectoryBatchItemWidget(QFrame):
             self.preview_summary_label.setText(str(exc))
             self.set_status("Preview failed")
             self._on_editor_changed()
+
+    def _handle_timestep_changed(self, _value: float) -> None:
+        if self._loading:
+            return
+        if self.auto_timestep_box.isChecked():
+            self.auto_timestep_box.setChecked(False)
+        self._on_editor_changed()
 
     def _on_editor_changed(self, *_args) -> None:
         if self._loading:
@@ -716,6 +781,8 @@ class MDTrajectoryBatchWorker(QObject):
             topology_file=job.topology_file,
             energy_file=job.energy_file,
             include_restart_duplicates=job.include_restart_duplicates,
+            frame_timestep_fs=job.frame_timestep_fs,
+            use_inferred_frame_times=job.use_manual_frame_timestep,
         )
         self.item_progress.emit(
             item_id,
@@ -780,6 +847,8 @@ class MDTrajectoryBatchWorker(QObject):
             written_count=len(export_result.written_files),
             selected_frames=export_result.selection.preview.selected_frames,
             cutoff_fs=job.cutoff_fs,
+            frame_timestep_fs=job.frame_timestep_fs,
+            use_manual_frame_timestep=job.use_manual_frame_timestep,
             include_restart_duplicates=job.include_restart_duplicates,
             metadata_file=export_result.metadata_file,
         )
@@ -1201,6 +1270,7 @@ def launch_mdtrajectory_batch_queue_ui(
 
 
 __all__ = [
+    "DEFAULT_FRAME_TIMESTEP_FS",
     "DEFAULT_TIME_CUTOFF_FS",
     "MDTrajectoryBatchItem",
     "MDTrajectoryBatchItemWidget",

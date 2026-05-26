@@ -4,13 +4,16 @@ import re
 import threading
 import uuid
 from dataclasses import dataclass, replace
+from math import acos, degrees, dist
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -26,8 +29,10 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -46,10 +51,16 @@ from saxshell.saxs.ui.branding import (
     load_saxshell_icon,
     prepare_saxshell_application_identity,
 )
+from saxshell.structure import PDBStructure
 from saxshell.xyz2pdb.mapping_workflow import (
     FreeAtomMappingInput,
     MoleculeMappingInput,
+    ReferenceBondToleranceInput,
     XYZToPDBMappingWorkflow,
+    reference_bond_tolerances,
+)
+from saxshell.xyz2pdb.ui.input_panel import (
+    xyz_input_convention_warning_message,
 )
 from saxshell.xyz2pdb.workflow import (
     ReferenceLibraryEntry,
@@ -58,6 +69,10 @@ from saxshell.xyz2pdb.workflow import (
     list_reference_library,
     suggest_output_dir,
 )
+
+_FALLBACK_BOND_TOLERANCE_PERCENT = 12.0
+_BATCH_CONSOLE_MAX_BLOCKS = 1200
+_BATCH_PROGRESS_LOG_MILESTONES = 20
 
 
 def _new_item_id() -> str:
@@ -105,6 +120,33 @@ def _validated_residue_code(value: str, field_name: str) -> str:
 def _default_free_atom_residue(element: str) -> str:
     letters = re.sub(r"[^A-Za-z]", "", element).upper()
     return (letters + "XX")[:3]
+
+
+def _normalized_table_atom_name(value: str, *, fallback: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9]", "", str(value or "")).strip().upper()
+    if not text:
+        text = fallback.upper()
+    return text[:4]
+
+
+def _is_progress_milestone(processed: int, total: int) -> bool:
+    total = max(int(total), 1)
+    processed = max(int(processed), 0)
+    if processed <= 0 or processed == 1 or processed >= total:
+        return True
+    stride = max(
+        (total + _BATCH_PROGRESS_LOG_MILESTONES - 1)
+        // _BATCH_PROGRESS_LOG_MILESTONES,
+        1,
+    )
+    return processed % stride == 0
+
+
+def _should_emit_batch_log_message(message: str) -> bool:
+    match = re.match(r"^\[(\d+)/(\d+)\]", str(message).strip())
+    if match is None:
+        return True
+    return _is_progress_milestone(int(match.group(1)), int(match.group(2)))
 
 
 def _project_reference_text(project_dir: Path | None) -> str:
@@ -251,7 +293,19 @@ class XYZToPDBBatchItemWidget(QFrame):
         self._loading = False
         self._selected = False
         self._available_elements: tuple[str, ...] = ()
+        self._molecule_inputs: list[MoleculeMappingInput] = []
         self._reference_entries: tuple[ReferenceLibraryEntry, ...] = ()
+        self._reference_bond_defaults: dict[
+            str,
+            tuple[ReferenceBondToleranceInput, ...],
+        ] = {}
+        self._reference_paths: dict[str, str] = {}
+        self._reference_atom_coordinates: dict[
+            str,
+            dict[str, tuple[float, float, float]],
+        ] = {}
+        self._last_autofilled_residue_name: str | None = None
+        self._populating_bond_table = False
         self._build_ui()
         self._load_item(item)
         self._refresh_reference_entries()
@@ -323,6 +377,7 @@ class XYZToPDBBatchItemWidget(QFrame):
             reference_library_dir=library_dir,
         )
         analysis = workflow.analyze_input()
+        target_output_dir = suggest_output_dir(input_path)
         self._available_elements = tuple(sorted(analysis.element_counts))
         self._refresh_free_element_combo()
         self._refresh_reference_entries()
@@ -334,7 +389,8 @@ class XYZToPDBBatchItemWidget(QFrame):
                 f"{element} x{count}"
                 for element, count in sorted(analysis.element_counts.items())
             ),
-            f"Suggested PDB folder: {suggest_output_dir(input_path)}",
+            f"Target PDB folder: {target_output_dir.name}",
+            f"Target PDB path: {target_output_dir}",
         ]
         self.analysis_summary_label.setText("\n".join(lines))
         self.set_progress(0, max(analysis.inspection.total_files, 1))
@@ -507,7 +563,14 @@ class XYZToPDBBatchItemWidget(QFrame):
 
     def _build_reference_molecules_group(self) -> QGroupBox:
         group = QGroupBox("Reference Molecules")
-        layout = QVBoxLayout(group)
+        layout = QHBoxLayout(group)
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
         controls = QGridLayout()
         self.reference_combo = QComboBox()
         self.reference_combo.currentIndexChanged.connect(
@@ -515,22 +578,57 @@ class XYZToPDBBatchItemWidget(QFrame):
         )
         self.molecule_residue_edit = QLineEdit()
         self.molecule_residue_edit.setPlaceholderText("DMF")
+        self.tight_scale_spin = QDoubleSpinBox()
+        self.tight_scale_spin.setDecimals(1)
+        self.tight_scale_spin.setRange(1.0, 500.0)
+        self.tight_scale_spin.setSingleStep(5.0)
+        self.tight_scale_spin.setSuffix(" %")
+        self.tight_scale_spin.setValue(85.0)
+        self.tight_scale_spin.valueChanged.connect(
+            self._on_bond_range_controls_changed
+        )
+        self.relaxed_scale_spin = QDoubleSpinBox()
+        self.relaxed_scale_spin.setDecimals(1)
+        self.relaxed_scale_spin.setRange(1.0, 500.0)
+        self.relaxed_scale_spin.setSingleStep(5.0)
+        self.relaxed_scale_spin.setSuffix(" %")
+        self.relaxed_scale_spin.setValue(135.0)
+        self.relaxed_scale_spin.valueChanged.connect(
+            self._on_bond_range_controls_changed
+        )
+        self.max_missing_h_spin = QSpinBox()
+        self.max_missing_h_spin.setRange(0, 8)
+        self.max_missing_h_spin.setValue(0)
         add_button = QPushButton("Add Molecule")
         add_button.clicked.connect(self._add_molecule)
+        update_button = QPushButton("Update Selected")
+        update_button.clicked.connect(self._update_selected_molecule)
         remove_button = QPushButton("Remove Selected")
         remove_button.clicked.connect(self._remove_selected_molecule)
         controls.addWidget(QLabel("Reference"), 0, 0)
         controls.addWidget(self.reference_combo, 0, 1)
         controls.addWidget(QLabel("Residue"), 0, 2)
         controls.addWidget(self.molecule_residue_edit, 0, 3)
-        controls.addWidget(add_button, 0, 4)
-        controls.addWidget(remove_button, 0, 5)
+        controls.addWidget(QLabel("Missing H"), 1, 0)
+        controls.addWidget(self.max_missing_h_spin, 1, 1)
+        controls.addWidget(add_button, 1, 2)
+        controls.addWidget(update_button, 1, 3)
+        controls.addWidget(remove_button, 1, 4)
         controls.setColumnStretch(1, 1)
         controls.setColumnStretch(3, 1)
-        layout.addLayout(controls)
+        left_layout.addLayout(controls)
 
-        self.molecule_table = QTableWidget(0, 2)
-        self.molecule_table.setHorizontalHeaderLabels(["Reference", "Residue"])
+        self.molecule_table = QTableWidget(0, 6)
+        self.molecule_table.setHorizontalHeaderLabels(
+            [
+                "Reference",
+                "Residue",
+                "Bonds",
+                "Tight %",
+                "Relaxed %",
+                "Missing H",
+            ]
+        )
         self.molecule_table.verticalHeader().setVisible(False)
         self.molecule_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -541,11 +639,92 @@ class XYZToPDBBatchItemWidget(QFrame):
         self.molecule_table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
+        self.molecule_table.itemSelectionChanged.connect(
+            self._on_selected_molecule_changed
+        )
         header = self.molecule_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         self.molecule_table.setMinimumHeight(140)
-        layout.addWidget(self.molecule_table)
+        left_layout.addWidget(self.molecule_table)
+
+        range_controls = QGridLayout()
+        range_controls.addWidget(QLabel("Tight"), 0, 0)
+        range_controls.addWidget(self.tight_scale_spin, 0, 1)
+        range_controls.addWidget(QLabel("Relaxed"), 0, 2)
+        range_controls.addWidget(self.relaxed_scale_spin, 0, 3)
+        range_controls.setColumnStretch(1, 1)
+        range_controls.setColumnStretch(3, 1)
+        right_layout.addLayout(range_controls)
+
+        bond_label = QLabel("Direct Bond Tolerances")
+        right_layout.addWidget(bond_label)
+        self.bond_table = QTableWidget(0, 8)
+        self.bond_table.setHorizontalHeaderLabels(
+            [
+                "Atom 1",
+                "Atom 2",
+                "Ref (A)",
+                "Tolerance (%)",
+                "Tight Min (A)",
+                "Tight Max (A)",
+                "Relaxed Min (A)",
+                "Relaxed Max (A)",
+            ]
+        )
+        self.bond_table.verticalHeader().setVisible(False)
+        self.bond_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.bond_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.bond_table.itemChanged.connect(self._on_bond_table_changed)
+        bond_header = self.bond_table.horizontalHeader()
+        for column in range(self.bond_table.columnCount()):
+            bond_header.setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.ResizeToContents,
+            )
+        self.bond_table.setMinimumHeight(140)
+        right_layout.addWidget(self.bond_table)
+
+        angle_label = QLabel("Reference Bond Angles")
+        right_layout.addWidget(angle_label)
+        self.angle_table = QTableWidget(0, 4)
+        self.angle_table.setHorizontalHeaderLabels(
+            [
+                "Atom 1",
+                "Center",
+                "Atom 3",
+                "Angle (deg)",
+            ]
+        )
+        self.angle_table.verticalHeader().setVisible(False)
+        self.angle_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.angle_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.angle_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        angle_header = self.angle_table.horizontalHeader()
+        for column in range(self.angle_table.columnCount()):
+            angle_header.setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.ResizeToContents,
+            )
+        self.angle_table.setMinimumHeight(100)
+        right_layout.addWidget(self.angle_table)
+
+        layout.addWidget(left_panel, stretch=2)
+        layout.addWidget(right_panel, stretch=3)
         return group
 
     def _load_item(self, item: XYZToPDBBatchItem) -> None:
@@ -587,20 +766,12 @@ class XYZToPDBBatchItemWidget(QFrame):
         self,
         inputs: tuple[MoleculeMappingInput, ...],
     ) -> None:
-        self.molecule_table.setRowCount(0)
-        for item in inputs:
-            row = self.molecule_table.rowCount()
-            self.molecule_table.insertRow(row)
-            self.molecule_table.setItem(
-                row,
-                0,
-                self._readonly_table_item(item.reference_name),
-            )
-            self.molecule_table.setItem(
-                row,
-                1,
-                self._readonly_table_item(item.residue_name),
-            )
+        self._molecule_inputs = list(inputs)
+        self._refresh_molecule_table()
+        if self._molecule_inputs:
+            self.molecule_table.selectRow(0)
+        else:
+            self._populate_bond_table(())
 
     def _set_settings_visible(self, visible: bool) -> None:
         self.settings_group.setVisible(bool(visible))
@@ -696,6 +867,15 @@ class XYZToPDBBatchItemWidget(QFrame):
 
     def _analyze_from_button(self) -> None:
         try:
+            input_warning = xyz_input_convention_warning_message(
+                _optional_path(self.input_path_edit.text())
+            )
+            if input_warning is not None:
+                QMessageBox.warning(
+                    self,
+                    "Check XYZ input",
+                    input_warning,
+                )
             self.analyze_input()
             self._on_editor_changed()
         except Exception as exc:
@@ -723,6 +903,21 @@ class XYZToPDBBatchItemWidget(QFrame):
         except Exception:
             entries = ()
         self._reference_entries = entries
+        self._reference_paths = {
+            entry.name: str(entry.path) for entry in entries
+        }
+        self._reference_atom_coordinates.clear()
+        self._reference_bond_defaults = {}
+        for entry in entries:
+            try:
+                self._reference_bond_defaults[entry.name] = (
+                    reference_bond_tolerances(
+                        entry.name,
+                        library_dir=library_dir,
+                    )
+                )
+            except Exception:
+                self._reference_bond_defaults[entry.name] = ()
         current = self.reference_combo.currentData()
         self.reference_combo.blockSignals(True)
         self.reference_combo.clear()
@@ -733,7 +928,11 @@ class XYZToPDBBatchItemWidget(QFrame):
             if index >= 0:
                 self.reference_combo.setCurrentIndex(index)
         self.reference_combo.blockSignals(False)
-        self._apply_selected_reference_default_residue()
+        self._apply_selected_reference_default_residue(force=False)
+        if 0 <= self.molecule_table.currentRow() < len(self._molecule_inputs):
+            self._on_selected_molecule_changed()
+        else:
+            self._load_default_bonds_for_reference()
 
     def _refresh_free_element_combo(self) -> None:
         current = self.free_element_combo.currentData()
@@ -758,9 +957,14 @@ class XYZToPDBBatchItemWidget(QFrame):
             self.free_residue_edit.setText(_default_free_atom_residue(element))
 
     def _on_reference_selection_changed(self, *_args) -> None:
-        self._apply_selected_reference_default_residue()
+        self._apply_selected_reference_default_residue(force=True)
+        self._load_default_bonds_for_reference()
 
-    def _apply_selected_reference_default_residue(self) -> None:
+    def _apply_selected_reference_default_residue(
+        self,
+        *,
+        force: bool,
+    ) -> None:
         reference_name = str(self.reference_combo.currentData() or "").strip()
         if not reference_name:
             return
@@ -774,8 +978,24 @@ class XYZToPDBBatchItemWidget(QFrame):
         )
         if entry is None:
             return
-        if not self.molecule_residue_edit.text().strip():
-            self.molecule_residue_edit.setText(entry.residue_name)
+        current_residue = self.molecule_residue_edit.text().strip()
+        should_replace = force or not current_residue
+        if (
+            not should_replace
+            and self._last_autofilled_residue_name is not None
+            and current_residue == self._last_autofilled_residue_name
+        ):
+            should_replace = True
+        if not should_replace:
+            return
+        self.molecule_residue_edit.setText(entry.residue_name)
+        self._last_autofilled_residue_name = entry.residue_name
+
+    def _load_default_bonds_for_reference(self) -> None:
+        reference_name = str(self.reference_combo.currentData() or "").strip()
+        self._populate_bond_table(
+            self._reference_bond_defaults.get(reference_name, ())
+        )
 
     def _add_free_atom(self) -> None:
         try:
@@ -818,42 +1038,111 @@ class XYZToPDBBatchItemWidget(QFrame):
 
     def _add_molecule(self) -> None:
         try:
-            reference_name = str(
-                self.reference_combo.currentData() or ""
-            ).strip()
-            if not reference_name:
-                raise ValueError("Choose a reference molecule first.")
-            residue = _validated_residue_code(
-                self.molecule_residue_edit.text(),
-                "Reference-molecule residue",
-            )
-            for row in range(self.molecule_table.rowCount()):
-                item = self.molecule_table.item(row, 1)
-                if item is not None and item.text().strip() == residue:
-                    raise ValueError(f"Residue {residue} is already listed.")
+            molecule = self._molecule_from_controls()
+            for item in self._molecule_inputs:
+                if item.residue_name == molecule.residue_name:
+                    raise ValueError(
+                        f"Residue {molecule.residue_name} is already listed."
+                    )
         except Exception as exc:
             QMessageBox.warning(self, "Unable to add molecule", str(exc))
             return
-        row = self.molecule_table.rowCount()
-        self.molecule_table.insertRow(row)
-        self.molecule_table.setItem(
-            row,
-            0,
-            self._readonly_table_item(reference_name),
+        self._molecule_inputs.append(molecule)
+        self._refresh_molecule_table()
+        self.molecule_table.selectRow(
+            max(self.molecule_table.rowCount() - 1, 0)
         )
-        self.molecule_table.setItem(
-            row,
-            1,
-            self._readonly_table_item(residue),
-        )
+        self._on_editor_changed()
+
+    def _update_selected_molecule(self) -> None:
+        row = self.molecule_table.currentRow()
+        if row < 0:
+            return
+        try:
+            molecule = self._molecule_from_controls()
+            for index, item in enumerate(self._molecule_inputs):
+                if index != row and item.residue_name == molecule.residue_name:
+                    raise ValueError(
+                        f"Residue {molecule.residue_name} is already listed."
+                    )
+        except Exception as exc:
+            QMessageBox.warning(self, "Unable to update molecule", str(exc))
+            return
+        self._molecule_inputs[row] = molecule
+        self._refresh_molecule_table()
+        self.molecule_table.selectRow(row)
         self._on_editor_changed()
 
     def _remove_selected_molecule(self) -> None:
         row = self.molecule_table.currentRow()
         if row < 0:
             return
-        self.molecule_table.removeRow(row)
+        if row < len(self._molecule_inputs):
+            del self._molecule_inputs[row]
+        self._refresh_molecule_table()
+        if self.molecule_table.rowCount():
+            self.molecule_table.selectRow(
+                min(row, self.molecule_table.rowCount() - 1)
+            )
+        else:
+            self._populate_bond_table(())
         self._on_editor_changed()
+
+    def _molecule_from_controls(self) -> MoleculeMappingInput:
+        reference_name = str(self.reference_combo.currentData() or "").strip()
+        if not reference_name:
+            raise ValueError("Choose a reference molecule first.")
+        residue = _validated_residue_code(
+            self.molecule_residue_edit.text(),
+            "Reference-molecule residue",
+        )
+        bond_tolerances = (
+            self._bond_inputs_from_table()
+            if self.bond_table.rowCount()
+            else tuple(self._reference_bond_defaults.get(reference_name, ()))
+        )
+        return MoleculeMappingInput(
+            reference_name=reference_name,
+            residue_name=residue,
+            bond_tolerances=bond_tolerances,
+            tight_pass_scale=float(self.tight_scale_spin.value()) / 100.0,
+            relaxed_pass_scale=float(self.relaxed_scale_spin.value()) / 100.0,
+            max_missing_hydrogens=int(self.max_missing_h_spin.value()),
+        )
+
+    def _refresh_molecule_table(self) -> None:
+        self.molecule_table.setRowCount(0)
+        for row, molecule in enumerate(self._molecule_inputs):
+            self.molecule_table.insertRow(row)
+            values = (
+                molecule.reference_name,
+                molecule.residue_name,
+                str(len(molecule.bond_tolerances)),
+                f"{molecule.tight_pass_scale * 100.0:.1f}%",
+                f"{molecule.relaxed_pass_scale * 100.0:.1f}%",
+                str(int(molecule.max_missing_hydrogens)),
+            )
+            for column, value in enumerate(values):
+                item = self._readonly_table_item(value)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.molecule_table.setItem(row, column, item)
+
+    def _on_selected_molecule_changed(self) -> None:
+        row = self.molecule_table.currentRow()
+        if row < 0 or row >= len(self._molecule_inputs):
+            self._populate_bond_table(())
+            return
+        molecule = self._molecule_inputs[row]
+        self._set_combo_value(self.reference_combo, molecule.reference_name)
+        self.molecule_residue_edit.setText(molecule.residue_name)
+        self.tight_scale_spin.setValue(
+            float(molecule.tight_pass_scale) * 100.0
+        )
+        self.relaxed_scale_spin.setValue(
+            float(molecule.relaxed_pass_scale) * 100.0
+        )
+        self.max_missing_h_spin.setValue(int(molecule.max_missing_hydrogens))
+        self._populate_bond_table(molecule.bond_tolerances)
 
     def _free_atom_inputs_from_table(self) -> list[FreeAtomMappingInput]:
         inputs: list[FreeAtomMappingInput] = []
@@ -871,19 +1160,276 @@ class XYZToPDBBatchItemWidget(QFrame):
         return inputs
 
     def _molecule_inputs_from_table(self) -> list[MoleculeMappingInput]:
-        inputs: list[MoleculeMappingInput] = []
-        for row in range(self.molecule_table.rowCount()):
-            reference_item = self.molecule_table.item(row, 0)
-            residue_item = self.molecule_table.item(row, 1)
-            if reference_item is None or residue_item is None:
+        return list(self._molecule_inputs)
+
+    def _populate_bond_table(
+        self,
+        bond_inputs: tuple[ReferenceBondToleranceInput, ...],
+    ) -> None:
+        reference_name = str(self.reference_combo.currentData() or "").strip()
+        self._populating_bond_table = True
+        self.bond_table.setRowCount(0)
+        for row, bond in enumerate(bond_inputs):
+            reference_length = self._reference_bond_length(
+                reference_name,
+                bond.atom1_name,
+                bond.atom2_name,
+            )
+            self.bond_table.insertRow(row)
+            self.bond_table.setItem(
+                row,
+                0,
+                self._readonly_table_item(bond.atom1_name),
+            )
+            self.bond_table.setItem(
+                row,
+                1,
+                self._readonly_table_item(bond.atom2_name),
+            )
+            reference_item = self._readonly_table_item(
+                ""
+                if reference_length is None
+                else f"{float(reference_length):.3f}"
+            )
+            reference_item.setData(
+                Qt.ItemDataRole.UserRole,
+                reference_length,
+            )
+            self.bond_table.setItem(row, 2, reference_item)
+            tolerance_item = QTableWidgetItem(f"{float(bond.tolerance):.2f}")
+            tolerance_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.bond_table.setItem(row, 3, tolerance_item)
+            for column in range(4, self.bond_table.columnCount()):
+                self.bond_table.setItem(
+                    row,
+                    column,
+                    self._readonly_table_item(""),
+                )
+        self._populating_bond_table = False
+        self._refresh_bond_table_range_columns()
+        self._populate_angle_table(reference_name, bond_inputs)
+
+    def _bond_inputs_from_table(
+        self,
+    ) -> tuple[ReferenceBondToleranceInput, ...]:
+        result: list[ReferenceBondToleranceInput] = []
+        for row in range(self.bond_table.rowCount()):
+            atom1_item = self.bond_table.item(row, 0)
+            atom2_item = self.bond_table.item(row, 1)
+            tolerance_item = self.bond_table.item(row, 3)
+            if (
+                atom1_item is None
+                or atom2_item is None
+                or tolerance_item is None
+            ):
                 continue
-            inputs.append(
-                MoleculeMappingInput(
-                    reference_name=reference_item.text().strip(),
-                    residue_name=residue_item.text().strip(),
+            try:
+                tolerance = float(tolerance_item.text().strip())
+            except ValueError:
+                tolerance = _FALLBACK_BOND_TOLERANCE_PERCENT
+            result.append(
+                ReferenceBondToleranceInput(
+                    atom1_name=atom1_item.text().strip(),
+                    atom2_name=atom2_item.text().strip(),
+                    tolerance=tolerance,
                 )
             )
-        return inputs
+        return tuple(result)
+
+    def _on_bond_table_changed(self, _item: QTableWidgetItem) -> None:
+        if self._populating_bond_table:
+            return
+        self._refresh_bond_table_range_columns()
+        row = self.molecule_table.currentRow()
+        if row < 0 or row >= len(self._molecule_inputs):
+            return
+        molecule = self._molecule_inputs[row]
+        self._molecule_inputs[row] = MoleculeMappingInput(
+            reference_name=molecule.reference_name,
+            residue_name=molecule.residue_name,
+            bond_tolerances=self._bond_inputs_from_table(),
+            tight_pass_scale=molecule.tight_pass_scale,
+            relaxed_pass_scale=molecule.relaxed_pass_scale,
+            max_assignment_distance=molecule.max_assignment_distance,
+            max_missing_hydrogens=molecule.max_missing_hydrogens,
+        )
+        self._refresh_molecule_table()
+        self.molecule_table.selectRow(row)
+        self._on_editor_changed()
+
+    def _on_bond_range_controls_changed(self, _value: float) -> None:
+        self._refresh_bond_table_range_columns()
+
+    def _refresh_bond_table_range_columns(self) -> None:
+        if not self.bond_table.rowCount():
+            return
+        tight_scale = float(self.tight_scale_spin.value()) / 100.0
+        relaxed_scale = float(self.relaxed_scale_spin.value()) / 100.0
+        self._populating_bond_table = True
+        for row in range(self.bond_table.rowCount()):
+            reference_item = self.bond_table.item(row, 2)
+            tolerance_item = self.bond_table.item(row, 3)
+            if reference_item is None or tolerance_item is None:
+                continue
+            reference_length = reference_item.data(Qt.ItemDataRole.UserRole)
+            try:
+                resolved_reference_length = float(reference_length)
+            except (TypeError, ValueError):
+                resolved_reference_length = None
+            try:
+                tolerance_percent = float(tolerance_item.text().strip())
+            except ValueError:
+                tolerance_percent = _FALLBACK_BOND_TOLERANCE_PERCENT
+            if resolved_reference_length is None:
+                values = ("", "", "", "")
+            else:
+                tight_min, tight_max = self._bond_search_bounds(
+                    resolved_reference_length,
+                    tolerance_percent,
+                    tight_scale,
+                )
+                relaxed_min, relaxed_max = self._bond_search_bounds(
+                    resolved_reference_length,
+                    tolerance_percent,
+                    relaxed_scale,
+                )
+                values = (
+                    f"{tight_min:.3f}",
+                    f"{tight_max:.3f}",
+                    f"{relaxed_min:.3f}",
+                    f"{relaxed_max:.3f}",
+                )
+            for column, value in enumerate(values, start=4):
+                item = self.bond_table.item(row, column)
+                if item is None:
+                    item = self._readonly_table_item(value)
+                    self.bond_table.setItem(row, column, item)
+                else:
+                    item.setText(value)
+        self._populating_bond_table = False
+
+    def _reference_bond_length(
+        self,
+        reference_name: str,
+        atom1_name: str,
+        atom2_name: str,
+    ) -> float | None:
+        atom_coordinates = self._reference_coordinates(reference_name)
+        coord1 = atom_coordinates.get(
+            _normalized_table_atom_name(atom1_name, fallback="A1")
+        )
+        coord2 = atom_coordinates.get(
+            _normalized_table_atom_name(atom2_name, fallback="A2")
+        )
+        if coord1 is None or coord2 is None:
+            return None
+        return float(dist(coord1, coord2))
+
+    def _reference_coordinates(
+        self,
+        reference_name: str,
+    ) -> dict[str, tuple[float, float, float]]:
+        atom_coordinates = self._reference_atom_coordinates.get(reference_name)
+        if atom_coordinates is not None:
+            return atom_coordinates
+        reference_path = self._reference_paths.get(reference_name)
+        if not reference_path:
+            return {}
+        structure = PDBStructure.from_file(reference_path)
+        atom_coordinates = {}
+        for index, atom in enumerate(structure.atoms, start=1):
+            fallback = f"{atom.element}{index}"
+            atom_coordinates[
+                _normalized_table_atom_name(
+                    atom.atom_name,
+                    fallback=fallback,
+                )
+            ] = tuple(float(value) for value in atom.coordinates)
+        self._reference_atom_coordinates[reference_name] = atom_coordinates
+        return atom_coordinates
+
+    def _populate_angle_table(
+        self,
+        reference_name: str,
+        bond_inputs: tuple[ReferenceBondToleranceInput, ...],
+    ) -> None:
+        self.angle_table.setRowCount(0)
+        atom_coordinates = self._reference_coordinates(reference_name)
+        if not atom_coordinates:
+            return
+        adjacency: dict[str, set[str]] = {}
+        for bond in bond_inputs:
+            atom1 = _normalized_table_atom_name(
+                bond.atom1_name,
+                fallback="A1",
+            )
+            atom2 = _normalized_table_atom_name(
+                bond.atom2_name,
+                fallback="A2",
+            )
+            adjacency.setdefault(atom1, set()).add(atom2)
+            adjacency.setdefault(atom2, set()).add(atom1)
+        rows: list[tuple[str, str, str, float]] = []
+        for center, neighbors in sorted(adjacency.items()):
+            sorted_neighbors = sorted(neighbors)
+            for first_index, atom1 in enumerate(sorted_neighbors):
+                for atom3 in sorted_neighbors[first_index + 1 :]:
+                    angle = self._reference_angle_degrees(
+                        atom_coordinates,
+                        atom1,
+                        center,
+                        atom3,
+                    )
+                    if angle is not None:
+                        rows.append((atom1, center, atom3, angle))
+        for row, (atom1, center, atom3, angle) in enumerate(rows):
+            self.angle_table.insertRow(row)
+            for column, value in enumerate(
+                (atom1, center, atom3, f"{angle:.3f}")
+            ):
+                self.angle_table.setItem(
+                    row,
+                    column,
+                    self._readonly_table_item(value),
+                )
+
+    def _reference_angle_degrees(
+        self,
+        atom_coordinates: dict[str, tuple[float, float, float]],
+        atom1: str,
+        center: str,
+        atom3: str,
+    ) -> float | None:
+        coord1 = atom_coordinates.get(atom1)
+        center_coord = atom_coordinates.get(center)
+        coord3 = atom_coordinates.get(atom3)
+        if coord1 is None or center_coord is None or coord3 is None:
+            return None
+        vector1 = [float(a) - float(b) for a, b in zip(coord1, center_coord)]
+        vector3 = [float(a) - float(b) for a, b in zip(coord3, center_coord)]
+        norm1 = sum(value * value for value in vector1) ** 0.5
+        norm3 = sum(value * value for value in vector3) ** 0.5
+        if norm1 <= 0.0 or norm3 <= 0.0:
+            return None
+        dot_product = sum(a * b for a, b in zip(vector1, vector3))
+        cosine = max(min(dot_product / (norm1 * norm3), 1.0), -1.0)
+        return float(degrees(acos(cosine)))
+
+    def _bond_search_bounds(
+        self,
+        reference_length: float,
+        tolerance_percent: float,
+        pass_scale: float,
+    ) -> tuple[float, float]:
+        absolute_tolerance = (
+            max(float(reference_length), 0.0)
+            * max(float(tolerance_percent), 0.0)
+            / 100.0
+        )
+        scaled_tolerance = absolute_tolerance * max(float(pass_scale), 0.0)
+        minimum = max(float(reference_length) - scaled_tolerance, 0.0)
+        maximum = float(reference_length) + scaled_tolerance
+        return minimum, maximum
 
     def _on_editor_changed(self, *_args) -> None:
         if self._loading:
@@ -977,15 +1523,20 @@ class XYZToPDBBatchWorker(QObject):
         job: XYZToPDBBatchJob,
     ) -> XYZToPDBBatchResult:
         settings = self._project_manager.load_project(job.project_dir)
+        target_output_dir = suggest_output_dir(job.input_path)
         workflow = XYZToPDBMappingWorkflow(
             job.input_path,
             reference_library_dir=job.reference_library_dir,
+        )
+        self.log.emit(
+            f"[{job.project_dir.name}] Target PDB folder: "
+            f"{target_output_dir.name} ({target_output_dir})"
         )
         self.item_progress.emit(
             item_id,
             0,
             1,
-            "Preparing mapping",
+            f"Target PDB folder: {target_output_dir.name}",
         )
 
         def on_progress(
@@ -995,16 +1546,17 @@ class XYZToPDBBatchWorker(QObject):
         ) -> None:
             self.item_progress.emit(item_id, processed, total, message)
 
+        def on_log(message: str) -> None:
+            if _should_emit_batch_log_message(message):
+                self.log.emit(f"[{job.project_dir.name}] {message}")
+
         result: XYZToPDBExportResult = workflow.export_with_mapping(
             molecule_inputs=job.molecule_inputs,
             free_atom_inputs=job.free_atom_inputs,
             hydrogen_mode=job.hydrogen_mode,
+            output_dir=target_output_dir,
             progress_callback=on_progress,
-            log_callback=(
-                lambda message: self.log.emit(
-                    f"[{job.project_dir.name}] {message}"
-                )
-            ),
+            log_callback=on_log,
             cancel_callback=self._cancel_requested.is_set,
         )
         settings.pdb_frames_dir = str(result.output_dir.expanduser().resolve())
@@ -1038,6 +1590,7 @@ class XYZToPDBBatchQueueWindow(QMainWindow):
         self._widgets_by_id: dict[str, XYZToPDBBatchItemWidget] = {}
         self._run_thread: QThread | None = None
         self._run_worker: XYZToPDBBatchWorker | None = None
+        self._last_progress_log_step_by_item: dict[str, tuple[int, int]] = {}
         self._initial_project_dir = (
             None
             if initial_project_dir is None
@@ -1165,6 +1718,7 @@ class XYZToPDBBatchQueueWindow(QMainWindow):
         run_layout.addWidget(self.queue_status_label)
         self.console = QTextEdit()
         self.console.setReadOnly(True)
+        self.console.document().setMaximumBlockCount(_BATCH_CONSOLE_MAX_BLOCKS)
         self.console.setMinimumHeight(160)
         run_layout.addWidget(self.console)
         root.addWidget(run_group)
@@ -1208,12 +1762,56 @@ class XYZToPDBBatchQueueWindow(QMainWindow):
         )
         if not selected_dirs:
             return
-        for project_dir in selected_dirs:
-            item = _queue_item_from_project_defaults(
-                project_dir,
-                reference_library_dir=self._reference_library_dir,
-            )
-            self.add_queue_item(item, auto_analyze=item.input_path is not None)
+        progress_dialog = self._project_load_progress_dialog(
+            len(selected_dirs)
+        )
+        try:
+            for index, project_dir in enumerate(selected_dirs, start=1):
+                if progress_dialog is not None:
+                    progress_dialog.setLabelText(
+                        "Loading XYZ -> PDB project "
+                        f"{index}/{len(selected_dirs)}:\n{project_dir}"
+                    )
+                    progress_dialog.setValue(index - 1)
+                    QApplication.processEvents()
+                item = _queue_item_from_project_defaults(
+                    project_dir,
+                    reference_library_dir=self._reference_library_dir,
+                )
+                self.add_queue_item(
+                    item,
+                    auto_analyze=item.input_path is not None,
+                )
+                if progress_dialog is not None:
+                    progress_dialog.setValue(index)
+                    QApplication.processEvents()
+        finally:
+            if progress_dialog is not None:
+                progress_dialog.setValue(len(selected_dirs))
+                progress_dialog.close()
+
+    def _project_load_progress_dialog(
+        self,
+        project_count: int,
+    ) -> QProgressDialog | None:
+        if project_count <= 1:
+            return None
+        dialog = QProgressDialog(
+            "Loading selected XYZ -> PDB projects...",
+            None,
+            0,
+            project_count,
+            self,
+        )
+        dialog.setWindowTitle("Loading XYZ -> PDB Projects")
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setValue(0)
+        dialog.show()
+        QApplication.processEvents()
+        return dialog
 
     def _on_item_settings_changed(self, _item_id: str) -> None:
         self._refresh_order_labels()
@@ -1289,6 +1887,7 @@ class XYZToPDBBatchQueueWindow(QMainWindow):
             return
 
         self.console.clear()
+        self._last_progress_log_step_by_item.clear()
         self._set_running(True)
         self.queue_status_label.setText(
             f"Running 0/{len(entries)} queued conversion(s)"
@@ -1328,7 +1927,42 @@ class XYZToPDBBatchQueueWindow(QMainWindow):
             self._run_worker.request_cancel()
 
     def _append_log(self, message: str) -> None:
-        self.console.append(message)
+        text = message.strip()
+        if not text:
+            return
+
+        scroll_bar = self.console.verticalScrollBar()
+        previous_value = scroll_bar.value()
+        was_at_bottom = previous_value >= max(scroll_bar.maximum() - 4, 0)
+
+        cursor = self.console.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if self.console.document().characterCount() > 1:
+            cursor.insertBlock()
+        cursor.insertText(text)
+        self.console.setTextCursor(cursor)
+
+        if was_at_bottom:
+            scroll_bar.setValue(scroll_bar.maximum())
+        else:
+            scroll_bar.setValue(previous_value)
+
+    def _should_log_progress(
+        self,
+        item_id: str,
+        processed: int,
+        total: int,
+    ) -> bool:
+        if not _is_progress_milestone(processed, total):
+            return False
+        key = (max(int(processed), 0), max(int(total), 1))
+        if (
+            key[0] < key[1]
+            and self._last_progress_log_step_by_item.get(item_id) == key
+        ):
+            return False
+        self._last_progress_log_step_by_item[item_id] = key
+        return True
 
     def _on_status(self, message: str) -> None:
         self.statusBar().showMessage(message)
@@ -1344,6 +1978,7 @@ class XYZToPDBBatchQueueWindow(QMainWindow):
         if widget is not None:
             widget.set_status(f"Running {index}/{total}")
             widget.set_progress(0, 1)
+        self._last_progress_log_step_by_item.pop(item_id, None)
         self.queue_status_label.setText(
             f"Running {index}/{total} queued conversion(s)"
         )
@@ -1356,9 +1991,16 @@ class XYZToPDBBatchQueueWindow(QMainWindow):
         message: str,
     ) -> None:
         widget = self._widgets_by_id.get(item_id)
+        display_name = item_id
         if widget is not None:
             widget.set_progress(processed, total)
             widget.set_status(message)
+            display_name = widget.item().display_name()
+        progress_text = f"[{display_name}] {processed}/{total}: {message}"
+        self.queue_status_label.setText(progress_text)
+        self.statusBar().showMessage(message)
+        if self._should_log_progress(item_id, processed, total):
+            self._append_log(progress_text)
 
     def _on_item_finished(
         self,

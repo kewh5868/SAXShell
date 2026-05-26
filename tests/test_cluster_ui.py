@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QComboBox, QTableWidgetItem
 
 import saxshell.cluster.cli as cluster_cli_module
+import saxshell.cluster.ui.batch_queue_window as batch_queue_module
 import saxshell.clusters as clusters_launcher
 from saxshell import saxshell as saxshell_module
 from saxshell.cluster import (
@@ -16,6 +17,7 @@ from saxshell.cluster import (
     example_pair_cutoff_definitions,
 )
 from saxshell.cluster.ui.batch_queue_window import (
+    _CONSOLE_MAX_BLOCK_COUNT,
     ClusterBatchItem,
     ClusterBatchJob,
     ClusterBatchQueueWindow,
@@ -75,6 +77,18 @@ def test_cluster_output_dir_suggestion_appends_unique_suffix(tmp_path):
     suggested = suggest_cluster_output_dir(frames_dir)
 
     assert suggested == source_dir / "clusters_splitpdb00010001"
+
+
+def test_cluster_output_dir_suggestion_avoids_nested_xyz2pdb_input_folder(
+    tmp_path,
+):
+    xyz_frames_dir = tmp_path / "splitxyz0001"
+    frames_dir = xyz_frames_dir / "xyz2pdb_splitxyz0001"
+    frames_dir.mkdir(parents=True)
+
+    suggested = suggest_cluster_output_dir(frames_dir)
+
+    assert suggested == tmp_path / "clusters_xyz2pdb_splitxyz0001"
 
 
 def test_definitions_panel_builds_atom_and_pair_rules(qapp):
@@ -141,6 +155,7 @@ def test_definitions_panel_starts_blank_with_builtin_preset_available(qapp):
 
     assert panel.atom_type_definitions() == {}
     assert panel.pair_cutoff_definitions() == {}
+    assert panel.shared_shells()
     assert (
         f"{DEFAULT_CLUSTER_EXTRACTION_PRESET_NAME} (Built-in)" in preset_names
     )
@@ -159,6 +174,7 @@ def test_definitions_panel_starts_blank_with_builtin_preset_available(qapp):
     assert not panel.use_pbc()
     assert panel.search_mode() == "kdtree"
     assert panel.save_state_frequency() == DEFAULT_SAVE_STATE_FREQUENCY
+    assert panel.shared_shells()
     assert panel.smart_solvation_shells()
     assert not panel.include_shell_atoms_in_stoichiometry()
 
@@ -327,7 +343,7 @@ def test_cluster_main_window_can_toggle_between_project_xyz_and_pdb_folders(
         "1\nframe\nPb 0.0 0.0 0.0\n",
         encoding="utf-8",
     )
-    pdb_frames_dir = tmp_path / "xyz2pdb_splitxyz0001"
+    pdb_frames_dir = xyz_frames_dir / "xyz2pdb_splitxyz0001"
     pdb_frames_dir.mkdir()
     (pdb_frames_dir / "frame_0000.pdb").write_text(
         "MODEL        1\nENDMDL\n",
@@ -378,6 +394,10 @@ def test_cluster_batch_queue_prefills_project_pdb_frames_and_default_preset(
     settings.frames_dir = str(xyz_frames_dir)
     settings.pdb_frames_dir = str(pdb_frames_dir)
     manager.save_project(settings)
+    (
+        tmp_path / "xyz_pbi2_dmso_1M_RT_den1p47_pbc_"
+        "11p84x11p84x11p84_024-pos-1.xyz"
+    ).write_text("2\nsource\n", encoding="utf-8")
 
     window = ClusterBatchQueueWindow(initial_project_dir=project_dir)
 
@@ -392,9 +412,18 @@ def test_cluster_batch_queue_prefills_project_pdb_frames_and_default_preset(
         "linker": [("I", None)],
         "shell": [("O", None)],
     }
+    assert widget.definitions_panel.shared_shells()
     assert "Mode: PDB frames" in widget.summary_box.toPlainText()
-    assert Path(widget.output_dir_edit.text()).name == (
-        "clusters_xyz2pdb_splitxyz0001"
+    assert widget.definitions_panel.box_dimensions() == (
+        11.84,
+        11.84,
+        11.84,
+    )
+    assert "Source box dimensions: 11.840 x 11.840 x 11.840 A" in (
+        widget.summary_box.toPlainText()
+    )
+    assert Path(widget.output_dir_edit.text()) == (
+        tmp_path / "clusters_xyz2pdb_splitxyz0001"
     )
     window.close()
 
@@ -514,6 +543,123 @@ def test_cluster_batch_queue_emits_registered_clusters_folder(qapp, tmp_path):
     window.close()
 
 
+def test_cluster_batch_queue_shows_progress_dialog_for_multiple_project_load(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_a = tmp_path / "project_a"
+    project_b = tmp_path / "project_b"
+    project_a.mkdir()
+    project_b.mkdir()
+    window = ClusterBatchQueueWindow()
+    monkeypatch.setattr(
+        batch_queue_module,
+        "_choose_existing_directories",
+        lambda *_args, **_kwargs: (project_a.resolve(), project_b.resolve()),
+    )
+    dialogs: list[object] = []
+
+    class FakeProgressDialog:
+        def __init__(self, label, cancel_text, minimum, maximum, parent):
+            del cancel_text, parent
+            self.labels = [label]
+            self.values: list[int] = []
+            self.minimum = minimum
+            self.maximum = maximum
+            self.closed = False
+            self.shown = False
+            dialogs.append(self)
+
+        def setWindowTitle(self, title):
+            self.title = title
+
+        def setWindowModality(self, modality):
+            self.modality = modality
+
+        def setMinimumDuration(self, duration):
+            self.minimum_duration = duration
+
+        def setAutoClose(self, enabled):
+            self.auto_close = enabled
+
+        def setAutoReset(self, enabled):
+            self.auto_reset = enabled
+
+        def setValue(self, value):
+            self.values.append(value)
+
+        def show(self):
+            self.shown = True
+
+        def setLabelText(self, label):
+            self.labels.append(label)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        batch_queue_module,
+        "QProgressDialog",
+        FakeProgressDialog,
+    )
+
+    window._choose_projects_to_add()
+
+    assert len(dialogs) == 1
+    dialog = dialogs[0]
+    assert dialog.maximum == 2
+    assert dialog.shown is True
+    assert dialog.closed is True
+    assert dialog.values[-1] == 2
+    assert any("project_a" in label for label in dialog.labels)
+    assert any("project_b" in label for label in dialog.labels)
+    assert window.queue_list.count() == 2
+    window.close()
+
+
+def test_cluster_batch_queue_console_log_is_bounded(qapp):
+    window = ClusterBatchQueueWindow()
+    window.show()
+    qapp.processEvents()
+
+    for index in range(_CONSOLE_MAX_BLOCK_COUNT + 25):
+        window._append_log(f"line {index}")
+    qapp.processEvents()
+
+    assert window.console.document().maximumBlockCount() == (
+        _CONSOLE_MAX_BLOCK_COUNT
+    )
+    assert window.console.document().blockCount() == _CONSOLE_MAX_BLOCK_COUNT
+    text = window.console.toPlainText()
+    assert "line 0" not in text
+    assert f"line {_CONSOLE_MAX_BLOCK_COUNT + 24}" in text
+    window.close()
+
+
+def test_cluster_batch_queue_console_log_preserves_manual_scroll(qapp):
+    window = ClusterBatchQueueWindow()
+    window.resize(420, 420)
+    window.show()
+    qapp.processEvents()
+
+    for index in range(200):
+        window._append_log(f"line {index}")
+    qapp.processEvents()
+
+    scroll_bar = window.console.verticalScrollBar()
+    scroll_bar.setValue(max(scroll_bar.maximum() // 2, 0))
+    previous_value = scroll_bar.value()
+
+    window._append_log("new line")
+    qapp.processEvents()
+
+    assert scroll_bar.value() < scroll_bar.maximum()
+    assert abs(scroll_bar.value() - previous_value) <= 2
+    window.close()
+
+
 def test_cluster_main_window_switches_to_xyz_mode(qapp, tmp_path):
     source_dir = tmp_path / "cluster_run"
     source_dir.mkdir()
@@ -529,6 +675,7 @@ def test_cluster_main_window_switches_to_xyz_mode(qapp, tmp_path):
     assert window.trajectory_panel.mode_label.text() == "Mode: XYZ frames"
     assert window.definitions_panel.title() == "Cluster Definitions (XYZ mode)"
     assert window.definitions_panel.atom_table.isColumnHidden(2)
+    assert window.definitions_panel.shared_shells()
     assert window.export_panel.export_button.text().endswith("Cluster XYZs")
     assert "Estimated box dimensions:" in (
         window.export_panel.selection_box.toPlainText()
@@ -564,6 +711,44 @@ def test_cluster_main_window_prefills_box_from_xyz_source_filename(
         "Box source: "
         "xyz_pbi2_dmso_1M_RT_den1p47_pbc_17p07x_041-pos-1.xyz" in preview_text
     )
+
+
+def test_cluster_main_window_prefills_box_from_sibling_xyz_source_for_pdb_frames(
+    qapp,
+    tmp_path,
+):
+    source_dir = tmp_path / "024_cp2k_pbi2_dmso_1M_RT"
+    source_dir.mkdir()
+    frames_dir = source_dir / "xyz2pdb_splitxyz_f2000_t1000fs"
+    frames_dir.mkdir()
+    (frames_dir / "frame_0000.pdb").write_text(
+        "MODEL        1\n"
+        "ATOM      1 PB1 SOL X   1       0.000   0.000   0.000"
+        "  1.00  0.00          PB\n"
+        "ATOM      2 I1  SOL X   1       1.000   0.000   0.000"
+        "  1.00  0.00           I\n"
+        "ENDMDL\n",
+        encoding="utf-8",
+    )
+    source_file = (
+        source_dir / "xyz_pbi2_dmso_1M_RT_den1p47_pbc_"
+        "11p84x11p84x11p84_024-pos-1.xyz"
+    )
+    source_file.write_text("2\nsource\n", encoding="utf-8")
+
+    window = ClusterMainWindow()
+    window.trajectory_panel.frames_dir_edit.setText(str(frames_dir))
+
+    assert window.definitions_panel.box_dimensions() == (
+        11.84,
+        11.84,
+        11.84,
+    )
+    preview_text = window.export_panel.selection_box.toPlainText()
+    assert "Mode: PDB frames" in preview_text
+    assert "Source box dimensions: 11.840 x 11.840 x 11.840 A" in preview_text
+    assert f"Box source: {source_file.name}" in preview_text
+    window.close()
 
 
 def test_cluster_main_window_uses_estimated_box_when_pbc_is_auto(

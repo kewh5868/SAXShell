@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from matplotlib.colors import to_hex
+from matplotlib.colors import to_hex, to_rgba
 from matplotlib.figure import Figure
 
 from saxshell.saxs.model_report import (
@@ -189,6 +189,7 @@ def test_filter_fit_axis_matches_dream_output_colors_and_hides_solvent():
         show_legend=False,
         compact=True,
         dream_output_style=True,
+        fit_q_bounds=(0.08, 0.18),
         settings=settings,
     )
 
@@ -206,6 +207,10 @@ def test_filter_fit_axis_matches_dream_output_colors_and_hides_solvent():
 
     assert left_collections == ["#000000"]
     assert left_lines == {"Model": "#d62728"}
+    assert left_axis.patches
+    assert left_axis.patches[0].get_facecolor() == pytest.approx(
+        to_rgba("#fef3c7", alpha=0.35)
+    )
     assert "Solvent contribution" not in left_lines
     assert right_axis.get_ylabel() == "S(q)"
     assert (

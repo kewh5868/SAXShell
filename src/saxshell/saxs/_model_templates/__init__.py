@@ -51,6 +51,7 @@ class TemplateSolutionScatteringSupport:
     volume_fraction_parameter: str | None = None
     volume_fraction_kind: str = "solute"
     volume_fraction_source: str = "saxs_effective"
+    molar_concentration_parameter: str | None = None
     solvent_contribution_scale_mode: str = "unscaled"
 
 
@@ -624,6 +625,26 @@ def _parse_solution_scattering_support(
                 f"unsupported volume fraction source {fraction_source!r}."
             )
 
+    raw_molar_concentration_target = raw_support.get(
+        "molar_concentration_target"
+    )
+    molar_concentration_parameter: str | None = None
+    if raw_molar_concentration_target is not None:
+        if not isinstance(raw_molar_concentration_target, dict):
+            raise ValueError(
+                f"Template metadata file {metadata_path.name} defines "
+                "'molar_concentration_target' with an invalid schema."
+            )
+        molar_concentration_parameter = (
+            str(raw_molar_concentration_target.get("parameter", "")).strip()
+            or None
+        )
+        if molar_concentration_parameter is None:
+            raise ValueError(
+                f"Template metadata file {metadata_path.name} declares a "
+                "molar_concentration_target without a parameter name."
+            )
+
     scale_mode = (
         str(
             raw_support.get(
@@ -645,6 +666,7 @@ def _parse_solution_scattering_support(
         volume_fraction_parameter=parameter_name,
         volume_fraction_kind=fraction_kind,
         volume_fraction_source=fraction_source,
+        molar_concentration_parameter=molar_concentration_parameter,
         solvent_contribution_scale_mode=scale_mode,
     )
 

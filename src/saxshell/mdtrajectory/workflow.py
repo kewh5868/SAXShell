@@ -15,6 +15,7 @@ from saxshell.mdtrajectory.frame.cutoff_analysis import (
     SteadyStateResult,
 )
 from saxshell.mdtrajectory.frame.manager import (
+    DEFAULT_FRAME_TIMESTEP_FS,
     ExportProgressCallback,
     FrameSelectionPreview,
     TrajectoryManager,
@@ -116,6 +117,10 @@ class MDTrajectorySelectionResult:
             "stride": preview.stride,
             "post_cutoff_stride": preview.post_cutoff_stride,
             "time_metadata_frames": preview.time_metadata_frames,
+            "source_time_metadata_frames": preview.source_time_metadata_frames,
+            "inferred_time_frames": preview.inferred_time_frames,
+            "frame_timestep_fs": preview.frame_timestep_fs,
+            "detected_frame_timestep_fs": preview.detected_frame_timestep_fs,
             "first_frame_index": preview.first_frame_index,
             "last_frame_index": preview.last_frame_index,
             "first_time_fs": preview.first_time_fs,
@@ -156,6 +161,8 @@ class MDTrajectoryWorkflow:
         energy_file: str | Path | None = None,
         backend: str = "auto",
         include_restart_duplicates: bool = False,
+        frame_timestep_fs: float | None = DEFAULT_FRAME_TIMESTEP_FS,
+        use_inferred_frame_times: bool = False,
     ) -> None:
         self.trajectory_file = Path(trajectory_file)
         self.topology_file = (
@@ -166,11 +173,17 @@ class MDTrajectoryWorkflow:
         )
         self.backend = backend
         self.include_restart_duplicates = bool(include_restart_duplicates)
+        self.frame_timestep_fs = (
+            None if frame_timestep_fs is None else float(frame_timestep_fs)
+        )
+        self.use_inferred_frame_times = bool(use_inferred_frame_times)
         self.manager = TrajectoryManager(
             input_file=self.trajectory_file,
             topology_file=self.topology_file,
             backend=backend,
             include_restart_duplicates=self.include_restart_duplicates,
+            frame_timestep_fs=self.frame_timestep_fs,
+            use_inferred_frame_times=self.use_inferred_frame_times,
         )
         self.summary: dict[str, object] | None = None
         self.energy_data: CP2KEnergyData | None = None
@@ -194,6 +207,25 @@ class MDTrajectoryWorkflow:
             return
         self.include_restart_duplicates = include_restart_duplicates
         self.manager.set_include_restart_duplicates(include_restart_duplicates)
+        self.summary = None
+
+    def set_frame_timestep(
+        self,
+        frame_timestep_fs: float | None,
+        *,
+        use_inferred_frame_times: bool | None = None,
+    ) -> None:
+        """Set the manual/fallback frame timestep used for missing
+        times."""
+        self.frame_timestep_fs = (
+            None if frame_timestep_fs is None else float(frame_timestep_fs)
+        )
+        if use_inferred_frame_times is not None:
+            self.use_inferred_frame_times = bool(use_inferred_frame_times)
+        self.manager.set_frame_timestep(
+            self.frame_timestep_fs,
+            use_inferred_frame_times=self.use_inferred_frame_times,
+        )
         self.summary = None
 
     def load_energy(self) -> CP2KEnergyData:
