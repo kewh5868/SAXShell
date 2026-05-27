@@ -129,7 +129,7 @@ class SoluteVolumeFractionEstimate:
                         f"{_format_density_g_per_ml(self.settings.solvent_density_g_per_ml)}"
                     ),
                     (
-                        "Estimated solvent volume: "
+                        "Neat-solvent diagnostic volume: "
                         f"{_format_volume_cm3(self.solvent_volume_cm3)}"
                     ),
                     (
@@ -141,7 +141,7 @@ class SoluteVolumeFractionEstimate:
                         f"{_format_fraction(self.additive_to_solution_volume_ratio)}"
                     ),
                     (
-                        "Estimated solvent volume fraction: "
+                        "Physical solvent fraction (1 - solute): "
                         f"{_format_fraction(self.solvent_volume_fraction)}"
                     ),
                 ]

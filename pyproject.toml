@@ -48,6 +48,7 @@ saxshell = "saxshell.saxshell:main"
 pdfsetup = "saxshell.pdfsetup:main"
 representativefinder = "saxshell.representativefinder.cli:main"
 structureviewer = "saxshell.saxs.structure_viewer.cli:main"
+uvvisfit = "saxshell.uvvis_fitting.cli:main"
 xyz2pdb = "saxshell.xyz2pdb.cli:main"
 
 [tool.setuptools-git-versioning]

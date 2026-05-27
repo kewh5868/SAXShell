@@ -3365,6 +3365,9 @@ def test_rmcsetup_solution_presets_load_bundled_values(
         "PbI2 - DMSO - 0.405 M"
     ].solvent_density_g_per_ml == pytest.approx(1.10)
     assert window._solution_presets[
+        "PbI2 - DMSO - 0.405 M"
+    ].solute_density_g_per_ml == pytest.approx(6.16)
+    assert window._solution_presets[
         "PbI2 - DMF - 0.49 M"
     ].solvent_density_g_per_ml == pytest.approx(0.944)
     assert window.solution_mode_combo.currentData() == "molarity_per_liter"

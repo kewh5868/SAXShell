@@ -349,6 +349,80 @@ def test_pdf_batch_queue_adds_multiple_selected_project_folders(
     assert project_dirs == [project_a.resolve(), project_b.resolve()]
 
 
+def test_pdf_batch_queue_shows_progress_dialog_for_multiple_project_load(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    project_a = tmp_path / "project_a"
+    project_b = tmp_path / "project_b"
+    project_a.mkdir()
+    project_b.mkdir()
+    window = DebyerPDFBatchQueueWindow()
+    monkeypatch.setattr(
+        batch_queue_module,
+        "_choose_existing_directories",
+        lambda *_args, **_kwargs: (project_a.resolve(), project_b.resolve()),
+    )
+    dialogs: list[object] = []
+
+    class FakeProgressDialog:
+        def __init__(self, label, cancel_text, minimum, maximum, parent):
+            del cancel_text, parent
+            self.labels = [label]
+            self.values: list[int] = []
+            self.minimum = minimum
+            self.maximum = maximum
+            self.closed = False
+            self.shown = False
+            dialogs.append(self)
+
+        def setWindowTitle(self, title):
+            self.title = title
+
+        def setWindowModality(self, modality):
+            self.modality = modality
+
+        def setMinimumDuration(self, duration):
+            self.minimum_duration = duration
+
+        def setAutoClose(self, enabled):
+            self.auto_close = enabled
+
+        def setAutoReset(self, enabled):
+            self.auto_reset = enabled
+
+        def setValue(self, value):
+            self.values.append(value)
+
+        def show(self):
+            self.shown = True
+
+        def setLabelText(self, label):
+            self.labels.append(label)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        batch_queue_module,
+        "QProgressDialog",
+        FakeProgressDialog,
+    )
+
+    window._choose_project_to_add()
+
+    assert len(dialogs) == 1
+    dialog = dialogs[0]
+    assert dialog.maximum == 2
+    assert dialog.shown is True
+    assert dialog.closed is True
+    assert dialog.values[-1] == 2
+    assert any("project_a" in label for label in dialog.labels)
+    assert any("project_b" in label for label in dialog.labels)
+    assert window.queue_list.count() == 2
+
+
 def test_pdf_batch_queue_prefills_project_debyer_defaults(
     qapp,
     tmp_path,

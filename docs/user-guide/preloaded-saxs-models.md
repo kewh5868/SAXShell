@@ -13,6 +13,7 @@ single paper.
 | -------------------------------------------------------------- | ----------------------------------------------------------- | ---------- | --------------------------------------------- |
 | `template_pydream_monosq_normalized.py`                        | `pyDREAM MonoSQ Normalized`                                 | current    | MonoSQ hard-sphere                            |
 | `template_pydream_monosq_normalized_scaled_solvent.py`         | `pyDREAM MonoSQ Normalized (Scaled Solvent Weight)`         | current    | MonoSQ hard-sphere with scale-coupled solvent |
+| `template_pydream_monosq_legacy.py`                            | `pyDREAM MonoSQ Legacy (MDScatter)`                         | current    | MonoSQ hard-sphere, MDScatter-compatible      |
 | `template_pydream_charged_monosq_normalized_scaled_solvent.py` | `pyDREAM Charged MonoSQ Normalized (Scaled Solvent Weight)` | current    | MonoSQ charged hard-sphere RMSA               |
 | `template_pydream_poly_lma_hs.py`                              | `pyDREAM Poly LMA Hard-Sphere`                              | current    | sphere-only Poly LMA hard-sphere              |
 | `template_pydream_poly_lma_hs_mix_approx.py`                   | `pyDREAM Poly LMA Hard-Sphere/Ellipsoid Mix (Approx.)`      | current    | mixed-shape approximate Poly LMA hard-sphere  |
@@ -123,6 +124,10 @@ new `scale` and `offset` limits are centered around the autoscale result rather
 than preserving the broad template-default ranges. The default `eff_r` starts at
 3 A, the lower bound of the effective-radius search range.
 
+The default `solv_w` range remains `[0, 1]`, but Prefit and DREAM batch
+processing preserve wider user-edited bounds and the templates evaluate the
+entered solvent multiplier directly.
+
 Because the solvent branch is scale-coupled, Prefit's scale recommendation also
 treats the solvent term as part of the scaled model instead of subtracting it as
 an already-scaled background contribution.
@@ -165,6 +170,30 @@ Here \(Z\) is the charged-sphere charge in elementary-charge units,
 \(T\) is the absolute temperature, \(c\_{\mathrm{salt}}\) is the molar
 concentration of added 1:1 electrolyte, and \(\epsilon_r\) is the solvent
 relative dielectric constant.
+
+When this template is active in Prefit, SAXSShell shows a `dielectconst`
+solvent preset dropdown above the parameter table. Choosing a preset updates
+the `dielectconst` table entry directly; choose `Custom` to keep or type a
+sample-specific value. The built-in presets are reference-table values from
+the Chemistry LibreTexts S1 solvent properties table:
+
+| Preset | Solvent                | `dielectconst` |
+| ------ | ---------------------- | -------------- |
+| DMF    | N,N-dimethylformamide  | 36.7           |
+| DMSO   | dimethyl sulfoxide     | 47.0           |
+| NMP    | N-methyl-2-pyrrolidone | 32.0           |
+| ACN    | acetonitrile           | 37.5           |
+| Water  | water                  | 78.54          |
+
+Prefit also exposes an `Estimate` button beside the charged template's
+`charge` parameter controls. It calculates the weighted formal charge from the
+current component stoichiometries and weights, then writes
+\(|\langle q\_{\mathrm{formal}}\rangle|\) into `charge`. The built-in formal
+charge assumptions are Pb = +2, I = -1, Cs = +1, MA = +1, and FA = +1, with
+common alkali/halide aliases included for related perovskite labels. Species
+without an assigned formal charge are treated as neutral and reported in the
+Prefit log, so neutral solvent/ligand atoms do not silently force an inorganic
+oxidation state.
 
 The implementation follows the SasView `hayter_msa` parameterization. The
 template first converts the fitted parameters into SI-derived screening terms:
@@ -235,6 +264,8 @@ calculator targets in its metadata:
   from the solution composition.
 - `solv_w` receives the combined solvent-background multiplier from attenuation
   and SAXS-effective solvent contrast.
+- `concentration_salt` receives the computed solute species concentration in
+  mol/L from the loaded solution chemistry information.
 - The solvent contribution is marked as globally scaled, so Prefit's autoscale
   calculation treats the solvent branch as part of the model curve.
 
@@ -243,7 +274,7 @@ calculator targets in its metadata:
 | Symbol / parameter                            | Meaning in SAXSShell                                                                                                       |
 | --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
 | \(w_i\)                                       | generated component weight for cluster profile \(i\)                                                                       |
-| \(w\_{\mathrm{solv}}\) / `solv_w`             | bounded solvent contribution weight                                                                                        |
+| \(w\_{\mathrm{solv}}\) / `solv_w`             | solvent contribution multiplier with user-configured bounds                                                                |
 | \(R\_{\mathrm{eff}}\) / `eff_r`               | effective hard-sphere radius used in `calc_monodisperse_sq(...)`; scaled-solvent MonoSQ defaults to 3 A                    |
 | \(\phi\_{\mathrm{vol}}\) / `vol_frac`         | effective hard-sphere volume fraction inside the Percus-Yevick term                                                        |
 | `scale`                                       | global intensity scale; original MonoSQ applies it only to solute, scaled-solvent MonoSQ applies it to solute plus solvent |
@@ -273,6 +304,12 @@ The archived `MonoSQ Basic` template uses the same forward model but omits the
 equation and simply factors the forward model into an intermediate helper
 function before evaluating the likelihood.
 
+The current `pyDREAM MonoSQ Legacy (MDScatter)` template is the supported
+reproduction path for the old MDScatter notebook convention. It keeps the
+unnormalized Gaussian likelihood, uses fixed \(\sigma = 10^{-4}\), applies the
+solvent trace inside the global scale branch, and defaults `scale` to
+\(10^{-10}\) with `vary=False`.
+
 ### Literature
 
 - J. K. Percus and G. J. Yevick, _Analysis of Classical Statistical Mechanics by Means of Collective Coordinates_,
@@ -285,6 +322,9 @@ function before evaluating the likelihood.
 - J. P. Hansen and J. B. Hayter, Molecular Physics **46**, 651-656 (1982).
 - SasView `hayter_msa` charged-sphere RMSA model documentation:
   <https://www.sasview.org/docs/user/models/hayter_msa.html>
+- Chemistry LibreTexts, S1: Solvent Properties. Dielectric constants for DMF,
+  DMSO, NMP, acetonitrile, and water:
+  <https://chem.libretexts.org/Ancillary_Materials/Reference/Reference_Tables/Solvents/S1%3A_Solvent_Properties>
 
 ## Poly LMA Hard-Sphere
 
@@ -317,18 +357,18 @@ x_i I_i(q) S*{\mathrm{HS}}(q; R*i^{\mathrm{eff}}, \phi*{\mathrm{int}}) \\
 
 ### Variables
 
-| Symbol / parameter                         | Meaning in SAXSShell                                                                             |
-| ------------------------------------------ | ------------------------------------------------------------------------------------------------ |
-| \(w_i\)                                    | raw cluster-abundance coefficient generated from the project component rows                      |
-| \(x_i\)                                    | normalized abundance used internally by the model                                                |
-| \(R_i^{\mathrm{eff}}\)                     | per-cluster effective interaction radius                                                         |
-| `r_eff_wN`                                 | generated Prefit/DREAM radius parameter for cluster `wN` when sphere mode is active              |
-| \(\phi\_{\mathrm{solute}}\) / `phi_solute` | SAXS-effective solute interaction ratio scaling the cluster contribution                         |
-| \(\phi\_{\mathrm{int}}\) / `phi_int`       | interaction packing fraction used only inside the hard-sphere structure factor                   |
-| \(s\_{\mathrm{solv}}\) / `solvent_scale`   | bounded attenuation solvent-scaling term, used together with the `phi_solute` solvent complement |
-| `scale`                                    | solute intensity scale factor                                                                    |
-| `offset`                                   | constant additive background                                                                     |
-| \(\sigma = e^{\log \sigma}\) / `log_sigma` | Gaussian noise scale for the DREAM likelihood                                                    |
+| Symbol / parameter                         | Meaning in SAXSShell                                                                                                 |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| \(w_i\)                                    | raw cluster-abundance coefficient generated from the project component rows                                          |
+| \(x_i\)                                    | normalized abundance used internally by the model                                                                    |
+| \(R_i^{\mathrm{eff}}\)                     | per-cluster effective interaction radius                                                                             |
+| `r_eff_wN`                                 | generated Prefit/DREAM radius parameter for cluster `wN` when sphere mode is active                                  |
+| \(\phi\_{\mathrm{solute}}\) / `phi_solute` | SAXS-effective solute interaction ratio scaling the cluster contribution                                             |
+| \(\phi\_{\mathrm{int}}\) / `phi_int`       | interaction packing fraction used only inside the hard-sphere structure factor                                       |
+| \(s\_{\mathrm{solv}}\) / `solvent_scale`   | attenuation solvent-scaling term with user-configured bounds, used together with the `phi_solute` solvent complement |
+| `scale`                                    | solute intensity scale factor                                                                                        |
+| `offset`                                   | constant additive background                                                                                         |
+| \(\sigma = e^{\log \sigma}\) / `log_sigma` | Gaussian noise scale for the DREAM likelihood                                                                        |
 
 In the current implementation, \(R_i^{\mathrm{eff}}\) is taken from the
 generated parameter `r_eff_wN` when that row exists. Otherwise, the template

@@ -7,7 +7,7 @@ from saxshell.saxs.cli import main
 def test_saxs_templates_command_lists_bundled_templates(capsys):
     assert main(["templates"]) == 0
     output = capsys.readouterr().out
-    assert "template_pd_likelihood_monosq_decoupled" in output
+    assert "template_pydream_poly_lma_hs" in output
 
 
 def test_saxs_templates_validate_command_reports_success(capsys, monkeypatch):
@@ -53,3 +53,16 @@ def test_saxs_templates_install_command_reports_destination(
     output = capsys.readouterr().out
     assert "validated candidate_template" in output
     assert "Installed template: /tmp/template.py" in output
+
+
+def test_saxs_dream_batch_run_command_invokes_manifest(monkeypatch, tmp_path):
+    manifest_path = tmp_path / "dream_backend_run_set.json"
+    called_paths = []
+    monkeypatch.setattr(
+        "saxshell.saxs.cli.run_dream_batch_manifest",
+        lambda path: called_paths.append(path),
+    )
+
+    assert main(["dream-batch", "run", str(manifest_path)]) == 0
+
+    assert called_paths == [manifest_path]

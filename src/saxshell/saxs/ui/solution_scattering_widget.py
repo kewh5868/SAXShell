@@ -643,6 +643,7 @@ class SolutionScatteringEstimatorWidget(QWidget):
         fraction_kind: str | None,
         fraction_source: str = "saxs_effective",
         solvent_weight_parameter: str | None = None,
+        molar_concentration_parameter: str | None = None,
     ) -> None:
         messages: list[str] = []
         if parameter_name and fraction_kind:
@@ -666,6 +667,10 @@ class SolutionScatteringEstimatorWidget(QWidget):
                 messages.append(
                     f"{solvent_weight_parameter} (combined solvent background multiplier)"
                 )
+        if molar_concentration_parameter:
+            messages.append(
+                f"{molar_concentration_parameter} (solute molar concentration)"
+            )
         if messages:
             self.target_label.setText(
                 "Active Prefit targets: " + "; ".join(messages) + "."
@@ -961,14 +966,9 @@ class SolutionScatteringEstimatorWidget(QWidget):
     def current_estimator_settings(
         self,
     ) -> SolutionScatteringEstimatorSettings:
-        mode = self._selected_solution_mode()
         return SolutionScatteringEstimatorSettings(
             solution=self._current_solution_settings(),
-            solute_density_g_per_ml=(
-                None
-                if mode == "molarity_per_liter"
-                else float(self.solute_density_spin.value())
-            ),
+            solute_density_g_per_ml=float(self.solute_density_spin.value()),
             solvent_density_g_per_ml=float(self.solvent_density_spin.value()),
             calculate_number_density=(
                 self.calculate_number_density_checkbox.isChecked()
@@ -998,9 +998,8 @@ class SolutionScatteringEstimatorWidget(QWidget):
         self.solution_mode_stack.setCurrentIndex(
             mode_to_index.get(selected_mode, 0)
         )
-        show_solute_density = selected_mode != "molarity_per_liter"
-        self.solute_density_label.setVisible(show_solute_density)
-        self.solute_density_spin.setVisible(show_solute_density)
+        self.solute_density_label.setVisible(True)
+        self.solute_density_spin.setVisible(True)
         self.solvent_density_label.setVisible(True)
         self.solvent_density_spin.setVisible(True)
         self.solution_mode_hint_label.setText(
@@ -1012,9 +1011,10 @@ class SolutionScatteringEstimatorWidget(QWidget):
         base = solution_properties_mode_hint_text(mode)
         if mode == "molarity_per_liter":
             return (
-                f"{base} In molarity mode the solute density is hidden, but "
-                "the solvent density remains active for attenuation and "
-                "volume-closure calculations."
+                f"{base} The solute density remains active for the physical "
+                "volume-fraction estimate; solvent density is reported as a "
+                "neat-solvent consistency diagnostic and remains active for "
+                "attenuation."
             )
         return (
             f"{base} In these modes, both component densities remain "

@@ -69,6 +69,15 @@ def main(argv: list[str] | None = None) -> int:
         nargs=argparse.REMAINDER,
         help="Arguments passed through to the blenderxyz command.",
     )
+    uvvisfit_parser = subparsers.add_parser(
+        "uvvisfit",
+        help="Launch the interactive UV-Vis pseudo-Voigt fitting UI.",
+    )
+    uvvisfit_parser.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="Arguments passed through to the uvvisfit command.",
+    )
     clusterdynamics_parser = subparsers.add_parser(
         "clusterdynamics",
         help=(
@@ -187,6 +196,14 @@ def main(argv: list[str] | None = None) -> int:
         if forwarded_args[:1] == ["--"]:
             forwarded_args = forwarded_args[1:]
         return blenderxyz_main(forwarded_args)
+
+    if args.command == "uvvisfit":
+        from saxshell.uvvis_fitting.cli import main as uvvisfit_main
+
+        forwarded_args = list(args.args)
+        if forwarded_args[:1] == ["--"]:
+            forwarded_args = forwarded_args[1:]
+        return uvvisfit_main(forwarded_args)
 
     if args.command == "clusterdynamics":
         from saxshell.clusterdynamics.cli import main as clusterdynamics_main

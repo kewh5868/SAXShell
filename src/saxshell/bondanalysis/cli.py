@@ -5,7 +5,11 @@ from pathlib import Path
 
 from saxshell.version import __version__
 
-from .bondanalyzer import AngleTripletDefinition, BondPairDefinition
+from .bondanalyzer import (
+    AngleTripletDefinition,
+    BondPairDefinition,
+    CoordinationNumberDefinition,
+)
 from .workflow import BondAnalysisWorkflow
 
 
@@ -13,8 +17,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bondanalysis",
         description=(
-            "Analyze bond-pair and angle-triplet distributions on "
-            "stoichiometry-level cluster folders, or launch the Qt UI. "
+            "Analyze bond-pair, angle-triplet, and coordination-number "
+            "distributions on "
+            "stoichiometry-level cluster folders, or launch the Qt UIs. "
             "Running without a subcommand launches the UI."
         ),
     )
@@ -35,6 +40,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ui_parser.set_defaults(handler=_handle_ui)
 
+    batch_ui_parser = subparsers.add_parser(
+        "batch-ui",
+        help="Launch the multi-project bondanalysis batch queue.",
+    )
+    batch_ui_parser.add_argument(
+        "project_dir",
+        nargs="?",
+        type=Path,
+        help="Optional SAXSShell project directory to seed the queue.",
+    )
+    batch_ui_parser.add_argument(
+        "--clusters-dir",
+        type=Path,
+        help="Optional clusters directory to prefill for the seeded project.",
+    )
+    batch_ui_parser.set_defaults(handler=_handle_batch_ui)
+
     inspect_parser = subparsers.add_parser(
         "inspect",
         help="Inspect the available cluster types in a clusters directory.",
@@ -44,7 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run",
-        help="Run bond-pair and angle-distribution analysis headlessly.",
+        help=(
+            "Run bond, angle, and coordination-distribution analysis "
+            "headlessly."
+        ),
     )
     run_parser.add_argument("clusters_dir", type=Path)
     run_parser.add_argument(
@@ -75,6 +100,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Angle triplet definition as " "VERTEX:ARM1:ARM2:CUTOFF1:CUTOFF2."
         ),
     )
+    run_parser.add_argument(
+        "--coordination-number",
+        action="append",
+        default=[],
+        help="Coordination definition as CENTER:NEIGHBOR:CUTOFF.",
+    )
     run_parser.set_defaults(handler=_handle_run)
 
     return parser
@@ -103,6 +134,15 @@ def _handle_ui(args: argparse.Namespace) -> int:
     return launch_bondanalysis_ui(getattr(args, "clusters_dir", None))
 
 
+def _handle_batch_ui(args: argparse.Namespace) -> int:
+    from .ui.batch_queue_window import launch_bondanalysis_batch_queue_ui
+
+    return launch_bondanalysis_batch_queue_ui(
+        getattr(args, "project_dir", None),
+        initial_clusters_dir=getattr(args, "clusters_dir", None),
+    )
+
+
 def _handle_inspect(args: argparse.Namespace) -> int:
     workflow = BondAnalysisWorkflow(args.clusters_dir)
     summary = workflow.inspect()
@@ -124,10 +164,14 @@ def _handle_inspect(args: argparse.Namespace) -> int:
 def _handle_run(args: argparse.Namespace) -> int:
     bond_pairs = _parse_bond_pairs(args.bond_pair)
     angle_triplets = _parse_angle_triplets(args.angle_triplet)
+    coordination_numbers = _parse_coordination_numbers(
+        args.coordination_number
+    )
     workflow = BondAnalysisWorkflow(
         args.clusters_dir,
         bond_pairs=bond_pairs,
         angle_triplets=angle_triplets,
+        coordination_numbers=coordination_numbers,
         output_dir=getattr(args, "output_dir", None),
         selected_cluster_types=(
             args.cluster_type if args.cluster_type else None
@@ -144,11 +188,15 @@ def _handle_run(args: argparse.Namespace) -> int:
     for cluster_result in result.cluster_results:
         bond_total = sum(cluster_result.bond_value_counts.values())
         angle_total = sum(cluster_result.angle_value_counts.values())
+        coordination_total = sum(
+            cluster_result.coordination_value_counts.values()
+        )
         lines.append(
             f"{cluster_result.cluster_type}: "
             f"{cluster_result.structure_count} file(s), "
             f"{bond_total} bond values, "
-            f"{angle_total} angle values"
+            f"{angle_total} angle values, "
+            f"{coordination_total} coordination values"
         )
     print("\n".join(lines))
     return 0
@@ -190,6 +238,27 @@ def _parse_angle_triplets(
                 parts[2],
                 float(parts[3]),
                 float(parts[4]),
+            )
+        )
+    return definitions
+
+
+def _parse_coordination_numbers(
+    values: list[str],
+) -> list[CoordinationNumberDefinition]:
+    definitions: list[CoordinationNumberDefinition] = []
+    for raw in values:
+        parts = [part.strip() for part in raw.split(":")]
+        if len(parts) != 3:
+            raise ValueError(
+                "Coordination-number arguments must look like "
+                "CENTER:NEIGHBOR:CUTOFF."
+            )
+        definitions.append(
+            CoordinationNumberDefinition(
+                parts[0],
+                parts[1],
+                float(parts[2]),
             )
         )
     return definitions

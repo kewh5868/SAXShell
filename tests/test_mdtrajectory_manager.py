@@ -2,7 +2,10 @@ import pytest
 
 from saxshell.mdtrajectory.frame.base import FrameRecord
 from saxshell.mdtrajectory.frame.exporters import export_xyz_frames
-from saxshell.mdtrajectory.frame.manager import TrajectoryManager
+from saxshell.mdtrajectory.frame.manager import (
+    DEFAULT_FRAME_TIMESTEP_FS,
+    TrajectoryManager,
+)
 
 
 def _write_uniform_time_xyz(
@@ -163,6 +166,60 @@ def test_prefix_style_headers_can_supply_frame_times(tmp_path):
     assert preview.selected_frames == 1
     assert preview.first_frame_index == 1
     assert preview.first_time_fs == pytest.approx(100.0)
+
+
+def test_inspect_detects_frame_timestep_from_trajectory_times(tmp_path):
+    trajectory_file = tmp_path / "traj.xyz"
+    _write_uniform_time_xyz(
+        trajectory_file,
+        n_frames=4,
+        timestep_fs=25.0,
+    )
+
+    manager = TrajectoryManager(
+        input_file=trajectory_file,
+        frame_timestep_fs=DEFAULT_FRAME_TIMESTEP_FS,
+    )
+
+    summary = manager.inspect()
+    preview = manager.preview_selection()
+
+    assert summary["detected_frame_timestep_fs"] == pytest.approx(25.0)
+    assert summary["source_time_metadata_frames"] == 4
+    assert summary["inferred_time_frames"] == 0
+    assert preview.detected_frame_timestep_fs == pytest.approx(25.0)
+    assert preview.frame_timestep_fs == pytest.approx(
+        DEFAULT_FRAME_TIMESTEP_FS
+    )
+
+
+def test_manual_frame_timestep_can_supply_missing_times(tmp_path):
+    trajectory_file = tmp_path / "traj.xyz"
+    trajectory_file.write_text(
+        "1\n"
+        "no source time\n"
+        "H 0.0 0.0 0.0\n"
+        "1\n"
+        "still no source time\n"
+        "H 1.0 0.0 0.0\n"
+        "1\n"
+        "still no source time\n"
+        "H 2.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    manager = TrajectoryManager(
+        input_file=trajectory_file,
+        frame_timestep_fs=2.5,
+    )
+
+    summary = manager.inspect()
+    preview = manager.preview_selection(min_time_fs=2.5)
+
+    assert summary["source_time_metadata_frames"] == 0
+    assert summary["inferred_time_frames"] == 3
+    assert preview.first_frame_index == 1
+    assert preview.first_time_fs == pytest.approx(2.5)
 
 
 def test_inspect_counts_frames_without_loading_entire_selection(tmp_path):

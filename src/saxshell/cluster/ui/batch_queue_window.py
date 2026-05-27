@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QSizePolicy,
     QTextEdit,
@@ -56,6 +58,8 @@ from saxshell.saxs.ui.branding import (
     prepare_saxshell_application_identity,
 )
 from saxshell.structure import AtomTypeDefinitions
+
+_CONSOLE_MAX_BLOCK_COUNT = 2000
 
 
 def _new_item_id() -> str:
@@ -223,7 +227,7 @@ class ClusterBatchItem:
     default_cutoff: float | None = None
     shell_levels: tuple[int, ...] = ()
     include_shell_levels: tuple[int, ...] = (0,)
-    shared_shells: bool = False
+    shared_shells: bool = True
     smart_solvation_shells: bool = True
     include_shell_atoms_in_stoichiometry: bool = False
 
@@ -1021,6 +1025,7 @@ class ClusterBatchQueueWindow(QMainWindow):
         self.console = QTextEdit()
         self.console.setReadOnly(True)
         self.console.setMinimumHeight(160)
+        self.console.document().setMaximumBlockCount(_CONSOLE_MAX_BLOCK_COUNT)
         run_layout.addWidget(self.console)
         root.addWidget(run_group)
 
@@ -1061,8 +1066,51 @@ class ClusterBatchQueueWindow(QMainWindow):
         )
         if not selected_dirs:
             return
-        for project_dir in selected_dirs:
-            self.add_queue_item(_queue_item_from_project_defaults(project_dir))
+        progress_dialog = self._project_load_progress_dialog(
+            len(selected_dirs)
+        )
+        try:
+            for index, project_dir in enumerate(selected_dirs, start=1):
+                if progress_dialog is not None:
+                    progress_dialog.setLabelText(
+                        "Loading cluster extraction project "
+                        f"{index}/{len(selected_dirs)}:\n{project_dir}"
+                    )
+                    progress_dialog.setValue(index - 1)
+                    QApplication.processEvents()
+                self.add_queue_item(
+                    _queue_item_from_project_defaults(project_dir)
+                )
+                if progress_dialog is not None:
+                    progress_dialog.setValue(index)
+                    QApplication.processEvents()
+        finally:
+            if progress_dialog is not None:
+                progress_dialog.setValue(len(selected_dirs))
+                progress_dialog.close()
+
+    def _project_load_progress_dialog(
+        self,
+        project_count: int,
+    ) -> QProgressDialog | None:
+        if project_count <= 1:
+            return None
+        dialog = QProgressDialog(
+            "Loading selected cluster extraction projects...",
+            None,
+            0,
+            project_count,
+            self,
+        )
+        dialog.setWindowTitle("Loading Cluster Extraction Projects")
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setValue(0)
+        dialog.show()
+        QApplication.processEvents()
+        return dialog
 
     def _on_item_settings_changed(self, _item_id: str) -> None:
         self._refresh_order_labels()
@@ -1180,7 +1228,25 @@ class ClusterBatchQueueWindow(QMainWindow):
             self._run_worker.request_cancel()
 
     def _append_log(self, message: str) -> None:
-        self.console.append(message)
+        text = message.strip()
+        if not text:
+            return
+
+        scroll_bar = self.console.verticalScrollBar()
+        previous_value = scroll_bar.value()
+        was_at_bottom = previous_value >= max(scroll_bar.maximum() - 4, 0)
+
+        cursor = self.console.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if self.console.document().characterCount() > 1:
+            cursor.insertBlock()
+        cursor.insertText(text)
+        self.console.setTextCursor(cursor)
+
+        if was_at_bottom:
+            scroll_bar.setValue(scroll_bar.maximum())
+        else:
+            scroll_bar.setValue(previous_value)
 
     def _on_status(self, message: str) -> None:
         self.statusBar().showMessage(message)

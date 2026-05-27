@@ -6,3 +6,6 @@ mater
 
 ;; Frobenius norm used in np.linalg.norm
 fro
+
+;; acetonitrile abbreviation used in solvent presets
+acn

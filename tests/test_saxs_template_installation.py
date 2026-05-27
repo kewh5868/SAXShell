@@ -20,6 +20,7 @@ TEMPLATE_CANDIDATE_DIR = Path("tests/template_candidates")
 CHARGED_MONOSQ_TEMPLATE = (
     "template_pydream_charged_monosq_normalized_scaled_solvent"
 )
+LEGACY_MONOSQ_TEMPLATE = "template_pydream_monosq_legacy"
 
 
 def _write_template(path: Path, body: str) -> Path:
@@ -183,10 +184,70 @@ def test_template_listing_hides_deprecated_by_default():
     }
 
     assert CHARGED_MONOSQ_TEMPLATE in visible_names
+    assert LEGACY_MONOSQ_TEMPLATE in visible_names
     assert "template_pd_likelihood_monosq_decoupled" not in visible_names
     assert "template_pd_likelihood_monosq_decoupled" in all_names
     assert "template_pydream_poly_lma_hs_legacy" not in visible_names
     assert "template_pydream_poly_lma_hs_legacy" in all_names
+
+
+def test_legacy_monosq_template_preserves_mdscatter_likelihood_convention():
+    spec = load_template_spec(LEGACY_MONOSQ_TEMPLATE)
+    module = load_template_module(LEGACY_MONOSQ_TEMPLATE)
+
+    assert spec.display_name == "pyDREAM MonoSQ Legacy (MDScatter)"
+    assert spec.deprecated is False
+    assert [parameter.name for parameter in spec.parameters] == [
+        "solv_w",
+        "offset",
+        "eff_r",
+        "vol_frac",
+        "scale",
+    ]
+    assert (
+        spec.solution_scattering_support.solvent_contribution_scale_mode
+        == "global_scale"
+    )
+
+    q_values = np.linspace(0.05, 0.30, 6)
+    component = np.linspace(10.0, 20.0, 6)
+    solvent = np.linspace(1.0, 2.0, 6)
+    params = {
+        "w0": 0.75,
+        "solv_w": 2.0,
+        "offset": 0.05,
+        "eff_r": 9.0,
+        "vol_frac": 0.02,
+        "scale": 1e-10,
+    }
+    profile = module.lmfit_model_profile(
+        q_values,
+        solvent,
+        [component],
+        **params,
+    )
+
+    module.q_values = q_values
+    module.experimental_intensities = profile
+    module.theoretical_intensities = [component]
+    module.solvent_intensities = solvent
+    dream_params = np.asarray(
+        [
+            params["w0"],
+            params["solv_w"],
+            params["offset"],
+            params["eff_r"],
+            params["vol_frac"],
+            params["scale"],
+        ],
+        dtype=float,
+    )
+
+    log_likelihood = module.log_likelihood_monosq_legacy(dream_params)
+    expected_per_point = -np.log(
+        np.sqrt(2.0 * np.pi) * module.LEGACY_LIKELIHOOD_SIGMA
+    )
+    assert log_likelihood == pytest.approx(len(q_values) * expected_per_point)
 
 
 def test_charged_monosq_template_spec_exposes_scaled_solvent_metadata():
@@ -217,6 +278,10 @@ def test_charged_monosq_template_spec_exposes_scaled_solvent_metadata():
     assert (
         spec.solution_scattering_support.solvent_contribution_scale_mode
         == "global_scale"
+    )
+    assert (
+        spec.solution_scattering_support.molar_concentration_parameter
+        == "concentration_salt"
     )
     assert spec.prefit_support.auto_apply_autoscale_on_load
     assert spec.prefit_support.autoscale_bounds_mode == "adaptive"

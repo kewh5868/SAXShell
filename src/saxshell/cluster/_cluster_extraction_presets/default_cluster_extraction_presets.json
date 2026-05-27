@@ -42,7 +42,7 @@
         "search_mode": "kdtree",
         "save_state_frequency": 1000,
         "shell_growth_levels": [],
-        "shared_shells": false,
+        "shared_shells": true,
         "include_shell_atoms_in_stoichiometry": false
       }
     }

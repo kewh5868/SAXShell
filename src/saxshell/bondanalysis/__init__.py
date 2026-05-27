@@ -5,6 +5,7 @@ from .bondanalyzer import (
     AtomRecord,
     BondAnalyzer,
     BondPairDefinition,
+    CoordinationNumberDefinition,
 )
 from .presets import (
     BondAnalysisPreset,
@@ -47,6 +48,7 @@ __all__ = [
     "BondAnalysisResultLeaf",
     "BondAnalysisWorkflow",
     "BondPairDefinition",
+    "CoordinationNumberDefinition",
     "ClusterTypeSummary",
     "build_plot_request",
     "bondanalysis_presets_path",

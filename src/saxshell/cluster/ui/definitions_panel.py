@@ -303,6 +303,7 @@ class ClusterDefinitionsPanel(QGroupBox):
         self.shared_shells_box = QCheckBox(
             "Allow shell atoms to be shared between clusters"
         )
+        self.shared_shells_box.setChecked(True)
         self.shared_shells_box.setToolTip(
             "If enabled, solvent atoms can belong to more than one cluster "
             "shell instead of being consumed by the first cluster that finds "

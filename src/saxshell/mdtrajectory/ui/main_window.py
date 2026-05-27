@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 
 from saxshell.mdtrajectory.frame.cp2k_ener import CP2KEnergyData
 from saxshell.mdtrajectory.frame.manager import (
+    DEFAULT_FRAME_TIMESTEP_FS,
     FrameSelectionPreview,
     TrajectoryManager,
 )
@@ -75,6 +76,8 @@ class InspectionWorker(QObject):
         summary: dict[str, object] | None = None,
         reload_trajectory: bool = True,
         include_restart_duplicates: bool = False,
+        frame_timestep_fs: float = DEFAULT_FRAME_TIMESTEP_FS,
+        use_inferred_frame_times: bool = False,
     ) -> None:
         super().__init__()
         self.trajectory_file = trajectory_file
@@ -84,6 +87,8 @@ class InspectionWorker(QObject):
         self.summary = summary
         self.reload_trajectory = reload_trajectory
         self.include_restart_duplicates = bool(include_restart_duplicates)
+        self.frame_timestep_fs = float(frame_timestep_fs)
+        self.use_inferred_frame_times = bool(use_inferred_frame_times)
 
     @Slot()
     def run(self) -> None:
@@ -109,6 +114,8 @@ class InspectionWorker(QObject):
                     include_restart_duplicates=(
                         self.include_restart_duplicates
                     ),
+                    frame_timestep_fs=self.frame_timestep_fs,
+                    use_inferred_frame_times=(self.use_inferred_frame_times),
                 )
                 summary = manager.inspect()
                 completed_steps += 1
@@ -482,9 +489,16 @@ class MDTrajectoryMainWindow(QMainWindow):
             previous_include_restart_duplicates = (
                 self.state.include_restart_duplicates
             )
+            previous_timestep = self.state.frame_timestep_fs
+            previous_manual_timestep = self.state.use_manual_frame_timestep
 
             if trajectory_file is None:
                 raise ValueError("No trajectory file selected.")
+
+            current_timestep = self.trajectory_panel.get_frame_timestep_fs()
+            current_manual_timestep = (
+                self.trajectory_panel.use_manual_frame_timestep()
+            )
 
             trajectory_changed = (
                 self.manager is None
@@ -492,6 +506,8 @@ class MDTrajectoryMainWindow(QMainWindow):
                 or topology_file != previous_topology
                 or self.export_panel.include_restart_duplicates()
                 != previous_include_restart_duplicates
+                or current_timestep != previous_timestep
+                or current_manual_timestep != previous_manual_timestep
             )
             energy_changed = energy_file != previous_energy
 
@@ -501,6 +517,8 @@ class MDTrajectoryMainWindow(QMainWindow):
             self.state.start = self.trajectory_panel.get_start()
             self.state.stop = self.trajectory_panel.get_stop()
             self.state.stride = self.trajectory_panel.get_stride()
+            self.state.frame_timestep_fs = current_timestep
+            self.state.use_manual_frame_timestep = current_manual_timestep
             self.state.include_restart_duplicates = (
                 self.export_panel.include_restart_duplicates()
             )
@@ -541,6 +559,10 @@ class MDTrajectoryMainWindow(QMainWindow):
                     include_restart_duplicates=(
                         self.state.include_restart_duplicates
                     ),
+                    frame_timestep_fs=self.state.frame_timestep_fs,
+                    use_inferred_frame_times=(
+                        self.state.use_manual_frame_timestep
+                    ),
                 )
                 return
 
@@ -567,6 +589,10 @@ class MDTrajectoryMainWindow(QMainWindow):
                     reload_trajectory=False,
                     include_restart_duplicates=(
                         self.state.include_restart_duplicates
+                    ),
+                    frame_timestep_fs=self.state.frame_timestep_fs,
+                    use_inferred_frame_times=(
+                        self.state.use_manual_frame_timestep
                     ),
                 )
                 return
@@ -663,6 +689,12 @@ class MDTrajectoryMainWindow(QMainWindow):
         self.state.start = self.trajectory_panel.get_start()
         self.state.stop = self.trajectory_panel.get_stop()
         self.state.stride = self.trajectory_panel.get_stride()
+        self.state.frame_timestep_fs = (
+            self.trajectory_panel.get_frame_timestep_fs()
+        )
+        self.state.use_manual_frame_timestep = (
+            self.trajectory_panel.use_manual_frame_timestep()
+        )
         self.state.use_cutoff_for_export = self.export_panel.use_cutoff()
         self.state.use_post_cutoff_stride = (
             self.export_panel.use_post_cutoff_stride()
@@ -744,6 +776,8 @@ class MDTrajectoryMainWindow(QMainWindow):
         summary: dict[str, object] | None = None,
         reload_trajectory: bool = True,
         include_restart_duplicates: bool = False,
+        frame_timestep_fs: float = DEFAULT_FRAME_TIMESTEP_FS,
+        use_inferred_frame_times: bool = False,
     ) -> None:
         self._set_operation_busy(True, "Inspecting trajectory...")
         self.export_panel.set_busy_progress("Inspection progress: starting...")
@@ -757,6 +791,8 @@ class MDTrajectoryMainWindow(QMainWindow):
             summary=summary,
             reload_trajectory=reload_trajectory,
             include_restart_duplicates=include_restart_duplicates,
+            frame_timestep_fs=frame_timestep_fs,
+            use_inferred_frame_times=use_inferred_frame_times,
         )
         self._inspect_worker.moveToThread(self._inspect_thread)
         self._inspect_thread.started.connect(self._inspect_worker.run)
@@ -840,6 +876,14 @@ class MDTrajectoryMainWindow(QMainWindow):
     def _handle_inspection_metadata(self, result: InspectionResult) -> None:
         self.manager = result.manager
         self._last_summary = result.summary
+        detected_timestep = result.summary.get("detected_frame_timestep_fs")
+        if detected_timestep is not None and not (
+            self.state.use_manual_frame_timestep
+        ):
+            self.trajectory_panel.set_frame_timestep_fs(
+                float(detected_timestep)
+            )
+            self.state.frame_timestep_fs = float(detected_timestep)
         self.trajectory_panel.set_summary(result.summary)
         n_frames = result.summary.get("n_frames", "unknown")
         file_type = result.summary.get("file_type", "unknown")
@@ -932,15 +976,20 @@ class MDTrajectoryMainWindow(QMainWindow):
             f"Frames written: {len(result.written_files)}",
             f"Start: {self.state.start}",
             f"Stop: {self.state.stop}",
-            f"Stride: {self.state.stride}",
+            f"Frame interval: {self.state.stride}",
+            "Frame timestep: "
+            f"{self.state.frame_timestep_fs:.6g} fs "
+            f"({'manual' if self.state.use_manual_frame_timestep else 'auto'})",
             "Restart duplicate frames: "
             f"{'included' if self.state.include_restart_duplicates else 'skipped'}",
         ]
         if result.applied_cutoff_fs is not None:
             lines.append(f"Applied cutoff: {result.applied_cutoff_fs:.3f} fs")
+            post_cutoff_interval = self._resolved_post_cutoff_stride(
+                min_time_fs=result.applied_cutoff_fs
+            )
             lines.append(
-                "Post-cutoff frame interval: "
-                f"{self._resolved_post_cutoff_stride(min_time_fs=result.applied_cutoff_fs)}"
+                "Post-cutoff frame interval: " f"{post_cutoff_interval}"
             )
         else:
             lines.append("Applied cutoff: None")
@@ -1010,8 +1059,11 @@ class MDTrajectoryMainWindow(QMainWindow):
                 f"Frames selected: {preview.selected_frames}",
                 f"Start: {preview.start}",
                 f"Stop: {preview.stop}",
-                f"Stride: {preview.stride}",
+                f"Frame interval: {preview.stride}",
                 f"Time-tagged frames: {preview.time_metadata_frames}",
+                "Frame timestep: "
+                f"{self.state.frame_timestep_fs:.6g} fs "
+                f"({'manual' if self.state.use_manual_frame_timestep else 'auto'})",
                 "Restart duplicate frames: "
                 f"{'included' if self.state.include_restart_duplicates else 'skipped'}",
             ]
@@ -1047,6 +1099,12 @@ class MDTrajectoryMainWindow(QMainWindow):
         )
         if callable(setter):
             setter(self.state.include_restart_duplicates)
+        timestep_setter = getattr(self.manager, "set_frame_timestep", None)
+        if callable(timestep_setter):
+            timestep_setter(
+                self.state.frame_timestep_fs,
+                use_inferred_frame_times=self.state.use_manual_frame_timestep,
+            )
 
     def _update_suggested_output_dir(
         self,

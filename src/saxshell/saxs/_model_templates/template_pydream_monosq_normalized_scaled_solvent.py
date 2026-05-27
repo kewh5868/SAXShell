@@ -50,7 +50,7 @@ def calc_monodisperse_sq(r, vol_frac, q_values):
 
 
 def _bounded_solvent_weight(value):
-    return float(np.clip(float(value), 0.0, 1.0))
+    return float(value)
 
 
 def structure_factor_profile(q, solvent_data, model_data, **params):

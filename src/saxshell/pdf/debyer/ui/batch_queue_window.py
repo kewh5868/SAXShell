@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QSizePolicy,
     QSpinBox,
@@ -1505,9 +1506,53 @@ class DebyerPDFBatchQueueWindow(QMainWindow):
         )
         if not selected_dirs:
             return
-        for project_dir in selected_dirs:
-            item = _queue_item_from_project_defaults(project_dir)
-            self.add_queue_item(item, auto_inspect=item.frames_dir is not None)
+        progress_dialog = self._project_load_progress_dialog(
+            len(selected_dirs)
+        )
+        try:
+            for index, project_dir in enumerate(selected_dirs, start=1):
+                if progress_dialog is not None:
+                    progress_dialog.setLabelText(
+                        "Loading PDF project "
+                        f"{index}/{len(selected_dirs)}:\n{project_dir}"
+                    )
+                    progress_dialog.setValue(index - 1)
+                    QApplication.processEvents()
+                item = _queue_item_from_project_defaults(project_dir)
+                # Saved projects can reference very large frame folders; keep
+                # project loading fast and rely on saved or manual settings.
+                widget = self.add_queue_item(item)
+                widget.set_status("Project loaded")
+                if progress_dialog is not None:
+                    progress_dialog.setValue(index)
+                    QApplication.processEvents()
+        finally:
+            if progress_dialog is not None:
+                progress_dialog.setValue(len(selected_dirs))
+                progress_dialog.close()
+
+    def _project_load_progress_dialog(
+        self,
+        project_count: int,
+    ) -> QProgressDialog | None:
+        if project_count <= 1:
+            return None
+        dialog = QProgressDialog(
+            "Loading selected PDF projects...",
+            None,
+            0,
+            project_count,
+            self,
+        )
+        dialog.setWindowTitle("Loading PDF Projects")
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setValue(0)
+        dialog.show()
+        QApplication.processEvents()
+        return dialog
 
     def _choose_frames_to_add(self) -> None:
         selected_dirs = _choose_existing_directories(

@@ -91,7 +91,7 @@ All three calculators share the same composition inputs:
 - solution density
 - solute and solvent stoichiometries
 - component molar masses
-- component densities when the selected input mode requires them
+- component densities for physical volume-fraction estimates and diagnostics
 - beam energy
 - capillary size and geometry
 - beam footprint and beam profile
@@ -114,6 +114,10 @@ In practical terms, SAXSShell combines:
 - linear attenuation coefficients derived from empirical formulas
 - edge-resolved fluorescence yields and line families from `xraydb`
 - beam-path averages defined by the selected capillary geometry
+- molarity and volume-percent conventions matching
+  [OpenStax Chemistry 2e](https://openstax.org/books/chemistry-2e/pages/3-3-molarity)
+  and
+  [Chemistry LibreTexts](<https://chem.libretexts.org/Bookshelves/Introductory_Chemistry/Chemistry_for_Allied_Health_(Soult)/08%3A_Properties_of_Solutions/8.01%3A_Concentrations_of_Solutions>)
 
 ### Physical solute-associated volume fraction
 
@@ -137,6 +141,42 @@ $$
 This is closer to the concentration-plus-specific-volume logic commonly used in
 solution SAXS than the older additive-volume estimate
 $V_{\mathrm{solute}} / (V_{\mathrm{solute}} + V_{\mathrm{solvent}})$.
+
+For `molarity_per_liter` inputs, SAXSShell uses a one-liter final-solution
+basis: molarity defines moles of solute per liter of solution, not per liter of
+neat solvent. If a solute density is available, it is the primary
+volume-fraction route:
+
+$$
+V_{\mathrm{solute}} =
+\frac{n_{\mathrm{solute}} M_{\mathrm{solute}}}
+{\rho_{\mathrm{solute}}},
+\qquad
+\phi_{\mathrm{phys}} =
+\frac{V_{\mathrm{solute}}}{1000\ \mathrm{cm^3}}.
+$$
+
+For the built-in `PbI2 - DMF - 0.49 M` preset, this gives
+\(m*{\mathrm{PbI_2}} = 0.49 \times 461.01 = 225.8949\ \mathrm{g}\).
+Using \(\rho*{\mathrm{PbI*2}} = 6.16\ \mathrm{g/mL}\) gives
+\(V*{\mathrm{PbI*2}} = 36.671\ \mathrm{cm^3}\) and
+\(\phi*{\mathrm{phys}} = 0.036671\) (3.6671%).
+
+The solvent density is still useful as a consistency diagnostic. With the same
+preset, \(\rho*{\mathrm{solution}} = 1.144\ \mathrm{g/mL}\) and
+\(\rho*{\mathrm{DMF}} = 0.944\ \mathrm{g/mL}\) imply a neat-solvent diagnostic
+volume of \(918.1051 / 0.944 = 972.569\ \mathrm{cm^3}\), and an additive
+component volume ratio of 1.009240. If no solute density is supplied,
+SAXSShell can fall back to solvent-density closure
+\(V*{\mathrm{solute}} = V*{\mathrm{solution}} - V\_{\mathrm{solvent}}\), which
+would give 0.027431 for this preset. That fallback is intentionally reported as
+a different method because solution volumes are not generally additive.
+
+The regression tests also include an independent volume-percent example from
+Chemistry LibreTexts: 40 mL ethanol in 240 mL final solution is 16.7% v/v.
+Converting that known composition to a molarity/density input recovers
+\(\phi = 40 / 240\), which guards the calculator against confusing final
+solution volume with solvent volume.
 
 SAXSShell still prints this physical estimate in the output console for
 reference. It is written to a Prefit parameter only when the active template
@@ -269,6 +309,12 @@ that weighted solvent trace inside the global scale. It also declares `vol_frac`
 as a calculator target, so Prefit writes the physical solute-associated volume
 fraction into `vol_frac` while keeping `solv_w` as the solvent-background
 multiplier.
+
+Prefit preserves user-edited bounds for `solv_w` and `solvent_scale` when
+resetting states and when handing a project to DREAM batch processing. The
+preloaded templates still start with conservative solvent-weight defaults, but
+they do not force the solvent multiplier back into `[0, 1]` after you expand
+the range.
 
 That scaled-solvent MonoSQ template also asks Prefit to autoscale on load. If
 experimental data are present and the project does not already have a saved Best

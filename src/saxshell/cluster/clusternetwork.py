@@ -449,16 +449,11 @@ def _move_cluster_files_to_stoichiometry_dirs(
 
     for cluster in clusters:
         temp_path = frame_dir / f"{frame_label}_{cluster.cluster_id}{suffix}"
-        stoich_label = stoichiometry_label(cluster.stoichiometry)
-        if stoichiometry_dir_cache is None:
-            stoich_dir = output_dir / stoich_label
-            stoich_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            stoich_dir = stoichiometry_dir_cache.get(stoich_label)
-            if stoich_dir is None:
-                stoich_dir = output_dir / stoich_label
-                stoich_dir.mkdir(parents=True, exist_ok=True)
-                stoichiometry_dir_cache[stoich_label] = stoich_dir
+        stoich_dir = _stoichiometry_output_dir(
+            output_dir,
+            cluster,
+            stoichiometry_dir_cache=stoichiometry_dir_cache,
+        )
         final_path = stoich_dir / temp_path.name
         if temp_path.exists():
             temp_path.replace(final_path)
@@ -471,6 +466,252 @@ def _move_cluster_files_to_stoichiometry_dirs(
         frame_dir.rmdir()
 
     return moved_files
+
+
+def _stoichiometry_output_dir(
+    output_dir: Path,
+    cluster: "ClusterRecord",
+    *,
+    stoichiometry_dir_cache: dict[str, Path] | None = None,
+) -> Path:
+    """Return the output directory for one cluster stoichiometry."""
+    stoich_label = stoichiometry_label(cluster.stoichiometry)
+    if stoichiometry_dir_cache is not None:
+        cached_dir = stoichiometry_dir_cache.get(stoich_label)
+        if cached_dir is not None:
+            return cached_dir
+
+    stoich_dir = output_dir / stoich_label
+    stoich_dir.mkdir(parents=True, exist_ok=True)
+    if stoichiometry_dir_cache is not None:
+        stoichiometry_dir_cache[stoich_label] = stoich_dir
+    return stoich_dir
+
+
+def _cluster_record_output_path(
+    output_dir: Path,
+    frame_label: str,
+    cluster: "ClusterRecord",
+    suffix: str,
+    *,
+    stoichiometry_dir_cache: dict[str, Path] | None = None,
+) -> Path:
+    stoich_dir = _stoichiometry_output_dir(
+        output_dir,
+        cluster,
+        stoichiometry_dir_cache=stoichiometry_dir_cache,
+    )
+    return stoich_dir / f"{frame_label}_{cluster.cluster_id}{suffix}"
+
+
+def _virtual_position_array(
+    cluster: "ClusterRecord",
+    atom_id: int,
+) -> np.ndarray | None:
+    position = cluster.virtual_positions.get(int(atom_id))
+    if position is None:
+        return None
+    return np.asarray(position, dtype=float)
+
+
+def _pdb_cluster_atoms_from_record(
+    pdb_structure: PDBStructure,
+    cluster: "ClusterRecord",
+    *,
+    include_shell_levels: Sequence[int],
+    use_pbc: bool,
+    box_dimensions: Sequence[float] | np.ndarray | None,
+) -> list[PDBAtom]:
+    shell_levels = cluster.shell_levels
+    core_ids = {
+        atom_id
+        for atom_id in cluster.atom_ids
+        if shell_levels.get(atom_id) == 0
+    }
+    shell_ids = {
+        atom_id
+        for atom_id in cluster.shell_atom_ids
+        if shell_levels.get(atom_id) in include_shell_levels
+    }
+
+    original_ids = set(core_ids)
+    if any(level > 0 for level in include_shell_levels):
+        original_ids |= shell_ids
+    if not original_ids:
+        return []
+
+    atom_by_id = {atom.atom_id: atom for atom in pdb_structure.atoms}
+    shell_residues = {
+        (atom_by_id[atom_id].residue_number, atom_by_id[atom_id].residue_name)
+        for atom_id in shell_ids
+        if atom_id in atom_by_id
+    }
+    complete_ids = set(original_ids)
+    for atom in pdb_structure.atoms:
+        residue_info = (atom.residue_number, atom.residue_name)
+        if residue_info in shell_residues:
+            complete_ids.add(atom.atom_id)
+
+    final_atoms: list[PDBAtom] = []
+    for atom_id in sorted(complete_ids):
+        atom = atom_by_id.get(atom_id)
+        if atom is None:
+            continue
+        copied_atom = atom.copy()
+        virtual_position = _virtual_position_array(cluster, atom_id)
+        if virtual_position is not None:
+            copied_atom.coordinates = virtual_position.copy()
+        final_atoms.append(copied_atom)
+
+    if not use_pbc or box_dimensions is None:
+        return final_atoms
+
+    box = np.asarray(box_dimensions, dtype=float)
+    if box.shape != (3,) or not np.any(box > 0.0):
+        return final_atoms
+
+    positive_axes = box > 0.0
+    wrapped_atoms: dict[int, dict[str, object]] = {}
+    for atom_id in complete_ids:
+        atom = atom_by_id.get(atom_id)
+        if atom is None:
+            continue
+        virtual_position = _virtual_position_array(cluster, atom_id)
+        if virtual_position is None:
+            continue
+        shift = np.zeros(3, dtype=int)
+        shift[positive_axes] = np.round(
+            (virtual_position[positive_axes] - atom.coordinates[positive_axes])
+            / box[positive_axes]
+        ).astype(int)
+        if np.any(shift):
+            wrapped_atoms[atom_id] = {
+                "shift": shift,
+                "residue": atom.residue_number,
+            }
+
+    residue_shifts: dict[int, list[np.ndarray]] = {}
+    for info in wrapped_atoms.values():
+        residue = int(info["residue"])
+        residue_shifts.setdefault(residue, []).append(
+            np.asarray(info["shift"], dtype=int)
+        )
+
+    majority_shifts: dict[int, np.ndarray] = {}
+    for residue, shifts in residue_shifts.items():
+        majority_shift, _ = Counter(
+            tuple(int(value) for value in shift) for shift in shifts
+        ).most_common(1)[0]
+        majority_shifts[residue] = np.array(majority_shift, dtype=int)
+
+    for atom in final_atoms:
+        shift = majority_shifts.get(atom.residue_number)
+        if shift is None or not np.any(shift):
+            continue
+        if atom.atom_id in wrapped_atoms:
+            continue
+        atom.coordinates = atom.coordinates + shift * box
+
+    return final_atoms
+
+
+def _write_pdb_cluster_record_files_to_stoichiometry_dirs(
+    pdb_structure: PDBStructure,
+    output_dir: Path,
+    frame_label: str,
+    clusters: Sequence["ClusterRecord"],
+    *,
+    include_shell_levels: Sequence[int],
+    use_pbc: bool,
+    box_dimensions: Sequence[float] | np.ndarray | None,
+    stoichiometry_dir_cache: dict[str, Path] | None = None,
+) -> list[Path]:
+    written_files: list[Path] = []
+    for cluster in clusters:
+        atoms = _pdb_cluster_atoms_from_record(
+            pdb_structure,
+            cluster,
+            include_shell_levels=include_shell_levels,
+            use_pbc=use_pbc,
+            box_dimensions=box_dimensions,
+        )
+        if not atoms:
+            continue
+        output_path = _cluster_record_output_path(
+            output_dir,
+            frame_label,
+            cluster,
+            ".pdb",
+            stoichiometry_dir_cache=stoichiometry_dir_cache,
+        )
+        pdb_structure.write_pdb_file(output_path, atoms)
+        written_files.append(output_path)
+    return written_files
+
+
+def _xyz_cluster_atoms_from_record(
+    xyz_structure: "XYZStructure",
+    cluster: "ClusterRecord",
+    *,
+    include_shell_levels: Sequence[int],
+) -> list["XYZAtom"]:
+    atom_ids = {
+        atom_id
+        for atom_id in cluster.atom_ids
+        if cluster.shell_levels.get(atom_id) in include_shell_levels
+    }
+    if not atom_ids:
+        return []
+
+    atom_by_id = {atom.atom_id: atom for atom in xyz_structure.atoms}
+    final_atoms: list[XYZAtom] = []
+    for atom_id in sorted(atom_ids):
+        atom = atom_by_id.get(atom_id)
+        if atom is None:
+            continue
+        copied_atom = atom.copy()
+        virtual_position = _virtual_position_array(cluster, atom_id)
+        if virtual_position is not None:
+            copied_atom.coordinates = virtual_position.copy()
+        final_atoms.append(copied_atom)
+    return final_atoms
+
+
+def _write_xyz_cluster_record_files_to_stoichiometry_dirs(
+    xyz_structure: "XYZStructure",
+    output_dir: Path,
+    frame_label: str,
+    clusters: Sequence["ClusterRecord"],
+    *,
+    include_shell_levels: Sequence[int],
+    stoichiometry_dir_cache: dict[str, Path] | None = None,
+) -> list[Path]:
+    written_files: list[Path] = []
+    for cluster in clusters:
+        atoms = _xyz_cluster_atoms_from_record(
+            xyz_structure,
+            cluster,
+            include_shell_levels=include_shell_levels,
+        )
+        if not atoms:
+            continue
+        output_path = _cluster_record_output_path(
+            output_dir,
+            frame_label,
+            cluster,
+            ".xyz",
+            stoichiometry_dir_cache=stoichiometry_dir_cache,
+        )
+        xyz_structure.write_xyz_file(
+            output_path,
+            atoms,
+            comment=(
+                f"frame={frame_label} cluster={cluster.cluster_id} "
+                "generated by SAXSShell cluster analysis"
+            ),
+        )
+        written_files.append(output_path)
+    return written_files
 
 
 @dataclass(slots=True)
@@ -486,6 +727,9 @@ class ClusterRecord:
     stoichiometry: dict[str, int]
     shell_levels: dict[int, int | str | None]
     detected_shell_atom_ids: tuple[int, ...] = ()
+    virtual_positions: dict[int, tuple[float, float, float]] = field(
+        default_factory=dict
+    )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -498,6 +742,10 @@ class ClusterRecord:
             "detected_shell_atom_ids": list(self.detected_shell_atom_ids),
             "stoichiometry": dict(self.stoichiometry),
             "shell_levels": dict(self.shell_levels),
+            "virtual_positions": {
+                str(atom_id): [float(value) for value in position]
+                for atom_id, position in self.virtual_positions.items()
+            },
         }
 
     @classmethod
@@ -509,6 +757,12 @@ class ClusterRecord:
         shell_levels = {
             int(atom_id): value
             for atom_id, value in dict(payload.get("shell_levels", {})).items()
+        }
+        virtual_positions = {
+            int(atom_id): tuple(float(component) for component in position)
+            for atom_id, position in dict(
+                payload.get("virtual_positions", {})
+            ).items()
         }
         return cls(
             cluster_id=str(payload["cluster_id"]),
@@ -541,6 +795,7 @@ class ClusterRecord:
                 ).items()
             },
             shell_levels=shell_levels,
+            virtual_positions=virtual_positions,
         )
 
 
@@ -636,6 +891,11 @@ def _update_cluster_record_shell_union(
     for atom_id in cluster.shell_atom_ids:
         updated_shell_levels[atom_id] = int(shell_levels[atom_id])
     cluster.shell_levels = updated_shell_levels
+    cluster.virtual_positions = {
+        atom_id: position
+        for atom_id, position in cluster.virtual_positions.items()
+        if atom_id in cluster.atom_ids
+    }
     stoichiometry_atom_ids = list(cluster.solute_atom_ids)
     if include_shell_atoms_in_stoichiometry:
         stoichiometry_atom_ids.extend(cluster.shell_atom_ids)
@@ -1449,6 +1709,7 @@ class ClusterNetwork:
             ]
             | None
         ) = None,
+        include_virtual_positions: bool = False,
     ) -> list[ClusterRecord]:
         """Find cluster networks for the current structure."""
         self._reset_state()
@@ -1542,7 +1803,9 @@ class ClusterNetwork:
                     shared_shells=shared_shells,
                 )
 
-        return self.cluster_records()
+        return self.cluster_records(
+            include_virtual_positions=include_virtual_positions
+        )
 
     def gather_complete_molecules_for_cluster(
         self,
@@ -1692,7 +1955,11 @@ class ClusterNetwork:
 
         return written_files
 
-    def cluster_records(self) -> list[ClusterRecord]:
+    def cluster_records(
+        self,
+        *,
+        include_virtual_positions: bool = False,
+    ) -> list[ClusterRecord]:
         """Return cluster summary records for the current structure."""
         records: list[ClusterRecord] = []
         for cluster, cluster_id in zip(self.clusters, self.cluster_labels):
@@ -1738,6 +2005,16 @@ class ClusterNetwork:
             shell_level_map = {
                 atom_id: self.shell_levels.get(atom_id) for atom_id in atom_ids
             }
+            virtual_positions = {}
+            if include_virtual_positions:
+                virtual_positions = {
+                    atom_id: tuple(
+                        float(component)
+                        for component in self.atom_virtual_positions[atom_id]
+                    )
+                    for atom_id in atom_ids
+                    if atom_id in self.atom_virtual_positions
+                }
             records.append(
                 ClusterRecord(
                     cluster_id=cluster_id,
@@ -1749,9 +2026,36 @@ class ClusterNetwork:
                     stoichiometry=stoichiometry,
                     shell_levels=shell_level_map,
                     detected_shell_atom_ids=detected_shell_atom_ids,
+                    virtual_positions=virtual_positions,
                 )
             )
         return records
+
+    def write_cluster_pdb_files_to_stoichiometry_dirs(
+        self,
+        output_dir: str | Path,
+        *,
+        frame_label: str | None = None,
+        include_shell_levels: Sequence[int] = (0, 1, 2),
+        stoichiometry_dir_cache: dict[str, Path] | None = None,
+    ) -> list[Path]:
+        """Write per-cluster PDB files directly into stoichiometry
+        folders."""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        source_label = (
+            frame_label or self.pdb_structure.source_name or "cluster_frame"
+        )
+        return _write_pdb_cluster_record_files_to_stoichiometry_dirs(
+            self.pdb_structure,
+            output_dir,
+            source_label,
+            self.cluster_records(include_virtual_positions=True),
+            include_shell_levels=include_shell_levels,
+            use_pbc=self.use_pbc,
+            box_dimensions=self.box,
+            stoichiometry_dir_cache=stoichiometry_dir_cache,
+        )
 
 
 class XYZClusterNetwork:
@@ -2141,6 +2445,7 @@ class XYZClusterNetwork:
         *,
         shell_levels: Sequence[int] = (1, 2),
         shared_shells: bool = False,
+        include_virtual_positions: bool = False,
     ) -> list[ClusterRecord]:
         """Find cluster networks for the current structure."""
         self._reset_state()
@@ -2172,7 +2477,9 @@ class XYZClusterNetwork:
                     shared_shells=shared_shells,
                 )
 
-        return self.cluster_records()
+        return self.cluster_records(
+            include_virtual_positions=include_virtual_positions
+        )
 
     def build_cluster_atoms(
         self,
@@ -2239,7 +2546,11 @@ class XYZClusterNetwork:
 
         return written_files
 
-    def cluster_records(self) -> list[ClusterRecord]:
+    def cluster_records(
+        self,
+        *,
+        include_virtual_positions: bool = False,
+    ) -> list[ClusterRecord]:
         """Return cluster summary records for the current structure."""
         records: list[ClusterRecord] = []
         for cluster, cluster_id in zip(self.clusters, self.cluster_labels):
@@ -2274,6 +2585,16 @@ class XYZClusterNetwork:
             shell_level_map = {
                 atom_id: self.shell_levels.get(atom_id) for atom_id in atom_ids
             }
+            virtual_positions = {}
+            if include_virtual_positions:
+                virtual_positions = {
+                    atom_id: tuple(
+                        float(component)
+                        for component in self.atom_virtual_positions[atom_id]
+                    )
+                    for atom_id in atom_ids
+                    if atom_id in self.atom_virtual_positions
+                }
             records.append(
                 ClusterRecord(
                     cluster_id=cluster_id,
@@ -2284,9 +2605,34 @@ class XYZClusterNetwork:
                     shell_atom_ids=shell_atom_ids,
                     stoichiometry=stoichiometry,
                     shell_levels=shell_level_map,
+                    virtual_positions=virtual_positions,
                 )
             )
         return records
+
+    def write_cluster_xyz_files_to_stoichiometry_dirs(
+        self,
+        output_dir: str | Path,
+        *,
+        frame_label: str | None = None,
+        include_shell_levels: Sequence[int] = (0, 1, 2),
+        stoichiometry_dir_cache: dict[str, Path] | None = None,
+    ) -> list[Path]:
+        """Write per-cluster XYZ files directly into stoichiometry
+        folders."""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        source_label = (
+            frame_label or self.xyz_structure.source_name or "cluster_frame"
+        )
+        return _write_xyz_cluster_record_files_to_stoichiometry_dirs(
+            self.xyz_structure,
+            output_dir,
+            source_label,
+            self.cluster_records(include_virtual_positions=True),
+            include_shell_levels=include_shell_levels,
+            stoichiometry_dir_cache=stoichiometry_dir_cache,
+        )
 
 
 class TrajectoryClusterAnalyzer:
@@ -2416,7 +2762,6 @@ class TrajectoryClusterAnalyzer:
         written_files: list[Path] = []
         frame_results: list[FrameClusterResult] = []
         total_frames = len(frames)
-        pending_sort_jobs: list[tuple[Path, str, list[ClusterRecord]]] = []
         stoichiometry_dir_cache: dict[str, Path] = {}
 
         for processed_count, frame in enumerate(frames, start=1):
@@ -2449,27 +2794,16 @@ class TrajectoryClusterAnalyzer:
                 )
             )
             frame_label = f"frame_{frame.frame_index:04d}"
-            frame_dir = output_dir / f"frame_{frame.frame_index:04d}"
-            network.write_cluster_pdb_files(
-                frame_dir,
-                frame_label=frame_label,
-                include_shell_levels=include_shell_levels,
-            )
-            pending_sort_jobs.append((frame_dir, frame_label, clusters))
-            if progress_callback is not None:
-                progress_callback(processed_count, total_frames, frame_label)
-
-        for frame_dir, frame_label, clusters in pending_sort_jobs:
             written_files.extend(
-                _move_cluster_files_to_stoichiometry_dirs(
+                network.write_cluster_pdb_files_to_stoichiometry_dirs(
                     output_dir,
-                    frame_dir,
-                    frame_label,
-                    clusters,
-                    suffix=".pdb",
+                    frame_label=frame_label,
+                    include_shell_levels=include_shell_levels,
                     stoichiometry_dir_cache=stoichiometry_dir_cache,
                 )
             )
+            if progress_callback is not None:
+                progress_callback(processed_count, total_frames, frame_label)
 
         self.last_results = frame_results
         return TrajectoryClusterExport(
@@ -2529,12 +2863,11 @@ class ExtractedFrameFolderClusterAnalyzer:
         box_source: str | None = None
         box_source_kind: str | None = None
 
-        if frame_format == "xyz":
-            detected_source = detect_source_box_dimensions(self.frames_dir)
-            if detected_source is not None:
-                box_dimensions, source_path = detected_source
-                box_source = source_path.name
-                box_source_kind = "source_filename"
+        detected_source = detect_source_box_dimensions(self.frames_dir)
+        if detected_source is not None:
+            box_dimensions, source_path = detected_source
+            box_source = source_path.name
+            box_source_kind = "source_filename"
 
         if box_dimensions is None:
             box_dimensions = self._estimate_box_dimensions(
@@ -2735,18 +3068,23 @@ class ExtractedFrameFolderClusterAnalyzer:
                     clusters=clusters,
                 )
                 frame_label = frame_path.stem
-                frame_dir = output_dir / frame_path.stem
                 if frame_format == "pdb":
-                    temporary_files = network.write_cluster_pdb_files(
-                        frame_dir,
-                        frame_label=frame_label,
-                        include_shell_levels=include_shell_levels,
+                    temporary_files = (
+                        network.write_cluster_pdb_files_to_stoichiometry_dirs(
+                            output_dir,
+                            frame_label=frame_label,
+                            include_shell_levels=include_shell_levels,
+                            stoichiometry_dir_cache=stoichiometry_dir_cache,
+                        )
                     )
                 else:
-                    temporary_files = network.write_cluster_xyz_files(
-                        frame_dir,
-                        frame_label=frame_label,
-                        include_shell_levels=include_shell_levels,
+                    temporary_files = (
+                        network.write_cluster_xyz_files_to_stoichiometry_dirs(
+                            output_dir,
+                            frame_label=frame_label,
+                            include_shell_levels=include_shell_levels,
+                            stoichiometry_dir_cache=stoichiometry_dir_cache,
+                        )
                     )
                 frame_entries[frame_path.name] = {
                     "frame_name": frame_path.name,
@@ -3025,6 +3363,9 @@ class ExtractedFrameFolderClusterAnalyzer:
                         run.solute_atom_ids: dict(run.shell_levels)
                         for run in active_runs.values()
                     },
+                    include_virtual_positions=(
+                        self.use_pbc and self.box_dimensions is not None
+                    ),
                 )
                 frame_result = FrameClusterResult(
                     frame_index=frame_index,
@@ -3115,50 +3456,48 @@ class ExtractedFrameFolderClusterAnalyzer:
                 frame_result = FrameClusterResult.from_dict(
                     dict(entry["result"])
                 )
-                network = self._build_network(frame_path)
-                if not isinstance(network, ClusterNetwork):
-                    raise ValueError(
-                        "Smart Solvation Shell mode requires PDB frames."
+                if self._frame_result_has_virtual_positions(frame_result):
+                    moved_files = self._write_pdb_frame_result_files(
+                        output_dir,
+                        frame_path=frame_path,
+                        frame_label=frame_label,
+                        clusters=frame_result.clusters,
+                        include_shell_levels=include_shell_levels,
+                        stoichiometry_dir_cache=stoichiometry_dir_cache,
                     )
-                rerun_clusters = network.find_clusters(
-                    shell_levels=shell_levels,
-                    shared_shells=shared_shells,
-                    core_includes_shell_atoms=False,
-                    persistent_shells_by_solute_key={
-                        cluster.solute_atom_ids: {
-                            atom_id: shell_level
-                            for atom_id, shell_level in _cluster_shell_level_payload(
-                                cluster
-                            ).items()
-                            if atom_id
-                            not in set(cluster.detected_shell_atom_ids)
-                        }
-                        for cluster in frame_result.clusters
-                    },
-                    preferred_cluster_ids_by_solute_key={
-                        cluster.solute_atom_ids: cluster.cluster_id
-                        for cluster in frame_result.clusters
-                    },
-                )
-                self._validate_smart_shell_rerun(
-                    expected_clusters=frame_result.clusters,
-                    actual_clusters=rerun_clusters,
-                    frame_name=frame_path.name,
-                )
-                frame_dir = output_dir / frame_label
-                network.write_cluster_pdb_files(
-                    frame_dir,
-                    frame_label=frame_label,
-                    include_shell_levels=include_shell_levels,
-                )
-                moved_files = _move_cluster_files_to_stoichiometry_dirs(
-                    output_dir,
-                    frame_dir,
-                    frame_label,
-                    frame_result.clusters,
-                    suffix=".pdb",
-                    stoichiometry_dir_cache=stoichiometry_dir_cache,
-                )
+                else:
+                    network = self._build_network(frame_path)
+                    if not isinstance(network, ClusterNetwork):
+                        raise ValueError(
+                            "Smart Solvation Shell mode requires PDB frames."
+                        )
+                    rerun_clusters = network.find_clusters(
+                        shell_levels=shell_levels,
+                        shared_shells=shared_shells,
+                        core_includes_shell_atoms=False,
+                        persistent_shells_by_solute_key=(
+                            self._persistent_shells_for_smart_rerun(
+                                frame_result.clusters
+                            )
+                        ),
+                        preferred_cluster_ids_by_solute_key={
+                            cluster.solute_atom_ids: cluster.cluster_id
+                            for cluster in frame_result.clusters
+                        },
+                    )
+                    self._validate_smart_shell_rerun(
+                        expected_clusters=frame_result.clusters,
+                        actual_clusters=rerun_clusters,
+                        frame_name=frame_path.name,
+                    )
+                    moved_files = (
+                        network.write_cluster_pdb_files_to_stoichiometry_dirs(
+                            output_dir,
+                            frame_label=frame_label,
+                            include_shell_levels=include_shell_levels,
+                            stoichiometry_dir_cache=stoichiometry_dir_cache,
+                        )
+                    )
                 entry.update(
                     {
                         "frame_name": frame_path.name,
@@ -3315,6 +3654,64 @@ class ExtractedFrameFolderClusterAnalyzer:
                     "Smart Solvation Shell rerun changed the solvent shell "
                     f"membership for {frame_name} ({cluster_id})."
                 )
+
+    def _frame_result_has_virtual_positions(
+        self,
+        frame_result: FrameClusterResult,
+    ) -> bool:
+        """Return whether stored frame records can write final PDB
+        files."""
+        if not self.use_pbc or self.box_dimensions is None:
+            return True
+        return all(
+            not cluster.atom_ids or bool(cluster.virtual_positions)
+            for cluster in frame_result.clusters
+        )
+
+    @staticmethod
+    def _persistent_shells_for_smart_rerun(
+        clusters: Sequence[ClusterRecord],
+    ) -> dict[tuple[int, ...], dict[int, int]]:
+        persistent_shells_by_solute_key: dict[tuple[int, ...], dict[int, int]]
+        persistent_shells_by_solute_key = {}
+        for cluster in clusters:
+            detected_shell_atom_ids = set(cluster.detected_shell_atom_ids)
+            persistent_shells_by_solute_key[cluster.solute_atom_ids] = {
+                atom_id: shell_level
+                for atom_id, shell_level in _cluster_shell_level_payload(
+                    cluster
+                ).items()
+                if atom_id not in detected_shell_atom_ids
+            }
+        return persistent_shells_by_solute_key
+
+    def _write_pdb_frame_result_files(
+        self,
+        output_dir: Path,
+        *,
+        frame_path: Path,
+        frame_label: str,
+        clusters: Sequence[ClusterRecord],
+        include_shell_levels: Sequence[int],
+        stoichiometry_dir_cache: dict[str, Path],
+    ) -> list[Path]:
+        structure = self._load_structure(
+            "pdb",
+            frame_path,
+            atom_type_definitions=self.atom_type_definitions,
+        )
+        if not isinstance(structure, PDBStructure):
+            raise ValueError("Smart Solvation Shell mode requires PDB frames.")
+        return _write_pdb_cluster_record_files_to_stoichiometry_dirs(
+            structure,
+            output_dir,
+            frame_label,
+            clusters,
+            include_shell_levels=include_shell_levels,
+            use_pbc=self.use_pbc,
+            box_dimensions=self.box_dimensions,
+            stoichiometry_dir_cache=stoichiometry_dir_cache,
+        )
 
     def export_cluster_pdbs(
         self,

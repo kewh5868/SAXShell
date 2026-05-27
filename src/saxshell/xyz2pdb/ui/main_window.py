@@ -45,7 +45,10 @@ from saxshell.xyz2pdb.mapping_workflow import (
     reference_bond_tolerances,
 )
 from saxshell.xyz2pdb.ui.export_panel import XYZToPDBExportPanel
-from saxshell.xyz2pdb.ui.input_panel import XYZToPDBInputPanel
+from saxshell.xyz2pdb.ui.input_panel import (
+    XYZToPDBInputPanel,
+    xyz_input_convention_warning_message,
+)
 from saxshell.xyz2pdb.ui.mapping_panel import XYZToPDBMappingPanel
 from saxshell.xyz2pdb.ui.reference_panel import ReferenceLibraryPanel
 from saxshell.xyz2pdb.ui.reference_update_dialog import (
@@ -292,6 +295,15 @@ class XYZToPDBMainWindow(QMainWindow):
 
     def inspect_input(self) -> None:
         try:
+            input_warning = xyz_input_convention_warning_message(
+                self.input_panel.get_input_path()
+            )
+            if input_warning is not None:
+                QMessageBox.warning(
+                    self,
+                    "Check XYZ input",
+                    input_warning,
+                )
             workflow = self._build_mapping_workflow()
             analysis = workflow.analyze_input()
             self._last_analysis = analysis

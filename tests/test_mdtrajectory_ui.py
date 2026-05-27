@@ -9,7 +9,11 @@ from PySide6.QtWidgets import QApplication
 
 import saxshell.mdtrajectory.ui.batch_queue_window as md_batch_queue_module
 from saxshell.mdtrajectory.frame.cp2k_ener import CP2KEnergyData
-from saxshell.mdtrajectory.frame.manager import FrameSelectionPreview
+from saxshell.mdtrajectory.frame.manager import (
+    DEFAULT_FRAME_TIMESTEP_FS,
+    FrameSelectionPreview,
+    TrajectoryManager,
+)
 from saxshell.mdtrajectory.ui.batch_queue_window import (
     DEFAULT_TIME_CUTOFF_FS,
     MDTrajectoryBatchJob,
@@ -21,6 +25,7 @@ from saxshell.mdtrajectory.ui.cutoff_panel import CutoffPanel
 from saxshell.mdtrajectory.ui.export_panel import ExportPanel
 from saxshell.mdtrajectory.ui.main_window import (
     ExportResult,
+    InspectionResult,
     MDTrajectoryMainWindow,
 )
 from saxshell.saxs.project_manager import SAXSProjectManager
@@ -48,6 +53,28 @@ def _write_batch_xyz(path: Path) -> None:
         "Pb 0.2 0.0 0.0\n",
         encoding="utf-8",
     )
+
+
+def _write_uniform_timestep_xyz(
+    path: Path,
+    *,
+    timestep_fs: float,
+    n_frames: int = 4,
+) -> None:
+    lines: list[str] = []
+    for frame_index in range(n_frames):
+        lines.extend(
+            [
+                "1\n",
+                (
+                    "i = "
+                    f"{frame_index}, time = "
+                    f"{frame_index * timestep_fs:.3f}, E = -1.0\n"
+                ),
+                f"Pb {frame_index:.1f} 0.0 0.0\n",
+            ]
+        )
+    path.write_text("".join(lines), encoding="utf-8")
 
 
 def _write_batch_restart_overlap_xyz(path: Path) -> None:
@@ -553,7 +580,67 @@ def test_mdtrajectory_batch_queue_prefills_current_project_defaults(
     assert widget.energy_file_edit.text() == str(energy_file.resolve())
     assert widget.output_dir_edit.text() == ""
     assert widget.cutoff_spin.value() == pytest.approx(DEFAULT_TIME_CUTOFF_FS)
+    assert widget.timestep_spin.value() == pytest.approx(
+        DEFAULT_FRAME_TIMESTEP_FS
+    )
+    assert widget.auto_timestep_box.isChecked()
     assert not widget.include_restart_duplicates_box.isChecked()
+    window.close()
+
+
+def test_mdtrajectory_window_updates_timestep_field_after_inspection(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    trajectory_file = tmp_path / "traj.xyz"
+    _write_uniform_timestep_xyz(trajectory_file, timestep_fs=25.0)
+    window = MDTrajectoryMainWindow()
+    manager = TrajectoryManager(
+        input_file=trajectory_file,
+        frame_timestep_fs=DEFAULT_FRAME_TIMESTEP_FS,
+    )
+    summary = manager.inspect()
+    window.state.trajectory_file = trajectory_file
+
+    window._handle_inspection_metadata(
+        InspectionResult(
+            manager=manager,
+            summary=summary,
+            energy_data=None,
+        )
+    )
+
+    assert window.trajectory_panel.auto_timestep_box.isChecked()
+    assert window.trajectory_panel.timestep_spin.value() == pytest.approx(25.0)
+    window.close()
+
+
+def test_mdtrajectory_batch_preview_updates_timestep_field_from_metadata(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "project_timestep"
+    settings = manager.create_project(project_dir)
+    trajectory_file = project_dir / "traj.xyz"
+    energy_file = project_dir / "traj.ener"
+    _write_uniform_timestep_xyz(trajectory_file, timestep_fs=25.0)
+    _write_batch_energy(energy_file)
+    settings.trajectory_file = str(trajectory_file)
+    settings.energy_file = str(energy_file)
+    manager.save_project(settings)
+    window = MDTrajectoryBatchQueueWindow(initial_project_dir=project_dir)
+    widget = next(iter(window._widgets_by_id.values()))
+
+    widget.preview_selection()
+
+    assert widget.auto_timestep_box.isChecked()
+    assert widget.timestep_spin.value() == pytest.approx(25.0)
+    assert "Frame timestep: 25 fs (auto)" in (
+        widget.preview_summary_label.text()
+    )
     window.close()
 
 

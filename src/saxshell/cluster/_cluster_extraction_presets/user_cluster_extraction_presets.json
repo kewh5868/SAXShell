@@ -42,7 +42,7 @@
         "search_mode": "kdtree",
         "save_state_frequency": 1000,
         "shell_growth_levels": [],
-        "shared_shells": false,
+        "shared_shells": true,
         "include_shell_atoms_in_stoichiometry": false
       }
     },
@@ -268,6 +268,64 @@
           "atom2": "O",
           "shell_cutoffs": {
             "0": 3.45
+          }
+        }
+      ],
+      "options": {
+        "use_pbc": false,
+        "search_mode": "kdtree",
+        "save_state_frequency": 1000,
+        "shell_growth_levels": [],
+        "shared_shells": true,
+        "smart_solvation_shells": true,
+        "include_shell_atoms_in_stoichiometry": false
+      }
+    },
+    "CsPbI3-DMSO": {
+      "atom_type_definitions": {
+        "node": [
+          {
+            "element": "Pb",
+            "residue": "PBI"
+          }
+        ],
+        "linker": [
+          {
+            "element": "I",
+            "residue": "PBI"
+          },
+          {
+            "element": "Cs",
+            "residue": "CSI"
+          }
+        ],
+        "shell": [
+          {
+            "element": "O",
+            "residue": "DMS"
+          }
+        ]
+      },
+      "pair_cutoff_definitions": [
+        {
+          "atom1": "Cs",
+          "atom2": "Pb",
+          "shell_cutoffs": {
+            "0": 5.0
+          }
+        },
+        {
+          "atom1": "Pb",
+          "atom2": "I",
+          "shell_cutoffs": {
+            "0": 3.36
+          }
+        },
+        {
+          "atom1": "Pb",
+          "atom2": "O",
+          "shell_cutoffs": {
+            "0": 3.36
           }
         }
       ],

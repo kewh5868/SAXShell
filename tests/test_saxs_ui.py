@@ -8,6 +8,7 @@ import shutil
 import threading
 import time
 import warnings
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,8 +19,8 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.colors import to_hex
 from matplotlib.figure import Figure
-from PySide6.QtCore import QObject, QRect, Qt, Signal
-from PySide6.QtGui import QColor, QTextOption
+from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QTextOption, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QTextEdit,
     QWidget,
 )
 from scipy import stats
@@ -137,10 +139,17 @@ from saxshell.saxs.solution_scattering_estimator import (
     SolutionScatteringEstimatorSettings,
     calculate_solution_scattering_estimate,
 )
+from saxshell.saxs.stoichiometry import (
+    estimate_weighted_formal_charge,
+    formal_charge_for_stoich_label,
+)
 from saxshell.saxs.template_installation import install_template_candidate
 from saxshell.saxs.ui.distribution_window import (
+    GUIDE_INTERVAL_SIGMA,
     INTERACTIVE_PREVIEW_THROTTLE_MS,
+    LEGACY_MD_WEIGHT_SMART_PRIOR_MODE,
     DistributionSetupWindow,
+    distribution_guide_bounds,
 )
 from saxshell.saxs.ui.dream_tab import DreamTab
 from saxshell.saxs.ui.experimental_data_loader import (
@@ -151,8 +160,11 @@ from saxshell.saxs.ui.experimental_overlay_window import (
 )
 from saxshell.saxs.ui.main_window import (
     AUTO_SNAP_PANES_KEY,
+    DISTRIBUTION_LOAD_TOTAL_STEPS,
     PACKMOL_DOCKER_PRESETS_KEY,
+    PROJECT_DUPLICATE_TOTAL_STEPS,
     PROJECT_LOAD_TOTAL_STEPS,
+    PROJECT_SETTINGS_APPLY_TOTAL_STEPS,
     InstallModelDialog,
     RuntimeBundleOpener,
     SAXSMainWindow,
@@ -174,6 +186,9 @@ POLY_LMA_HS_MIX_TEMPLATE = "template_pydream_poly_lma_hs_mix_approx"
 SCALED_SOLVENT_MONOSQ_TEMPLATE = (
     "template_pydream_monosq_normalized_scaled_solvent"
 )
+CHARGED_MONOSQ_TEMPLATE = (
+    "template_pydream_charged_monosq_normalized_scaled_solvent"
+)
 
 
 def _table_column_index(table, label: str) -> int:
@@ -182,6 +197,22 @@ def _table_column_index(table, label: str) -> int:
         if header_item is not None and header_item.text() == label:
             return index
     raise AssertionError(f"Column {label!r} was not found.")
+
+
+def _make_wheel_event(widget) -> QWheelEvent:
+    center = widget.rect().center()
+    local_pos = QPointF(center)
+    global_pos = QPointF(widget.mapToGlobal(center))
+    return QWheelEvent(
+        local_pos,
+        global_pos,
+        QPoint(0, 0),
+        QPoint(0, 120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
 
 
 def _plot_lines_by_gid(axis, gid: str):
@@ -380,6 +411,90 @@ def _build_minimal_saxs_project(
         settings.frames_dir = str(frames_dir)
     if pdb_frames_dir is not None:
         settings.pdb_frames_dir = str(pdb_frames_dir)
+    manager.save_project(settings)
+    return project_dir, paths
+
+
+def _build_two_component_saxs_project(tmp_path):
+    manager = SAXSProjectManager()
+    project_dir = tmp_path / "two_component_saxs_project"
+    settings = manager.create_project(project_dir)
+    paths = build_project_paths(project_dir)
+
+    q_values = np.linspace(0.05, 0.3, 8)
+    pbi3_component = np.linspace(10.0, 17.0, 8)
+    pbi4_component = np.linspace(3.0, 10.0, 8)
+    template_name = "template_pd_likelihood_monosq_decoupled"
+    template_module = load_template_module(template_name)
+    experimental = template_module.lmfit_model_profile(
+        q_values,
+        np.zeros_like(q_values),
+        [pbi3_component, pbi4_component],
+        w0=0.4,
+        w1=0.6,
+        solv_w=0.0,
+        offset=0.05,
+        eff_r=9.0,
+        vol_frac=0.0,
+        scale=5e-4,
+    )
+    experimental_path = paths.experimental_data_dir / "exp_demo.txt"
+    np.savetxt(experimental_path, np.column_stack([q_values, experimental]))
+    _write_component_file(
+        paths.scattering_components_dir / "PbI3_no_motif.txt",
+        q_values,
+        pbi3_component,
+    )
+    _write_component_file(
+        paths.scattering_components_dir / "PbI4_no_motif.txt",
+        q_values,
+        pbi4_component,
+    )
+    (paths.project_dir / "md_prior_weights.json").write_text(
+        json.dumps(
+            {
+                "origin": "clusters",
+                "total_files": 2,
+                "structures": {
+                    "PbI3": {
+                        "no_motif": {
+                            "count": 1,
+                            "weight": 0.4,
+                            "representative": "frame_0001.xyz",
+                            "profile_file": "PbI3_no_motif.txt",
+                        }
+                    },
+                    "PbI4": {
+                        "no_motif": {
+                            "count": 1,
+                            "weight": 0.6,
+                            "representative": "frame_0002.xyz",
+                            "profile_file": "PbI4_no_motif.txt",
+                        }
+                    },
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (paths.project_dir / "md_saxs_map.json").write_text(
+        json.dumps(
+            {
+                "saxs_map": {
+                    "PbI3": {"no_motif": "PbI3_no_motif.txt"},
+                    "PbI4": {"no_motif": "PbI4_no_motif.txt"},
+                }
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    settings.experimental_data_path = str(experimental_path)
+    settings.copied_experimental_data_file = str(experimental_path)
+    settings.selected_model_template = template_name
     manager.save_project(settings)
     return project_dir, paths
 
@@ -686,8 +801,7 @@ def _write_minimal_dream_results(
         chain_samples = []
         chain_logps = []
         for step_index in range(4):
-            adjustment = (chain_index + 1) * (step_index + 1) * 0.01
-            chain_samples.append(active_values + adjustment)
+            chain_samples.append(active_values.copy())
             chain_logps.append(-5.0 + chain_index + step_index * 0.5)
         sampled_params.append(chain_samples)
         log_ps.append(chain_logps)
@@ -833,8 +947,8 @@ def _write_stoichiometry_filter_dream_results(tmp_path):
                 "param": "w1",
                 "value": 0.0,
                 "vary": True,
-                "distribution": "lognorm",
-                "dist_params": {"loc": 0.0, "scale": 1.0, "s": 0.1},
+                "distribution": "uniform",
+                "dist_params": {"loc": 0.0, "scale": 1.0},
             },
             {
                 "structure": "",
@@ -865,8 +979,8 @@ def _write_stoichiometry_filter_dream_results(tmp_path):
                 "param": "w1",
                 "value": 0.0,
                 "vary": True,
-                "distribution": "lognorm",
-                "dist_params": {"loc": 0.0, "scale": 1.0, "s": 0.1},
+                "distribution": "uniform",
+                "dist_params": {"loc": 0.0, "scale": 1.0},
             },
         ],
         "active_parameter_indices": [0, 1],
@@ -1454,7 +1568,7 @@ def test_prefit_solute_volume_fraction_estimator_is_template_aware_and_applies(
         in widget.output_box.toPlainText()
     )
     assert (
-        "Estimated solvent volume: 9.000 cm^3"
+        "Neat-solvent diagnostic volume: 9.000 cm^3"
         in widget.output_box.toPlainText()
     )
     assert (
@@ -1473,6 +1587,88 @@ def test_prefit_solute_volume_fraction_estimator_is_template_aware_and_applies(
 
     base_window.close()
     poly_window.close()
+
+
+def test_prefit_charged_template_applies_solution_concentration_target(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.selected_model_template = CHARGED_MONOSQ_TEMPLATE
+    manager.save_project(settings)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    status_text = window.prefit_tab.solute_volume_fraction_status_label.text()
+    assert "concentration_salt" in status_text
+
+    window.prefit_tab.solute_volume_fraction_collapse_button.click()
+    widget = window.prefit_tab.solute_volume_fraction_widget
+    assert "concentration_salt" in widget.target_label.text()
+    molarity_index = widget.solution_mode_combo.findData("molarity_per_liter")
+    assert molarity_index >= 0
+    widget.solution_mode_combo.setCurrentIndex(molarity_index)
+    widget.solution_density_spin.setValue(1.0)
+    widget.solute_stoich_edit.setText("Cs1Pb1I3")
+    widget.solvent_stoich_edit.setText("H2O")
+    widget.molar_mass_solute_spin.setValue(620.0)
+    widget.molar_mass_solvent_spin.setValue(18.015)
+    widget.molarity_spin.setValue(0.405)
+    widget.molarity_element_edit.setText("Pb")
+    widget.solute_density_spin.setValue(2.0)
+    widget.solvent_density_spin.setValue(1.0)
+
+    expected_settings = widget.current_estimator_settings()
+    assert expected_settings.solute_density_g_per_ml == pytest.approx(2.0)
+    expected_estimate = calculate_solution_scattering_estimate(
+        SolutionScatteringEstimatorSettings(
+            solution=expected_settings.solution,
+            solute_density_g_per_ml=expected_settings.solute_density_g_per_ml,
+            solvent_density_g_per_ml=expected_settings.solvent_density_g_per_ml,
+            calculate_number_density=expected_settings.calculate_number_density,
+            calculate_solute_volume_fraction=(
+                expected_settings.calculate_solute_volume_fraction
+            ),
+            calculate_solvent_scattering_contribution=(
+                expected_settings.calculate_solvent_scattering_contribution
+            ),
+            calculate_sample_fluorescence_yield=(
+                expected_settings.calculate_sample_fluorescence_yield
+            ),
+            beam=expected_settings.beam,
+        )
+    )
+    expected_concentration = expected_estimate.solution_result.moles_solute / (
+        expected_estimate.solution_result.volume_solution_cm3 / 1000.0
+    )
+
+    widget.calculate_button.click()
+
+    vol_frac_row = window.prefit_tab.find_parameter_row("vol_frac")
+    assert vol_frac_row >= 0
+    assert float(
+        window.prefit_tab.parameter_table.item(vol_frac_row, 3).text()
+    ) == pytest.approx(
+        expected_estimate.volume_fraction_estimate.solute_volume_fraction,
+        rel=1e-3,
+    )
+    concentration_row = window.prefit_tab.find_parameter_row(
+        "concentration_salt"
+    )
+    assert concentration_row >= 0
+    assert float(
+        window.prefit_tab.parameter_table.item(concentration_row, 3).text()
+    ) == pytest.approx(expected_concentration)
+    assert (
+        window.prefit_tab.parameter_table.item(
+            concentration_row, 4
+        ).checkState()
+        == Qt.CheckState.Unchecked
+    )
+    assert "Applied concentration_salt =" in widget.output_box.toPlainText()
+    window.close()
 
 
 def test_prefit_single_solvent_weight_uses_combined_saxs_effective_multiplier(
@@ -1603,7 +1799,7 @@ def test_prefit_scaled_solvent_monosq_applies_physical_vol_frac_target(
     window.close()
 
 
-def test_prefit_solute_volume_fraction_widget_hides_solute_density_in_molarity_mode(
+def test_prefit_solute_volume_fraction_widget_uses_solute_density_in_molarity_mode(
     qapp,
     tmp_path,
 ):
@@ -1618,16 +1814,19 @@ def test_prefit_solute_volume_fraction_widget_hides_solute_density_in_molarity_m
     widget.solution_mode_combo.setCurrentIndex(molarity_index)
 
     assert not widget.solution_density_spin.isHidden()
-    assert widget.solute_density_label.isHidden()
-    assert widget.solute_density_spin.isHidden()
+    assert not widget.solute_density_label.isHidden()
+    assert not widget.solute_density_spin.isHidden()
     assert not widget.solvent_density_label.isHidden()
     assert not widget.solvent_density_spin.isHidden()
-    assert widget.current_estimator_settings().solute_density_g_per_ml is None
+    assert (
+        widget.current_estimator_settings().solute_density_g_per_ml
+        == pytest.approx(widget.solute_density_spin.value())
+    )
     assert (
         widget.current_estimator_settings().solvent_density_g_per_ml
         == pytest.approx(widget.solvent_density_spin.value())
     )
-    assert "solvent density remains active" in (
+    assert "solute density remains active" in (
         widget.solution_mode_hint_label.text().lower()
     )
     window.close()
@@ -1643,6 +1842,7 @@ def test_solute_volume_fraction_widget_loads_builtin_solvent_density_presets(
     assert dmf_index >= 0
     widget.solution_preset_combo.setCurrentIndex(dmf_index)
     widget._load_selected_solution_preset()
+    assert widget.solute_density_spin.value() == pytest.approx(6.16)
     assert widget.solvent_density_spin.value() == pytest.approx(0.944)
 
     dmso_index = widget.solution_preset_combo.findData("PbI2 - DMSO - 0.405 M")
@@ -2855,7 +3055,8 @@ def test_poly_lma_dream_parameter_map_tracks_cluster_geometry_shape(
     ellipsoid_a_entry = next(
         entry for entry in ellipsoid_entries if entry.param == "a_eff_w0"
     )
-    assert ellipsoid_a_entry.distribution == "norm"
+    assert ellipsoid_a_entry.distribution == "lognorm"
+    assert set(ellipsoid_a_entry.dist_params) == {"loc", "scale", "s"}
 
     window.close()
 
@@ -2872,9 +3073,13 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert window.save_project_action.text() == "Save Project"
     assert window.save_project_action.shortcuts()
     assert window.save_project_as_action.text() == "Save Project As..."
+    assert window.duplicate_project_for_new_fit_action.text() == (
+        "Duplicate Project for New Fit..."
+    )
     assert window.link_packmol_docker_action.text() == (
         "Link Packmol Docker Container..."
     )
+    assert window.duplicate_project_for_new_fit_action.isEnabled() is True
     assert window.link_packmol_docker_action.isEnabled() is True
     assert all(
         button.text() != "Save Project State"
@@ -2887,6 +3092,7 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert window.md_extraction_menu.title() == "MD Extraction"
     assert window.structure_analysis_menu.title() == "Structure Analysis"
     assert window.batch_processing_menu.title() == "Batch Processing"
+    assert window.spectroscopy_menu.title() == "Spectroscopy"
     assert window.visualization_menu.title() == "Visualization"
     assert window.cli_setup_menu.title() == "CLI Setup"
     assert window.beta_menu.title() == "(beta)"
@@ -2894,6 +3100,9 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert window.xyz2pdb_action.text() == "Open XYZ -> PDB Conversion"
     assert window.cluster_action.text() == "Open Cluster Extraction"
     assert window.bondanalysis_action.text() == "Open Bond Analysis"
+    assert window.structure_distribution_browser_action.text() == (
+        "Open Structure Distribution Browser"
+    )
     assert (
         window.debye_waller_analysis_action.text()
         == "Open Debye-Waller Analysis"
@@ -2908,6 +3117,7 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
         "Cluster Dynamics",
         "PDF",
         "Batch Processing",
+        "Spectroscopy",
         "Visualization",
         "SAXS Calculation Preview",
         "X-ray Toolkit",
@@ -2925,6 +3135,7 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
         action.text() for action in window.structure_analysis_menu.actions()
     ] == [
         "Open Bond Analysis",
+        "Open Structure Distribution Browser",
         "Open Representative Structures",
     ]
     visualization_actions = [
@@ -2942,6 +3153,7 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
         "Cluster Dynamics",
         "PDF",
         "Batch Processing",
+        "Spectroscopy",
         "Visualization",
         "SAXS Calculation Preview",
         "X-ray Toolkit",
@@ -2952,6 +3164,7 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
         action.text() for action in window.structure_analysis_menu.actions()
     ] == [
         "Open Bond Analysis",
+        "Open Structure Distribution Browser",
         "Open Representative Structures",
     ]
     visualization_actions = [
@@ -2991,6 +3204,14 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
         window.representativefinder_batch_queue_action.text()
         == "Open Representative Structures Batch Queue"
     )
+    assert (
+        window.bondanalysis_batch_queue_action.text()
+        == "Open Bond Analysis Batch Queue"
+    )
+    assert (
+        window.dream_backend_batch_queue_action.text()
+        == "Open DREAM Backend Batch Queue (Beta)"
+    )
     assert [
         action.text() for action in window.batch_processing_menu.actions()
     ] == [
@@ -2998,7 +3219,9 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
         "Open XYZ -> PDB Batch Queue",
         "Open Cluster Extraction Batch Queue",
         "Open Representative Structures Batch Queue",
+        "Open Bond Analysis Batch Queue",
         "Open PDF Batch Queue",
+        "Open DREAM Backend Batch Queue (Beta)",
     ]
     assert window.fullrmc_action.text() == "Open RMC Setup (fullrmc)"
     assert window.structure_viewer_action.text() == "Structure Viewer"
@@ -3026,6 +3249,18 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
         == "Open 3D FFT Born Approximation"
     )
     assert window.xray_toolkit_menu.title() == "X-ray Toolkit"
+    assert window.aps_detector_stitch_action.text() == "APS Detector Stitch"
+    assert [
+        action.text()
+        for action in window.xray_toolkit_menu.actions()
+        if not action.isSeparator()
+    ] == [
+        "APS Detector Stitch",
+        "Open Volume Fraction Estimate",
+        "Open Number Density Estimate",
+        "Open Attenuation Estimate",
+        "Open Fluorescence Estimate",
+    ]
     assert (
         window.volume_fraction_action.text() == "Open Volume Fraction Estimate"
     )
@@ -3076,6 +3311,10 @@ def test_main_window_menus_expose_project_tools_and_help(qapp, tmp_path):
     assert window.dream_output_settings_action.text() == "Main UI Settings..."
     assert window.window_presets_menu.title() == "Window Presets"
     assert window.auto_fit_window_action.text() == "Auto Fit Current Screen"
+    assert (
+        window.restore_default_window_size_action.text()
+        == "Restore Loaded Default Size"
+    )
     preset_labels = [
         action.text()
         for action in window.window_presets_menu.actions()
@@ -3220,6 +3459,40 @@ def test_project_setup_prep_buttons_span_form_row(qapp):
     window.close()
 
 
+def test_main_window_mouse_wheel_does_not_change_value_controls(qapp):
+    del qapp
+    window = SAXSMainWindow()
+    window.show()
+    QApplication.processEvents()
+
+    spin = window.prefit_tab.nfev_spin
+    spin.setValue(100)
+    spin_event = _make_wheel_event(spin)
+
+    assert window._should_suppress_value_wheel_event(spin, spin_event)
+    QApplication.sendEvent(spin, spin_event)
+
+    assert spin.value() == 100
+
+    combo = window.prefit_tab.method_combo
+    assert combo.count() > 1
+    combo.setCurrentIndex(0)
+    combo_event = _make_wheel_event(combo)
+
+    assert window._should_suppress_value_wheel_event(combo, combo_event)
+    QApplication.sendEvent(combo, combo_event)
+
+    assert combo.currentIndex() == 0
+
+    scroll_viewport = window.project_setup_tab.summary_box.viewport()
+    scroll_event = _make_wheel_event(scroll_viewport)
+    assert not window._should_suppress_value_wheel_event(
+        scroll_viewport,
+        scroll_event,
+    )
+    window.close()
+
+
 def test_console_autoscroll_setting_controls_tab_output_scroll(
     qapp, tmp_path, monkeypatch
 ):
@@ -3353,11 +3626,11 @@ def test_volume_fraction_tool_window_opens_with_citation_and_target(
     tool_window.estimator_widget.solution_mode_combo.setCurrentIndex(
         molarity_index
     )
-    assert tool_window.estimator_widget.solute_density_label.isHidden()
-    assert tool_window.estimator_widget.solute_density_spin.isHidden()
+    assert not tool_window.estimator_widget.solute_density_label.isHidden()
+    assert not tool_window.estimator_widget.solute_density_spin.isHidden()
     assert not tool_window.estimator_widget.solvent_density_label.isHidden()
     assert not tool_window.estimator_widget.solvent_density_spin.isHidden()
-    assert "volume-closure calculations" in (
+    assert "solute density remains active" in (
         tool_window.estimator_widget.solution_mode_hint_label.text().lower()
     )
 
@@ -3375,6 +3648,26 @@ def test_volume_fraction_tool_window_opens_with_citation_and_target(
         tool_window.estimator_widget.output_box.toPlainText()
     )
     assert "atoms/A^3" in tool_window.estimator_widget.output_box.toPlainText()
+
+    tool_window.close()
+    window.close()
+
+
+def test_aps_detector_stitch_tool_window_opens_from_main_window(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    window._open_aps_detector_stitch_tool()
+
+    tool_window = window._aps_detector_stitch_tool_window
+    assert tool_window is not None
+    assert tool_window.windowTitle() == "APS Detector Stitch"
+    assert tool_window.save_button.isEnabled() is False
+    assert tool_window in window._child_tool_windows
 
     tool_window.close()
     window.close()
@@ -3513,6 +3806,46 @@ def test_bondanalysis_tool_uses_active_project_clusters_dir(
     assert launched["shown"] is True
     assert launched["raised"] is True
     assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
+def test_structure_distribution_browser_uses_active_project_dir(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    launched: dict[str, object] = {}
+
+    class FakeStructureDistributionBrowserWindow:
+        def __init__(self, *, initial_project_dir=None):
+            launched["project_dir"] = initial_project_dir
+            launched["instance"] = self
+
+        def show(self):
+            launched["shown"] = True
+
+        def raise_(self):
+            launched["raised"] = True
+
+    monkeypatch.setattr(
+        "saxshell.structure_distributions.ui.main_window."
+        "StructureDistributionBrowserWindow",
+        FakeStructureDistributionBrowserWindow,
+    )
+
+    window._open_structure_distribution_browser_tool()
+
+    assert launched["project_dir"] == Path(project_dir).resolve()
+    assert launched["shown"] is True
+    assert launched["raised"] is True
+    assert launched["instance"] in window._child_tool_windows
+    assert (
+        window._single_instance_child_tool_windows[
+            "structure_distribution_browser"
+        ]
+        is launched["instance"]
+    )
     window.close()
 
 
@@ -4348,6 +4681,48 @@ def test_representativefinder_batch_queue_uses_active_project_clusters_dir(
     window.close()
 
 
+def test_bondanalysis_batch_queue_uses_active_project_clusters_dir(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    clusters_dir = tmp_path / "clusters_xyz2pdb_splitxyz_f0fs"
+    clusters_dir.mkdir()
+    window.current_settings.clusters_dir = str(clusters_dir)
+    window.project_manager.save_project(window.current_settings)
+    launched: dict[str, object] = {}
+
+    class FakeBondAnalysisBatchQueueWindow(QWidget):
+        def __init__(self, **kwargs):
+            super().__init__()
+            launched.update(kwargs)
+            launched["instance"] = self
+
+        def show(self):
+            launched["shown"] = True
+
+        def raise_(self):
+            launched["raised"] = True
+
+    monkeypatch.setattr(
+        "saxshell.bondanalysis.ui.batch_queue_window."
+        "BondAnalysisBatchQueueWindow",
+        FakeBondAnalysisBatchQueueWindow,
+    )
+
+    window._open_bondanalysis_batch_queue_tool()
+
+    assert launched["initial_clusters_dir"] == clusters_dir.resolve()
+    assert launched["initial_project_dir"] == Path(project_dir).resolve()
+    assert launched["shown"] is True
+    assert launched["raised"] is True
+    assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
 def test_xyz2pdb_tool_uses_active_project_frames_dir_and_project_dir(
     qapp, tmp_path, monkeypatch
 ):
@@ -5147,6 +5522,1071 @@ def test_cluster_dynamics_ml_cli_setup_uses_active_project_dir(
         == Path(window.current_settings.project_dir).resolve()
     )
     assert launched["instance"] in window._child_tool_windows
+    window.close()
+
+
+def test_dream_backend_batch_setup_uses_active_project_dir(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    launched: dict[str, object] = {}
+
+    class FakeBatchSetupWindow:
+        pass
+
+    def fake_launch_dream_batch_run_file_ui(
+        *,
+        initial_project_dir=None,
+        initial_prefit_parameter_entries=None,
+        initial_fit_q_range=None,
+    ):
+        launched["project_dir"] = initial_project_dir
+        launched["prefit_entries"] = initial_prefit_parameter_entries
+        launched["fit_q_range"] = initial_fit_q_range
+        launched["instance"] = FakeBatchSetupWindow()
+        return launched["instance"]
+
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.dream_batch_window."
+        "launch_dream_batch_run_file_ui",
+        fake_launch_dream_batch_run_file_ui,
+    )
+
+    window._open_dream_backend_batch_setup_tool()
+
+    assert (
+        launched["project_dir"]
+        == Path(window.current_settings.project_dir).resolve()
+    )
+    assert launched["instance"] in window._child_tool_windows
+    assert launched["prefit_entries"]
+    assert launched["fit_q_range"] is not None
+    assert (
+        window._single_instance_child_tool_windows["dream_backend_batch_setup"]
+        is launched["instance"]
+    )
+    window.close()
+
+
+def test_dream_backend_batch_setup_uses_active_prefit_parameters(
+    qapp,
+    tmp_path,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    stale_entries = [
+        PrefitParameterEntry.from_dict(entry.to_dict())
+        for entry in prefit.parameter_entries
+    ]
+    for entry in stale_entries:
+        if entry.name == "scale":
+            entry.value = 0.123
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.best_prefit_parameter_entries = [
+        entry.to_dict() for entry in stale_entries
+    ]
+    manager.save_project(settings)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    window.prefit_tab.set_parameter_row("scale", value=2.345)
+    window.prefit_tab.fit_q_min_spin.setValue(0.11)
+    window.prefit_tab.fit_q_max_spin.setValue(0.21)
+    qapp.processEvents()
+    window._open_dream_backend_batch_setup_tool()
+
+    batch_window = window._single_instance_child_tool_windows[
+        "dream_backend_batch_setup"
+    ]
+    scale_entry = next(
+        entry
+        for entry in batch_window._draft_prefit_entries
+        if entry.name == "scale"
+    )
+    scale_rows = {
+        batch_window.prefit_parameter_table.item(row, 0).text(): row
+        for row in range(batch_window.prefit_parameter_table.rowCount())
+    }
+    assert scale_entry.value == pytest.approx(2.345)
+    assert float(
+        batch_window.prefit_parameter_table.item(
+            scale_rows["scale"],
+            3,
+        ).text()
+    ) == pytest.approx(2.345)
+    assert "active Prefit parameters" in (
+        batch_window.prefit_status_label.text()
+    )
+    assert batch_window.fit_q_min_spin.value() == pytest.approx(0.11)
+    assert batch_window.fit_q_max_spin.value() == pytest.approx(0.21)
+    assert "DREAM fit: 0.11 to 0.21" in (
+        batch_window.fit_range_status_label.text()
+    )
+
+    batch_window.fit_q_min_spin.setValue(0.121)
+    batch_window.fit_q_max_spin.setValue(0.193)
+    batch_settings = batch_window._settings_from_controls()
+    assert batch_settings.fit_q_min == pytest.approx(0.121)
+    assert batch_settings.fit_q_max == pytest.approx(0.193)
+
+    window.prefit_tab.set_parameter_row("scale", value=3.456)
+    window._open_dream_backend_batch_setup_tool()
+
+    updated_scale_entry = next(
+        entry
+        for entry in batch_window._draft_prefit_entries
+        if entry.name == "scale"
+    )
+    assert updated_scale_entry.value == pytest.approx(3.456)
+    batch_window.close()
+    window.close()
+
+
+def test_dream_backend_batch_search_preset_updates_controls(qapp):
+    del qapp
+    from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
+
+    window = DreamBatchRunFileWindow()
+    top_n_index = window.posterior_filter_combo.findData("top_n_logp")
+    assert top_n_index >= 0
+    window.posterior_filter_combo.setCurrentIndex(top_n_index)
+    window.posterior_top_percent_spin.setValue(12.5)
+    window.posterior_top_n_spin.setValue(123)
+    preset_index = window.search_filter_preset_combo.findData(
+        "more_aggressive"
+    )
+    window.search_filter_preset_combo.setCurrentIndex(preset_index)
+
+    assert window.chains_spin.value() == 8
+    assert window.iterations_spin.value() == 20000
+    assert window.burnin_spin.value() == 25
+    assert window.nseedchains_spin.value() == 80
+    assert window.crossover_burnin_spin.value() == 2000
+    assert window.posterior_filter_combo.currentData() == "top_n_logp"
+    assert window.posterior_top_percent_spin.value() == pytest.approx(12.5)
+    assert window.posterior_top_n_spin.value() == 123
+    settings_payload = json.loads(window.settings_json_edit.toPlainText())
+    filter_payload = json.loads(window.filter_json_edit.toPlainText())
+    assert settings_payload["search_filter_preset"] == "more_aggressive"
+    assert "posterior_filter_mode" not in settings_payload
+    assert "posterior_top_percent" not in settings_payload
+    assert "posterior_top_n" not in settings_payload
+    assert filter_payload["posterior_filter_mode"] == "top_n_logp"
+    assert filter_payload["posterior_top_n"] == 123
+
+    window.iterations_spin.setValue(12345)
+
+    assert window.search_filter_preset_combo.currentData() == "custom"
+    window.close()
+
+
+def test_dream_backend_batch_parameter_spins_ignore_wheel_events(
+    qapp,
+    tmp_path,
+):
+    from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    window = DreamBatchRunFileWindow(initial_project_dir=project_dir)
+    window.show()
+    qapp.processEvents()
+
+    window.iterations_spin.setValue(12345)
+    before_iterations = window.iterations_spin.value()
+    window.iterations_spin.setFocus()
+    QApplication.sendEvent(
+        window.iterations_spin,
+        _make_wheel_event(window.iterations_spin),
+    )
+    qapp.processEvents()
+
+    assert window.iterations_spin.value() == before_iterations
+
+    top_percent_index = window.posterior_filter_combo.findData(
+        "top_percent_logp"
+    )
+    assert top_percent_index >= 0
+    window.posterior_filter_combo.setCurrentIndex(top_percent_index)
+    window.posterior_top_percent_spin.setValue(12.5)
+    window._add_filter_set()
+    table_spin = window.filter_table.cellWidget(
+        0,
+        window.FILTER_COL_TOP_PERCENT,
+    )
+    assert table_spin is not None
+    assert table_spin.isEnabled()
+    before_table_percent = table_spin.value()
+    table_spin.setFocus()
+    QApplication.sendEvent(table_spin, _make_wheel_event(table_spin))
+    qapp.processEvents()
+
+    assert table_spin.value() == pytest.approx(before_table_percent)
+    window.close()
+
+
+def test_dream_backend_batch_queue_selection_shows_settings_and_prior_guides(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    window = DreamBatchRunFileWindow(initial_project_dir=project_dir)
+
+    assert window.prefit_preview_figure.axes
+    prefit_axis = window.prefit_preview_figure.axes[0]
+    assert prefit_axis.get_xscale() == "log"
+    assert prefit_axis.get_yscale() == "log"
+    assert window.prior_table.columnCount() == 7
+    assert [
+        window.prior_table.horizontalHeaderItem(column).text()
+        for column in range(window.prior_table.columnCount())
+    ][-2:] == ["Guide Low", "Guide High"]
+    assert window.prior_table.rowCount() > 0
+    assert window.prior_table.item(0, 5) is not None
+    assert window.prior_table.item(0, 6) is not None
+
+    window._create_queue_item()
+
+    assert window.queue_table.rowCount() == 1
+    queue_headers = [
+        window.queue_table.horizontalHeaderItem(column).text()
+        for column in range(window.queue_table.columnCount())
+    ]
+    assert queue_headers[2:4] == ["Fit q min", "Fit q max"]
+    assert window.queue_settings_table.rowCount() > 0
+    assert window.queue_prior_table.rowCount() > 0
+    assert [
+        window.queue_prior_table.horizontalHeaderItem(column).text()
+        for column in range(window.queue_prior_table.columnCount())
+    ][-2:] == ["Guide Low", "Guide High"]
+    settings_names = {
+        window.queue_settings_table.item(row, 0).text()
+        for row in range(window.queue_settings_table.rowCount())
+    }
+    assert "niterations" in settings_names
+    assert "posterior_filter_mode" not in settings_names
+    assert "posterior_top_percent" not in settings_names
+    manager = window._require_manager()
+    queue_item = manager.run_set.queue_items[0]
+    window.queue_table.item(0, window.QUEUE_COL_FIT_Q_MIN).setText("0.11")
+    window.queue_table.item(0, window.QUEUE_COL_FIT_Q_MAX).setText("0.21")
+    edited_settings = load_dream_settings(queue_item.settings_path)
+    edited_metadata = json.loads(
+        Path(queue_item.metadata_path).read_text(encoding="utf-8")
+    )
+    assert edited_settings.fit_q_min == pytest.approx(0.11)
+    assert edited_settings.fit_q_max == pytest.approx(0.21)
+    assert edited_metadata["prefit_fit_q_range"]["q_min"] == pytest.approx(
+        0.11
+    )
+    assert "Fit q-range: 0.11 to 0.21" in window.queue_detail_label.text()
+    raw_queue_settings = json.loads(
+        Path(queue_item.settings_path).read_text(encoding="utf-8")
+    )
+    assert "niterations" in raw_queue_settings
+    assert "posterior_filter_mode" not in raw_queue_settings
+    raw_queue_metadata = json.loads(
+        Path(queue_item.metadata_path).read_text(encoding="utf-8")
+    )
+    assert "posterior_filter_mode" not in raw_queue_metadata["settings"]
+    assert window.queue_prior_table.item(0, 5) is not None
+    assert window.queue_prior_table.item(0, 6) is not None
+    opened_paths: list[Path] = []
+    window._reveal_path_in_file_browser = opened_paths.append
+    _script_path, commands_path = manager.generate_shell_script()
+    window._refresh_command_box()
+
+    assert window.open_commands_button.isEnabled() is True
+
+    window._reveal_command_set_file()
+
+    assert opened_paths == [commands_path]
+    window.close()
+
+
+def test_dream_backend_batch_queue_table_edits_per_item_weight_use(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
+
+    project_dir, _paths = _build_two_component_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    window = DreamBatchRunFileWindow(initial_project_dir=project_dir)
+
+    w0_row = next(
+        row
+        for row in range(window.prefit_parameter_table.rowCount())
+        if window.prefit_parameter_table.item(row, 0).text() == "w0"
+    )
+    w0_button = window.prefit_parameter_table.cellWidget(w0_row, 8)
+    assert isinstance(w0_button, QPushButton)
+    w0_button.setChecked(False)
+    window._on_prefit_active_toggled(w0_row, w0_button)
+    window._create_queue_item()
+
+    manager = window._require_manager()
+    queue_item = manager.run_set.queue_items[0]
+    weights_item = window.queue_table.item(0, window.QUEUE_COL_WEIGHTS)
+    assert "w0 off" in weights_item.text()
+    assert "w1 on" in weights_item.text()
+
+    weights_item.setText("w0=on; w1=off")
+
+    edited_metadata = json.loads(
+        Path(queue_item.metadata_path).read_text(encoding="utf-8")
+    )
+    edited_params = [
+        entry["param"] for entry in edited_metadata["parameter_map"]
+    ]
+    assert (
+        "w0 on"
+        in window.queue_table.item(
+            0,
+            window.QUEUE_COL_WEIGHTS,
+        ).text()
+    )
+    assert (
+        "w1 off"
+        in window.queue_table.item(
+            0,
+            window.QUEUE_COL_WEIGHTS,
+        ).text()
+    )
+    assert "Weights: w0 on; w1 off" in window.queue_detail_label.text()
+    assert [name for name in edited_params if name.startswith("w")] == ["w0"]
+    assert "w0" in edited_metadata["full_parameter_names"]
+    assert "w1" not in edited_metadata["full_parameter_names"]
+    window.close()
+
+
+def test_dream_backend_batch_preserves_custom_prefit_solvent_weight_bounds(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.set_template(SCALED_SOLVENT_MONOSQ_TEMPLATE)
+    entries = prefit.load_parameter_entries()
+    for entry in entries:
+        if entry.name != "solv_w":
+            continue
+        entry.value = 2.5
+        entry.minimum = 0.0
+        entry.maximum = 5.0
+        entry.vary = False
+    prefit.save_fit(entries)
+
+    reloaded_prefit = SAXSPrefitWorkflow(project_dir)
+    reloaded_solvent_entry = next(
+        entry
+        for entry in reloaded_prefit.parameter_entries
+        if entry.name == "solv_w"
+    )
+
+    assert reloaded_solvent_entry.value == pytest.approx(2.5)
+    assert reloaded_solvent_entry.minimum == pytest.approx(0.0)
+    assert reloaded_solvent_entry.maximum == pytest.approx(5.0)
+
+    window = DreamBatchRunFileWindow(initial_project_dir=project_dir)
+    draft_prefit_entries = {
+        entry.name: entry for entry in window._draft_prefit_entries
+    }
+    draft_prior_entries = {
+        entry.param: entry for entry in window._draft_parameter_entries
+    }
+
+    assert draft_prefit_entries["solv_w"].value == pytest.approx(2.5)
+    assert draft_prefit_entries["solv_w"].minimum == pytest.approx(0.0)
+    assert draft_prefit_entries["solv_w"].maximum == pytest.approx(5.0)
+    assert draft_prior_entries["solv_w"].value == pytest.approx(2.5)
+    assert draft_prior_entries["solv_w"].vary is False
+
+    param_col = _table_column_index(window.prefit_parameter_table, "Param")
+    value_col = _table_column_index(window.prefit_parameter_table, "Value")
+    min_col = _table_column_index(window.prefit_parameter_table, "Min")
+    max_col = _table_column_index(window.prefit_parameter_table, "Max")
+    solvent_row = next(
+        row
+        for row in range(window.prefit_parameter_table.rowCount())
+        if window.prefit_parameter_table.item(row, param_col).text()
+        == "solv_w"
+    )
+
+    assert (
+        window.prefit_parameter_table.item(solvent_row, value_col).text()
+        == "2.5"
+    )
+    assert (
+        window.prefit_parameter_table.item(solvent_row, min_col).text() == "0"
+    )
+    assert (
+        window.prefit_parameter_table.item(solvent_row, max_col).text() == "5"
+    )
+    window.close()
+
+
+def test_dream_backend_batch_queue_item_uses_edited_prior_draft(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    from saxshell.saxs.dream.batch import load_parameter_map_for_queue_item
+    from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    window = DreamBatchRunFileWindow(initial_project_dir=project_dir)
+
+    window.queue_label_edit.setText("original")
+    window._create_queue_item()
+    manager = window._require_manager()
+    original_item = manager.run_set.queue_items[-1]
+    original_entries = {
+        entry.param: entry
+        for entry in load_parameter_map_for_queue_item(original_item)
+    }
+    assert original_entries["w0"].dist_params["s"] != pytest.approx(1.234)
+
+    edited_entries = [
+        DreamParameterEntry.from_dict(entry.to_dict())
+        for entry in window._draft_parameter_entries
+    ]
+    for entry in edited_entries:
+        if entry.param != "w0":
+            continue
+        entry.distribution = "lognorm"
+        entry.dist_params = {"loc": 0.0, "scale": 0.6, "s": 1.234}
+        entry.smart_preset_status = "custom"
+    window._save_prior_draft(edited_entries)
+
+    window.queue_table.selectRow(0)
+    window._refresh_selected_queue_item_view()
+    window.queue_label_edit.setText("edited")
+    window._create_queue_item()
+
+    edited_item = manager.run_set.queue_items[-1]
+    edited_queue_entries = {
+        entry.param: entry
+        for entry in load_parameter_map_for_queue_item(edited_item)
+    }
+    queue_prior_rows = {
+        window.queue_prior_table.item(row, 0).text(): row
+        for row in range(window.queue_prior_table.rowCount())
+    }
+    w0_row = queue_prior_rows["w0"]
+
+    assert len(manager.run_set.queue_items) == 2
+    assert window._selected_queue_item_id() == edited_item.item_id
+    assert edited_queue_entries["w0"].dist_params["s"] == pytest.approx(1.234)
+    assert '"s": 1.234' in window.queue_prior_table.item(w0_row, 4).text()
+    assert "Selected queue item 'edited' priors" in (
+        window.prior_summary_label.text()
+    )
+    window.close()
+
+
+def test_dream_backend_batch_generate_script_rotates_command_folder(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    window = DreamBatchRunFileWindow(initial_project_dir=project_dir)
+    manager = window._require_manager()
+    original_run_set_dir = manager.run_set.resolved_run_set_dir
+    monkeypatch.setattr(
+        QMessageBox, "information", lambda *args, **kwargs: None
+    )
+
+    window._create_queue_item()
+    window._generate_shell_script()
+
+    first_run_set_dir = manager.run_set.resolved_run_set_dir
+    first_commands_path = manager.run_set.commands_path
+    assert first_run_set_dir != original_run_set_dir
+    assert first_commands_path.is_file()
+    assert Path(window.run_set_edit.text()).resolve() == first_run_set_dir
+    assert window.open_commands_button.isEnabled() is True
+
+    opened_paths: list[Path] = []
+    window._reveal_path_in_file_browser = opened_paths.append
+    window._reveal_command_set_file()
+    assert opened_paths == [first_commands_path]
+
+    window._generate_shell_script()
+
+    second_run_set_dir = manager.run_set.resolved_run_set_dir
+    second_commands_path = manager.run_set.commands_path
+    assert second_run_set_dir != first_run_set_dir
+    assert second_commands_path != first_commands_path
+    assert first_commands_path.is_file()
+    assert second_commands_path.is_file()
+    assert Path(window.run_set_edit.text()).resolve() == second_run_set_dir
+
+    opened_paths.clear()
+    window._reveal_command_set_file()
+    assert opened_paths == [second_commands_path]
+    window.close()
+
+
+def test_dream_backend_batch_prefit_weight_toggle_updates_draft_priors(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    window = DreamBatchRunFileWindow(initial_project_dir=project_dir)
+    param_col = _table_column_index(window.prefit_parameter_table, "Param")
+    use_col = _table_column_index(window.prefit_parameter_table, "Use")
+    w0_row = next(
+        row
+        for row in range(window.prefit_parameter_table.rowCount())
+        if window.prefit_parameter_table.item(row, param_col).text() == "w0"
+    )
+    use_button = window.prefit_parameter_table.cellWidget(w0_row, use_col)
+
+    assert isinstance(use_button, QPushButton)
+    assert use_button.text() == "On"
+    assert "w0" in {entry.param for entry in window._draft_parameter_entries}
+
+    use_button.click()
+    QApplication.processEvents()
+
+    assert {
+        entry.name: entry.active for entry in window._draft_prefit_entries
+    }["w0"] is False
+    assert "w0" not in {
+        entry.param for entry in window._draft_parameter_entries
+    }
+    w0_row = next(
+        row
+        for row in range(window.prefit_parameter_table.rowCount())
+        if window.prefit_parameter_table.item(row, param_col).text() == "w0"
+    )
+    use_button = window.prefit_parameter_table.cellWidget(w0_row, use_col)
+    assert isinstance(use_button, QPushButton)
+    assert use_button.text() == "Off"
+
+    use_button.click()
+    QApplication.processEvents()
+
+    assert {
+        entry.name: entry.active for entry in window._draft_prefit_entries
+    }["w0"] is True
+    assert "w0" in {entry.param for entry in window._draft_parameter_entries}
+    window.close()
+
+
+def test_dream_backend_batch_queue_preset_creates_monosq_sweep(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    from saxshell.saxs.dream import load_dream_settings
+    from saxshell.saxs.dream.batch import (
+        load_dream_batch_manifest,
+        load_parameter_map_for_queue_item,
+    )
+    from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    window = DreamBatchRunFileWindow(initial_project_dir=project_dir)
+
+    preset_index = window.queue_preset_combo.findData(
+        "scale-offset-toggle_fixed-solv_w"
+    )
+    assert preset_index >= 0
+    window.queue_preset_combo.setCurrentIndex(preset_index)
+    assert "Creates 10 queue items" in window.queue_preset_combo.toolTip()
+
+    window.queue_label_edit.setText("monosq sweep")
+    window._apply_selected_queue_preset()
+
+    manager = window._require_manager()
+    assert len(manager.run_set.queue_items) == 10
+    labels = [item.label for item in manager.run_set.queue_items]
+    assert len(set(labels)) == 10
+    assert "monosq sweep - Scale+Offset On - Strict" in labels
+    assert "monosq sweep - Scale+Offset Off - Rounded Guides" in labels
+    assert "monosq sweep - Scale+Offset On - Legacy MD Weights" in labels
+
+    on_strict = next(
+        item
+        for item in manager.run_set.queue_items
+        if item.label == "monosq sweep - Scale+Offset On - Strict"
+    )
+    off_rounded = next(
+        item
+        for item in manager.run_set.queue_items
+        if item.label == "monosq sweep - Scale+Offset Off - Rounded Guides"
+    )
+    on_legacy = next(
+        item
+        for item in manager.run_set.queue_items
+        if item.label == "monosq sweep - Scale+Offset On - Legacy MD Weights"
+    )
+
+    settings = load_dream_settings(on_strict.settings_path)
+    assert settings.search_filter_preset == "more_aggressive"
+    assert settings.niterations == 20000
+    settings_payload = json.loads(
+        Path(on_strict.settings_path).read_text(encoding="utf-8")
+    )
+    assert "posterior_filter_mode" not in settings_payload
+    assert "posterior_top_percent" not in settings_payload
+
+    entries = {
+        entry.param: entry
+        for entry in load_parameter_map_for_queue_item(on_strict)
+    }
+    assert entries["solv_w"].vary is False
+    assert entries["eff_r"].vary is True
+    assert entries["vol_frac"].vary is True
+    assert entries["scale"].vary is True
+    assert entries["offset"].vary is True
+    assert all(
+        entry.vary is True
+        for name, entry in entries.items()
+        if name.startswith("w")
+    )
+    assert {entry.smart_preset_status for entry in entries.values()} == {
+        "strict"
+    }
+
+    rounded_entries = {
+        entry.param: entry
+        for entry in load_parameter_map_for_queue_item(off_rounded)
+    }
+    assert rounded_entries["scale"].vary is False
+    assert rounded_entries["offset"].vary is False
+    assert rounded_entries["solv_w"].vary is False
+    assert "rounded_guides" in {
+        entry.smart_preset_status for entry in rounded_entries.values()
+    }
+    legacy_entries = {
+        entry.param: entry
+        for entry in load_parameter_map_for_queue_item(on_legacy)
+    }
+    assert legacy_entries["w0"].distribution == "lognorm"
+    assert legacy_entries["w0"].dist_params["loc"] == pytest.approx(0.0)
+    assert legacy_entries["w0"].dist_params["scale"] == pytest.approx(0.6)
+    assert legacy_entries["w0"].dist_params["s"] == pytest.approx(1.0)
+    assert (
+        legacy_entries["w0"].smart_preset_status
+        == LEGACY_MD_WEIGHT_SMART_PRIOR_MODE
+    )
+    assert legacy_entries["scale"].smart_preset_status == "custom"
+    off_rounded_row = next(
+        index
+        for index, item in enumerate(manager.run_set.queue_items)
+        if item.item_id == off_rounded.item_id
+    )
+    window.queue_table.selectRow(off_rounded_row)
+    window._refresh_selected_queue_item_view()
+    prior_rows = {
+        window.prior_table.item(row, 0).text(): row
+        for row in range(window.prior_table.rowCount())
+    }
+    queue_prior_rows = {
+        window.queue_prior_table.item(row, 0).text(): row
+        for row in range(window.queue_prior_table.rowCount())
+    }
+    scale_prior_row = prior_rows["scale"]
+    scale_queue_prior_row = queue_prior_rows["scale"]
+
+    assert "Selected queue item" in window.prior_summary_label.text()
+    assert off_rounded.label in window.prior_summary_label.text()
+    assert window.prior_table.rowCount() == window.queue_prior_table.rowCount()
+    assert window.prior_table.item(scale_prior_row, 2).text() == "No"
+    assert [
+        window.prior_table.item(scale_prior_row, column).text()
+        for column in range(window.prior_table.columnCount())
+    ] == [
+        window.queue_prior_table.item(scale_queue_prior_row, column).text()
+        for column in range(window.queue_prior_table.columnCount())
+    ]
+
+    removed_dir = Path(manager.run_set.queue_items[0].run_dir)
+    assert removed_dir.is_dir()
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    window.queue_table.selectRow(0)
+    window._remove_selected_queue_item()
+
+    assert len(manager.run_set.queue_items) == 9
+    assert window.queue_table.rowCount() == 9
+    assert not removed_dir.exists()
+    assert (
+        len(
+            load_dream_batch_manifest(
+                manager.run_set.manifest_path
+            ).queue_items
+        )
+        == 9
+    )
+    window.close()
+
+
+def test_dream_backend_batch_filter_presets_save_and_reload(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    window = DreamBatchRunFileWindow(initial_project_dir=project_dir)
+
+    assert (
+        window.filter_controls_grid.itemAtPosition(0, 1).widget()
+        is window.filter_label_edit
+    )
+    assert (
+        window.filter_controls_grid.itemAtPosition(1, 1).widget()
+        is window.bestfit_method_combo
+    )
+    assert window.filter_preset_combo.count() >= 5
+    top_n_index = window.posterior_filter_combo.findData("top_n_logp")
+    assert top_n_index >= 0
+    window.posterior_filter_combo.setCurrentIndex(top_n_index)
+    median_index = window.bestfit_method_combo.findData("median")
+    assert median_index >= 0
+    window.bestfit_method_combo.setCurrentIndex(median_index)
+    window.posterior_top_n_spin.setValue(123)
+    window.filter_label_edit.setText("saved_top_123")
+
+    window._save_current_filter_preset()
+
+    preset_path = window._filter_preset_dir() / "saved_top_123.json"
+    assert preset_path.is_file()
+    saved_index = window.filter_preset_combo.findData(
+        f"saved:{preset_path.name}"
+    )
+    assert saved_index >= 0
+    assert "top 123 by log-posterior" in window.filter_preset_combo.toolTip()
+
+    all_index = window.posterior_filter_combo.findData("all_post_burnin")
+    assert all_index >= 0
+    window.posterior_filter_combo.setCurrentIndex(all_index)
+    window.posterior_top_n_spin.setValue(999)
+    window.filter_preset_combo.setCurrentIndex(saved_index)
+    window._load_selected_filter_preset()
+
+    assert window.posterior_filter_combo.currentData() == "top_n_logp"
+    assert window.bestfit_method_combo.currentData() == "median"
+    assert window.posterior_top_n_spin.value() == 123
+    window.close()
+
+    reopened = DreamBatchRunFileWindow(initial_project_dir=project_dir)
+    assert (
+        reopened.filter_preset_combo.findData(f"saved:{preset_path.name}") >= 0
+    )
+    reopened.close()
+
+
+def test_dream_backend_batch_filter_list_presets_save_and_reload(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    window = DreamBatchRunFileWindow(initial_project_dir=project_dir)
+
+    assert [
+        window.filter_table.horizontalHeaderItem(column).text()
+        for column in range(window.filter_table.columnCount())
+    ] == [
+        "Label",
+        "Posterior",
+        "Top %",
+        "Top N",
+        "Best-fit",
+        "Violin data",
+        "Violin samples",
+        "Y-axis scale",
+        "Stoichiometry",
+        "Created",
+    ]
+
+    window.filter_label_edit.setText("all_map")
+    window._add_filter_set()
+
+    top_n_index = window.posterior_filter_combo.findData("top_n_logp")
+    assert top_n_index >= 0
+    window.posterior_filter_combo.setCurrentIndex(top_n_index)
+    median_index = window.bestfit_method_combo.findData("median")
+    assert median_index >= 0
+    window.bestfit_method_combo.setCurrentIndex(median_index)
+    weights_only_index = window.violin_mode_combo.findData("weights_only")
+    assert weights_only_index >= 0
+    window.violin_mode_combo.setCurrentIndex(weights_only_index)
+    map_chain_index = window.violin_sample_source_combo.findData(
+        "map_chain_only"
+    )
+    assert map_chain_index >= 0
+    window.violin_sample_source_combo.setCurrentIndex(map_chain_index)
+    window.stoichiometry_elements_edit.setText("Pb, I")
+    window.stoichiometry_ratio_edit.setText("1:2")
+    window.stoichiometry_filter_checkbox.setChecked(True)
+    window.stoichiometry_tolerance_spin.setValue(3.5)
+    window.posterior_top_n_spin.setValue(123)
+    window.filter_label_edit.setText("top_123_median")
+    window._add_filter_set()
+
+    manager = window._require_manager()
+    assert len(manager.run_set.filter_sets) == 2
+    assert (
+        "On: Pb, I = 1:2"
+        in window.filter_table.item(
+            1,
+            window.FILTER_COL_STOICHIOMETRY,
+        ).text()
+    )
+    assert (
+        "+/- 3.5%"
+        in window.filter_table.item(
+            1,
+            window.FILTER_COL_STOICHIOMETRY,
+        ).text()
+    )
+    assert (
+        window.filter_table.cellWidget(
+            1,
+            window.FILTER_COL_VIOLIN_MODE,
+        ).currentData()
+        == "weights_only"
+    )
+    assert (
+        window.filter_table.cellWidget(
+            1,
+            window.FILTER_COL_VIOLIN_SAMPLE_SOURCE,
+        ).currentData()
+        == "map_chain_only"
+    )
+
+    window.filter_list_label_edit.setText("saved_filter_matrix")
+    window._save_current_filter_list_preset()
+
+    preset_path = window._filter_list_preset_dir() / "saved_filter_matrix.json"
+    saved_payload = json.loads(preset_path.read_text(encoding="utf-8"))
+
+    assert preset_path.is_file()
+    assert len(saved_payload["filter_sets"]) == 2
+    assert saved_payload["filter_sets"][0]["label"] == "all_map"
+    assert "posterior_filter_settings" in saved_payload["filter_sets"][0]
+    assert (
+        "niterations"
+        not in saved_payload["filter_sets"][0]["posterior_filter_settings"]
+    )
+    assert (
+        window.filter_list_preset_combo.findData(f"saved:{preset_path.name}")
+        >= 0
+    )
+    original_run_set_dir = manager.run_set.resolved_run_set_dir
+    window.close()
+
+    reopened = DreamBatchRunFileWindow(initial_project_dir=project_dir)
+    assert Path(reopened.run_set_edit.text()).resolve() == original_run_set_dir
+    assert [
+        item.label for item in reopened._require_manager().run_set.filter_sets
+    ] == ["all_map", "top_123_median"]
+    assert reopened.filter_table.rowCount() == 2
+    saved_index = reopened.filter_list_preset_combo.findData(
+        f"saved:{preset_path.name}"
+    )
+    assert saved_index >= 0
+    reopened.filter_list_preset_combo.setCurrentIndex(saved_index)
+    assert "2 posterior filter set" in (
+        reopened.filter_list_preset_combo.toolTip()
+    )
+
+    reopened._load_selected_filter_list_preset()
+
+    reloaded_manager = reopened._require_manager()
+    labels = [item.label for item in reloaded_manager.run_set.filter_sets]
+    modes = [
+        item.settings.posterior_filter_mode
+        for item in reloaded_manager.run_set.filter_sets
+    ]
+    manifest_payload = json.loads(
+        reloaded_manager.run_set.manifest_path.read_text(encoding="utf-8")
+    )
+
+    assert labels == ["all_map", "top_123_median"]
+    assert modes == ["all_post_burnin", "top_n_logp"]
+    assert reloaded_manager.run_set.filter_sets[
+        1
+    ].settings.posterior_top_n == (123)
+    assert (
+        "On: Pb, I = 1:2"
+        in reopened.filter_table.item(
+            1,
+            reopened.FILTER_COL_STOICHIOMETRY,
+        ).text()
+    )
+    assert (
+        reopened.filter_table.cellWidget(
+            1,
+            reopened.FILTER_COL_VIOLIN_MODE,
+        ).currentData()
+        == "weights_only"
+    )
+    assert (
+        reopened.filter_table.cellWidget(
+            1,
+            reopened.FILTER_COL_VIOLIN_SAMPLE_SOURCE,
+        ).currentData()
+        == "map_chain_only"
+    )
+    assert len(manifest_payload["filter_sets"]) == 2
+    assert (
+        manifest_payload["filter_sets"][1]["posterior_filter_settings"][
+            "posterior_top_n"
+        ]
+        == 123
+    )
+
+    reopened.filter_table.selectRow(0)
+    reopened._remove_selected_filter_set()
+    updated_manifest_payload = json.loads(
+        reloaded_manager.run_set.manifest_path.read_text(encoding="utf-8")
+    )
+
+    assert [item.label for item in reloaded_manager.run_set.filter_sets] == [
+        "top_123_median"
+    ]
+    assert reopened.filter_table.rowCount() == 1
+    assert len(updated_manifest_payload["filter_sets"]) == 1
+    assert updated_manifest_payload["filter_sets"][0]["label"] == (
+        "top_123_median"
+    )
+    reopened.close()
+
+
+def test_dream_backend_batch_filter_table_edits_update_manifest(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    from saxshell.saxs.dream.batch import load_dream_batch_manifest
+    from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    window = DreamBatchRunFileWindow(initial_project_dir=project_dir)
+
+    all_params_index = window.violin_mode_combo.findData("all_parameters")
+    assert all_params_index >= 0
+    window.violin_mode_combo.setCurrentIndex(all_params_index)
+    window.filter_label_edit.setText("editable_filter")
+    window._add_filter_set()
+
+    posterior_combo = window.filter_table.cellWidget(
+        0,
+        window.FILTER_COL_POSTERIOR_MODE,
+    )
+    top_percent_spin = window.filter_table.cellWidget(
+        0,
+        window.FILTER_COL_TOP_PERCENT,
+    )
+    top_n_spin = window.filter_table.cellWidget(
+        0,
+        window.FILTER_COL_TOP_N,
+    )
+    bestfit_combo = window.filter_table.cellWidget(
+        0,
+        window.FILTER_COL_BESTFIT,
+    )
+    violin_combo = window.filter_table.cellWidget(
+        0,
+        window.FILTER_COL_VIOLIN_MODE,
+    )
+    scale_combo = window.filter_table.cellWidget(
+        0,
+        window.FILTER_COL_VIOLIN_VALUE_SCALE,
+    )
+
+    assert posterior_combo.currentData() == "all_post_burnin"
+    assert violin_combo.currentData() == "all_parameters"
+    assert not top_percent_spin.isEnabled()
+    assert not top_n_spin.isEnabled()
+
+    posterior_combo.setCurrentIndex(
+        posterior_combo.findData("top_percent_logp")
+    )
+    assert top_percent_spin.isEnabled()
+    assert not top_n_spin.isEnabled()
+    top_percent_spin.setValue(12.5)
+    bestfit_combo.setCurrentIndex(bestfit_combo.findData("median"))
+    violin_combo.setCurrentIndex(violin_combo.findData("weights_only"))
+    scale_combo.setCurrentIndex(scale_combo.findData("atom_fraction_percent"))
+    window.filter_table.item(0, window.FILTER_COL_LABEL).setText(
+        "edited_filter"
+    )
+
+    manager = window._require_manager()
+    edited = manager.run_set.filter_sets[0]
+    assert edited.label == "edited_filter"
+    assert edited.settings.posterior_filter_mode == "top_percent_logp"
+    assert edited.settings.posterior_top_percent == pytest.approx(12.5)
+    assert edited.settings.bestfit_method == "median"
+    assert edited.settings.violin_parameter_mode == "weights_only"
+    assert edited.settings.violin_value_scale_mode == "atom_fraction_percent"
+
+    posterior_combo.setCurrentIndex(posterior_combo.findData("top_n_logp"))
+    assert not top_percent_spin.isEnabled()
+    assert top_n_spin.isEnabled()
+    top_n_spin.setValue(321)
+
+    manifest = load_dream_batch_manifest(manager.run_set.manifest_path)
+    persisted = manifest.filter_sets[0]
+    assert persisted.label == "edited_filter"
+    assert persisted.settings.posterior_filter_mode == "top_n_logp"
+    assert persisted.settings.posterior_top_percent == pytest.approx(12.5)
+    assert persisted.settings.posterior_top_n == 321
+    assert persisted.settings.violin_parameter_mode == "weights_only"
+    assert persisted.settings.violin_value_scale_mode == (
+        "atom_fraction_percent"
+    )
     window.close()
 
 
@@ -7192,6 +8632,183 @@ def test_save_project_as_copies_project_and_rewrites_internal_paths(
     assert window.current_settings.project_dir == str(copied_dir.resolve())
 
 
+def test_duplicate_project_for_new_fit_clears_fit_state_and_keeps_components(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    destination_parent = tmp_path / "fit_copies"
+    destination_parent.mkdir()
+
+    geometry_path = paths.prefit_dir / "cluster_geometry_metadata.json"
+    geometry_path.write_text('{"rows": []}\n', encoding="utf-8")
+    (paths.prefit_dir / "prefit_state.json").write_text(
+        '{"parameter_entries": []}\n',
+        encoding="utf-8",
+    )
+    (paths.prefit_dir / "pd_prefit_params.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    (paths.prefit_dir / "latest_prefit_curve.txt").write_text(
+        "q model\n",
+        encoding="utf-8",
+    )
+    snapshot_dir = paths.prefit_dir / "prefit_20260101_000000"
+    snapshot_dir.mkdir()
+    (snapshot_dir / "prefit_state.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    paths.dream_runtime_dir.mkdir(parents=True, exist_ok=True)
+    (paths.dream_dir / "pd_settings.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    (paths.dream_dir / "pd_param_map.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    old_run_dir = paths.dream_runtime_dir / "dream_old"
+    old_run_dir.mkdir()
+    np.save(old_run_dir / "dream_sampled_params.npy", np.zeros((1, 1)))
+    np.save(old_run_dir / "dream_log_ps.npy", np.zeros((1,)))
+    (paths.exported_results_dir / "old_fit.txt").write_text(
+        "old fit\n",
+        encoding="utf-8",
+    )
+    (paths.reports_dir / "old_report.txt").write_text(
+        "old report\n",
+        encoding="utf-8",
+    )
+
+    assert window.current_settings is not None
+    window.current_settings.best_prefit_template = (
+        window.current_settings.selected_model_template
+    )
+    window.current_settings.best_prefit_parameter_entries = [
+        {"name": "scale", "value": 1.0}
+    ]
+    favorite = DreamBestFitSelection(
+        run_name="dream_old",
+        run_relative_path="dream/runtime_scripts/dream_old",
+        label="Old DREAM fit",
+    )
+    window.current_settings.dream_favorite_selection = favorite
+    window.current_settings.dream_favorite_history = [favorite]
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getExistingDirectory",
+        lambda *args, **kwargs: str(destination_parent),
+    )
+    monkeypatch.setattr(
+        QInputDialog,
+        "getText",
+        lambda *args, **kwargs: ("same_distribution_new_data", True),
+    )
+    started_tasks: list[dict[str, object]] = []
+    progress_updates: list[tuple[int, int, str]] = []
+
+    def run_project_task_sync(
+        task_name,
+        task_fn,
+        *,
+        start_message,
+        settings=None,
+        progress_total=1,
+        unit_label="items",
+        title=None,
+    ):
+        started_tasks.append(
+            {
+                "task_name": task_name,
+                "start_message": start_message,
+                "settings": settings,
+                "progress_total": progress_total,
+                "unit_label": unit_label,
+                "title": title,
+            }
+        )
+        result = task_fn(
+            lambda processed, total, message: progress_updates.append(
+                (processed, total, message)
+            )
+        )
+        window._on_task_finished(task_name, result)
+
+    monkeypatch.setattr(
+        window,
+        "_start_project_task",
+        run_project_task_sync,
+    )
+
+    window.duplicate_project_for_new_fit()
+
+    copied_dir = destination_parent / "same_distribution_new_data"
+    copied_settings = SAXSProjectManager().load_project(copied_dir)
+    copied_paths = build_project_paths(copied_dir)
+    copied_artifacts = project_artifact_paths(copied_settings)
+
+    assert len(started_tasks) == 1
+    assert started_tasks[0]["task_name"] == "duplicate_project_for_new_fit"
+    assert (
+        started_tasks[0]["start_message"]
+        == "Duplicating active project folder..."
+    )
+    assert started_tasks[0]["settings"] is not None
+    assert started_tasks[0]["progress_total"] == PROJECT_DUPLICATE_TOTAL_STEPS
+    assert started_tasks[0]["unit_label"] == "steps"
+    assert started_tasks[0]["title"] == "Duplicating SAXS Project"
+    assert (
+        2,
+        PROJECT_DUPLICATE_TOTAL_STEPS,
+        "Copying active project folder...",
+    ) in progress_updates
+    assert progress_updates[-1] == (
+        PROJECT_DUPLICATE_TOTAL_STEPS,
+        PROJECT_DUPLICATE_TOTAL_STEPS,
+        "Saving duplicated project settings...",
+    )
+    assert copied_settings.project_name == "same_distribution_new_data"
+    assert copied_settings.project_dir == str(copied_dir.resolve())
+    assert copied_settings.experimental_data_path is None
+    assert copied_settings.copied_experimental_data_file is None
+    assert copied_settings.solvent_data_path is None
+    assert copied_settings.copied_solvent_data_file is None
+    assert copied_settings.best_prefit_template is None
+    assert copied_settings.best_prefit_parameter_entries == []
+    assert copied_settings.dream_favorite_selection is None
+    assert copied_settings.dream_favorite_history == []
+
+    assert copied_artifacts.component_map_file.is_file()
+    assert (copied_artifacts.component_dir / "A_no_motif.txt").is_file()
+    assert copied_artifacts.prior_weights_file.is_file()
+    assert (
+        copied_artifacts.prefit_dir / "cluster_geometry_metadata.json"
+    ).is_file()
+    assert not (copied_artifacts.prefit_dir / "prefit_state.json").exists()
+    assert not (copied_artifacts.prefit_dir / "pd_prefit_params.json").exists()
+    assert not (
+        copied_artifacts.prefit_dir / "latest_prefit_curve.txt"
+    ).exists()
+    assert not any(
+        path.is_dir() and path.name.startswith("prefit_")
+        for path in copied_artifacts.prefit_dir.iterdir()
+    )
+    assert not (copied_artifacts.dream_dir / "pd_settings.json").exists()
+    assert not (copied_artifacts.dream_dir / "pd_param_map.json").exists()
+    assert list(copied_artifacts.dream_runtime_dir.iterdir()) == []
+    assert list(copied_paths.experimental_data_dir.iterdir()) == []
+    assert not (copied_paths.exported_results_dir / "old_fit.txt").exists()
+    assert list(copied_paths.exported_data_dir.iterdir()) == []
+    assert list(copied_paths.exported_plots_dir.iterdir()) == []
+    assert list(copied_paths.reports_dir.iterdir()) == []
+    assert window.current_settings is not None
+    assert window.current_settings.project_dir == str(copied_dir.resolve())
+
+
 def test_prefit_layout_uses_left_parameter_panel_and_combined_output(qapp):
     del qapp
     window = SAXSMainWindow()
@@ -7236,9 +8853,12 @@ def test_dream_layout_uses_combined_output_and_two_plot_panels(qapp):
     assert window.dream_tab._outer_scroll_area.widgetResizable()
     assert window.dream_tab.output_box is window.dream_tab.log_box
     assert window.dream_tab.output_box is window.dream_tab.summary_box
+    assert window.dream_tab.fit_parameter_table.columnCount() == 4
+    assert window.dream_tab.fit_parameter_table.rowCount() == 0
+    assert not window.dream_tab.fit_parameter_table.isEnabled()
     assert (
         window.dream_tab.output_box.lineWrapMode()
-        == window.dream_tab.output_box.LineWrapMode.WidgetWidth
+        == window.dream_tab.output_box.LineWrapMode.NoWrap
     )
     assert (
         window.dream_tab.output_box.wordWrapMode()
@@ -7250,7 +8870,7 @@ def test_dream_layout_uses_combined_output_and_two_plot_panels(qapp):
     )
     assert (
         window.dream_tab.output_box.horizontalScrollBarPolicy()
-        == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        == Qt.ScrollBarPolicy.ScrollBarAsNeeded
     )
     assert window.dream_tab.progress_label.wordWrap()
     assert (
@@ -7261,6 +8881,22 @@ def test_dream_layout_uses_combined_output_and_two_plot_panels(qapp):
     assert window.dream_tab._main_splitter.count() == 2
     assert window.dream_tab.verbose_checkbox.isChecked()
     assert window.dream_tab.verbose_interval_spin.value() == pytest.approx(5.0)
+
+
+def test_dream_violin_toolbar_actions_keep_static_plot_layout(qapp):
+    del qapp
+    tab = DreamTab()
+    before_size = tab.violin_canvas.size()
+
+    for action in tab.violin_toolbar.actions():
+        label = action.text().replace("&", "").strip()
+        if action.isSeparator() or not label or label == "Save":
+            continue
+        action.trigger()
+        QApplication.processEvents()
+
+        assert not tab.violin_figure.get_constrained_layout()
+        assert tab.violin_canvas.size() == before_size
 
 
 def test_dream_progress_label_wrap_does_not_resize_left_pane(qapp):
@@ -7312,9 +8948,32 @@ def test_dream_progress_label_wrap_does_not_resize_left_pane(qapp):
         is window.dream_tab._plot_panel
     )
     assert window.dream_tab._plot_splitter.count() == 2
+    assert (
+        window.dream_tab._plot_panel.sizePolicy().verticalPolicy()
+        == QSizePolicy.Policy.Expanding
+    )
     assert window.dream_tab._output_group.parentWidget() is not None
     assert window.dream_tab.model_canvas is not None
     assert window.dream_tab.violin_canvas is not None
+    assert not window.dream_tab.violin_figure.get_constrained_layout()
+    assert all(
+        item[0] not in {"Subplots", "Customize"}
+        for item in window.dream_tab.violin_toolbar.toolitems
+    )
+    assert (
+        window.dream_tab.violin_toolbar.sizePolicy().verticalPolicy()
+        == QSizePolicy.Policy.Fixed
+    )
+    assert (
+        window.dream_tab.model_canvas.sizePolicy().verticalPolicy()
+        == QSizePolicy.Policy.Expanding
+    )
+    assert (
+        window.dream_tab.violin_canvas.sizePolicy().verticalPolicy()
+        == QSizePolicy.Policy.Expanding
+    )
+    assert window.dream_tab.model_canvas.minimumHeight() <= 240
+    assert window.dream_tab.violin_canvas.minimumHeight() <= 240
     assert window.dream_tab.show_experimental_trace_checkbox.isChecked()
     assert window.dream_tab.show_model_trace_checkbox.isChecked()
     assert not window.dream_tab.show_solvent_trace_checkbox.isChecked()
@@ -7356,6 +9015,18 @@ def test_dream_progress_label_wrap_does_not_resize_left_pane(qapp):
     assert (
         window.dream_tab.violin_value_scale_combo.findData(
             "additional_parameters_only"
+        )
+        >= 0
+    )
+    assert (
+        window.dream_tab.violin_value_scale_combo.findData(
+            "structure_fraction_percent"
+        )
+        >= 0
+    )
+    assert (
+        window.dream_tab.violin_value_scale_combo.findData(
+            "atom_fraction_percent"
         )
         >= 0
     )
@@ -7406,6 +9077,8 @@ def test_dream_progress_label_wrap_does_not_resize_left_pane(qapp):
         "DREAM Analysis"
     )
     assert not window.dream_tab.apply_filter_button.isEnabled()
+    assert window.dream_tab.filter_progress_label.isHidden()
+    assert window.dream_tab.filter_progress_bar.isHidden()
     assert "No DREAM dataset is loaded yet" in (
         window.dream_tab.filter_status_box.toPlainText()
     )
@@ -7466,6 +9139,46 @@ def test_auto_snap_panes_disabled_preserves_manual_splitter_sizes(qapp):
         Qt.MouseButton.LeftButton,
         Qt.KeyboardModifier.NoModifier,
         window.prefit_tab._plot_group.rect().center(),
+    )
+    QApplication.processEvents()
+    after_sizes = splitter.sizes()
+
+    assert abs(after_sizes[0] - before_sizes[0]) <= 2
+    assert abs(after_sizes[1] - before_sizes[1]) <= 2
+    window.close()
+
+
+def test_dream_violin_toolbar_click_does_not_auto_snap_plot_pane(qapp):
+    del qapp
+    window = SAXSMainWindow()
+    window.resize(1800, 980)
+    window.show()
+    window.tabs.setCurrentWidget(window.dream_tab)
+    QApplication.processEvents()
+
+    splitter = window.dream_tab._top_splitter
+    current_total = sum(size for size in splitter.sizes() if size > 0)
+    splitter.setSizes([900, max(current_total - 900, 1)])
+    QApplication.processEvents()
+    before_sizes = splitter.sizes()
+    toolbar = window.dream_tab.violin_toolbar
+    button = next(
+        (
+            toolbar.widgetForAction(action)
+            for action in toolbar.actions()
+            if not action.isSeparator()
+            and action.isEnabled()
+            and toolbar.widgetForAction(action) is not None
+        ),
+        None,
+    )
+    assert button is not None
+
+    QTest.mouseClick(
+        button,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        button.rect().center(),
     )
     QApplication.processEvents()
     after_sizes = splitter.sizes()
@@ -7587,6 +9300,26 @@ def test_dream_tab_batches_runtime_output_console_updates(qapp, monkeypatch):
     assert len(render_calls) == 1
 
 
+def test_dream_tab_bounds_live_runtime_output_text(qapp):
+    del qapp
+    tab = DreamTab()
+    long_lines = [
+        f"runtime line {index:04d} " + ("x" * 200) for index in range(900)
+    ]
+
+    for line in long_lines:
+        tab.append_runtime_output(line)
+    tab._flush_pending_runtime_output()
+
+    text = tab.output_box.toPlainText()
+    assert "DREAM Runtime Output" in text
+    assert "Earlier DREAM runtime output omitted" in text
+    assert "runtime line 0000" not in text
+    assert "runtime line 0899" in text
+    assert len(tab._history_messages) == 1
+    assert len(tab._history_messages[0]) <= tab.MAX_RUNTIME_OUTPUT_CHARS
+
+
 def test_dream_tab_flushes_pending_runtime_output_before_regular_logs(qapp):
     del qapp
     tab = DreamTab()
@@ -7600,6 +9333,46 @@ def test_dream_tab_flushes_pending_runtime_output_before_regular_logs(qapp):
     assert "runtime line" in text
     assert "final log line" in text
     assert text.index("runtime line") < text.index("final log line")
+
+
+def test_dream_tab_current_prior_map_displays_distribution_guides(qapp):
+    del qapp
+    tab = DreamTab()
+    tab.set_parameter_map_entries(
+        [
+            DreamParameterEntry(
+                structure="PbI2",
+                motif="motif_A",
+                param_type="SAXS",
+                param="scale",
+                value=1.0,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 1.0, "scale": 0.2},
+            ),
+            DreamParameterEntry(
+                structure="PbI2",
+                motif="motif_B",
+                param_type="SAXS",
+                param="phi_solute",
+                value=0.45,
+                vary=True,
+                distribution="uniform",
+                dist_params={"loc": 0.2, "scale": 0.5},
+            ),
+        ]
+    )
+
+    table = tab.parameter_map_table
+    low_column = _table_column_index(table, "Guide Low")
+    high_column = _table_column_index(table, "Guide High")
+
+    assert float(table.item(0, low_column).text()) == pytest.approx(0.4)
+    assert float(table.item(0, high_column).text()) == pytest.approx(1.6)
+    assert float(table.item(1, low_column).text()) == pytest.approx(0.2)
+    assert float(table.item(1, high_column).text()) == pytest.approx(0.7)
+    assert "current norm prior" in table.item(0, low_column).toolTip()
+    assert "current uniform prior" in table.item(1, high_column).toolTip()
 
 
 def test_dream_search_filter_presets_update_and_fall_back_to_custom(qapp):
@@ -7630,6 +9403,41 @@ def test_dream_search_filter_presets_update_and_fall_back_to_custom(qapp):
     window.dream_tab.iterations_spin.setValue(21000)
 
     assert window.dream_tab.selected_search_filter_preset() == "custom"
+
+
+def test_dream_legacy_notebook_preset_updates_sampler_controls(qapp):
+    del qapp
+    window = SAXSMainWindow()
+
+    legacy_index = window.dream_tab.search_filter_preset_combo.findData(
+        "legacy_saxs_notebook"
+    )
+    assert legacy_index >= 0
+    window.dream_tab.search_filter_preset_combo.setCurrentIndex(legacy_index)
+
+    assert (
+        window.dream_tab.selected_search_filter_preset()
+        == "legacy_saxs_notebook"
+    )
+    assert window.dream_tab.chains_spin.value() == 50
+    assert window.dream_tab.iterations_spin.value() == 15000
+    assert window.dream_tab.burnin_spin.value() == 40
+    assert window.dream_tab.nseedchains_spin.value() == 500
+    assert window.dream_tab.crossover_burnin_spin.value() == 1000
+    assert window.dream_tab.history_thin_spin.value() == 10
+    assert window.dream_tab.lambda_spin.value() == pytest.approx(0.05)
+    assert window.dream_tab.zeta_spin.value() == pytest.approx(1e-12)
+    assert window.dream_tab.snooker_spin.value() == pytest.approx(0.1)
+    assert window.dream_tab.p_gamma_unity_spin.value() == pytest.approx(0.2)
+    assert window.dream_tab.verbose_checkbox.isChecked()
+    assert window.dream_tab.parallel_checkbox.isChecked()
+    assert window.dream_tab.adapt_checkbox.isChecked()
+
+    payload = window.dream_tab.settings_payload()
+    assert payload.search_filter_preset == "legacy_saxs_notebook"
+    assert payload.nchains == 50
+    assert payload.niterations == 15000
+    window.close()
 
 
 def test_main_window_ui_scale_updates_fonts_and_minimum_sizes(qapp):
@@ -7677,6 +9485,93 @@ def test_main_window_window_preset_resizes_and_scales_ui(qapp, monkeypatch):
     assert window._ui_scale == pytest.approx(1.1)
 
 
+def test_main_window_restore_loaded_default_size(qapp, monkeypatch):
+    del qapp
+    window = SAXSMainWindow()
+    loaded_default_size = QSize(window._loaded_default_window_size)
+    monkeypatch.setattr(
+        window,
+        "_current_available_geometry",
+        lambda: QRect(0, 0, 1728, 1117),
+    )
+
+    window._apply_window_layout_preset("display_1440p")
+    assert window._ui_scale == pytest.approx(1.1)
+    assert window.size() != loaded_default_size
+
+    window._restore_loaded_default_window_size()
+
+    assert window.size() == loaded_default_size
+    assert window._ui_scale == pytest.approx(1.0)
+
+
+def test_main_window_current_screen_uses_largest_window_overlap(qapp):
+    del qapp
+
+    class _FakeScreen:
+        def __init__(self, geometry: QRect) -> None:
+            self._geometry = geometry
+
+        def geometry(self) -> QRect:
+            return self._geometry
+
+    primary = _FakeScreen(QRect(0, 0, 1440, 900))
+    external = _FakeScreen(QRect(1440, 0, 1920, 1080))
+
+    selected = SAXSMainWindow._screen_with_largest_window_overlap(
+        [primary, external],
+        QRect(1700, 100, 1000, 700),
+    )
+
+    assert selected is external
+
+
+def test_auto_window_layout_rescales_main_horizontal_splitters(
+    qapp,
+    monkeypatch,
+):
+    del qapp
+    window = SAXSMainWindow()
+    monkeypatch.setattr(
+        window,
+        "_current_available_geometry",
+        lambda: QRect(0, 0, 1728, 1117),
+    )
+    monkeypatch.setattr(
+        window,
+        "_splitter_widget_minimum_width",
+        lambda widget: 80,
+    )
+    monkeypatch.setattr(
+        window,
+        "_splitter_widget_preferred_width",
+        lambda widget: 420,
+    )
+    window.show()
+    QApplication.processEvents()
+
+    tab_splitters = (
+        (window.project_setup_tab, window.project_setup_tab._pane_splitter),
+        (window.prefit_tab, window.prefit_tab._pane_splitter),
+        (window.dream_tab, window.dream_tab._top_splitter),
+    )
+    for _tab, splitter in tab_splitters:
+        splitter.setSizes([900, 90])
+    QApplication.processEvents()
+
+    window._apply_auto_window_layout_preset()
+    QApplication.processEvents()
+
+    for tab, splitter in tab_splitters:
+        window.tabs.setCurrentWidget(tab)
+        QApplication.processEvents()
+        QApplication.processEvents()
+        sizes = splitter.sizes()
+        assert min(sizes) > 200
+        assert abs(sizes[0] - sizes[1]) <= 100
+    window.close()
+
+
 def test_dream_blink_highlight_does_not_override_button_stylesheet(qapp):
     del qapp
     window = SAXSMainWindow()
@@ -7700,7 +9595,9 @@ def test_dream_blink_uses_per_button_effects(qapp):
     assert window.dream_tab.write_button.graphicsEffect() is not first_effect
 
 
-def test_dream_prior_map_table_updates_after_saving_entries(qapp, tmp_path):
+def test_dream_prior_map_table_updates_after_saving_entries(
+    qapp, tmp_path, monkeypatch
+):
     del qapp
     project_dir, _paths = _build_minimal_saxs_project(tmp_path)
     window = SAXSMainWindow(initial_project_dir=project_dir)
@@ -7716,6 +9613,26 @@ def test_dream_prior_map_table_updates_after_saving_entries(qapp, tmp_path):
             dist_params={"loc": 0.0, "scale": 0.6, "s": 0.1},
         )
     ]
+    progress_events: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        window,
+        "_show_dream_progress_dialog",
+        lambda message, **kwargs: progress_events.append(
+            ("show", message, kwargs)
+        ),
+    )
+    monkeypatch.setattr(
+        window,
+        "_update_dream_progress_dialog",
+        lambda processed, total, message, **kwargs: progress_events.append(
+            ("update", processed, total, message, kwargs)
+        ),
+    )
+    monkeypatch.setattr(
+        window,
+        "_close_dream_progress_dialog",
+        lambda: progress_events.append(("close",)),
+    )
 
     window._save_distribution_entries(entries)
 
@@ -7724,6 +9641,34 @@ def test_dream_prior_map_table_updates_after_saving_entries(qapp, tmp_path):
     assert table.item(0, 0).text() == "PbI2"
     assert table.item(0, 3).text() == "w0"
     assert table.item(0, 5).text() == "Yes"
+    low_column = _table_column_index(table, "Guide Low")
+    high_column = _table_column_index(table, "Guide High")
+    assert float(table.item(0, low_column).text()) == pytest.approx(
+        0.6 * np.exp(-GUIDE_INTERVAL_SIGMA * 0.1),
+        rel=1e-5,
+    )
+    assert float(table.item(0, high_column).text()) == pytest.approx(
+        0.6 * np.exp(GUIDE_INTERVAL_SIGMA * 0.1),
+        rel=1e-5,
+    )
+    assert "Central 99.73% interval" in (table.item(0, low_column).toolTip())
+    assert progress_events[0] == (
+        "show",
+        "Saving DREAM prior parameter map...",
+        {
+            "total": 3,
+            "unit_label": "steps",
+            "title": "Saving DREAM Prior Map",
+        },
+    )
+    assert [
+        event[1:4] for event in progress_events if event[0] == "update"
+    ] == [
+        (1, 3, "Loading DREAM workflow..."),
+        (2, 3, "Writing DREAM prior parameter map..."),
+        (3, 3, "Refreshing DREAM prior map state..."),
+    ]
+    assert progress_events[-1] == ("close",)
 
 
 def test_distribution_window_prompts_before_quitting_without_first_save(
@@ -7985,10 +9930,11 @@ def test_distribution_window_switches_lognorm_params_for_norm_and_uniform(
     assert "s" not in norm_params
     assert set(norm_params) == {"loc", "scale"}
     assert float(window.table.item(0, low_column).text()) == pytest.approx(
-        -1.8
+        0.0,
+        abs=1e-12,
     )
     assert float(window.table.item(0, high_column).text()) == pytest.approx(
-        1.8
+        1.2
     )
     assert window.figure.axes[0].get_title() == "w0: norm"
 
@@ -7999,11 +9945,12 @@ def test_distribution_window_switches_lognorm_params_for_norm_and_uniform(
     assert "s" not in uniform_params
     assert set(uniform_params) == {"loc", "scale"}
     assert float(window.table.item(0, low_column).text()) == pytest.approx(
-        0.0,
-        abs=1e-12,
+        0.379272,
+        rel=1e-6,
     )
     assert float(window.table.item(0, high_column).text()) == pytest.approx(
-        0.6
+        0.820728,
+        rel=1e-6,
     )
     assert window.figure.axes[0].get_title() == "w0: uniform"
 
@@ -8047,7 +9994,6 @@ def test_distribution_window_displays_distribution_guide_bounds(qapp):
 
     low_column = _table_column_index(window.table, "Guide Low")
     high_column = _table_column_index(window.table, "Guide High")
-    q_low = stats.norm.cdf(-3.0)
     q_high = stats.norm.cdf(3.0)
 
     assert float(window.table.item(0, low_column).text()) == pytest.approx(0.4)
@@ -8058,10 +10004,7 @@ def test_distribution_window_displays_distribution_guide_bounds(qapp):
     assert float(window.table.item(1, high_column).text()) == pytest.approx(
         0.7
     )
-    assert float(window.table.item(2, low_column).text()) == pytest.approx(
-        stats.lognorm.ppf(q_low, s=0.1, loc=0.0, scale=0.6),
-        rel=1e-6,
-    )
+    assert float(window.table.item(2, low_column).text()) == pytest.approx(0.0)
     assert float(window.table.item(2, high_column).text()) == pytest.approx(
         stats.lognorm.ppf(q_high, s=0.1, loc=0.0, scale=0.6),
         rel=1e-6,
@@ -8128,11 +10071,67 @@ def test_distribution_window_manual_guide_edit_updates_norm_params(qapp):
 
     entry = window.current_entries()[0]
     assert entry.value == pytest.approx(1.0)
-    assert entry.dist_params["loc"] == pytest.approx(1.0)
-    assert entry.dist_params["scale"] == pytest.approx(0.3)
+    assert entry.dist_params["loc"] == pytest.approx(0.85)
+    assert entry.dist_params["scale"] == pytest.approx(0.25)
     assert float(window.table.item(0, low_column).text()) == pytest.approx(0.1)
     assert float(window.table.item(0, high_column).text()) == pytest.approx(
-        1.9
+        1.6
+    )
+
+    window.table.item(0, high_column).setText("2.2")
+    QApplication.processEvents()
+
+    entry = window.current_entries()[0]
+    assert entry.value == pytest.approx(1.0)
+    assert entry.dist_params["loc"] == pytest.approx(1.15)
+    assert entry.dist_params["scale"] == pytest.approx(0.35)
+    assert float(window.table.item(0, low_column).text()) == pytest.approx(0.1)
+    assert float(window.table.item(0, high_column).text()) == pytest.approx(
+        2.2
+    )
+
+
+def test_distribution_window_manual_guide_edit_preserves_uniform_bound(qapp):
+    del qapp
+    window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="PbI2",
+                motif="motif_A",
+                param_type="SAXS",
+                param="phi_solute",
+                value=0.45,
+                vary=True,
+                distribution="uniform",
+                dist_params={"loc": 0.2, "scale": 0.5},
+            )
+        ]
+    )
+
+    low_column = _table_column_index(window.table, "Guide Low")
+    high_column = _table_column_index(window.table, "Guide High")
+
+    window.table.item(0, high_column).setText("0.9")
+    QApplication.processEvents()
+
+    entry = window.current_entries()[0]
+    assert entry.value == pytest.approx(0.45)
+    assert entry.dist_params["loc"] == pytest.approx(0.2)
+    assert entry.dist_params["scale"] == pytest.approx(0.7)
+    assert float(window.table.item(0, low_column).text()) == pytest.approx(0.2)
+    assert float(window.table.item(0, high_column).text()) == pytest.approx(
+        0.9
+    )
+
+    window.table.item(0, low_column).setText("0.1")
+    QApplication.processEvents()
+
+    entry = window.current_entries()[0]
+    assert entry.dist_params["loc"] == pytest.approx(0.1)
+    assert entry.dist_params["scale"] == pytest.approx(0.8)
+    assert float(window.table.item(0, low_column).text()) == pytest.approx(0.1)
+    assert float(window.table.item(0, high_column).text()) == pytest.approx(
+        0.9
     )
 
 
@@ -8153,6 +10152,7 @@ def test_distribution_window_manual_guide_edit_updates_lognorm_params(qapp):
         ]
     )
 
+    low_column = _table_column_index(window.table, "Guide Low")
     high_column = _table_column_index(window.table, "Guide High")
 
     window.table.item(0, high_column).setText("0.9")
@@ -8160,10 +10160,25 @@ def test_distribution_window_manual_guide_edit_updates_lognorm_params(qapp):
 
     entry = window.current_entries()[0]
     assert entry.value == pytest.approx(0.6)
+    assert float(window.table.item(0, low_column).text()) == pytest.approx(0.0)
     assert float(window.table.item(0, high_column).text()) == pytest.approx(
         0.9
     )
-    assert entry.dist_params["s"] != pytest.approx(0.1)
+    assert entry.dist_params["s"] == pytest.approx(0.1)
+    assert entry.dist_params["loc"] < 0.0
+    assert entry.dist_params["scale"] != pytest.approx(0.6)
+
+    window.table.item(0, low_column).setText("0")
+    QApplication.processEvents()
+
+    entry = window.current_entries()[0]
+    guide_low, _guide_high, _guide_kind = distribution_guide_bounds(entry)
+    assert entry.dist_params["loc"] < 0.0
+    assert guide_low == pytest.approx(0.0, abs=1e-12)
+    assert float(window.table.item(0, low_column).text()) == pytest.approx(0.0)
+    assert float(window.table.item(0, high_column).text()) == pytest.approx(
+        0.9
+    )
 
 
 def test_distribution_window_interactive_drag_preview_is_throttled(
@@ -8468,6 +10483,205 @@ def test_distribution_window_row_reset_preserves_original_baseline_after_preset(
     assert reset_entry.smart_preset_status == "custom"
 
 
+def test_distribution_window_reset_all_priors_restores_distributions(qapp):
+    window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="PbI2",
+                motif="motif_A",
+                param_type="SAXS",
+                param="scale",
+                value=1.0,
+                vary=False,
+                distribution="norm",
+                dist_params={"loc": 1.0, "scale": 0.2},
+                smart_preset_status="strict",
+            ),
+            DreamParameterEntry(
+                structure="PbI3",
+                motif="motif_B",
+                param_type="Both",
+                param="w1",
+                value=0.4,
+                vary=True,
+                distribution="lognorm",
+                dist_params={"loc": 0.0, "scale": 0.4, "s": 0.15},
+                smart_preset_status="lenient",
+            ),
+        ]
+    )
+
+    first_distribution = window.table.cellWidget(0, 6)
+    second_distribution = window.table.cellWidget(1, 6)
+    first_vary = window.table.cellWidget(0, 5)
+    second_vary = window.table.cellWidget(1, 5)
+    first_status = window.table.cellWidget(0, 8)
+
+    first_distribution.setCurrentText("uniform")
+    second_distribution.setCurrentText("norm")
+    first_vary.setChecked(True)
+    second_vary.setChecked(False)
+    first_status.setCurrentIndex(first_status.findData("custom"))
+    window.table.item(0, 4).setText("2.5")
+    window.table.item(0, 7).setText(
+        json.dumps({"loc": 0.0, "scale": 4.0}, sort_keys=True)
+    )
+    window.table.item(1, 7).setText(
+        json.dumps({"loc": 5.0, "scale": 0.5}, sort_keys=True)
+    )
+    qapp.processEvents()
+
+    window.reset_all_priors_button.click()
+    qapp.processEvents()
+
+    entries = window.current_entries()
+    assert entries[0].value == pytest.approx(1.0)
+    assert entries[0].vary is False
+    assert entries[0].distribution == "norm"
+    assert entries[0].dist_params == pytest.approx({"loc": 1.0, "scale": 0.2})
+    assert entries[0].smart_preset_status == "strict"
+    assert entries[1].value == pytest.approx(0.4)
+    assert entries[1].vary is True
+    assert entries[1].distribution == "lognorm"
+    assert entries[1].dist_params == pytest.approx(
+        {"loc": 0.0, "scale": 0.4, "s": 0.15}
+    )
+    assert entries[1].smart_preset_status == "lenient"
+    assert "including distributions" in window.console.toPlainText()
+
+
+def test_distribution_window_reset_all_uses_program_defaults_not_loaded_map(
+    qapp,
+):
+    default_entry = DreamParameterEntry(
+        structure="PbI2",
+        motif="motif_A",
+        param_type="SAXS",
+        param="scale",
+        value=1.0,
+        vary=False,
+        distribution="norm",
+        dist_params={"loc": 1.0, "scale": 0.2},
+        smart_preset_status="custom",
+    )
+    loaded_saved_entry = DreamParameterEntry(
+        structure="PbI2",
+        motif="motif_A",
+        param_type="SAXS",
+        param="scale",
+        value=2.0,
+        vary=True,
+        distribution="uniform",
+        dist_params={"loc": 1.5, "scale": 1.0},
+        smart_preset_status="lenient",
+    )
+    window = DistributionSetupWindow(
+        [loaded_saved_entry],
+        default_entries=[default_entry],
+    )
+
+    window.reset_all_priors_button.click()
+    qapp.processEvents()
+
+    entry = window.current_entries()[0]
+    assert entry.value == pytest.approx(1.0)
+    assert entry.vary is False
+    assert entry.distribution == "norm"
+    assert entry.dist_params == pytest.approx({"loc": 1.0, "scale": 0.2})
+    assert entry.smart_preset_status == "custom"
+
+
+def test_distribution_window_reset_all_ignores_saved_session_baseline(
+    qapp,
+    monkeypatch,
+):
+    window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="PbI2",
+                motif="motif_A",
+                param_type="SAXS",
+                param="scale",
+                value=1.0,
+                vary=False,
+                distribution="norm",
+                dist_params={"loc": 1.0, "scale": 0.2},
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.distribution_window.QMessageBox.information",
+        lambda *args, **kwargs: None,
+    )
+
+    distribution_combo = window.table.cellWidget(0, 6)
+    vary_box = window.table.cellWidget(0, 5)
+    distribution_combo.setCurrentText("uniform")
+    vary_box.setChecked(True)
+    window.table.item(0, 4).setText("2.0")
+    window.table.item(0, 7).setText(
+        json.dumps({"loc": 1.0, "scale": 2.0}, sort_keys=True)
+    )
+    qapp.processEvents()
+    window._emit_saved()
+
+    window.table.item(0, 4).setText("3.0")
+    window.table.item(0, 7).setText(
+        json.dumps({"loc": 2.0, "scale": 4.0}, sort_keys=True)
+    )
+    qapp.processEvents()
+
+    window.reset_all_priors_button.click()
+    qapp.processEvents()
+
+    entry = window.current_entries()[0]
+    assert entry.value == pytest.approx(1.0)
+    assert entry.vary is False
+    assert entry.distribution == "norm"
+    assert entry.dist_params == pytest.approx({"loc": 1.0, "scale": 0.2})
+    assert "program-generated defaults" in window.console.toPlainText()
+
+
+def test_open_distribution_editor_reset_all_uses_workflow_default_map(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    workflow = SAXSDreamWorkflow(project_dir)
+    default_entries = workflow.create_default_parameter_map(persist=False)
+    saved_entries = [
+        DreamParameterEntry.from_dict(entry.to_dict())
+        for entry in default_entries
+    ]
+    saved_entries[0].value = 2.0
+    saved_entries[0].distribution = "norm"
+    saved_entries[0].dist_params = {"loc": 2.0, "scale": 0.1}
+    workflow.save_parameter_map(saved_entries)
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    window.open_distribution_editor()
+
+    editor = window.distribution_window
+    assert editor is not None
+    loaded_entry = editor.current_entries()[0]
+    assert loaded_entry.value == pytest.approx(2.0)
+    assert loaded_entry.distribution == "norm"
+
+    editor.reset_all_priors_button.click()
+    QApplication.processEvents()
+
+    reset_entry = editor.current_entries()[0]
+    assert reset_entry.value == pytest.approx(default_entries[0].value)
+    assert reset_entry.distribution == default_entries[0].distribution
+    assert reset_entry.dist_params == pytest.approx(
+        default_entries[0].dist_params
+    )
+
+    editor.close()
+    window.close()
+
+
 def test_distribution_window_can_toggle_all_vary_flags(qapp):
     del qapp
     window = DistributionSetupWindow(
@@ -8589,6 +10803,202 @@ def test_distribution_window_smart_prior_preset_tightens_and_relaxes_spreads(
     lenient_entries = window.current_entries()
     assert lenient_entries[0].dist_params["s"] == pytest.approx(0.195)
     assert lenient_entries[1].dist_params["scale"] == pytest.approx(0.2925)
+
+
+def test_distribution_window_rounded_guides_smart_prior_preset(qapp):
+    del qapp
+    window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="",
+                motif="",
+                param_type="SAXS",
+                param="scale",
+                value=0.55,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 0.55, "scale": 0.047},
+            ),
+        ]
+    )
+
+    rounded_index = window.smart_prior_preset_combo.findData("rounded_guides")
+    assert rounded_index >= 0
+    assert window.table.cellWidget(0, 8).findData("rounded_guides") >= 0
+
+    window.smart_prior_preset_combo.setCurrentIndex(rounded_index)
+    window.apply_smart_prior_preset_button.click()
+
+    entry = window.current_entries()[0]
+    assert entry.smart_preset_status == "rounded_guides"
+    assert entry.dist_params["loc"] == pytest.approx(0.55)
+    assert entry.dist_params["scale"] == pytest.approx(0.05)
+    assert window.table.cellWidget(0, 8).currentData() == "rounded_guides"
+    window._has_existing_parameter_map = True
+    window.close()
+
+
+def test_distribution_window_legacy_md_weight_smart_prior_preset(qapp):
+    del qapp
+    window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="A",
+                motif="m1",
+                param_type="Both",
+                param="w0",
+                value=0.42,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 0.42, "scale": 0.08},
+            ),
+            DreamParameterEntry(
+                structure="",
+                motif="",
+                param_type="SAXS",
+                param="scale",
+                value=1.2,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 1.2, "scale": 0.3},
+            ),
+        ]
+    )
+
+    legacy_index = window.smart_prior_preset_combo.findData(
+        LEGACY_MD_WEIGHT_SMART_PRIOR_MODE
+    )
+    assert legacy_index >= 0
+    assert (
+        window.table.cellWidget(0, 8).findData(
+            LEGACY_MD_WEIGHT_SMART_PRIOR_MODE
+        )
+        >= 0
+    )
+
+    window.smart_prior_preset_combo.setCurrentIndex(legacy_index)
+    window.apply_smart_prior_preset_button.click()
+
+    entries = {entry.param: entry for entry in window.current_entries()}
+    weight_entry = entries["w0"]
+    assert weight_entry.distribution == "lognorm"
+    assert weight_entry.dist_params["loc"] == pytest.approx(0.0)
+    assert weight_entry.dist_params["scale"] == pytest.approx(0.42)
+    assert weight_entry.dist_params["s"] == pytest.approx(1.0)
+    assert (
+        weight_entry.smart_preset_status == LEGACY_MD_WEIGHT_SMART_PRIOR_MODE
+    )
+    assert entries["scale"].distribution == "norm"
+    assert entries["scale"].dist_params["scale"] == pytest.approx(0.3)
+    assert entries["scale"].smart_preset_status == "custom"
+    window._has_existing_parameter_map = True
+    window.close()
+
+
+def test_dream_prior_editors_offer_rounded_guides_in_main_and_batch_ui(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    from saxshell.saxs.ui.dream_batch_window import DreamBatchRunFileWindow
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+
+    main_window = SAXSMainWindow(initial_project_dir=project_dir)
+    main_window.open_distribution_editor()
+    main_editor = main_window.distribution_window
+
+    assert main_editor is not None
+    assert main_editor.smart_prior_preset_combo.findData("rounded_guides") >= 0
+    assert (
+        main_editor.smart_prior_preset_combo.findData(
+            LEGACY_MD_WEIGHT_SMART_PRIOR_MODE
+        )
+        >= 0
+    )
+    main_editor._has_existing_parameter_map = True
+    main_editor.close()
+    main_window.close()
+
+    batch_window = DreamBatchRunFileWindow(initial_project_dir=project_dir)
+    batch_window._open_prior_editor()
+    batch_editor = batch_window._distribution_window
+
+    assert batch_editor is not None
+    assert (
+        batch_editor.smart_prior_preset_combo.findData("rounded_guides") >= 0
+    )
+    assert (
+        batch_editor.smart_prior_preset_combo.findData(
+            LEGACY_MD_WEIGHT_SMART_PRIOR_MODE
+        )
+        >= 0
+    )
+    batch_editor.close()
+    batch_window.close()
+
+
+def test_distribution_window_smart_prior_presets_keep_weight_guides_nonnegative(
+    qapp,
+):
+    del qapp
+    window = DistributionSetupWindow(
+        [
+            DreamParameterEntry(
+                structure="A",
+                motif="m1",
+                param_type="Both",
+                param="w0",
+                value=0.5,
+                vary=True,
+                distribution="uniform",
+                dist_params={"loc": 0.0, "scale": 1.0},
+            ),
+            DreamParameterEntry(
+                structure="B",
+                motif="m2",
+                param_type="Both",
+                param="w1",
+                value=0.2,
+                vary=True,
+                distribution="norm",
+                dist_params={"loc": 0.2, "scale": 0.2},
+            ),
+            DreamParameterEntry(
+                structure="C",
+                motif="m3",
+                param_type="Both",
+                param="w2",
+                value=0.4,
+                vary=True,
+                distribution="lognorm",
+                dist_params={"loc": -0.1, "scale": 0.5, "s": 0.2},
+            ),
+        ]
+    )
+
+    window.smart_prior_preset_combo.setCurrentIndex(
+        window.smart_prior_preset_combo.findData("very_lenient")
+    )
+    window.apply_smart_prior_preset_button.click()
+    QApplication.processEvents()
+
+    low_column = _table_column_index(window.table, "Guide Low")
+    entries = window.current_entries()
+
+    assert entries[0].dist_params["loc"] == pytest.approx(0.0)
+    assert entries[0].dist_params["scale"] > 1.0
+    assert (
+        entries[1].dist_params["loc"]
+        - GUIDE_INTERVAL_SIGMA * entries[1].dist_params["scale"]
+    ) >= -1e-9
+    assert entries[2].dist_params["loc"] == pytest.approx(0.0)
+    assert all(
+        float(window.table.item(row, low_column).text()) >= -1e-9
+        for row in range(window.table.rowCount())
+    )
 
 
 def test_distribution_window_smart_prior_preset_can_target_selected_structures(
@@ -8842,7 +11252,7 @@ def test_distribution_window_row_status_can_override_single_structure_preset(
     small_status_combo.setCurrentIndex(very_lenient_index)
     entries = window.current_entries()
 
-    assert entries[0].dist_params["scale"] == pytest.approx(0.14625)
+    assert entries[0].dist_params["scale"] == pytest.approx(0.1)
     assert entries[2].dist_params["scale"] == pytest.approx(0.2925)
     assert entries[1].dist_params["scale"] == pytest.approx(0.15)
     assert entries[3].dist_params["scale"] == pytest.approx(0.3)
@@ -9487,6 +11897,99 @@ def test_run_dream_requires_written_runtime_bundle(
     )
 
 
+def test_write_dream_bundle_shows_progress_popup(qapp, tmp_path, monkeypatch):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    workflow = SAXSDreamWorkflow(project_dir)
+    workflow.create_default_parameter_map(persist=True)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    progress_events: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        window,
+        "_show_dream_progress_dialog",
+        lambda message, **kwargs: progress_events.append(
+            ("show", message, kwargs)
+        ),
+    )
+    monkeypatch.setattr(
+        window,
+        "_update_dream_progress_dialog",
+        lambda processed, total, message, **kwargs: progress_events.append(
+            ("update", processed, total, message, kwargs)
+        ),
+    )
+    monkeypatch.setattr(
+        window,
+        "_close_dream_progress_dialog",
+        lambda: progress_events.append(("close",)),
+    )
+
+    window.write_dream_bundle()
+
+    assert window._last_written_dream_bundle is not None
+    assert progress_events[0] == (
+        "show",
+        "Preparing DREAM runtime bundle...",
+        {
+            "total": 5,
+            "unit_label": "steps",
+            "title": "Writing DREAM Runtime Bundle",
+        },
+    )
+    assert [
+        event[1:4] for event in progress_events if event[0] == "update"
+    ] == [
+        (1, 5, "Loading DREAM workflow..."),
+        (2, 5, "Loading DREAM settings and prior map..."),
+        (3, 5, "Validating DREAM prior map and filter settings..."),
+        (4, 5, "Writing DREAM runtime bundle files..."),
+        (5, 5, "Refreshing DREAM runtime state..."),
+    ]
+    assert progress_events[-1] == ("close",)
+
+
+def test_run_dream_validates_stoichiometry_filter_before_worker_start(
+    qapp, tmp_path, monkeypatch
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    workflow = SAXSDreamWorkflow(project_dir)
+    entries = workflow.create_default_parameter_map(persist=True)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    window._save_distribution_entries(entries)
+    window.write_dream_bundle()
+
+    window.dream_tab.stoichiometry_filter_checkbox.setChecked(True)
+    window.dream_tab.stoichiometry_elements_edit.setText("Pb, I")
+    window.dream_tab.stoichiometry_ratio_edit.clear()
+
+    started = {"value": False}
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_start_dream_run_task",
+        lambda *args, **kwargs: started.update({"value": True}),
+    )
+    monkeypatch.setattr(
+        window,
+        "_show_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    window.run_dream_bundle()
+
+    assert started["value"] is False
+    assert len(errors) == 1
+    assert errors[0][0] == "Stoichiometry filter incomplete"
+    assert "target is invalid" in errors[0][1]
+    assert "Enter both stoichiometry target elements" in errors[0][1]
+    assert "Run DREAM blocked" in window.dream_tab.output_box.toPlainText()
+
+
 def test_preview_runtime_bundle_opens_latest_written_script(
     qapp, tmp_path, monkeypatch
 ):
@@ -10057,6 +12560,8 @@ def test_load_latest_dream_results_updates_both_plot_panels(qapp, tmp_path):
     assert "RMSE:" in metric_text
     assert "Mean |res|:" in metric_text
     assert "R²:" in metric_text
+    assert "Fit q-range:" in metric_text
+    assert "Output q-range:" in metric_text
     assert (
         window.dream_tab.violin_figure.axes[0].get_title()
         == "Posterior parameter distributions"
@@ -10066,6 +12571,69 @@ def test_load_latest_dream_results_updates_both_plot_panels(qapp, tmp_path):
         for label in window.dream_tab.violin_figure.axes[0].get_xticklabels()
     ]
     assert "w0 (A)" in tick_labels
+
+
+def test_dream_model_plot_metrics_include_fitted_stoichiometry(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    run_dir = _write_stoichiometry_filter_dream_results(tmp_path)
+    metadata_path = run_dir / "dream_runtime_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    for parameter_name, value in (
+        ("solv_w", 0.0),
+        ("offset", 0.0),
+        ("eff_r", 1.0),
+        ("vol_frac", 0.01),
+    ):
+        metadata["parameter_map"].append(
+            {
+                "structure": "",
+                "motif": "",
+                "param_type": "SAXS",
+                "param": parameter_name,
+                "value": value,
+                "vary": False,
+                "distribution": "norm",
+                "dist_params": {"loc": value, "scale": 0.1},
+            }
+        )
+        metadata["full_parameter_names"].append(parameter_name)
+        metadata["fixed_parameter_values"].append(value)
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    loader = SAXSDreamResultsLoader(run_dir, burnin_percent=0)
+    plot_data = loader.build_model_fit_data(bestfit_method="map")
+    tab = DreamTab()
+
+    tab.plot_model_fit(plot_data)
+
+    assert plot_data.fitted_stoichiometry_text == "Stoich: Pb:I = 1:2"
+    assert [parameter.name for parameter in plot_data.fit_parameters] == [
+        "w0",
+        "w1",
+        "scale",
+        "solv_w",
+        "offset",
+        "eff_r",
+        "vol_frac",
+    ]
+    assert tab.fit_parameter_table.isEnabled()
+    assert tab.fit_parameter_table.rowCount() == 7
+    assert tab.fit_parameter_table.item(0, 0).text() == "w0"
+    assert tab.fit_parameter_table.item(0, 1).text() == "1"
+    assert tab.fit_parameter_table.item(0, 2).text() == "Varied"
+    assert tab.fit_parameter_table.item(0, 3).text() == "PbI2"
+    assert tab.fit_parameter_table.item(2, 0).text() == "scale"
+    assert tab.fit_parameter_table.item(2, 2).text() == "Fixed"
+    metric_text = "\n".join(
+        text.get_text() for text in tab.model_figure.axes[0].texts
+    )
+    assert "Stoich: Pb:I = 1:2" in metric_text
+    tab.close()
 
 
 def test_dream_analysis_saved_run_dropdown_loads_selected_run_state(
@@ -10163,6 +12731,57 @@ def test_dream_analysis_saved_run_dropdown_loads_selected_run_state(
     assert (
         str(older_bundle.run_dir) in window.dream_tab.output_box.toPlainText()
     )
+
+
+def test_dream_analysis_saved_run_dropdown_refreshes_completed_batch_run(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    from saxshell.saxs.dream import DreamBatchRunSetManager
+
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    prefit = SAXSPrefitWorkflow(project_dir)
+    prefit.save_fit(prefit.parameter_entries)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    manager = DreamBatchRunSetManager(project_dir, label="batch dropdown")
+    entries = manager.workflow.create_default_parameter_map(persist=False)
+    settings = manager.workflow.load_settings()
+    settings.nchains = 2
+    settings.niterations = 6
+    item = manager.add_queue_item(
+        label="batch item",
+        settings=settings,
+        entries=entries,
+    )
+    run_dir = Path(item.run_dir).resolve()
+
+    assert window.dream_tab.saved_runs_combo.findData(str(run_dir)) < 0
+
+    metadata = json.loads(Path(item.metadata_path).read_text(encoding="utf-8"))
+    active_values = np.asarray(
+        [entry["value"] for entry in metadata["active_parameter_entries"]],
+        dtype=float,
+    )
+    np.save(
+        run_dir / "dream_sampled_params.npy",
+        np.tile(active_values, (2, 3, 1)),
+    )
+    np.save(run_dir / "dream_log_ps.npy", np.zeros((2, 3)))
+    item.status = "completed"
+    manager.save_manifest()
+
+    window.tabs.setCurrentWidget(window.dream_tab)
+    QApplication.processEvents()
+
+    refreshed_index = window.dream_tab.saved_runs_combo.findData(str(run_dir))
+    assert refreshed_index >= 0
+    window.dream_tab.saved_runs_combo.setCurrentIndex(refreshed_index)
+    assert "Batch: batch dropdown" in (
+        window.dream_tab.selected_saved_run_label() or ""
+    )
+    window.close()
 
 
 def test_dream_analysis_saved_run_preview_is_non_destructive(
@@ -10291,6 +12910,8 @@ def test_dream_model_plot_includes_residual_subplot(qapp, tmp_path):
     assert residual_axis.get_ylabel() == "Residual"
     assert residual_axis.get_xlabel() == Q_A_INVERSE_LABEL
     assert residual_axis.get_xscale() == top_axis.get_xscale()
+    assert top_axis.patches
+    assert residual_axis.patches
 
     residual_line = residual_axis.get_lines()[-1]
     plot_data = window.dream_tab._current_model_plot_data
@@ -10362,7 +12983,11 @@ def test_dream_violin_scale_modes_and_palette_controls(qapp, tmp_path):
 
     palette_index = window.dream_tab.violin_palette_combo.findData("plasma")
     window.load_latest_results()
-    window.dream_tab.violin_value_scale_combo.setCurrentIndex(1)
+    window.dream_tab.violin_value_scale_combo.setCurrentIndex(
+        window.dream_tab.violin_value_scale_combo.findData(
+            "weights_unit_interval"
+        )
+    )
     window.dream_tab.violin_palette_combo.setCurrentIndex(palette_index)
     window.dream_tab._configure_plot_color_button(
         window.dream_tab.violin_point_color_button,
@@ -10394,7 +13019,9 @@ def test_dream_violin_scale_modes_and_palette_controls(qapp, tmp_path):
         keep_alpha=False,
     )
 
-    window.dream_tab.violin_value_scale_combo.setCurrentIndex(2)
+    window.dream_tab.violin_value_scale_combo.setCurrentIndex(
+        window.dream_tab.violin_value_scale_combo.findData("normalized_all")
+    )
     _apply_dream_filter_changes(window, qapp)
 
     axis = window.dream_tab.violin_figure.axes[0]
@@ -10408,6 +13035,71 @@ def test_dream_violin_scale_modes_and_palette_controls(qapp, tmp_path):
     ]
     assert "w0 (A)" in normalized_labels
     assert "solv_w" in normalized_labels
+
+
+def test_dream_violin_weight_fraction_percent_scale_modes(qapp, tmp_path):
+    run_dir = _write_weight_order_dream_results(tmp_path)
+    loader = SAXSDreamResultsLoader(run_dir, burnin_percent=0)
+    summary = loader.get_summary()
+    violin_plot = loader.build_violin_data(
+        mode="weights_only",
+        weight_order="structure_order",
+    )
+    tab = DreamTab()
+
+    tab.violin_value_scale_combo.setCurrentIndex(
+        tab.violin_value_scale_combo.findData("structure_fraction_percent")
+    )
+    structure_payload = tab.prepare_violin_plot_payload(summary, violin_plot)
+
+    assert structure_payload["ylabel"] == "Structure fraction (%)"
+    assert structure_payload["title"] == (
+        "Posterior structure fraction distributions"
+    )
+    assert structure_payload["y_limits"] == (0.0, 100.0)
+    assert structure_payload["display_names"] == [
+        "w0 (I2)",
+        "w1 (Pb2)",
+        "w2 (PbI2O)",
+    ]
+    expected_structure_selected = np.asarray(
+        [
+            0.34 / 1.01 * 100.0,
+            0.41 / 1.01 * 100.0,
+            0.26 / 1.01 * 100.0,
+        ]
+    )
+    assert np.asarray(structure_payload["samples"]) == pytest.approx(
+        np.asarray(
+            [
+                [35.0, 40.0, 25.0],
+                expected_structure_selected,
+            ]
+        )
+    )
+    assert np.asarray(structure_payload["selected_values"]) == pytest.approx(
+        expected_structure_selected
+    )
+
+    tab.violin_value_scale_combo.setCurrentIndex(
+        tab.violin_value_scale_combo.findData("atom_fraction_percent")
+    )
+    atom_payload = tab.prepare_violin_plot_payload(summary, violin_plot)
+
+    assert atom_payload["ylabel"] == "Total atom fraction (%)"
+    assert atom_payload["title"] == (
+        "Posterior total atom fraction distributions"
+    )
+    atom_denominator = 0.34 * 2.0 + 0.41 * 2.0 + 0.26 * 4.0
+    assert np.asarray(atom_payload["selected_values"]) == pytest.approx(
+        np.asarray(
+            [
+                0.34 * 2.0 / atom_denominator * 100.0,
+                0.41 * 2.0 / atom_denominator * 100.0,
+                0.26 * 4.0 / atom_denominator * 100.0,
+            ]
+        )
+    )
 
 
 def test_dream_violin_custom_color_controls_apply_to_plot(
@@ -10530,6 +13222,34 @@ def test_dream_tab_limits_violin_display_sample_count(qapp):
     assert np.allclose(limited[-1], samples[-1])
 
 
+def test_dream_tab_scales_violin_display_count_by_parameter_count(qapp):
+    del qapp
+    samples = np.arange(180_000, dtype=float).reshape(6_000, 30)
+
+    limited = DreamTab._display_violin_samples(samples)
+
+    expected_rows = DreamTab.MAX_VIOLIN_PLOT_SAMPLE_POINTS // 30
+    assert limited.shape == (expected_rows, 30)
+    assert np.allclose(limited[0], samples[0])
+    assert np.allclose(limited[-1], samples[-1])
+
+
+def test_dream_tab_caps_large_runtime_console_output(qapp):
+    del qapp
+    tab = DreamTab()
+    tab.append_runtime_output(
+        "line 0\n" + ("x" * (tab.MAX_RUNTIME_OUTPUT_CHARS + 50_000))
+    )
+    tab._flush_pending_runtime_output()
+
+    text = tab.output_box.toPlainText()
+
+    assert "DREAM Runtime Output" in text
+    assert "Earlier DREAM runtime output omitted" in text
+    assert len(text) < tab.MAX_CONSOLE_TEXT_CHARS + 1_000
+    assert tab.output_box.lineWrapMode() == QTextEdit.LineWrapMode.NoWrap
+
+
 def test_dream_results_loader_can_order_weight_violin_labels_by_structure(
     tmp_path,
 ):
@@ -10569,6 +13289,14 @@ def test_dream_results_loader_splits_radius_and_additional_violin_modes(
     additional_plot = loader.build_violin_data(
         mode="additional_parameters_only"
     )
+    selected_plot = loader.build_violin_data(
+        mode="selected_additional_parameter",
+        selected_parameter="offset",
+    )
+    fallback_selected_plot = loader.build_violin_data(
+        mode="selected_additional_parameter",
+        selected_parameter="not_in_this_model",
+    )
     fit_plot = loader.build_violin_data(mode="fit_parameters")
 
     assert radius_plot.parameter_names == [
@@ -10582,6 +13310,9 @@ def test_dream_results_loader_splits_radius_and_additional_violin_modes(
         "offset",
         "phi_int",
     ]
+    assert selected_plot.parameter_names == ["offset"]
+    assert selected_plot.samples[:, 0].tolist() == pytest.approx([0.05, 0.07])
+    assert fallback_selected_plot.parameter_names == ["scale"]
     assert fit_plot.parameter_names == [
         "r_eff_w0",
         "a_eff_w1",
@@ -10593,6 +13324,75 @@ def test_dream_results_loader_splits_radius_and_additional_violin_modes(
     ]
 
 
+def test_dream_tab_selected_additional_parameter_options_are_dynamic(qapp):
+    del qapp
+    tab = DreamTab()
+    entries = [
+        DreamParameterEntry(
+            structure="A",
+            motif="m1",
+            param_type="Both",
+            param="w0",
+            value=0.35,
+            vary=True,
+            distribution="lognorm",
+            dist_params={"loc": 0.0, "scale": 0.35, "s": 0.1},
+        ),
+        DreamParameterEntry(
+            structure="A",
+            motif="m1",
+            param_type="Both",
+            param="r_eff_w0",
+            value=9.0,
+            vary=True,
+            distribution="norm",
+            dist_params={"loc": 9.0, "scale": 0.5},
+        ),
+        DreamParameterEntry(
+            structure="",
+            motif="",
+            param_type="SAXS",
+            param="scale",
+            value=1.0,
+            vary=True,
+            distribution="norm",
+            dist_params={"loc": 1.0, "scale": 0.1},
+        ),
+        DreamParameterEntry(
+            structure="",
+            motif="",
+            param_type="SAXS",
+            param="offset",
+            value=0.05,
+            vary=True,
+            distribution="norm",
+            dist_params={"loc": 0.05, "scale": 0.01},
+        ),
+    ]
+
+    tab.set_parameter_map_entries(entries)
+
+    assert [
+        tab.violin_parameter_combo.itemData(index)
+        for index in range(tab.violin_parameter_combo.count())
+    ] == ["scale", "offset"]
+    assert not tab.violin_parameter_combo.isEnabled()
+
+    tab.violin_mode_combo.setCurrentIndex(
+        tab.violin_mode_combo.findData("selected_additional_parameter")
+    )
+    tab.violin_parameter_combo.setCurrentIndex(
+        tab.violin_parameter_combo.findData("offset")
+    )
+
+    assert tab.violin_parameter_combo.isEnabled()
+    assert tab.settings_payload().violin_selected_parameter == "offset"
+
+    tab.set_violin_parameter_options(["vol_frac"], selected_parameter="offset")
+
+    assert tab.selected_violin_parameter() == "vol_frac"
+
+
 def test_effective_dream_violin_mode_honors_new_value_scale_overrides():
     radius_settings = DreamRunSettings(
         violin_parameter_mode="fit_parameters",
@@ -10600,6 +13400,18 @@ def test_effective_dream_violin_mode_honors_new_value_scale_overrides():
     )
     additional_settings = DreamRunSettings(
         violin_parameter_mode="weights_only",
+        violin_value_scale_mode="additional_parameters_only",
+    )
+    structure_fraction_settings = DreamRunSettings(
+        violin_parameter_mode="fit_parameters",
+        violin_value_scale_mode="structure_fraction_percent",
+    )
+    atom_fraction_settings = DreamRunSettings(
+        violin_parameter_mode="fit_parameters",
+        violin_value_scale_mode="atom_fraction_percent",
+    )
+    selected_parameter_settings = DreamRunSettings(
+        violin_parameter_mode="selected_additional_parameter",
         violin_value_scale_mode="additional_parameters_only",
     )
 
@@ -10610,6 +13422,22 @@ def test_effective_dream_violin_mode_honors_new_value_scale_overrides():
     assert (
         SAXSMainWindow._effective_dream_violin_mode(additional_settings)
         == "additional_parameters_only"
+    )
+    assert (
+        SAXSMainWindow._effective_dream_violin_mode(
+            structure_fraction_settings
+        )
+        == "weights_only"
+    )
+    assert (
+        SAXSMainWindow._effective_dream_violin_mode(atom_fraction_settings)
+        == "weights_only"
+    )
+    assert (
+        SAXSMainWindow._effective_dream_violin_mode(
+            selected_parameter_settings
+        )
+        == "selected_additional_parameter"
     )
 
 
@@ -10703,6 +13531,23 @@ def test_dream_filter_changes_wait_for_apply_button(qapp, tmp_path):
 
     assert "Posterior samples kept: 1" in window.dream_tab._summary_text
     assert not window.dream_tab.apply_filter_button.isEnabled()
+    assert not window.dream_tab.filter_progress_label.isHidden()
+    assert not window.dream_tab.filter_progress_bar.isHidden()
+    assert window.dream_tab.filter_progress_label.text() == (
+        "DREAM filter applied."
+    )
+    assert window.dream_tab.filter_progress_bar.maximum() == 4
+    assert window.dream_tab.filter_progress_bar.value() == 4
+    assert window._dream_progress_dialog is not None
+    assert window._dream_progress_dialog.windowTitle() == (
+        "Applying DREAM Filter"
+    )
+    assert not window._dream_progress_dialog.isVisible()
+    assert window._dream_progress_dialog.progress_bar.maximum() == 4
+    assert window._dream_progress_dialog.progress_bar.value() == 4
+    assert window._dream_progress_dialog.message_label.text() == (
+        "DREAM filter applied."
+    )
 
 
 def test_prefit_stoichiometry_status_updates_with_weight_edits(qapp, tmp_path):
@@ -10762,6 +13607,34 @@ def test_prefit_stoichiometry_status_updates_with_weight_edits(qapp, tmp_path):
     assert after != before
     assert "Observed ratio:" in after
     assert "Deviation from target:" in after
+
+
+def test_formal_charge_estimator_handles_perovskite_stoichiometries():
+    charge, counts, unresolved = formal_charge_for_stoich_label("MAPbI3")
+
+    assert charge == pytest.approx(0.0)
+    assert counts["MA"] == 1
+    assert counts["Pb"] == 1
+    assert counts["I"] == 3
+    assert unresolved == ()
+
+    charge, counts, unresolved = formal_charge_for_stoich_label("CsPbI2")
+
+    assert charge == pytest.approx(1.0)
+    assert counts["Cs"] == 1
+    assert unresolved == ()
+
+    estimate = estimate_weighted_formal_charge(
+        [
+            ("PbI", 2.0),
+            ("PbI3", 1.0),
+        ]
+    )
+
+    assert estimate.is_valid
+    assert estimate.weighted_mean_signed_charge_e == pytest.approx(1.0 / 3.0)
+    assert estimate.absolute_weighted_mean_charge_e == pytest.approx(1.0 / 3.0)
+    assert estimate.weighted_mean_absolute_charge_e == pytest.approx(1.0)
 
 
 def test_dream_results_loader_reuses_cached_plot_data_across_interval_changes(
@@ -10826,7 +13699,18 @@ def test_dream_plot_data_exports_save_into_exported_results_data(
 ):
     del qapp
     project_dir, paths = _build_minimal_saxs_project(tmp_path)
-    _write_minimal_dream_results(project_dir)
+    workflow = SAXSDreamWorkflow(project_dir)
+    dream_settings = workflow.load_settings()
+    dream_settings.search_filter_preset = "legacy_gui_default"
+    dream_entries = workflow.create_default_parameter_map(persist=False)
+    for entry in dream_entries:
+        entry.smart_preset_status = "proportional"
+    dream_entries[0].smart_preset_status = "legacy_md_weights"
+    _write_minimal_dream_results(
+        project_dir,
+        settings=dream_settings,
+        entries=dream_entries,
+    )
     window = SAXSMainWindow(initial_project_dir=project_dir)
 
     class _AcceptedDialog:
@@ -10897,9 +13781,34 @@ def test_dream_plot_data_exports_save_into_exported_results_data(
     )
     assert model_report.is_file()
     assert model_metadata["export_kind"] == "dream_model_fit"
+    assert model_metadata["preset_summary"]["dream_search_preset"] == (
+        "legacy_gui_default"
+    )
+    assert (
+        "Legacy MD Weights"
+        in model_metadata["preset_summary"]["prior_preset_summary"]
+    )
+    first_parameter_summary = model_metadata["summary"]["parameter_summary"][0]
+    assert "guide_low" in first_parameter_summary
+    assert "guide_high" in first_parameter_summary
+    assert "guide_clip_status" in first_parameter_summary
     assert model_metadata["model_fit"]["includes_structure_factor"] is True
     assert model_metadata["model_fit"]["fit_metrics"]["rmse"] >= 0.0
-    assert "Model fit metrics:" in model_report.read_text(encoding="utf-8")
+    assert model_metadata["model_fit"]["fit_q_range"]
+    assert model_metadata["model_fit"]["output_q_range"]
+    assert "fit_q_min" in model_metadata["model_fit"]
+    assert "output_q_max" in model_metadata["model_fit"]
+    model_report_text = model_report.read_text(encoding="utf-8")
+    assert "Model fit metrics:" in model_report_text
+    assert "Fit q-range:" in model_report_text
+    assert "Output q-range:" in model_report_text
+    assert (
+        "DREAM search preset: Legacy GUI Default (legacy_gui_default)"
+        in model_report_text
+    )
+    assert "Legacy MD Weights: 1 parameter" in model_report_text
+    assert "guide_low=" in model_report_text
+    assert "guide_high=" in model_report_text
     assert "w0 (A)" in dialog_csv_export.read_text(encoding="utf-8")
     violin_payload = pickle.loads(dialog_pkl_export.read_bytes())
     violin_metadata = json.loads(
@@ -10982,6 +13891,7 @@ def test_dream_model_report_export_builds_context_and_writes_pptx(
     assert context.dream_parameter_map_entries
     assert context.dream_summary.posterior_sample_count > 0
     assert context.dream_filter_views
+    assert "Fit q-range:" in "\n".join(context.output_summary_lines)
     assert "Posterior filter:" in "\n".join(context.output_summary_lines)
     assert (context.asset_dir / "report_manifest.json").is_file()
 
@@ -11071,6 +13981,11 @@ def test_dream_model_report_export_writes_real_pptx(qapp, tmp_path):
         and "SAXS Model Report" in shape.text
     )
     assert title_shape.text_frame.paragraphs[0].runs[0].font.name == "Arial"
+    assert "Guide clipping legend" in slide_texts[0]
+    assert "Guide Low clipping" in slide_texts[0]
+    assert "Guide High clipping" in slide_texts[0]
+    assert any("Fit q-range:" in slide_text for slide_text in slide_texts)
+    assert any("Output q-range:" in slide_text for slide_text in slide_texts)
     assert (
         sum(
             "Posterior Violin Comparison" in slide_text
@@ -11676,6 +14591,272 @@ def test_prefit_template_selection_stays_pending_until_change_requested(
     window.close()
 
 
+def test_prefit_active_fit_range_controls_update_workflow(
+    qapp,
+    tmp_path,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert window.prefit_workflow is not None
+    window.prefit_tab.fit_q_min_spin.setValue(0.11)
+    window.prefit_tab.fit_q_max_spin.setValue(0.21)
+    qapp.processEvents()
+
+    evaluation = window.prefit_tab.current_evaluation()
+    assert evaluation is not None
+    expected_q = np.linspace(0.05, 0.3, 8)
+    expected_mask = (expected_q >= 0.11) & (expected_q <= 0.21)
+
+    assert window.prefit_workflow.settings.prefit_fit_q_min == pytest.approx(
+        0.11
+    )
+    assert window.prefit_workflow.settings.prefit_fit_q_max == pytest.approx(
+        0.21
+    )
+    saved_settings = SAXSProjectManager().load_project(project_dir)
+    assert saved_settings.prefit_fit_q_min == pytest.approx(0.11)
+    assert saved_settings.prefit_fit_q_max == pytest.approx(0.21)
+    assert np.array_equal(evaluation.fit_mask, expected_mask)
+    assert np.count_nonzero(np.isfinite(evaluation.residuals)) == 3
+    assert "Active fit q-range: 0.11 to 0.21" in (
+        window.prefit_tab.summary_box.toPlainText()
+    )
+    assert window.dream_tab.fit_q_min_spin.value() == pytest.approx(0.11)
+    assert window.dream_tab.fit_q_max_spin.value() == pytest.approx(0.21)
+    assert "DREAM fit: 0.11 to 0.21" in (
+        window.dream_tab.fit_range_status_label.text()
+    )
+
+    window.dream_tab.fit_q_min_spin.setValue(0.121)
+    window.dream_tab.fit_q_max_spin.setValue(0.193)
+    dream_settings = window.dream_tab.settings_payload()
+    assert dream_settings.fit_q_min == pytest.approx(0.121)
+    assert dream_settings.fit_q_max == pytest.approx(0.193)
+    window._load_prefit_preview()
+    assert window.dream_tab.fit_q_min_spin.value() == pytest.approx(0.121)
+    assert window.dream_tab.fit_q_max_spin.value() == pytest.approx(0.193)
+    window.close()
+
+
+def test_prefit_fit_range_controls_sit_above_run_prefit_button(qapp):
+    tab = PrefitTab()
+    tab.show()
+    qapp.processEvents()
+
+    parent_group = tab.fit_range_controls_row.parentWidget()
+    assert parent_group is not None
+    assert parent_group.title() == "Prefit Controls"
+    assert tab.fit_range_controls_row.geometry().top() < (
+        tab._run_button_cell.geometry().top()
+    )
+    assert tab.fit_q_min_spin.parentWidget() is tab.fit_range_controls_row
+    assert tab.fit_q_max_spin.parentWidget() is tab.fit_range_controls_row
+    tab.close()
+
+
+def test_prefit_dielectric_presets_update_charged_template_parameter(qapp):
+    del qapp
+    tab = PrefitTab()
+    tab.populate_parameter_table(
+        [
+            PrefitParameterEntry(
+                structure="A",
+                motif="no_motif",
+                name="scale",
+                value=1.0,
+                vary=True,
+                minimum=0.0,
+                maximum=10.0,
+                category="fit",
+            )
+        ]
+    )
+
+    assert tab.dielectric_preset_row.isHidden()
+
+    tab.populate_parameter_table(
+        [
+            PrefitParameterEntry(
+                structure="global",
+                motif="fit",
+                name="dielectconst",
+                value=78.54,
+                vary=False,
+                minimum=1.0,
+                maximum=200.0,
+                category="fit",
+            )
+        ]
+    )
+    edited_events = []
+    tab.parameter_table_edited.connect(lambda: edited_events.append(True))
+
+    assert not tab.dielectric_preset_row.isHidden()
+    assert tab.dielectric_preset_combo.findData("DMF") >= 0
+    assert tab.dielectric_preset_combo.findData("DMSO") >= 0
+    assert tab.dielectric_preset_combo.findData("NMP") >= 0
+    assert tab.dielectric_preset_combo.findData("ACN") >= 0
+    assert tab.dielectric_preset_combo.findData("water") >= 0
+
+    dmso_index = tab.dielectric_preset_combo.findData("DMSO")
+    tab.dielectric_preset_combo.setCurrentIndex(dmso_index)
+
+    row = tab.find_parameter_row("dielectconst")
+    assert row >= 0
+    assert float(tab.parameter_table.item(row, 3).text()) == pytest.approx(
+        47.0
+    )
+    assert edited_events
+
+    tab.set_parameter_row("dielectconst", value=12.34)
+
+    assert tab.dielectric_preset_combo.currentData() is None
+
+    tab.close()
+
+
+def test_prefit_weight_use_button_only_toggles_weight_entries(qapp):
+    del qapp
+    tab = PrefitTab()
+    tab.populate_parameter_table(
+        [
+            PrefitParameterEntry(
+                structure="PbI2",
+                motif="m1",
+                name="w0",
+                value=0.4,
+                vary=False,
+                minimum=0.0,
+                maximum=1.0,
+                category="weight",
+            ),
+            PrefitParameterEntry(
+                structure="PbI3",
+                motif="m2",
+                name="w1",
+                value=0.6,
+                vary=False,
+                minimum=0.0,
+                maximum=1.0,
+                category="weight",
+                active=False,
+            ),
+            PrefitParameterEntry(
+                structure="",
+                motif="",
+                name="scale",
+                value=1.0,
+                vary=True,
+                minimum=0.0,
+                maximum=10.0,
+                category="fit",
+                active=False,
+            ),
+        ]
+    )
+
+    assert tab.parameter_table.horizontalHeaderItem(4).text() == "Vary"
+    assert tab.parameter_table.horizontalHeaderItem(7).text() == "Use"
+    assert tab.parameter_table.horizontalHeaderItem(8).text() == "Reset"
+    w0_row = tab.find_parameter_row("w0")
+    w1_row = tab.find_parameter_row("w1")
+    scale_row = tab.find_parameter_row("scale")
+    w0_button = tab.parameter_table.cellWidget(w0_row, 7)
+    w1_button = tab.parameter_table.cellWidget(w1_row, 7)
+
+    assert isinstance(w0_button, QPushButton)
+    assert isinstance(w1_button, QPushButton)
+    assert w0_button.text() == "On"
+    assert w1_button.text() == "Off"
+    assert tab.parameter_table.cellWidget(scale_row, 7) is None
+    assert tab.parameter_table.item(scale_row, 7).text() == ""
+
+    w0_button.click()
+    QApplication.processEvents()
+    entries = {entry.name: entry for entry in tab.parameter_entries()}
+
+    assert entries["w0"].active is False
+    assert entries["w1"].active is False
+    assert entries["scale"].active is True
+    assert tab.parameter_table.item(scale_row, 4).checkState() == (
+        Qt.CheckState.Checked
+    )
+    tab.close()
+
+
+def test_prefit_charge_estimator_button_applies_weighted_formal_charge(
+    qapp,
+    monkeypatch,
+):
+    del qapp
+    window = SAXSMainWindow()
+    window.prefit_workflow = SimpleNamespace(
+        template_spec=SimpleNamespace(name=CHARGED_MONOSQ_TEMPLATE),
+        parameter_entries=[],
+    )
+    window.prefit_tab.populate_parameter_table(
+        [
+            PrefitParameterEntry(
+                structure="PbI",
+                motif="m1",
+                name="w0",
+                value=2.0,
+                vary=False,
+                minimum=0.0,
+                maximum=5.0,
+                category="weight",
+            ),
+            PrefitParameterEntry(
+                structure="PbI3",
+                motif="m2",
+                name="w1",
+                value=1.0,
+                vary=False,
+                minimum=0.0,
+                maximum=5.0,
+                category="weight",
+            ),
+            PrefitParameterEntry(
+                structure="",
+                motif="",
+                name="charge",
+                value=19.0,
+                vary=True,
+                minimum=1.0e-6,
+                maximum=200.0,
+                category="fit",
+            ),
+        ]
+    )
+    preview_calls = []
+    monkeypatch.setattr(
+        window,
+        "_load_prefit_preview",
+        lambda *args, **kwargs: preview_calls.append(True),
+    )
+
+    assert not window.prefit_tab.charge_estimate_row.isHidden()
+
+    window.prefit_tab.charge_estimate_button.click()
+
+    charge_row = window.prefit_tab.find_parameter_row("charge")
+    assert charge_row >= 0
+    assert float(
+        window.prefit_tab.parameter_table.item(charge_row, 3).text()
+    ) == pytest.approx(1.0 / 3.0)
+    workflow_entries = {
+        entry.name: entry for entry in window.prefit_workflow.parameter_entries
+    }
+    assert workflow_entries["charge"].value == pytest.approx(1.0 / 3.0)
+    assert "Weighted mean signed charge: 0.333333 e" in (
+        window.prefit_tab.output_box.toPlainText()
+    )
+    assert preview_calls
+
+    window.close()
+
+
 def test_settings_from_project_tab_uses_active_template_when_selection_differs(
     qapp, tmp_path
 ):
@@ -12225,6 +15406,10 @@ def test_prefit_tab_reorders_controls_and_parameter_actions(qapp):
     assert tab._prefit_control_button_grid.itemAtPosition(0, 0).widget() is (
         tab._run_button_cell
     )
+    run_button_row = tab._run_button_cell.layout().itemAt(0).layout()
+    assert run_button_row.itemAt(0).widget() is tab.run_button
+    assert run_button_row.itemAt(1).widget() is tab.undo_fit_button
+    assert not tab.undo_fit_button.isEnabled()
     assert tab._prefit_control_button_grid.itemAtPosition(0, 1).widget() is (
         tab.autosave_checkbox
     )
@@ -12241,6 +15426,137 @@ def test_prefit_tab_reorders_controls_and_parameter_actions(qapp):
         tab.reset_best_button
     )
     assert tab.sequence_history_checkbox.text() == "Sequence history logger"
+
+
+def test_prefit_undo_button_restores_previous_fit_step(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert window.prefit_workflow is not None
+    monkeypatch.setattr(window, "_load_dream_workflow", lambda: None)
+    monkeypatch.setattr(
+        window,
+        "_confirm_large_prefit_parameter_count",
+        lambda names: (True, False),
+    )
+
+    window.prefit_tab.set_parameter_row("scale", value=0.001)
+    assert not window.prefit_tab.undo_fit_button.isEnabled()
+
+    def fake_run_fit(entries, *, method="leastsq", max_nfev=10000):
+        del max_nfev
+        updated_entries = [
+            PrefitParameterEntry.from_dict(entry.to_dict())
+            for entry in entries
+        ]
+        for entry in updated_entries:
+            if entry.name == "scale":
+                entry.value = 0.009
+        evaluation = window.prefit_workflow.evaluate(updated_entries)
+        residuals = np.asarray(evaluation.residuals, dtype=float)
+        return PrefitFitResult(
+            parameter_entries=updated_entries,
+            evaluation=evaluation,
+            fit_report="fake lmfit report",
+            method=method,
+            nfev=6,
+            chi_square=float(np.sum(residuals**2)),
+            reduced_chi_square=float(np.mean(residuals**2)),
+            r_squared=0.75,
+            optimization_strategy=f"lmfit {method}",
+            grid_evaluations=0,
+        )
+
+    monkeypatch.setattr(window.prefit_workflow, "run_fit", fake_run_fit)
+
+    window.run_prefit()
+
+    fitted_entries = {
+        entry.name: entry for entry in window.prefit_tab.parameter_entries()
+    }
+    assert fitted_entries["scale"].value == pytest.approx(0.009)
+    assert window.prefit_tab.undo_fit_button.isEnabled()
+
+    window.prefit_tab.undo_fit_button.click()
+
+    restored_entries = {
+        entry.name: entry for entry in window.prefit_tab.parameter_entries()
+    }
+    assert restored_entries["scale"].value == pytest.approx(0.001)
+    assert not window.prefit_tab.undo_fit_button.isEnabled()
+    assert "Undid most recent Prefit run" in (
+        window.prefit_tab.output_box.toPlainText()
+    )
+    window.close()
+
+
+def test_prefit_rejects_negative_r_squared_fit_step(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert window.prefit_workflow is not None
+    monkeypatch.setattr(window, "_load_dream_workflow", lambda: None)
+    monkeypatch.setattr(
+        window,
+        "_confirm_large_prefit_parameter_count",
+        lambda names: (True, False),
+    )
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_show_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    window.prefit_tab.set_parameter_row("scale", value=0.001)
+
+    def fake_run_fit(entries, *, method="leastsq", max_nfev=10000):
+        del max_nfev
+        updated_entries = [
+            PrefitParameterEntry.from_dict(entry.to_dict())
+            for entry in entries
+        ]
+        for entry in updated_entries:
+            if entry.name == "scale":
+                entry.value = 0.009
+        evaluation = window.prefit_workflow.evaluate(updated_entries)
+        residuals = np.asarray(evaluation.residuals, dtype=float)
+        return PrefitFitResult(
+            parameter_entries=updated_entries,
+            evaluation=evaluation,
+            fit_report="fake lmfit report",
+            method=method,
+            nfev=6,
+            chi_square=float(np.sum(residuals**2)),
+            reduced_chi_square=float(np.mean(residuals**2)),
+            r_squared=-0.25,
+            optimization_strategy=f"lmfit {method}",
+            grid_evaluations=0,
+        )
+
+    monkeypatch.setattr(window.prefit_workflow, "run_fit", fake_run_fit)
+
+    window.run_prefit()
+
+    entries = {
+        entry.name: entry for entry in window.prefit_tab.parameter_entries()
+    }
+    assert entries["scale"].value == pytest.approx(0.001)
+    assert not window.prefit_tab.undo_fit_button.isEnabled()
+    assert errors
+    assert errors[-1][0] == "Prefit failed"
+    assert "R^2 is negative" in errors[-1][1]
+    window.close()
 
 
 def test_prefit_sequence_history_logger_records_fit_actions(
@@ -14759,19 +18075,29 @@ def test_create_fft_distribution_resets_pushed_component_indicator(
     window.build_prior_weights()
     QApplication.processEvents()
 
+    assert window.current_settings is not None
+    active_artifact_paths = project_artifact_paths(
+        window.current_settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+    assert active_artifact_paths.root_dir != artifact_paths.root_dir
     metadata_payload = json.loads(
-        artifact_paths.distribution_metadata_file.read_text(encoding="utf-8")
+        active_artifact_paths.distribution_metadata_file.read_text(
+            encoding="utf-8"
+        )
     )
     component_files = (
-        list(artifact_paths.component_dir.glob("*.txt"))
-        if artifact_paths.component_dir.is_dir()
+        list(active_artifact_paths.component_dir.glob("*.txt"))
+        if active_artifact_paths.component_dir.is_dir()
         else []
     )
 
     assert "#6b7280" in (
         window.project_setup_tab.components_built_indicator.styleSheet()
     )
-    assert not artifact_paths.component_map_file.exists()
+    assert artifact_paths.component_map_file.exists()
+    assert not active_artifact_paths.component_map_file.exists()
     assert component_files == []
     assert metadata_payload["component_artifacts_ready"] is False
     assert metadata_payload["prior_artifacts_ready"] is True
@@ -14782,6 +18108,8 @@ def test_fft_born_main_window_uses_split_scrollable_layout(qapp):
     del qapp
     window = FFTBornApproximationMainWindow(preview_mode=True)
     assert window.windowTitle() == "3D FFT Born Approximation (Preview)"
+    assert window.size().width() >= 1680
+    assert window.size().height() >= 1040
     assert isinstance(window._pane_splitter, QSplitter)
     assert isinstance(window._left_scroll_area, QScrollArea)
     assert isinstance(window._right_scroll_area, QScrollArea)
@@ -14808,6 +18136,52 @@ def test_fft_born_main_window_uses_split_scrollable_layout(qapp):
         assert widget.toolTip().strip()
     assert "project q-range" in window.q_min_spin.toolTip()
     assert "Nyquist limit" in window.spacing_spin.toolTip()
+    window.close()
+
+
+def test_fft_born_deferred_input_shows_startup_progress_popup(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    structure_path = tmp_path / "startup.xyz"
+    structure_path.write_text(
+        "\n".join(
+            [
+                "1",
+                "startup",
+                "Pb 0.0 0.0 0.0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    window = FFTBornApproximationMainWindow(preview_mode=True)
+    window._deferred_initial_input_path = structure_path
+    observed: dict[str, object] = {}
+
+    def fake_load_input_path(path):
+        observed["path"] = path
+        dialog = window._progress_dialog
+        assert dialog is not None
+        assert dialog.isVisible()
+        assert dialog.windowTitle() == "Opening 3D FFT Born Approximation"
+        assert "Discovering 3D FFT Born profile targets" in (
+            dialog.message_label.text()
+        )
+        assert dialog.progress_bar.maximum() == 3
+        assert dialog.progress_bar.value() == 1
+
+    monkeypatch.setattr(window, "_load_input_path", fake_load_input_path)
+
+    window.show()
+    window._load_deferred_input()
+
+    assert observed["path"] == structure_path
+    assert window._deferred_initial_input_path is None
+    assert window._progress_dialog is not None
+    assert not window._progress_dialog.isVisible()
     window.close()
 
 
@@ -15660,6 +19034,74 @@ def test_fft_push_to_model_records_representative_component_source(
     window.close()
 
 
+def test_fft_push_to_model_shows_progress_popup(qapp, tmp_path):
+    q_values = np.asarray([0.01, 0.02, 0.03], dtype=float)
+    target = _FFTProfileTarget(
+        key="average|input|A|no_motif",
+        display_name="A",
+        structure_name="A",
+        motif_name="no_motif",
+        file_count=1,
+        reference_file=tmp_path / "frame_0001.xyz",
+        source_files=(tmp_path / "frame_0001.xyz",),
+        representative="frame_0001.xyz",
+        source_mode="average",
+        solvent_mode="input",
+    )
+    distribution_root = tmp_path / "distribution"
+    window = FFTBornApproximationMainWindow(
+        preview_mode=False,
+        initial_distribution_id="distribution",
+        initial_distribution_root_dir=distribution_root,
+    )
+    window._loaded_input_path = tmp_path
+    window._current_profile_targets = (target,)
+    window._active_profile_key = target.key
+    window._computed_profile_results = {
+        target.key: _FFTProfileComputationResult(
+            target=target,
+            q_values=q_values,
+            fft_result=_make_fft_result_for_test(
+                q_values,
+                np.asarray([1.0, 0.9, 0.8], dtype=float),
+            ),
+            legacy_q_values=None,
+            legacy_intensity=None,
+            exact_debye_intensity=None,
+            legacy_elapsed_seconds=None,
+            debye_elapsed_seconds=None,
+        )
+    }
+    observed_payloads: list[object] = []
+
+    def record_push(payload):
+        observed_payloads.append(payload)
+        dialog = window._progress_dialog
+        assert dialog is not None
+        assert dialog.isVisible()
+        assert dialog.windowTitle() == "Pushing Traces to Model"
+        assert "Notifying model" in dialog.message_label.text()
+        assert dialog.progress_bar.maximum() == 5
+        assert dialog.progress_bar.value() == 5
+
+    window.born_components_built.connect(record_push)
+    window.show()
+    qapp.processEvents()
+
+    window._push_components_to_model()
+
+    assert observed_payloads
+    assert window._progress_dialog is not None
+    assert not window._progress_dialog.isVisible()
+    assert (distribution_root / "md_saxs_map.json").is_file()
+    assert (
+        distribution_root
+        / "born_approximation_3d_fft"
+        / "born_approximation_3d_fft_component_summary.json"
+    ).is_file()
+    window.close()
+
+
 def test_fft_restored_trace_requires_recompute_when_endpoint_is_missing(
     qapp,
     tmp_path,
@@ -16367,6 +19809,69 @@ def test_representative_toggle_keeps_prior_histogram_and_hides_stale_average_com
     assert all(
         str(row.get("source_kind", "")) == "cluster_dir"
         for row in window.project_setup_tab.recognized_cluster_rows()
+    )
+    window.close()
+
+
+def test_enabling_representative_structures_shows_progress_popup(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    progress_events: list[tuple[str, object]] = []
+    applied: dict[str, object] = {}
+
+    def fake_show_progress_dialog(
+        total,
+        message,
+        *,
+        unit_label="items",
+        title=None,
+    ):
+        progress_events.append(("show", total, message, unit_label, title))
+
+    def fake_apply_project_settings(settings, **kwargs):
+        applied["use_representative_structures"] = (
+            settings.use_representative_structures
+        )
+        progress_callback = kwargs.get("progress_callback")
+        assert progress_callback is not None
+        progress_callback("Loading project controls...")
+        progress_callback("Loading representative structure status...")
+
+    monkeypatch.setattr(
+        window,
+        "_show_progress_dialog",
+        fake_show_progress_dialog,
+    )
+    monkeypatch.setattr(
+        window,
+        "_close_progress_dialog",
+        lambda: progress_events.append(("close",)),
+    )
+    monkeypatch.setattr(
+        window,
+        "_apply_project_settings",
+        fake_apply_project_settings,
+    )
+
+    window._on_representative_structures_changed(True)
+
+    assert applied["use_representative_structures"] is True
+    assert progress_events[0] == (
+        "show",
+        PROJECT_SETTINGS_APPLY_TOTAL_STEPS,
+        "Switching to Representative Structures...",
+        "steps",
+        "Using Representative Structures",
+    )
+    assert progress_events[-1] == ("close",)
+    assert (
+        window.project_setup_tab.activity_progress_bar.maximum()
+        == PROJECT_SETTINGS_APPLY_TOTAL_STEPS
     )
     window.close()
 
@@ -17372,6 +20877,77 @@ def test_prefit_plot_trace_toggles_control_visible_series(qapp, tmp_path):
     assert "Experimental" not in line_labels
 
 
+def test_prefit_plot_metrics_include_fitted_stoichiometry(qapp, tmp_path):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    entries = window.prefit_workflow.load_parameter_entries()
+    weight_count = 0
+    for entry in entries:
+        if entry.name.startswith("w"):
+            entry.structure = "PbI2"
+            weight_count += 1
+    assert weight_count > 0
+
+    evaluation = window.prefit_workflow.evaluate(entries)
+    window.prefit_tab.plot_evaluation(evaluation)
+
+    assert evaluation.fitted_stoichiometry_text == "Stoich: Pb:I = 1:2"
+    metric_text = "\n".join(
+        text.get_text() for text in window.prefit_tab.figure.axes[0].texts
+    )
+    assert "Stoich: Pb:I = 1:2" in metric_text
+    window.close()
+
+
+def test_prefit_stoichiometry_compensator_auto_guess_and_collapse(
+    qapp,
+):
+    del qapp
+    tab = PrefitTab()
+    entries = [
+        PrefitParameterEntry(
+            structure="PbI2",
+            motif="no_motif",
+            name="w0",
+            value=0.5,
+            vary=True,
+            minimum=0.0,
+            maximum=1.0,
+            category="weight",
+        ),
+        PrefitParameterEntry(
+            structure="I",
+            motif="no_motif",
+            name="w1",
+            value=0.2,
+            vary=True,
+            minimum=0.0,
+            maximum=1.0,
+            category="weight",
+        ),
+    ]
+    tab.set_stoichiometry_compensator_visible(True)
+    tab.set_stoichiometry_compensator_settings(
+        target_elements_text="Pb, I",
+        target_ratio_text="1:3",
+        compensator_weight_names=[],
+        parameter_entries=entries,
+    )
+
+    assert tab.stoichiometry_compensator_settings() == (
+        "Pb, I",
+        "1:3",
+        ["w1"],
+    )
+    assert tab.stoichiometry_compensator_is_collapsed()
+    tab.set_stoichiometry_compensator_collapsed(False)
+    assert not tab.stoichiometry_compensator_is_collapsed()
+    assert "Auto Guess" not in [
+        button.text() for button in tab.findChildren(QPushButton)
+    ]
+
+
 def test_prefit_plot_editor_updates_residual_plot_fields(qapp):
     q_values = np.asarray([0.05, 0.08, 0.12, 0.18], dtype=float)
     experimental = np.asarray([10.0, 8.0, 6.0, 4.0], dtype=float)
@@ -17564,7 +21140,8 @@ def test_save_prefit_plot_data_exports_csv_with_metadata(
     assert "# fit_metrics:" in contents
     assert (
         "q,experimental_intensity,model_intensity,residual,"
-        "solvent_intensity,solvent_contribution,structure_factor" in contents
+        "solvent_intensity,solvent_contribution,structure_factor,"
+        "active_fit_region" in contents
     )
 
 
@@ -17592,7 +21169,7 @@ def test_save_prefit_plot_data_exports_npy_with_metadata_sidecar(
     assert metadata_path.is_file()
     matrix = np.load(export_path)
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    assert matrix.shape[1] == 7
+    assert matrix.shape[1] == 8
     assert metadata["columns"] == [
         "q",
         "experimental_intensity",
@@ -17601,6 +21178,7 @@ def test_save_prefit_plot_data_exports_npy_with_metadata_sidecar(
         "solvent_intensity",
         "solvent_contribution",
         "structure_factor",
+        "active_fit_region",
     ]
     assert "fit_conditions" in metadata
     assert "fit_metrics" in metadata
@@ -18759,6 +22337,26 @@ def test_project_setup_can_load_saved_distribution_and_scope_prefit_and_dream(
     window.project_setup_tab.load_distribution_button.click()
     QApplication.processEvents()
 
+    assert window._progress_dialog is not None
+    assert window._progress_dialog.windowTitle() == (
+        "Loading Computed Distribution"
+    )
+    assert not window._progress_dialog.isVisible()
+    assert (
+        window.project_setup_tab.activity_progress_bar.maximum()
+        == DISTRIBUTION_LOAD_TOTAL_STEPS
+    )
+    assert (
+        window.project_setup_tab.activity_progress_bar.value()
+        == DISTRIBUTION_LOAD_TOTAL_STEPS
+    )
+    assert (
+        window.project_setup_tab.activity_progress_label.text()
+        == "Computed distribution loaded."
+    )
+    assert "Loading computed distribution:" in (
+        window._progress_dialog.output_box.toPlainText()
+    )
     assert window.project_setup_tab.active_distribution_text() == (
         excluded_label
     )
@@ -18773,6 +22371,265 @@ def test_project_setup_can_load_saved_distribution_and_scope_prefit_and_dream(
     assert window.dream_tab.selected_saved_run_dir() == str(
         (excluded_artifacts.dream_runtime_dir / "dream_excluded").resolve()
     )
+    assert window.current_settings.active_distribution_id == (
+        excluded_artifacts.distribution_id
+    )
+    window.close()
+
+
+def test_new_computed_distribution_attempts_get_unique_active_ids(tmp_path):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    settings.best_prefit_template = settings.selected_model_template
+    settings.best_prefit_parameter_entries = [{"name": "scale"}]
+    settings.dream_favorite_selection = DreamBestFitSelection(
+        run_name="old",
+        run_relative_path="dream/runtime_scripts/old",
+    )
+
+    first_settings = manager.settings_for_new_computed_distribution(settings)
+    first_paths = project_artifact_paths(
+        first_settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+    manager.ensure_artifact_dirs(first_paths)
+    manager._write_distribution_metadata(
+        first_settings,
+        artifact_paths=first_paths,
+    )
+    second_settings = manager.settings_for_new_computed_distribution(settings)
+    second_paths = project_artifact_paths(
+        second_settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+
+    assert first_settings.active_distribution_id is not None
+    assert second_settings.active_distribution_id is not None
+    assert first_settings.active_distribution_id != (
+        second_settings.active_distribution_id
+    )
+    assert first_settings.active_distribution_id.endswith("__idx-001")
+    assert second_settings.active_distribution_id.endswith("__idx-002")
+    assert "__created-" in first_settings.active_distribution_id
+    assert first_paths.prefit_dir != second_paths.prefit_dir
+    assert first_paths.dream_dir != second_paths.dream_dir
+    assert first_settings.best_prefit_template is None
+    assert first_settings.best_prefit_parameter_entries == []
+    assert first_settings.dream_favorite_selection is None
+    assert first_settings.dream_favorite_history == []
+
+
+def test_project_setup_can_delete_selected_saved_distribution(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    _settings, artifact_paths = _seed_saved_distribution_from_root(project_dir)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    monkeypatch.setattr(
+        "saxshell.saxs.ui.main_window.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    assert window.project_setup_tab.computed_distribution_combo.count() == 1
+    assert artifact_paths.root_dir.is_dir()
+
+    window.project_setup_tab.delete_distribution_button.click()
+    QApplication.processEvents()
+
+    assert not artifact_paths.root_dir.exists()
+    assert window.project_setup_tab.computed_distribution_combo.count() == 0
+    assert window.current_settings.active_distribution_id is None
+    assert "Deleted computed distribution." in (
+        window.project_setup_tab.summary_box.toPlainText()
+    )
+    window.close()
+
+
+def test_project_manager_duplicates_distribution_as_fresh_attempt_without_fit_state(
+    tmp_path,
+):
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    source_settings, source_artifacts = _seed_saved_distribution_from_root(
+        project_dir,
+        include_cluster_geometry=True,
+    )
+    _write_distribution_history_artifacts(
+        source_artifacts,
+        state_name="prefit_source",
+        run_name="dream_source",
+    )
+    (source_artifacts.prefit_dir / "prefit_state.json").write_text(
+        json.dumps({"parameter_entries": [{"name": "scale"}]}, indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
+    (source_artifacts.dream_dir / "pd_settings.json").write_text(
+        json.dumps({"run_label": "source"}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    duplicate_record = manager.duplicate_saved_distribution(
+        project_dir,
+        source_artifacts.distribution_id,
+        base_settings=source_settings,
+    )
+    duplicate_settings = manager.settings_for_saved_distribution(
+        project_dir,
+        duplicate_record.distribution_id,
+        base_settings=source_settings,
+    )
+    duplicate_artifacts = project_artifact_paths(
+        duplicate_settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+
+    assert duplicate_record.distribution_id != source_artifacts.distribution_id
+    assert duplicate_record.base_distribution_id == (
+        project_module.distribution_id_for_settings(source_settings)
+    )
+    assert duplicate_record.attempt_index == 1
+    assert duplicate_record.created_at is not None
+    assert duplicate_record.updated_at is not None
+    datetime.fromisoformat(duplicate_record.created_at)
+    datetime.fromisoformat(duplicate_record.updated_at)
+    assert duplicate_artifacts.root_dir == duplicate_record.distribution_dir
+    assert duplicate_artifacts.component_map_file.is_file()
+    assert (duplicate_artifacts.component_dir / "A_no_motif.txt").is_file()
+    assert duplicate_artifacts.prior_weights_file.is_file()
+    assert (
+        duplicate_artifacts.prefit_dir / "cluster_geometry_metadata.json"
+    ).is_file()
+    assert not (duplicate_artifacts.prefit_dir / "prefit_state.json").exists()
+    assert not any(
+        path.is_dir() and path.name.startswith("prefit_")
+        for path in duplicate_artifacts.prefit_dir.iterdir()
+    )
+    assert not (duplicate_artifacts.dream_dir / "pd_settings.json").exists()
+    assert list(duplicate_artifacts.dream_runtime_dir.iterdir()) == []
+    assert duplicate_settings.active_distribution_id == (
+        duplicate_record.distribution_id
+    )
+    assert duplicate_settings.best_prefit_parameter_entries == []
+    assert duplicate_settings.dream_favorite_history == []
+
+
+def test_project_setup_duplicate_distribution_button_loads_new_attempt(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, _paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    source_settings, source_artifacts = _seed_saved_distribution_from_root(
+        project_dir,
+    )
+    manager.save_project(source_settings)
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+
+    assert window.project_setup_tab.duplicate_distribution_button.isEnabled()
+    window.project_setup_tab.duplicate_distribution_button.click()
+    QApplication.processEvents()
+
+    records = manager.list_saved_distributions(project_dir)
+    assert len(records) == 2
+    duplicated_ids = {
+        record.distribution_id
+        for record in records
+        if record.distribution_id != source_artifacts.distribution_id
+    }
+    assert len(duplicated_ids) == 1
+    duplicated_id = duplicated_ids.pop()
+    assert window.current_settings is not None
+    assert window.current_settings.active_distribution_id == duplicated_id
+    assert window.project_setup_tab.selected_distribution_id() == duplicated_id
+    assert "Duplicated computed distribution settings" in (
+        window.project_setup_tab.summary_box.toPlainText()
+    )
+    window.close()
+
+
+def test_loading_empty_distribution_resets_previous_prefit_and_dream_channels(
+    qapp,
+    tmp_path,
+):
+    del qapp
+    project_dir, paths = _build_minimal_saxs_project(tmp_path)
+    manager = SAXSProjectManager()
+    first_settings, first_artifacts = _seed_saved_distribution_from_root(
+        project_dir
+    )
+    first_settings.active_distribution_id = first_artifacts.distribution_id
+    _write_distribution_history_artifacts(
+        first_artifacts,
+        state_name="prefit_first",
+        run_name="dream_first",
+    )
+
+    second_settings = manager.settings_for_new_computed_distribution(
+        first_settings
+    )
+    second_artifacts = project_artifact_paths(
+        second_settings,
+        storage_mode="distribution",
+        allow_legacy_fallback=False,
+    )
+    manager.ensure_artifact_dirs(second_artifacts)
+    shutil.copytree(
+        paths.scattering_components_dir,
+        second_artifacts.component_dir,
+        dirs_exist_ok=True,
+    )
+    shutil.copy2(
+        paths.project_dir / "md_saxs_map.json",
+        second_artifacts.component_map_file,
+    )
+    shutil.copy2(
+        paths.project_dir / "md_prior_weights.json",
+        second_artifacts.prior_weights_file,
+    )
+    manager._write_distribution_metadata(
+        second_settings,
+        artifact_paths=second_artifacts,
+    )
+    manager.save_project(first_settings)
+
+    window = SAXSMainWindow(initial_project_dir=project_dir)
+    assert window.prefit_workflow.prefit_dir == first_artifacts.prefit_dir
+    assert window.prefit_tab.saved_state_combo.itemText(0) == "prefit_first"
+    assert window.dream_tab.selected_saved_run_dir() == str(
+        (first_artifacts.dream_runtime_dir / "dream_first").resolve()
+    )
+
+    target_index = (
+        window.project_setup_tab.computed_distribution_combo.findData(
+            second_artifacts.distribution_id
+        )
+    )
+    assert target_index >= 0
+    window.project_setup_tab.computed_distribution_combo.setCurrentIndex(
+        target_index
+    )
+    window.project_setup_tab.load_distribution_button.click()
+    QApplication.processEvents()
+
+    assert window.current_settings.active_distribution_id == (
+        second_artifacts.distribution_id
+    )
+    assert window.prefit_workflow.prefit_dir == second_artifacts.prefit_dir
+    assert window.prefit_tab.saved_state_combo.count() == 0
+    assert window.dream_tab.selected_saved_run_dir() is None
+    assert window.dream_tab.saved_runs_combo.currentText() == (
+        DreamTab.NO_SAVED_RUNS_LABEL
+    )
+    assert "Attempt 001" in window.project_setup_tab.active_distribution_text()
     window.close()
 
 

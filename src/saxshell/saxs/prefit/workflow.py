@@ -43,6 +43,19 @@ from saxshell.saxs.project_manager import (
     load_built_component_q_range,
     project_artifact_paths,
 )
+from saxshell.saxs.stoichiometry import (
+    build_stoichiometry_target,
+    weighted_stoichiometry_text,
+)
+from saxshell.saxs.stoichiometry_compensator import (
+    STOICH_COMPENSATOR_BASE_WEIGHTS_INPUT,
+    STOICH_COMPENSATOR_MASK_INPUT,
+    STOICH_COMPONENT_COUNTS_INPUT,
+    STOICH_TARGET_RATIO_INPUT,
+    component_count_matrix,
+    guess_single_atom_compensator_names,
+    template_uses_stoichiometry_compensator,
+)
 
 
 def _natural_sort_key(value: str) -> list[object]:
@@ -51,6 +64,77 @@ def _natural_sort_key(value: str) -> list[object]:
         for token in re.split(r"(\d+)", value)
         if token
     ]
+
+
+def _component_order_from_payloads(
+    *payloads: dict[str, object],
+) -> list[tuple[str, str, str]]:
+    for payload in payloads:
+        raw_order = payload.get("component_order", [])
+        if not isinstance(raw_order, list):
+            continue
+        order: list[tuple[int, str, str, str]] = []
+        for fallback_index, raw_entry in enumerate(raw_order):
+            if not isinstance(raw_entry, dict):
+                continue
+            structure = str(raw_entry.get("structure", "")).strip()
+            motif = (
+                str(raw_entry.get("motif", "no_motif")).strip() or "no_motif"
+            )
+            if not structure:
+                continue
+            try:
+                order_index = int(raw_entry.get("order_index", fallback_index))
+            except (TypeError, ValueError):
+                order_index = fallback_index
+            order.append(
+                (
+                    order_index,
+                    structure,
+                    motif,
+                    str(raw_entry.get("profile_file", "")).strip(),
+                )
+            )
+        if order:
+            return [
+                (structure, motif, profile_file)
+                for _index, structure, motif, profile_file in sorted(
+                    order,
+                    key=lambda item: item[0],
+                )
+            ]
+    return []
+
+
+def _ordered_saxs_map_items(
+    saxs_map: object,
+    component_order: list[tuple[str, str, str]],
+) -> list[tuple[str, str, str]]:
+    if not isinstance(saxs_map, dict):
+        return []
+    items: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for structure, motif, profile_file in component_order:
+        motif_map = saxs_map.get(structure, {})
+        if not isinstance(motif_map, dict):
+            continue
+        resolved_profile_file = (
+            profile_file or str(motif_map.get(motif, "")).strip()
+        )
+        if not resolved_profile_file:
+            continue
+        items.append((structure, motif, resolved_profile_file))
+        seen.add((structure, motif))
+    for structure, raw_motif_map in saxs_map.items():
+        if not isinstance(raw_motif_map, dict):
+            continue
+        for motif, profile_file in raw_motif_map.items():
+            key = (str(structure), str(motif))
+            if key in seen:
+                continue
+            items.append((key[0], key[1], str(profile_file).strip()))
+            seen.add(key)
+    return items
 
 
 def _optional_str(value: object) -> str | None:
@@ -64,6 +148,12 @@ def _optional_int(value: object) -> int | None:
     if value in (None, ""):
         return None
     return int(value)
+
+
+def _optional_float(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    return float(value)
 
 
 MINIMUM_POSITIVE_RADIUS = float(np.nextafter(0.0, 1.0))
@@ -81,6 +171,11 @@ SOLVENT_WEIGHT_PARAMETER_NAMES = (
     "solv_w",
     "solvent_scale",
 )
+MOLAR_CONCENTRATION_PARAMETER_NAMES = (
+    "concentration_salt",
+    "salt_concentration",
+    "solute_concentration",
+)
 PREFIT_MODEL_POSITIVE_FLOOR_RELATIVE = 1e-9
 PREFIT_MODEL_NEGATIVE_PENALTY_MULTIPLIER = 25.0
 PREFIT_MODEL_NONFINITE_PENALTY_MULTIPLIER = 100.0
@@ -91,6 +186,8 @@ PREFIT_GRID_SWEEP_LEVEL_POINTS: dict[int, tuple[int, ...]] = {
     3: (4, 4, 4),
 }
 PREFIT_SEQUENCE_HISTORY_FILENAME = "prefit_sequence_history.json"
+WEIGHT_PARAMETER_RE = re.compile(r"w\d+")
+COMPONENT_SCOPED_PARAMETER_RE = re.compile(r"(?:^|_)w\d+$")
 
 
 def q_range_boundary_tolerance(
@@ -166,6 +263,7 @@ class PrefitParameterEntry:
     category: str
     value_expression: str | None = None
     initial_value_expression: str | None = None
+    active: bool = True
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -190,7 +288,31 @@ class PrefitParameterEntry:
             minimum=float(payload.get("minimum", payload.get("min", 0.0))),
             maximum=float(payload.get("maximum", payload.get("max", 0.0))),
             category=str(payload.get("category", "fit")),
+            active=bool(payload.get("active", True)),
         )
+
+
+def is_prefit_weight_parameter_name(name: object) -> bool:
+    return WEIGHT_PARAMETER_RE.fullmatch(str(name or "").strip()) is not None
+
+
+def is_prefit_weight_entry(entry: PrefitParameterEntry) -> bool:
+    return str(
+        entry.category
+    ).strip() == "weight" or is_prefit_weight_parameter_name(entry.name)
+
+
+def is_prefit_entry_active(entry: PrefitParameterEntry) -> bool:
+    return (not is_prefit_weight_entry(entry)) or bool(entry.active)
+
+
+def _component_scoped_weight_name(parameter_name: object) -> str | None:
+    text = str(parameter_name or "").strip()
+    match = COMPONENT_SCOPED_PARAMETER_RE.search(text)
+    if match is None:
+        return None
+    token = match.group(0).lstrip("_")
+    return token if is_prefit_weight_parameter_name(token) else None
 
 
 def _parameter_value_expression(
@@ -427,6 +549,18 @@ def validate_prefit_parameter_identifiability(
         )
 
 
+def raise_for_negative_prefit_r_squared(r_squared: object) -> None:
+    try:
+        value = float(r_squared)
+    except (TypeError, ValueError):
+        return
+    if np.isfinite(value) and value < 0.0:
+        raise ValueError(
+            "Rejected Prefit result because R^2 is negative "
+            f"({value:.6g}). The previous Prefit parameters were kept."
+        )
+
+
 def _prefit_grid_searchable_entries(
     entries: list[PrefitParameterEntry],
 ) -> list[PrefitParameterEntry]:
@@ -447,9 +581,13 @@ class PrefitEvaluation:
     experimental_intensities: np.ndarray | None
     model_intensities: np.ndarray
     residuals: np.ndarray | None
+    fit_q_min: float | None = None
+    fit_q_max: float | None = None
+    fit_mask: np.ndarray | None = None
     solvent_intensities: np.ndarray | None = None
     solvent_contribution: np.ndarray | None = None
     structure_factor_trace: np.ndarray | None = None
+    fitted_stoichiometry_text: str | None = None
 
     @property
     def is_model_only(self) -> bool:
@@ -509,6 +647,8 @@ class PrefitSavedState:
     method: str | None = None
     max_nfev: int | None = None
     autosave_prefits: bool | None = None
+    fit_q_min: float | None = None
+    fit_q_max: float | None = None
 
 
 class SAXSPrefitWorkflow:
@@ -537,6 +677,10 @@ class SAXSPrefitWorkflow:
             self.template_dir,
         )
         self.artifact_paths = project_artifact_paths(self.settings)
+        self.project_manager.lock_distribution_component_order(
+            self.settings,
+            artifact_paths=self.artifact_paths,
+        )
         self.component_map_path = self.artifact_paths.component_map_file
         self.prior_weights_path = self.artifact_paths.prior_weights_file
         self.component_dir = self.artifact_paths.component_dir
@@ -591,6 +735,20 @@ class SAXSPrefitWorkflow:
         )
 
     @staticmethod
+    def evaluation_fit_mask(evaluation: PrefitEvaluation) -> np.ndarray:
+        q_values = np.asarray(evaluation.q_values, dtype=float)
+        mask = np.ones(q_values.shape, dtype=bool)
+        if evaluation.fit_mask is not None:
+            fit_mask = np.asarray(evaluation.fit_mask, dtype=bool)
+            if fit_mask.shape == q_values.shape:
+                mask &= fit_mask
+        elif evaluation.residuals is not None:
+            residuals = np.asarray(evaluation.residuals, dtype=float)
+            if residuals.shape == q_values.shape:
+                mask &= np.isfinite(residuals)
+        return mask
+
+    @staticmethod
     def _evaluation_statistics(
         entries: list[PrefitParameterEntry],
         evaluation: PrefitEvaluation,
@@ -600,21 +758,36 @@ class SAXSPrefitWorkflow:
             or evaluation.experimental_intensities is None
         ):
             return {}
-        chi_square = float(np.sum(evaluation.residuals**2))
+        fit_mask = SAXSPrefitWorkflow.evaluation_fit_mask(evaluation)
+        residuals = np.asarray(evaluation.residuals, dtype=float)
+        experimental = np.asarray(
+            evaluation.experimental_intensities,
+            dtype=float,
+        )
+        finite_mask = (
+            fit_mask & np.isfinite(residuals) & np.isfinite(experimental)
+        )
+        if not np.any(finite_mask):
+            return {
+                "chi_square": float("nan"),
+                "reduced_chi_square": float("nan"),
+                "r_squared": float("nan"),
+            }
+        fit_residuals = np.asarray(residuals[finite_mask], dtype=float)
+        fit_experimental = np.asarray(experimental[finite_mask], dtype=float)
+        chi_square = float(np.sum(fit_residuals**2))
         dof = max(
-            len(evaluation.q_values)
-            - sum(1 for entry in entries if entry.vary),
+            int(fit_residuals.size)
+            - sum(
+                1
+                for entry in entries
+                if entry.vary and is_prefit_entry_active(entry)
+            ),
             1,
         )
         reduced_chi_square = chi_square / dof
         ss_total = float(
-            np.sum(
-                (
-                    evaluation.experimental_intensities
-                    - np.mean(evaluation.experimental_intensities)
-                )
-                ** 2
-            )
+            np.sum((fit_experimental - np.mean(fit_experimental)) ** 2)
         )
         r_squared = (
             1.0 - chi_square / ss_total if ss_total > 0.0 else float("nan")
@@ -651,6 +824,54 @@ class SAXSPrefitWorkflow:
         self.experimental_data = self._load_experimental_trace()
         self.solvent_data = self._load_solvent_trace()
 
+    def active_model_q_bounds(
+        self,
+        parameter_entries: list[PrefitParameterEntry] | None = None,
+    ) -> tuple[float, float]:
+        entries = parameter_entries or self.parameter_entries
+        active_components = self._active_components_for_entries(entries)
+        q_values = self._component_q_values(active_components)
+        if q_values.size == 0:
+            raise ValueError("The active Prefit model trace has no q-values.")
+        return (float(np.min(q_values)), float(np.max(q_values)))
+
+    def set_prefit_fit_q_range(
+        self,
+        q_min: float | None,
+        q_max: float | None,
+        *,
+        parameter_entries: list[PrefitParameterEntry] | None = None,
+    ) -> tuple[float, float]:
+        entries = parameter_entries or self.parameter_entries
+        active_components = self._active_components_for_entries(entries)
+        q_values = self._component_q_values(active_components)
+        fit_q_min, fit_q_max = self._resolve_prefit_fit_q_bounds(
+            q_values,
+            requested_q_min=q_min,
+            requested_q_max=q_max,
+        )
+        model_q_min = float(np.min(q_values))
+        model_q_max = float(np.max(q_values))
+        if q_min is None and q_max is None:
+            self.settings.prefit_fit_q_min = None
+            self.settings.prefit_fit_q_max = None
+        elif np.isclose(fit_q_min, model_q_min) and np.isclose(
+            fit_q_max, model_q_max
+        ):
+            self.settings.prefit_fit_q_min = None
+            self.settings.prefit_fit_q_max = None
+        else:
+            self.settings.prefit_fit_q_min = float(fit_q_min)
+            self.settings.prefit_fit_q_max = float(fit_q_max)
+        self._save_project_settings()
+        return fit_q_min, fit_q_max
+
+    def reset_prefit_fit_q_range(self) -> tuple[float, float]:
+        self.settings.prefit_fit_q_min = None
+        self.settings.prefit_fit_q_max = None
+        self._save_project_settings()
+        return self.active_model_q_bounds()
+
     def apply_project_settings(
         self,
         settings: ProjectSettings,
@@ -672,6 +893,10 @@ class SAXSPrefitWorkflow:
         self.settings = incoming_settings
         self.paths = build_project_paths(self.settings.project_dir)
         self.artifact_paths = project_artifact_paths(self.settings)
+        self.project_manager.lock_distribution_component_order(
+            self.settings,
+            artifact_paths=self.artifact_paths,
+        )
         self.component_map_path = self.artifact_paths.component_map_file
         self.prior_weights_path = self.artifact_paths.prior_weights_file
         self.component_dir = self.artifact_paths.component_dir
@@ -712,10 +937,25 @@ class SAXSPrefitWorkflow:
     def evaluate(
         self,
         parameter_entries: list[PrefitParameterEntry] | None = None,
+        *,
+        fit_q_min: float | None = None,
+        fit_q_max: float | None = None,
     ) -> PrefitEvaluation:
-        entries = parameter_entries or self.parameter_entries
-        q_values = self._component_q_values()
-        model_data = self._model_data_for_q_values(q_values)
+        entries = self._copy_entries(
+            parameter_entries or self.parameter_entries
+        )
+        active_entries = self._active_parameter_entries_for_model(entries)
+        active_components = self._active_components_for_entries(entries)
+        q_values = self._component_q_values(active_components)
+        fit_mask, fit_q_min, fit_q_max = self._prefit_fit_mask_for_q_values(
+            q_values,
+            requested_q_min=fit_q_min,
+            requested_q_max=fit_q_max,
+        )
+        model_data = self._model_data_for_q_values(
+            q_values,
+            components=active_components,
+        )
         experimental = (
             np.interp(
                 q_values,
@@ -726,7 +966,7 @@ class SAXSPrefitWorkflow:
             else None
         )
         _lmfit_params, resolved_entries = build_prefit_lmfit_parameters(
-            entries
+            active_entries
         )
         params = {entry.name: float(entry.value) for entry in resolved_entries}
         solvent_data = (
@@ -739,7 +979,7 @@ class SAXSPrefitWorkflow:
             if self.solvent_data is not None
             else None
         )
-        extra_inputs = self._lmfit_extra_inputs()
+        extra_inputs = self._lmfit_extra_inputs(parameter_entries=entries)
         model_intensities = self._lmfit_model_function()(
             q_values,
             solvent_data,
@@ -766,6 +1006,16 @@ class SAXSPrefitWorkflow:
             if experimental is not None
             else None
         )
+        if residuals is not None:
+            fit_residuals = np.full_like(
+                np.asarray(residuals, dtype=float),
+                np.nan,
+                dtype=float,
+            )
+            fit_residuals[fit_mask] = np.asarray(residuals, dtype=float)[
+                fit_mask
+            ]
+            residuals = fit_residuals
         return PrefitEvaluation(
             q_values=q_values,
             experimental_intensities=experimental,
@@ -775,9 +1025,28 @@ class SAXSPrefitWorkflow:
                 if residuals is not None
                 else None
             ),
+            fit_q_min=fit_q_min,
+            fit_q_max=fit_q_max,
+            fit_mask=np.asarray(fit_mask, dtype=bool),
             solvent_intensities=solvent_intensities,
             solvent_contribution=solvent_contribution,
             structure_factor_trace=structure_factor_trace,
+            fitted_stoichiometry_text=self._fitted_stoichiometry_text(
+                resolved_entries
+            ),
+        )
+
+    @staticmethod
+    def _fitted_stoichiometry_text(
+        entries: list[PrefitParameterEntry],
+    ) -> str | None:
+        return weighted_stoichiometry_text(
+            (
+                (entry.structure, float(entry.value))
+                for entry in entries
+                if str(entry.name).startswith("w")
+                and str(entry.structure).strip()
+            )
         )
 
     def grid_searchable_parameter_names(
@@ -996,11 +1265,25 @@ class SAXSPrefitWorkflow:
         validate_prefit_parameter_identifiability(
             parameter_entries or self.parameter_entries
         )
-        lmfit_params, entries = build_prefit_lmfit_parameters(
+        original_entries = self._copy_entries(
             parameter_entries or self.parameter_entries
         )
-        q_values = self._component_q_values()
-        model_data = self._model_data_for_q_values(q_values)
+        active_entries = self._active_parameter_entries_for_model(
+            original_entries
+        )
+        active_components = self._active_components_for_entries(
+            original_entries
+        )
+        lmfit_params, entries = build_prefit_lmfit_parameters(active_entries)
+        trace_q_values = self._component_q_values(active_components)
+        fit_mask, _fit_q_min, _fit_q_max = self._prefit_fit_mask_for_q_values(
+            trace_q_values
+        )
+        q_values = np.asarray(trace_q_values[fit_mask], dtype=float)
+        model_data = self._model_data_for_q_values(
+            q_values,
+            components=active_components,
+        )
         experimental = np.interp(
             q_values,
             self.experimental_data.q_values,
@@ -1012,7 +1295,9 @@ class SAXSPrefitWorkflow:
             else np.zeros_like(q_values)
         )
         lmfit_model = self._lmfit_model_function()
-        extra_inputs = self._lmfit_extra_inputs()
+        extra_inputs = self._lmfit_extra_inputs(
+            parameter_entries=original_entries
+        )
         grid_sweep_result: PrefitGridSweepResult | None = None
         optimization_strategy = f"lmfit {method}"
 
@@ -1059,7 +1344,11 @@ class SAXSPrefitWorkflow:
             entry.minimum = float(fitted.min)
             entry.maximum = float(fitted.max)
 
-        evaluation = self.evaluate(entries)
+        merged_entries = self._merge_fitted_active_entries(
+            original_entries,
+            entries,
+        )
+        evaluation = self.evaluate(merged_entries)
         if (
             evaluation.residuals is None
             or evaluation.experimental_intensities is None
@@ -1067,7 +1356,8 @@ class SAXSPrefitWorkflow:
             raise ValueError(
                 "Prefit fit statistics are unavailable without experimental SAXS data."
             )
-        statistics = self._evaluation_statistics(entries, evaluation)
+        statistics = self._evaluation_statistics(merged_entries, evaluation)
+        raise_for_negative_prefit_r_squared(statistics.get("r_squared"))
         report_text = fit_report(result)
         if grid_sweep_result is not None:
             report_text = (
@@ -1081,7 +1371,7 @@ class SAXSPrefitWorkflow:
                 f"{report_text}"
             )
         fit_result = PrefitFitResult(
-            parameter_entries=entries,
+            parameter_entries=merged_entries,
             evaluation=evaluation,
             fit_report=report_text,
             method=method,
@@ -1096,10 +1386,10 @@ class SAXSPrefitWorkflow:
                 else int(grid_sweep_result.evaluations)
             ),
         )
-        self.parameter_entries = entries
+        self.parameter_entries = merged_entries
         if self.settings.autosave_prefits:
             report_path = self.save_fit(
-                entries,
+                merged_entries,
                 evaluation=evaluation,
                 fit_result=fit_result,
                 method=method,
@@ -1108,6 +1398,104 @@ class SAXSPrefitWorkflow:
             )
             fit_result.report_path = report_path
         return fit_result
+
+    def _evaluation_fit_q_range_payload(
+        self,
+        evaluation: PrefitEvaluation,
+    ) -> dict[str, object]:
+        q_values = np.asarray(evaluation.q_values, dtype=float)
+        if q_values.size == 0:
+            return {
+                "q_min": None,
+                "q_max": None,
+                "point_count": 0,
+                "model_q_min": None,
+                "model_q_max": None,
+            }
+        fit_mask = self.evaluation_fit_mask(evaluation)
+        fit_q_values = q_values[fit_mask]
+        return {
+            "q_min": (
+                None
+                if evaluation.fit_q_min is None
+                else float(evaluation.fit_q_min)
+            ),
+            "q_max": (
+                None
+                if evaluation.fit_q_max is None
+                else float(evaluation.fit_q_max)
+            ),
+            "point_count": int(fit_q_values.size),
+            "model_q_min": float(np.min(q_values)),
+            "model_q_max": float(np.max(q_values)),
+        }
+
+    def save_parameter_state(
+        self,
+        parameter_entries: list[PrefitParameterEntry] | None = None,
+        *,
+        method: str | None = None,
+        max_nfev: int | None = None,
+        autosave_prefits: bool | None = None,
+    ) -> Path:
+        entries = parameter_entries or self.parameter_entries
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        evaluation: PrefitEvaluation | None = None
+        try:
+            evaluation = self.evaluate(entries)
+            statistics = self._evaluation_statistics(entries, evaluation)
+        except Exception:
+            statistics = {}
+        try:
+            template_runtime_inputs = self.template_runtime_inputs_payload(
+                parameter_entries=entries
+            )
+        except Exception:
+            template_runtime_inputs = {}
+        cluster_geometry_payload = (
+            None
+            if self.cluster_geometry_table is None
+            else self.cluster_geometry_table.to_dict()
+        )
+        fit_q_range_payload = (
+            self._evaluation_fit_q_range_payload(evaluation)
+            if evaluation is not None
+            else {
+                "q_min": self.settings.prefit_fit_q_min,
+                "q_max": self.settings.prefit_fit_q_max,
+                "point_count": None,
+                "model_q_min": None,
+                "model_q_max": None,
+            }
+        )
+        state_payload = {
+            "saved_at": timestamp,
+            "template_name": self.template_spec.name,
+            "parameter_entries": [entry.to_dict() for entry in entries],
+            "run_settings": {
+                "method": method,
+                "max_nfev": max_nfev,
+                "optimization_strategy": None,
+                "grid_evaluations": None,
+                "autosave_prefits": (
+                    self.settings.autosave_prefits
+                    if autosave_prefits is None
+                    else bool(autosave_prefits)
+                ),
+            },
+            "statistics": statistics,
+            "fit_q_range": fit_q_range_payload,
+            "template_runtime_inputs": template_runtime_inputs,
+            "cluster_geometry_metadata": cluster_geometry_payload,
+        }
+        self.prefit_dir.mkdir(parents=True, exist_ok=True)
+        state_path = self.prefit_dir / "prefit_state.json"
+        state_path.write_text(
+            json.dumps(state_payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        self.parameter_entries = list(entries)
+        return state_path
 
     def save_fit(
         self,
@@ -1125,7 +1513,9 @@ class SAXSPrefitWorkflow:
         self.prefit_dir.mkdir(parents=True, exist_ok=True)
         snapshot_dir = self.prefit_dir / f"prefit_{timestamp}"
         snapshot_dir.mkdir(parents=True, exist_ok=True)
-        template_runtime_inputs = self.template_runtime_inputs_payload()
+        template_runtime_inputs = self.template_runtime_inputs_payload(
+            parameter_entries=entries
+        )
         cluster_geometry_payload = (
             None
             if self.cluster_geometry_table is None
@@ -1136,6 +1526,7 @@ class SAXSPrefitWorkflow:
             if fit_result is not None
             else self._evaluation_statistics(entries, evaluation)
         )
+        fit_q_range_payload = self._evaluation_fit_q_range_payload(evaluation)
 
         state_payload = {
             "saved_at": timestamp,
@@ -1171,6 +1562,7 @@ class SAXSPrefitWorkflow:
                 if fit_result is not None
                 else evaluation_statistics
             ),
+            "fit_q_range": fit_q_range_payload,
             "template_runtime_inputs": template_runtime_inputs,
             "cluster_geometry_metadata": cluster_geometry_payload,
         }
@@ -1188,7 +1580,12 @@ class SAXSPrefitWorkflow:
         weights_payload = []
         fit_parameters_payload: dict[str, float] = {}
         fit_parameter_meta: dict[str, dict[str, object]] = {}
-        for entry in entries:
+        active_entries = self._active_parameter_entries_for_model(entries)
+        active_components = self._active_components_for_entries(entries)
+        active_component_names = {
+            component.param_name for component in active_components
+        }
+        for entry in active_entries:
             meta = {
                 "vary": entry.vary,
                 "min": entry.minimum,
@@ -1221,6 +1618,7 @@ class SAXSPrefitWorkflow:
             "weights": weights_payload,
             "fit_parameters": fit_parameters_payload,
             "fit_parameter_meta": fit_parameter_meta,
+            "fit_q_range": fit_q_range_payload,
             "component_order": [
                 {
                     "structure": component.structure,
@@ -1229,6 +1627,7 @@ class SAXSPrefitWorkflow:
                     "profile_file": component.profile_file,
                 }
                 for component in self.components
+                if component.param_name in active_component_names
             ],
             "template_runtime_inputs": template_runtime_inputs,
             "cluster_geometry_metadata": cluster_geometry_payload,
@@ -1250,6 +1649,7 @@ class SAXSPrefitWorkflow:
             )
 
         curve_path = self.prefit_dir / "latest_prefit_curve.txt"
+        fit_mask_column = self.evaluation_fit_mask(evaluation).astype(int)
         if (
             evaluation.experimental_intensities is not None
             and evaluation.residuals is not None
@@ -1260,17 +1660,22 @@ class SAXSPrefitWorkflow:
                     evaluation.experimental_intensities,
                     evaluation.model_intensities,
                     evaluation.residuals,
+                    fit_mask_column,
                 ]
             )
-            curve_header = "q experimental_intensity model_intensity residual"
+            curve_header = (
+                "q experimental_intensity model_intensity residual "
+                "active_fit_region"
+            )
         else:
             curve_data = np.column_stack(
                 [
                     evaluation.q_values,
                     evaluation.model_intensities,
+                    fit_mask_column,
                 ]
             )
-            curve_header = "q model_intensity"
+            curve_header = "q model_intensity active_fit_region"
         np.savetxt(
             curve_path,
             curve_data,
@@ -1365,8 +1770,9 @@ class SAXSPrefitWorkflow:
         events.append(event_payload)
         payload["updated_at"] = timestamp
         payload["template_name"] = self.template_spec.name
-        payload["distribution_id"] = distribution_id_for_settings(
-            self.settings
+        payload["distribution_id"] = (
+            self.artifact_paths.distribution_id
+            or distribution_id_for_settings(self.settings)
         )
         payload["sequence_logger_enabled"] = bool(
             self.settings.prefit_sequence_history_enabled
@@ -1394,8 +1800,9 @@ class SAXSPrefitWorkflow:
         payload.setdefault("events", [])
         payload["project_dir"] = str(self.paths.project_dir)
         payload["template_name"] = self.template_spec.name
-        payload["distribution_id"] = distribution_id_for_settings(
-            self.settings
+        payload["distribution_id"] = (
+            self.artifact_paths.distribution_id
+            or distribution_id_for_settings(self.settings)
         )
         payload["sequence_logger_enabled"] = bool(
             self.settings.prefit_sequence_history_enabled
@@ -1410,7 +1817,10 @@ class SAXSPrefitWorkflow:
             "updated_at": timestamp,
             "project_dir": str(self.paths.project_dir),
             "template_name": self.template_spec.name,
-            "distribution_id": distribution_id_for_settings(self.settings),
+            "distribution_id": (
+                self.artifact_paths.distribution_id
+                or distribution_id_for_settings(self.settings)
+            ),
             "sequence_logger_enabled": bool(
                 self.settings.prefit_sequence_history_enabled
             ),
@@ -1494,6 +1904,9 @@ class SAXSPrefitWorkflow:
             )
         payload = json.loads(state_path.read_text(encoding="utf-8"))
         run_settings = payload.get("run_settings", {})
+        fit_q_range = payload.get("fit_q_range", {})
+        if not isinstance(fit_q_range, dict):
+            fit_q_range = {}
         cluster_geometry_table = self._load_saved_state_cluster_geometry_table(
             state_dir,
             payload,
@@ -1530,6 +1943,18 @@ class SAXSPrefitWorkflow:
                 bool(run_settings.get("autosave_prefits"))
                 if "autosave_prefits" in run_settings
                 else None
+            ),
+            fit_q_min=_optional_float(
+                fit_q_range.get(
+                    "q_min",
+                    payload.get("prefit_fit_q_min"),
+                )
+            ),
+            fit_q_max=_optional_float(
+                fit_q_range.get(
+                    "q_max",
+                    payload.get("prefit_fit_q_max"),
+                )
             ),
         )
 
@@ -1618,7 +2043,11 @@ class SAXSPrefitWorkflow:
                 - solvent_contribution,
                 dtype=float,
             )
-        mask = np.isfinite(target) & np.isfinite(model)
+        mask = (
+            self.evaluation_fit_mask(evaluation)
+            & np.isfinite(target)
+            & np.isfinite(model)
+        )
         if not np.any(mask):
             raise ValueError(
                 "A scale recommendation is not available because the current "
@@ -1858,6 +2287,20 @@ class SAXSPrefitWorkflow:
                 return candidate
         return None
 
+    def molar_concentration_estimator_target(self) -> str | None:
+        support = self.template_spec.solution_scattering_support
+        if support.molar_concentration_parameter is not None:
+            return support.molar_concentration_parameter
+        parameter_names = {
+            str(parameter.name).strip()
+            for parameter in self.template_spec.parameters
+            if str(parameter.name).strip()
+        }
+        for candidate in MOLAR_CONCENTRATION_PARAMETER_NAMES:
+            if candidate in parameter_names:
+                return candidate
+        return None
+
     def solvent_contribution_is_scaled_by_global_scale(self) -> bool:
         return (
             self.template_spec.solution_scattering_support.solvent_contribution_scale_mode
@@ -2051,14 +2494,19 @@ class SAXSPrefitWorkflow:
             return
         self._apply_cluster_geometry_table(table)
 
-    def template_runtime_inputs(self) -> dict[str, np.ndarray]:
+    def template_runtime_inputs(
+        self,
+        parameter_entries: list[PrefitParameterEntry] | None = None,
+    ) -> dict[str, np.ndarray]:
         required_names = {
             *self.template_spec.extra_lmfit_inputs,
             *self.template_spec.cluster_geometry_support.runtime_input_names,
         }
         if not required_names:
             return {}
-        available_inputs = self._available_template_runtime_inputs()
+        available_inputs = self._available_template_runtime_inputs(
+            parameter_entries=parameter_entries
+        )
         missing = [
             name
             for name in sorted(required_names)
@@ -2074,10 +2522,15 @@ class SAXSPrefitWorkflow:
             for name in sorted(required_names)
         }
 
-    def template_runtime_inputs_payload(self) -> dict[str, list[float]]:
+    def template_runtime_inputs_payload(
+        self,
+        parameter_entries: list[PrefitParameterEntry] | None = None,
+    ) -> dict[str, list[float]]:
         return {
             name: np.asarray(values, dtype=float).tolist()
-            for name, values in self.template_runtime_inputs().items()
+            for name, values in self.template_runtime_inputs(
+                parameter_entries=parameter_entries
+            ).items()
         }
 
     def _build_default_parameter_entries(
@@ -2302,6 +2755,11 @@ class SAXSPrefitWorkflow:
                     initial_value_expression=(
                         _parameter_initial_value_expression(existing_entry)
                     ),
+                    active=(
+                        bool(existing_entry.active)
+                        if is_prefit_weight_entry(default_entry)
+                        else True
+                    ),
                 )
             )
         defaults_by_name = {
@@ -2314,6 +2772,96 @@ class SAXSPrefitWorkflow:
             )
             for entry in merged_entries
         ]
+
+    def _active_weight_names_for_entries(
+        self,
+        entries: list[PrefitParameterEntry] | None = None,
+    ) -> set[str]:
+        source_entries = entries or self.parameter_entries
+        active_names = {
+            str(entry.name).strip()
+            for entry in source_entries
+            if is_prefit_weight_entry(entry) and is_prefit_entry_active(entry)
+        }
+        if not active_names:
+            raise ValueError(
+                "At least one component weight w<NN> must be enabled for "
+                "Prefit and DREAM."
+            )
+        return active_names
+
+    def _inactive_weight_names_for_entries(
+        self,
+        entries: list[PrefitParameterEntry] | None = None,
+    ) -> set[str]:
+        source_entries = entries or self.parameter_entries
+        return {
+            str(entry.name).strip()
+            for entry in source_entries
+            if is_prefit_weight_entry(entry)
+            and not is_prefit_entry_active(entry)
+        }
+
+    def _active_components_for_entries(
+        self,
+        entries: list[PrefitParameterEntry] | None = None,
+    ) -> list[PrefitComponent]:
+        active_weight_names = self._active_weight_names_for_entries(entries)
+        components = [
+            component
+            for component in self.components
+            if component.param_name in active_weight_names
+        ]
+        if not components:
+            raise ValueError(
+                "At least one component weight w<NN> must be enabled for "
+                "Prefit and DREAM."
+            )
+        return components
+
+    def _active_parameter_entries_for_model(
+        self,
+        entries: list[PrefitParameterEntry] | None = None,
+    ) -> list[PrefitParameterEntry]:
+        source_entries = self._copy_entries(entries or self.parameter_entries)
+        self._active_weight_names_for_entries(source_entries)
+        inactive_weight_names = self._inactive_weight_names_for_entries(
+            source_entries
+        )
+        active_entries: list[PrefitParameterEntry] = []
+        for entry in source_entries:
+            if is_prefit_weight_entry(entry):
+                if is_prefit_entry_active(entry):
+                    active_entries.append(entry)
+                continue
+            scoped_weight_name = _component_scoped_weight_name(entry.name)
+            if scoped_weight_name in inactive_weight_names:
+                continue
+            entry.active = True
+            active_entries.append(entry)
+        return active_entries
+
+    @staticmethod
+    def _merge_fitted_active_entries(
+        original_entries: list[PrefitParameterEntry],
+        fitted_entries: list[PrefitParameterEntry],
+    ) -> list[PrefitParameterEntry]:
+        fitted_by_name = {
+            str(entry.name): entry for entry in fitted_entries if entry.name
+        }
+        merged: list[PrefitParameterEntry] = []
+        for original_entry in original_entries:
+            fitted_entry = fitted_by_name.get(str(original_entry.name))
+            if fitted_entry is None:
+                merged.append(
+                    PrefitParameterEntry.from_dict(original_entry.to_dict())
+                )
+                continue
+            updated = PrefitParameterEntry.from_dict(fitted_entry.to_dict())
+            if is_prefit_weight_entry(original_entry):
+                updated.active = bool(original_entry.active)
+            merged.append(updated)
+        return merged
 
     def _ensure_project_parameter_presets(self) -> None:
         dirty = False
@@ -2378,25 +2926,10 @@ class SAXSPrefitWorkflow:
         entry: PrefitParameterEntry,
         default_entry: PrefitParameterEntry | None = None,
     ) -> PrefitParameterEntry:
+        del default_entry
         constrained = PrefitParameterEntry.from_dict(entry.to_dict())
-        if constrained.name not in SOLVENT_WEIGHT_PARAMETER_NAMES:
-            return constrained
-        minimum = 0.0
-        maximum = 1.0
-        if default_entry is not None:
-            minimum = max(minimum, float(default_entry.minimum))
-            maximum = min(maximum, float(default_entry.maximum))
-        bounded_minimum = max(float(constrained.minimum), minimum)
-        bounded_maximum = min(float(constrained.maximum), maximum)
-        if bounded_maximum < bounded_minimum:
-            bounded_minimum = minimum
-            bounded_maximum = maximum
-        constrained.minimum = bounded_minimum
-        constrained.maximum = bounded_maximum
-        constrained.value = min(
-            max(float(constrained.value), constrained.minimum),
-            constrained.maximum,
-        )
+        if not is_prefit_weight_entry(constrained):
+            constrained.active = True
         return constrained
 
     def _has_matching_entry_signature(
@@ -2512,37 +3045,42 @@ class SAXSPrefitWorkflow:
         )
         saxs_map = map_payload.get("saxs_map", {})
         structures = prior_payload.get("structures", {})
+        if not isinstance(structures, dict):
+            structures = {}
+        component_order = _component_order_from_payloads(
+            map_payload,
+            prior_payload,
+        )
         components: list[PrefitComponent] = []
-        index = 0
-        for structure in sorted(saxs_map, key=_natural_sort_key):
-            motif_map = saxs_map[structure]
-            for motif in sorted(motif_map, key=_natural_sort_key):
-                profile_file = str(motif_map[motif])
-                profile_path = self.component_dir / profile_file
-                raw_data = self._load_numeric_table(profile_path)
-                q_values = np.asarray(raw_data[:, 0], dtype=float)
-                intensities = np.asarray(raw_data[:, 1], dtype=float)
-                components.append(
-                    PrefitComponent(
-                        structure=structure,
-                        motif=motif,
-                        param_name=f"w{index}",
-                        weight_value=float(
-                            structures.get(structure, {})
-                            .get(motif, {})
-                            .get(
-                                "normalized_weight",
-                                structures.get(structure, {})
-                                .get(motif, {})
-                                .get("weight", 0.0),
-                            )
-                        ),
-                        profile_file=profile_file,
-                        q_values=q_values,
-                        intensities=intensities,
-                    )
+        for index, (structure, motif, profile_file) in enumerate(
+            _ordered_saxs_map_items(saxs_map, component_order)
+        ):
+            profile_path = self.component_dir / profile_file
+            raw_data = self._load_numeric_table(profile_path)
+            q_values = np.asarray(raw_data[:, 0], dtype=float)
+            intensities = np.asarray(raw_data[:, 1], dtype=float)
+            structure_payload = structures.get(structure, {})
+            if not isinstance(structure_payload, dict):
+                structure_payload = {}
+            motif_payload = structure_payload.get(motif, {})
+            if not isinstance(motif_payload, dict):
+                motif_payload = {}
+            components.append(
+                PrefitComponent(
+                    structure=structure,
+                    motif=motif,
+                    param_name=f"w{index}",
+                    weight_value=float(
+                        motif_payload.get(
+                            "normalized_weight",
+                            motif_payload.get("weight", 0.0),
+                        )
+                    ),
+                    profile_file=profile_file,
+                    q_values=q_values,
+                    intensities=intensities,
                 )
-                index += 1
+            )
         if not components:
             raise ValueError(
                 "No SAXS component profiles were found for the selected "
@@ -2581,8 +3119,13 @@ class SAXSPrefitWorkflow:
                 )
         return None
 
-    def _component_q_values(self) -> np.ndarray:
-        return self._component_q_values_from_candidates(self.components)
+    def _component_q_values(
+        self,
+        components: list[PrefitComponent] | None = None,
+    ) -> np.ndarray:
+        return self._component_q_values_from_candidates(
+            components or self.components
+        )
 
     def _supported_component_q_range(self) -> tuple[float, float]:
         supported = load_built_component_q_range(
@@ -2670,6 +3213,107 @@ class SAXSPrefitWorkflow:
                 "q-range to be applied."
             )
         return requested_min, requested_max
+
+    @staticmethod
+    def _fit_q_range_tolerance(q_values: np.ndarray) -> float:
+        q_values = np.asarray(q_values, dtype=float)
+        finite_q = q_values[np.isfinite(q_values)]
+        if finite_q.size < 2:
+            return Q_RANGE_EDGE_TOLERANCE_ABS
+        sorted_q = np.sort(finite_q)
+        diffs = np.diff(sorted_q)
+        positive_diffs = diffs[diffs > 0.0]
+        spacing = (
+            float(np.min(positive_diffs))
+            if positive_diffs.size
+            else float(np.max(np.abs(sorted_q)))
+        )
+        scale = max(float(np.max(np.abs(sorted_q))), 1.0)
+        return max(
+            Q_RANGE_EDGE_TOLERANCE_ABS,
+            spacing * 1.0e-6,
+            scale * 1.0e-9,
+        )
+
+    def _resolve_prefit_fit_q_bounds(
+        self,
+        q_values: np.ndarray,
+        *,
+        requested_q_min: float | None = None,
+        requested_q_max: float | None = None,
+    ) -> tuple[float, float]:
+        q_values = np.asarray(q_values, dtype=float)
+        if q_values.size == 0:
+            raise ValueError("The active Prefit model trace has no q-values.")
+        model_q_min = float(np.min(q_values))
+        model_q_max = float(np.max(q_values))
+        raw_q_min = (
+            requested_q_min
+            if requested_q_min is not None
+            else self.settings.prefit_fit_q_min
+        )
+        raw_q_max = (
+            requested_q_max
+            if requested_q_max is not None
+            else self.settings.prefit_fit_q_max
+        )
+        fit_q_min = model_q_min if raw_q_min is None else float(raw_q_min)
+        fit_q_max = model_q_max if raw_q_max is None else float(raw_q_max)
+        if not np.isfinite(fit_q_min) or not np.isfinite(fit_q_max):
+            raise ValueError("The active Prefit fit q-range must be finite.")
+        if fit_q_min > fit_q_max:
+            raise ValueError(
+                "The active Prefit fit q min must be less than or equal to "
+                "the fit q max."
+            )
+        tolerance = self._fit_q_range_tolerance(q_values)
+        if (
+            fit_q_min < model_q_min
+            and abs(fit_q_min - model_q_min) <= tolerance
+        ):
+            fit_q_min = model_q_min
+        if (
+            fit_q_max > model_q_max
+            and abs(fit_q_max - model_q_max) <= tolerance
+        ):
+            fit_q_max = model_q_max
+        if (
+            fit_q_min < model_q_min - tolerance
+            or fit_q_max > model_q_max + tolerance
+        ):
+            raise ValueError(
+                "The active Prefit fit q-range "
+                f"{fit_q_min:.6g} to {fit_q_max:.6g} extends beyond the "
+                "active model trace "
+                f"({model_q_min:.6g} to {model_q_max:.6g})."
+            )
+        fit_q_min = max(fit_q_min, model_q_min)
+        fit_q_max = min(fit_q_max, model_q_max)
+        return fit_q_min, fit_q_max
+
+    def _prefit_fit_mask_for_q_values(
+        self,
+        q_values: np.ndarray,
+        *,
+        requested_q_min: float | None = None,
+        requested_q_max: float | None = None,
+    ) -> tuple[np.ndarray, float, float]:
+        q_values = np.asarray(q_values, dtype=float)
+        fit_q_min, fit_q_max = self._resolve_prefit_fit_q_bounds(
+            q_values,
+            requested_q_min=requested_q_min,
+            requested_q_max=requested_q_max,
+        )
+        tolerance = self._fit_q_range_tolerance(q_values)
+        fit_mask = (q_values >= fit_q_min - tolerance) & (
+            q_values <= fit_q_max + tolerance
+        )
+        if not np.any(fit_mask):
+            raise ValueError(
+                "The active Prefit fit q-range does not overlap the active "
+                "model trace q-grid."
+            )
+        return fit_mask, fit_q_min, fit_q_max
 
     def _component_q_range_boundary_tolerance(
         self,
@@ -2768,10 +3412,12 @@ class SAXSPrefitWorkflow:
     def _model_data_for_q_values(
         self,
         q_values: np.ndarray,
+        *,
+        components: list[PrefitComponent] | None = None,
     ) -> list[np.ndarray]:
         return [
             self._component_intensities_on_grid(component, q_values)
-            for component in self.components
+            for component in (components or self.components)
         ]
 
     def _solvent_trace_for_q_values(
@@ -2943,8 +3589,13 @@ class SAXSPrefitWorkflow:
             return None
         return structure_factor_array
 
-    def _lmfit_extra_inputs(self) -> list[np.ndarray]:
-        runtime_inputs = self.template_runtime_inputs()
+    def _lmfit_extra_inputs(
+        self,
+        parameter_entries: list[PrefitParameterEntry] | None = None,
+    ) -> list[np.ndarray]:
+        runtime_inputs = self.template_runtime_inputs(
+            parameter_entries=parameter_entries
+        )
         return [
             np.asarray(runtime_inputs[input_name], dtype=float)
             for input_name in self.template_spec.extra_lmfit_inputs
@@ -3027,13 +3678,102 @@ class SAXSPrefitWorkflow:
             self.cluster_geometry_table,
         )
 
-    def _available_template_runtime_inputs(self) -> dict[str, np.ndarray]:
+    def _available_template_runtime_inputs(
+        self,
+        parameter_entries: list[PrefitParameterEntry] | None = None,
+    ) -> dict[str, np.ndarray]:
         runtime_inputs: dict[str, np.ndarray] = {}
-        cluster_geometry_inputs = self._cluster_geometry_runtime_inputs()
+        cluster_geometry_inputs = self._cluster_geometry_runtime_inputs(
+            parameter_entries=parameter_entries
+        )
         runtime_inputs.update(cluster_geometry_inputs)
+        runtime_inputs.update(
+            self._stoichiometry_compensator_runtime_inputs(
+                parameter_entries=parameter_entries
+            )
+        )
         return runtime_inputs
 
-    def _cluster_geometry_runtime_inputs(self) -> dict[str, np.ndarray]:
+    def _stoichiometry_compensator_runtime_inputs(
+        self,
+        parameter_entries: list[PrefitParameterEntry] | None = None,
+    ) -> dict[str, np.ndarray]:
+        if not template_uses_stoichiometry_compensator(
+            self.template_spec.name
+        ):
+            return {}
+        target = build_stoichiometry_target(
+            self.settings.stoichiometry_compensator_target_elements_text,
+            self.settings.stoichiometry_compensator_target_ratio_text,
+        )
+        if target is None:
+            raise ValueError(
+                "The stoichiometry-compensator template requires target "
+                "elements and a target ratio in SAXS Prefit."
+            )
+        active_components = self._active_components_for_entries(
+            parameter_entries or self.parameter_entries
+        )
+        component_names = tuple(
+            component.param_name for component in active_components
+        )
+        selected_names = tuple(
+            str(name).strip()
+            for name in self.settings.stoichiometry_compensator_weight_names
+            if str(name).strip()
+        )
+        if not selected_names:
+            selected_names = guess_single_atom_compensator_names(
+                tuple(
+                    (component.param_name, component.structure)
+                    for component in active_components
+                ),
+                target.elements,
+            )
+        selected_set = set(selected_names)
+        mask = np.asarray(
+            [1.0 if name in selected_set else 0.0 for name in component_names],
+            dtype=float,
+        )
+        if not np.any(mask > 0.5):
+            raise ValueError(
+                "Select at least one component weight as the stoichiometry "
+                "compensator. Single-atom components are guessed "
+                "automatically when present."
+            )
+        base_weights = np.asarray(
+            [
+                (
+                    (
+                        float(component.weight_value)
+                        if float(component.weight_value) > 0.0
+                        else 1.0
+                    )
+                    if component.param_name in selected_set
+                    else 0.0
+                )
+                for component in active_components
+            ],
+            dtype=float,
+        )
+        counts = component_count_matrix(
+            tuple(component.structure for component in active_components),
+            target.elements,
+        )
+        return {
+            STOICH_TARGET_RATIO_INPUT: np.asarray(
+                target.ratio,
+                dtype=float,
+            ),
+            STOICH_COMPONENT_COUNTS_INPUT: counts,
+            STOICH_COMPENSATOR_MASK_INPUT: mask,
+            STOICH_COMPENSATOR_BASE_WEIGHTS_INPUT: base_weights,
+        }
+
+    def _cluster_geometry_runtime_inputs(
+        self,
+        parameter_entries: list[PrefitParameterEntry] | None = None,
+    ) -> dict[str, np.ndarray]:
         capability = self.template_spec.cluster_geometry_support
         if not capability.supported:
             return {}
@@ -3084,9 +3824,12 @@ class SAXSPrefitWorkflow:
                 "component weight parameter: "
                 + ", ".join(sorted(set(duplicate_parameters)))
             )
+        active_components = self._active_components_for_entries(
+            parameter_entries or self.parameter_entries
+        )
         missing_components = [
             component.param_name
-            for component in self.components
+            for component in active_components
             if component.param_name not in row_by_parameter
         ]
         if missing_components:
@@ -3097,7 +3840,7 @@ class SAXSPrefitWorkflow:
         runtime_inputs = {
             binding.runtime_name: [] for binding in capability.runtime_bindings
         }
-        for component in self.components:
+        for component in active_components:
             row = row_by_parameter[component.param_name]
             for binding in capability.runtime_bindings:
                 runtime_inputs[binding.runtime_name].append(
@@ -3112,12 +3855,33 @@ class SAXSPrefitWorkflow:
             for name, values in runtime_inputs.items()
         }
 
+    @staticmethod
+    def _fit_q_range_text(evaluation: PrefitEvaluation) -> str:
+        q_values = np.asarray(evaluation.q_values, dtype=float)
+        if q_values.size == 0:
+            return "unavailable"
+        q_min = (
+            float(evaluation.fit_q_min)
+            if evaluation.fit_q_min is not None
+            else float(np.min(q_values))
+        )
+        q_max = (
+            float(evaluation.fit_q_max)
+            if evaluation.fit_q_max is not None
+            else float(np.max(q_values))
+        )
+        return f"{q_min:.6g} to {q_max:.6g}"
+
     def _build_report_text(
         self,
         entries: list[PrefitParameterEntry],
         fit_result: PrefitFitResult | None,
         evaluation: PrefitEvaluation,
     ) -> str:
+        q_values = np.asarray(evaluation.q_values, dtype=float)
+        fit_point_count = int(
+            np.count_nonzero(self.evaluation_fit_mask(evaluation))
+        )
         lines = [
             f"Project: {self.paths.project_dir}",
             f"Template: {self.template_spec.name}",
@@ -3129,13 +3893,24 @@ class SAXSPrefitWorkflow:
             lines.append(
                 f"  {entry.name}: value={entry.value:.6g}, "
                 f"vary={entry.vary}, min={entry.minimum:.6g}, "
-                f"max={entry.maximum:.6g}"
+                f"max={entry.maximum:.6g}, active={entry.active}"
             )
         lines.extend(
             [
                 "",
                 "Fit statistics:",
-                f"  q points: {len(evaluation.q_values)}",
+                f"  model q points: {len(evaluation.q_values)}",
+                "  model q-range: "
+                + (
+                    "unavailable"
+                    if q_values.size == 0
+                    else (
+                        f"{float(np.min(q_values)):.6g} to "
+                        f"{float(np.max(q_values)):.6g}"
+                    )
+                ),
+                f"  fit q points: {fit_point_count}",
+                f"  fit q-range: {self._fit_q_range_text(evaluation)}",
             ]
         )
         if fit_result is None and (

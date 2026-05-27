@@ -4,6 +4,8 @@ from pathlib import Path
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -17,7 +19,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from saxshell.mdtrajectory.frame.manager import TrajectoryManager
+from saxshell.mdtrajectory.frame.manager import (
+    DEFAULT_FRAME_TIMESTEP_FS,
+    TrajectoryManager,
+)
 
 
 class TrajectoryPanel(QGroupBox):
@@ -29,6 +34,7 @@ class TrajectoryPanel(QGroupBox):
 
     def __init__(self) -> None:
         super().__init__("Trajectory")
+        self._loading_timestep = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -103,7 +109,8 @@ class TrajectoryPanel(QGroupBox):
         self.stride_spin.setRange(1, 10**9)
         self.stride_spin.setValue(1)
         self.stride_spin.setToolTip(
-            "Keep every Nth frame after the start/stop slice is applied."
+            "Keep every Nth frame after the start/stop range is applied. "
+            "For example, 1 keeps every frame and 10 keeps every tenth frame."
         )
         self.stride_spin.valueChanged.connect(
             lambda _value: self.selection_changed.emit()
@@ -111,7 +118,34 @@ class TrajectoryPanel(QGroupBox):
 
         form.addRow("Start frame", self.start_spin)
         form.addRow("Stop frame", self.stop_spin)
-        form.addRow("Stride", self.stride_spin)
+        form.addRow("Frame interval", self.stride_spin)
+
+        self.auto_timestep_box = QCheckBox(
+            "Auto-calculate frame timestep from trajectory"
+        )
+        self.auto_timestep_box.setChecked(True)
+        self.auto_timestep_box.setToolTip(
+            "Use time values embedded in the trajectory when available. "
+            "The value below is updated after inspection and is used as a "
+            "fallback for trajectories without frame times."
+        )
+        self.auto_timestep_box.toggled.connect(
+            lambda _checked: self.selection_changed.emit()
+        )
+        form.addRow("", self.auto_timestep_box)
+
+        self.timestep_spin = QDoubleSpinBox()
+        self.timestep_spin.setRange(1.0e-9, 1.0e12)
+        self.timestep_spin.setDecimals(6)
+        self.timestep_spin.setSingleStep(0.5)
+        self.timestep_spin.setSuffix(" fs")
+        self.timestep_spin.setValue(DEFAULT_FRAME_TIMESTEP_FS)
+        self.timestep_spin.setToolTip(
+            "Frame timestep in femtoseconds. Inspection updates this from "
+            "trajectory time metadata when it can be calculated."
+        )
+        self.timestep_spin.valueChanged.connect(self._handle_timestep_changed)
+        form.addRow("Frame timestep", self.timestep_spin)
 
         layout.addLayout(form)
 
@@ -209,6 +243,19 @@ class TrajectoryPanel(QGroupBox):
     def get_stride(self) -> int:
         return self.stride_spin.value()
 
+    def get_frame_timestep_fs(self) -> float:
+        return float(self.timestep_spin.value())
+
+    def use_manual_frame_timestep(self) -> bool:
+        return not self.auto_timestep_box.isChecked()
+
+    def set_frame_timestep_fs(self, value: float) -> None:
+        self._loading_timestep = True
+        try:
+            self.timestep_spin.setValue(float(value))
+        finally:
+            self._loading_timestep = False
+
     def set_summary(self, summary: dict[str, object]) -> None:
         lines = [f"{key}: {value}" for key, value in summary.items()]
         self.summary_box.setPlainText("\n".join(lines))
@@ -230,5 +277,14 @@ class TrajectoryPanel(QGroupBox):
             input_file=trajectory,
             topology_file=topology,
             backend="auto",
+            frame_timestep_fs=self.get_frame_timestep_fs(),
+            use_inferred_frame_times=self.use_manual_frame_timestep(),
         )
         return manager.inspect()
+
+    def _handle_timestep_changed(self, _value: float) -> None:
+        if self._loading_timestep:
+            return
+        if self.auto_timestep_box.isChecked():
+            self.auto_timestep_box.setChecked(False)
+        self.selection_changed.emit()

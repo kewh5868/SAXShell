@@ -120,20 +120,28 @@ Important distinction:
 
 ## Search/Filter Presets
 
-The DREAM tab includes three built-in presets that change both search depth and
-posterior filtering behavior:
+The DREAM tab includes built-in presets that change both search depth and
+posterior filtering behavior. The first three are the current SAXSShell
+profiles; the `Legacy ...` rows reproduce settings mined from the old
+MDScatter pyDREAM UI and notebooks.
 
-| Preset          | Chains | Iterations | Burn-in | nSeedChains | Crossover burn-in | Default filter         | Top % | Top N |
-| --------------- | -----: | ---------: | ------: | ----------: | ----------------: | ---------------------- | ----: | ----: |
-| Less Aggressive |      4 |       5000 |     15% |          24 |               500 | All Post-burnin        |    20 |  1000 |
-| Medium          |      4 |      10000 |     20% |          40 |              1000 | All Post-burnin        |    10 |   500 |
-| More Aggressive |      8 |      20000 |     25% |          80 |              2000 | Top % by Log-posterior |     5 |   250 |
+| Preset                    | Chains | Iterations | Burn-in | nSeedChains | Crossover burn-in | Default filter         | Top % | Top N |
+| ------------------------- | -----: | ---------: | ------: | ----------: | ----------------: | ---------------------- | ----: | ----: |
+| Less Aggressive           |      4 |       5000 |     15% |          24 |               500 | All Post-burnin        |    20 |  1000 |
+| Medium                    |      4 |      10000 |     20% |          40 |              1000 | All Post-burnin        |    10 |   500 |
+| More Aggressive           |      8 |      20000 |     25% |          80 |              2000 | Top % by Log-posterior |     5 |   250 |
+| Legacy GUI Default        |      4 |      10000 |     20% |          40 |              1000 | All Post-burnin        |    10 |   500 |
+| Legacy SAXS Notebook      |     50 |      15000 |     40% |         500 |              1000 | All Post-burnin        |    10 |   500 |
+| Legacy KWhite Long        |     50 |      20000 |     40% |         500 |              1000 | All Post-burnin        |    10 |   500 |
+| Legacy TChaney Production |     25 |      50000 |     10% |         250 |              1000 | All Post-burnin        |    10 |   500 |
 
 Use them as follows:
 
 - **Less Aggressive**: faster first pass, broader retained posterior
 - **Medium**: balanced default for most routine runs
 - **More Aggressive**: deeper search and tighter posterior screening
+- **Legacy ...**: compatibility presets for reproducing older MDScatter
+  pyDREAM runs
 
 If you change any of the linked controls manually, the preset switches to
 `Custom`.

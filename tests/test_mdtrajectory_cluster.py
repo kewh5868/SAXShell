@@ -492,6 +492,102 @@ def test_smart_solvation_shell_updates_scale_linearly_for_contiguous_runs(
         } == {10, 11}
 
 
+def test_smart_solvation_shell_sorting_reuses_stored_frame_records(
+    tmp_path,
+    monkeypatch,
+):
+    frames_dir = tmp_path / "splitpdb0001"
+    frames_dir.mkdir()
+    frame_count = 6
+    for frame_index in range(frame_count):
+        if frame_index % 2 == 0:
+            residue10_y = 1.0
+            residue11_y = 4.0
+        else:
+            residue10_y = 4.0
+            residue11_y = 1.0
+        (frames_dir / f"frame_{frame_index:04d}.pdb").write_text(
+            "".join(
+                _smart_shell_frame_lines(
+                    residue10_y=residue10_y,
+                    residue11_y=residue11_y,
+                )
+            )
+        )
+
+    build_count = 0
+    original_build_network = (
+        cluster_module.ExtractedFrameFolderClusterAnalyzer._build_network
+    )
+
+    def counted_build_network(self, frame_path):
+        nonlocal build_count
+        build_count += 1
+        return original_build_network(self, frame_path)
+
+    monkeypatch.setattr(
+        cluster_module.ExtractedFrameFolderClusterAnalyzer,
+        "_build_network",
+        counted_build_network,
+    )
+    analyzer = ExtractedFrameFolderClusterAnalyzer(
+        frames_dir=frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoffs_def=PAIR_CUTOFFS,
+        smart_solvation_shells=True,
+    )
+
+    export = analyzer.export_cluster_pdbs(
+        tmp_path / "clusters_from_folder",
+        shell_levels=(1,),
+        include_shell_levels=(0, 1),
+    )
+
+    assert build_count == frame_count
+    assert len(export.written_files) == frame_count
+
+
+def test_smart_solvation_shell_fast_sort_preserves_pbc_virtual_positions(
+    tmp_path,
+):
+    frames_dir = tmp_path / "splitpdb0001"
+    frames_dir.mkdir()
+    (frames_dir / "frame_0000.pdb").write_text(
+        "".join(
+            [
+                "MODEL        1\n",
+                _pdb_atom_line(1, "PB1", "SOL", 1, 9.7, 0.0, 0.0, "Pb"),
+                _pdb_atom_line(2, "I1", "SOL", 1, 9.0, 0.0, 0.0, "I"),
+                _pdb_atom_line(3, "O1", "WAT", 10, 0.2, 0.0, 0.0, "O"),
+                _pdb_atom_line(4, "H1", "WAT", 10, 0.2, 0.7, 0.0, "H"),
+                "ENDMDL\n",
+            ]
+        )
+    )
+
+    analyzer = ExtractedFrameFolderClusterAnalyzer(
+        frames_dir=frames_dir,
+        atom_type_definitions=ATOM_TYPE_DEFINITIONS,
+        pair_cutoffs_def=PAIR_CUTOFFS,
+        box_dimensions=(10.0, 10.0, 10.0),
+        use_pbc=True,
+        smart_solvation_shells=True,
+    )
+
+    export = analyzer.export_cluster_pdbs(
+        tmp_path / "clusters_from_folder",
+        shell_levels=(1,),
+        include_shell_levels=(0, 1),
+    )
+
+    structure = PDBStructure.from_file(export.written_files[0])
+    x_by_atom_id = {
+        atom.atom_id: float(atom.coordinates[0]) for atom in structure.atoms
+    }
+    assert x_by_atom_id[3] == pytest.approx(10.2)
+    assert x_by_atom_id[4] == pytest.approx(10.2)
+
+
 def test_smart_solvation_shell_resume_preserves_deferred_unions(tmp_path):
     frames_dir = tmp_path / "splitpdb0001"
     frames_dir.mkdir()
