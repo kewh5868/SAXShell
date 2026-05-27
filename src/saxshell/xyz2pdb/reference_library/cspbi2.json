@@ -1,0 +1,17 @@
+{
+  "backbone_pairs": [
+    [
+      "I2",
+      "CS1"
+    ],
+    [
+      "PB1",
+      "I2"
+    ],
+    [
+      "PB1",
+      "I1"
+    ]
+  ],
+  "residue_name": "CIT"
+}

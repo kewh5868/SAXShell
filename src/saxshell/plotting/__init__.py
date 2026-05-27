@@ -15,6 +15,12 @@
 """Python package for analysis of small-angle scattering data from
 molecular dynamics derived liquid structures."""
 
+from saxshell.plotting.axis_scale import (  # noqa
+    apply_axis_scales,
+    axis_has_positive_values,
+    resolve_axis_scale,
+    safe_set_axis_scale,
+)
 from saxshell.plotting.igor_inline import (  # noqa
     IgorInlineSegment,
     apply_igor_inline_text_artist,

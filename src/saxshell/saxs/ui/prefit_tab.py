@@ -43,6 +43,7 @@ from saxshell.plotting import (
     LinePlotSeriesDefaults,
     LinePlotSettings,
     PlotEditorWindow,
+    apply_axis_scales,
 )
 from saxshell.saxs._model_templates import TemplateSpec
 from saxshell.saxs.dielectric_presets import (
@@ -2705,8 +2706,10 @@ class PrefitTab(QWidget):
             structure_mask = np.isfinite(structure_values)
             if np.any(structure_mask):
                 structure_axis = top.twinx()
-                structure_axis.set_xscale(
-                    "log" if self.log_x_checkbox.isChecked() else "linear"
+                apply_axis_scales(
+                    structure_axis,
+                    log_x=self.log_x_checkbox.isChecked(),
+                    log_y=False,
                 )
                 (structure_line,) = structure_axis.plot(
                     np.asarray(evaluation.q_values, dtype=float)[
@@ -2743,8 +2746,11 @@ class PrefitTab(QWidget):
             )
             plotted_lines.append(model_line)
 
-        top.set_xscale("log" if self.log_x_checkbox.isChecked() else "linear")
-        top.set_yscale("log" if self.log_y_checkbox.isChecked() else "linear")
+        apply_axis_scales(
+            top,
+            log_x=self.log_x_checkbox.isChecked(),
+            log_y=self.log_y_checkbox.isChecked(),
+        )
         top.set_ylabel(
             self._line_plot_settings.resolve_primary_y_label(defaults)
         )
@@ -2832,8 +2838,10 @@ class PrefitTab(QWidget):
                     "Residual",
                 ),
             )
-            bottom.set_xscale(
-                "log" if self.log_x_checkbox.isChecked() else "linear"
+            apply_axis_scales(
+                bottom,
+                log_x=self.log_x_checkbox.isChecked(),
+                log_y=False,
             )
             bottom.set_xlabel(
                 self._line_plot_settings.resolve_x_label(defaults)

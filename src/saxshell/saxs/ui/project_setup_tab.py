@@ -55,6 +55,8 @@ from saxshell.plotting import (
     StackedHistogramPlotDefaults,
     StackedHistogramPlotEditorControls,
     StackedHistogramPlotSettings,
+    apply_axis_scales,
+    safe_set_axis_scale,
 )
 from saxshell.plotting.stacked_histogram import (
     render_stacked_histogram_export_payload,
@@ -4606,10 +4608,10 @@ class ProjectSetupTab(QWidget):
             try:
                 xscale = str(state.get("xscale", "")).strip()
                 if xscale and axis.get_xscale() != xscale:
-                    axis.set_xscale(xscale)
+                    safe_set_axis_scale(axis, "x", xscale)
                 yscale = str(state.get("yscale", "")).strip()
                 if yscale and axis.get_yscale() != yscale:
-                    axis.set_yscale(yscale)
+                    safe_set_axis_scale(axis, "y", yscale)
                 x_limits = state.get("xlim")
                 if isinstance(x_limits, list) and len(x_limits) == 2:
                     axis.set_xlim(float(x_limits[0]), float(x_limits[1]))
@@ -4775,7 +4777,12 @@ class ProjectSetupTab(QWidget):
         lines: list[object] = []
         scheme_colors = self._component_scheme_colors(component_paths)
         for component_path in component_paths:
-            data = np.loadtxt(component_path, comments="#")
+            if not component_path.is_file():
+                continue
+            try:
+                data = np.loadtxt(component_path, comments="#")
+            except (OSError, ValueError):
+                continue
             q_values = np.asarray(data[:, 0], dtype=float)
             intensities = np.asarray(data[:, 1], dtype=float)
             component_key = component_path.stem
@@ -4841,11 +4848,10 @@ class ProjectSetupTab(QWidget):
         }
 
     def _apply_saxs_axis_style(self, axis, *, is_component_axis: bool) -> None:
-        axis.set_xscale(
-            "log" if self.component_log_x_checkbox.isChecked() else "linear"
-        )
-        axis.set_yscale(
-            "log" if self.component_log_y_checkbox.isChecked() else "linear"
+        apply_axis_scales(
+            axis,
+            log_x=self.component_log_x_checkbox.isChecked(),
+            log_y=self.component_log_y_checkbox.isChecked(),
         )
         if not is_component_axis or self._experimental_summary is None:
             axis.set_xlabel(Q_A_INVERSE_LABEL)
