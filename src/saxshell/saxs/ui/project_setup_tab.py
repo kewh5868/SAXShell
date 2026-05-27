@@ -657,6 +657,12 @@ class ProjectSetupTab(QWidget):
             "matching component workflow for that saved distribution."
         )
         self.build_components_button = QPushButton("Build SAXS Components")
+        self.build_components_button.setToolTip(
+            "Build SAXS component traces for the active computed distribution. "
+            "Geometry-aware templates such as pyDREAM Poly LMA Hard-Sphere also "
+            "compute cluster geometry metadata automatically so SAXS Prefit is "
+            "ready to run."
+        )
         self.build_components_button.clicked.connect(
             self.build_components_requested.emit
         )

@@ -2390,9 +2390,10 @@ class SAXSPrefitWorkflow:
             or not self.cluster_geometry_table.rows
         ):
             return (
-                "Compute cluster geometry metadata to provide per-cluster "
-                "effective radii and structure-factor recommendations for "
-                f"{self.template_spec.display_name}."
+                "This template needs per-cluster effective radii before Prefit "
+                "or DREAM can run. Build SAXS Components in Project Setup to "
+                "compute them automatically, or click Compute Cluster Geometry "
+                f"below for {self.template_spec.display_name}."
             )
         try:
             runtime_inputs = sorted(self.template_runtime_inputs().keys())

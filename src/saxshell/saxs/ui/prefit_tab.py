@@ -1482,8 +1482,19 @@ class PrefitTab(QWidget):
             not self.solute_volume_fraction_widget.isHidden()
         )
 
-    def set_cluster_geometry_status_text(self, text: str) -> None:
+    def set_cluster_geometry_status_text(
+        self,
+        text: str,
+        *,
+        attention: bool = False,
+    ) -> None:
         self.cluster_geometry_status_label.setText(text.strip())
+        if attention:
+            self.cluster_geometry_status_label.setStyleSheet(
+                "color: #b45309; font-weight: 600;"
+            )
+        else:
+            self.cluster_geometry_status_label.setStyleSheet("")
 
     def populate_cluster_geometry_table(
         self,

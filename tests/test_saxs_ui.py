@@ -2014,7 +2014,10 @@ def test_prefit_cluster_geometry_section_is_template_aware(qapp, tmp_path):
 
     assert poly_window.prefit_workflow.supports_cluster_geometry_metadata()
     assert not poly_window.prefit_tab._cluster_geometry_group.isHidden()
-    assert "Compute cluster geometry metadata" in (
+    assert "Build SAXS Components" in (
+        poly_window.prefit_tab.cluster_geometry_status_label.text()
+    )
+    assert "Compute Cluster Geometry" in (
         poly_window.prefit_tab.cluster_geometry_status_label.text()
     )
     assert (

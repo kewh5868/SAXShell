@@ -3890,6 +3890,9 @@ class SAXSMainWindow(QMainWindow):
             try:
                 self._load_prefit_workflow()
                 self._load_dream_workflow()
+                self._ensure_prefit_cluster_geometry_metadata(
+                    log_to_activity=True,
+                )
             except Exception:
                 pass
             self.project_setup_tab.finish_activity_progress(
@@ -3934,6 +3937,9 @@ class SAXSMainWindow(QMainWindow):
             try:
                 self._load_prefit_workflow()
                 self._load_dream_workflow()
+                self._ensure_prefit_cluster_geometry_metadata(
+                    log_to_activity=True,
+                )
             except Exception:
                 pass
             self.project_setup_tab.finish_activity_progress(
@@ -4436,8 +4442,14 @@ class SAXSMainWindow(QMainWindow):
                 self.prefit_workflow.allowed_cluster_geometry_approximations()
             ),
         )
+        status_text = self.prefit_workflow.cluster_geometry_status_text()
+        needs_geometry_attention = (
+            self.prefit_workflow.supports_cluster_geometry_metadata()
+            and not self.prefit_workflow.cluster_geometry_rows()
+        )
         self.prefit_tab.set_cluster_geometry_status_text(
-            self.prefit_workflow.cluster_geometry_status_text()
+            status_text,
+            attention=needs_geometry_attention,
         )
         self._capture_prefit_cluster_geometry_sync_snapshot()
 
@@ -10591,7 +10603,93 @@ class SAXSMainWindow(QMainWindow):
             )
         self._refresh_saved_prefit_states()
         self._refresh_model_only_mode_state()
+        self._ensure_prefit_cluster_geometry_metadata(log_to_activity=False)
         return self.prefit_workflow
+
+    def _ensure_prefit_cluster_geometry_metadata(
+        self,
+        *,
+        log_to_activity: bool = True,
+    ) -> bool:
+        if self.prefit_workflow is None:
+            return False
+        if not self.prefit_workflow.supports_cluster_geometry_metadata():
+            return False
+        geometry_ready = bool(self.prefit_workflow.cluster_geometry_rows())
+        if geometry_ready:
+            try:
+                self.prefit_workflow.template_runtime_inputs()
+                self._refresh_prefit_cluster_geometry_section()
+                return True
+            except Exception:
+                geometry_ready = False
+        try:
+            self.prefit_workflow.parameter_entries = (
+                self.prefit_tab.parameter_entries()
+            )
+            self.prefit_workflow.set_cluster_geometry_active_radii_type(
+                self.prefit_tab.cluster_geometry_active_radii_type()
+            )
+            self.prefit_workflow.set_cluster_geometry_active_ionic_radius_type(
+                self.prefit_tab.cluster_geometry_active_ionic_radius_type()
+            )
+            table = (
+                self.prefit_workflow.compute_cluster_geometry_table_with_progress()
+            )
+            self.prefit_tab.populate_cluster_geometry_table(
+                self.prefit_workflow.cluster_geometry_rows(),
+                mapping_options=(
+                    self.prefit_workflow.cluster_geometry_mapping_options()
+                ),
+                active_radii_type=(
+                    self.prefit_workflow.cluster_geometry_active_radii_type()
+                ),
+                active_ionic_radius_type=(
+                    self.prefit_workflow.cluster_geometry_active_ionic_radius_type()
+                ),
+                allowed_sf_approximations=(
+                    self.prefit_workflow.allowed_cluster_geometry_approximations()
+                ),
+            )
+            self.prefit_tab.populate_parameter_table(
+                self.prefit_workflow.parameter_entries
+            )
+            self._capture_prefit_cluster_geometry_sync_snapshot()
+            self._set_prefit_sequence_baseline(
+                self.prefit_workflow.parameter_entries
+            )
+            self.prefit_tab.set_cluster_geometry_status_text(
+                self.prefit_workflow.cluster_geometry_status_text(),
+                attention=False,
+            )
+            self.prefit_tab.append_log(
+                "Loaded cluster geometry metadata for Prefit.\n"
+                f"Template: {self.prefit_workflow.template_spec.name}\n"
+                f"Clusters: {len(table.rows)}"
+            )
+            if log_to_activity:
+                self.project_setup_tab.append_summary(
+                    "Prepared cluster geometry metadata for "
+                    f"{self.prefit_workflow.template_spec.display_name} "
+                    f"({len(table.rows)} cluster rows)."
+                )
+            self._load_prefit_preview()
+            return True
+        except Exception as exc:
+            self.prefit_tab.set_cluster_geometry_status_text(
+                self.prefit_workflow.cluster_geometry_status_text(),
+                attention=True,
+            )
+            self.prefit_tab.append_log(
+                "Cluster geometry metadata is still required before Prefit "
+                f"can run.\n{exc}"
+            )
+            if log_to_activity:
+                self.project_setup_tab.append_summary(
+                    "Cluster geometry metadata could not be prepared "
+                    f"automatically.\n{exc}"
+                )
+            return False
 
     def _apply_prefit_template_fallback(
         self,
@@ -10668,8 +10766,10 @@ class SAXSMainWindow(QMainWindow):
             )
             self.prefit_tab.set_cluster_geometry_status_text(
                 "The active template expects per-cluster geometry metadata. "
-                "Build prior weights and load the Prefit workflow to map "
-                "component rows, then compute cluster geometry metadata."
+                "Build SAXS Components in Project Setup to compute effective "
+                "radii automatically, or use Compute Cluster Geometry below "
+                "after the Prefit workflow loads.",
+                attention=True,
             )
         else:
             self.prefit_tab.set_cluster_geometry_status_text(
