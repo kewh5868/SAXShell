@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -17428,8 +17429,7 @@ def test_experimental_data_header_dialog_allows_manual_column_selection(
 
 
 def test_experimental_data_header_dialog_geometry_is_screen_bounded(
-    qapp,
-    tmp_path,
+    qapp, tmp_path
 ):
     del qapp
     data_path = tmp_path / "exp_long_lines.txt"
@@ -17454,10 +17454,9 @@ def test_experimental_data_header_dialog_geometry_is_screen_bounded(
     assert dialog.preview_box.minimumHeight() == 250
     assert dialog.status_label.wordWrap()
     assert dialog.status_label.minimumWidth() == 0
-    combo_size_policy = dialog.q_column_combo.SizeAdjustPolicy
     assert (
         dialog.q_column_combo.sizeAdjustPolicy()
-        == combo_size_policy.AdjustToMinimumContentsLengthWithIcon
+        == dialog.q_column_combo.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
     )
 
     screen = QApplication.primaryScreen()
