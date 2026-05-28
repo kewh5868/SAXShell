@@ -655,7 +655,11 @@ workflow.
 ## References
 
 [^hoerl1970]: Hoerl, A. E., and Kennard, R. W. "Ridge Regression: Biased Estimation for Nonorthogonal Problems." _Technometrics_ 12, no. 1 (1970): 55-67. <https://doi.org/10.1080/00401706.1970.10488634>
+
 [^tibshirani1996]: Tibshirani, R. "Regression Shrinkage and Selection via the Lasso." _Journal of the Royal Statistical Society: Series B (Methodological)_ 58, no. 1 (1996): 267-288. <https://doi.org/10.1111/j.2517-6161.1996.tb02080.x>
+
 [^zou2005]: Zou, H., and Hastie, T. "Regularization and Variable Selection via the Elastic Net." _Journal of the Royal Statistical Society: Series B (Statistical Methodology)_ 67, no. 2 (2005): 301-320. <https://doi.org/10.1111/j.1467-9868.2005.00503.x>
+
 [^rasmussen2006]: Rasmussen, C. E., and Williams, C. K. I. _Gaussian Processes for Machine Learning._ MIT Press, 2006. <https://gaussianprocess.org/gpml>
+
 [^gilmer2017]: Gilmer, J., Schoenholz, S. S., Riley, P. F., Vinyals, O., and Dahl, G. E. "Neural Message Passing for Quantum Chemistry." _Proceedings of the 34th International Conference on Machine Learning_ 70 (2017): 1263-1272. <https://proceedings.mlr.press/v70/gilmer17a.html>
