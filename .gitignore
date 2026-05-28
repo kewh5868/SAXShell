@@ -116,3 +116,8 @@ target/
 # Ipython Notebook
 .ipynb_checkpoints
 src/saxshell/fullrmc/_solution_property_presets/user_solution_property_presets.json
+crash_log.txt
+qt_stderr.txt
+qt_stdout.txt
+saxshell_stderr.txt
+saxshell_stdout.txt

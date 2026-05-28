@@ -2013,7 +2013,10 @@ def test_prefit_cluster_geometry_section_is_template_aware(qapp, tmp_path):
 
     assert poly_window.prefit_workflow.supports_cluster_geometry_metadata()
     assert not poly_window.prefit_tab._cluster_geometry_group.isHidden()
-    assert "Compute cluster geometry metadata" in (
+    assert "Build SAXS Components" in (
+        poly_window.prefit_tab.cluster_geometry_status_label.text()
+    )
+    assert "Compute Cluster Geometry" in (
         poly_window.prefit_tab.cluster_geometry_status_label.text()
     )
     assert (
@@ -17288,6 +17291,46 @@ def test_load_experimental_data_file_detects_three_column_headers(
     assert np.allclose(summary.errors, [0.1, 0.2])
 
 
+def test_load_experimental_data_file_ignores_stale_error_column_index(
+    tmp_path,
+):
+    data_path = tmp_path / "exp_two_columns.txt"
+    data_path.write_text(
+        "0.05\t10.0\n" "0.10\t9.5\n",
+        encoding="utf-8",
+    )
+
+    summary = load_experimental_data_file(
+        data_path,
+        error_column=2,
+    )
+
+    assert summary.error_column is None
+    assert summary.errors is None
+    assert np.allclose(summary.q_values, [0.05, 0.10])
+    assert np.allclose(summary.intensities, [10.0, 9.5])
+
+
+def test_load_experimental_data_file_reloads_after_header_detection(
+    tmp_path,
+):
+    data_path = tmp_path / "exp_header_reload.txt"
+    data_path.write_text(
+        "q_demo\tintensity_demo\terror_demo\n"
+        "0.05\t10.0\t0.1\n"
+        "0.10\t9.5\t0.2\n",
+        encoding="utf-8",
+    )
+
+    summary = load_experimental_data_file(data_path, skiprows=0)
+
+    assert summary.header_rows == 1
+    assert summary.error_column == 2
+    assert np.allclose(summary.q_values, [0.05, 0.10])
+    assert np.allclose(summary.intensities, [10.0, 9.5])
+    assert np.allclose(summary.errors, [0.1, 0.2])
+
+
 def test_experimental_overlay_window_loads_multiple_header_styles(
     qapp,
     tmp_path,
@@ -17428,8 +17471,7 @@ def test_experimental_data_header_dialog_allows_manual_column_selection(
 
 
 def test_experimental_data_header_dialog_geometry_is_screen_bounded(
-    qapp,
-    tmp_path,
+    qapp, tmp_path
 ):
     del qapp
     data_path = tmp_path / "exp_long_lines.txt"
@@ -17454,10 +17496,9 @@ def test_experimental_data_header_dialog_geometry_is_screen_bounded(
     assert dialog.preview_box.minimumHeight() == 250
     assert dialog.status_label.wordWrap()
     assert dialog.status_label.minimumWidth() == 0
-    combo_size_policy = dialog.q_column_combo.SizeAdjustPolicy
     assert (
         dialog.q_column_combo.sizeAdjustPolicy()
-        == combo_size_policy.AdjustToMinimumContentsLengthWithIcon
+        == dialog.q_column_combo.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
     )
 
     screen = QApplication.primaryScreen()

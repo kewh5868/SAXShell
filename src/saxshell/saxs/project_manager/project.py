@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -2699,13 +2700,15 @@ class SAXSProjectManager:
         settings: ProjectSettings,
     ) -> ExperimentalDataSummary:
         path = self._resolve_experimental_source(settings)
-        return load_experimental_data_file(
+        summary = load_experimental_data_file(
             path,
             skiprows=settings.experimental_header_rows,
             q_column=settings.experimental_q_column,
             intensity_column=settings.experimental_intensity_column,
             error_column=settings.experimental_error_column,
         )
+        _apply_experimental_column_settings(settings, summary)
+        return summary
 
     def load_solvent_data(
         self,
@@ -2714,13 +2717,15 @@ class SAXSProjectManager:
         path = self._resolve_solvent_source(settings)
         if path is None:
             return None
-        return load_experimental_data_file(
+        summary = load_experimental_data_file(
             path,
             skiprows=settings.solvent_header_rows,
             q_column=settings.solvent_q_column,
             intensity_column=settings.solvent_intensity_column,
             error_column=settings.solvent_error_column,
         )
+        _apply_solvent_column_settings(settings, summary)
+        return summary
 
     def scan_cluster_inventory(
         self,
@@ -3560,6 +3565,229 @@ class SAXSProjectManager:
             )
         return cluster_bins
 
+    @staticmethod
+    def _prefit_mapping_components_from_entries(
+        component_entries: list[ProjectComponentEntry],
+    ) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(
+                structure=str(entry.structure).strip(),
+                motif=str(entry.motif).strip() or "no_motif",
+                param_name=f"w{index}",
+            )
+            for index, entry in enumerate(component_entries)
+        ]
+
+    @staticmethod
+    def _cluster_geometry_metadata_is_ready(
+        table,
+        mapping_components: list[SimpleNamespace],
+    ) -> bool:
+        if not table.rows:
+            return False
+        valid_parameters = {
+            str(getattr(component, "param_name", "")).strip()
+            for component in mapping_components
+            if str(getattr(component, "param_name", "")).strip()
+        }
+        if not valid_parameters:
+            return False
+        mapped_parameters: set[str] = set()
+        for row in table.rows:
+            mapped_parameter = str(row.mapped_parameter or "").strip()
+            if (
+                not mapped_parameter
+                or mapped_parameter not in valid_parameters
+            ):
+                return False
+            mapped_parameters.add(mapped_parameter)
+        return valid_parameters <= mapped_parameters
+
+    def _cluster_geometry_metadata_path_for_settings(
+        self,
+        settings: ProjectSettings,
+        *,
+        artifact_paths: ProjectArtifactPaths | None = None,
+    ) -> Path:
+        resolved_paths = artifact_paths or project_artifact_paths(
+            settings,
+            storage_mode="distribution",
+        )
+        if settings.use_predicted_structure_weights:
+            return resolved_paths.predicted_cluster_geometry_metadata_file
+        return resolved_paths.cluster_geometry_metadata_file
+
+    def _cluster_bins_for_geometry_metadata(
+        self,
+        settings: ProjectSettings,
+        component_entries: list[ProjectComponentEntry],
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> list[ClusterBin]:
+        active_components = {
+            (
+                str(entry.structure).strip(),
+                str(entry.motif).strip() or "no_motif",
+            )
+            for entry in component_entries
+        }
+        if settings.use_representative_structures:
+            inventory = self._representative_cluster_inventory(
+                settings,
+                progress_callback=progress_callback,
+            )
+            return [
+                cluster_bin
+                for cluster_bin in inventory.cluster_bins
+                if (
+                    str(cluster_bin.structure).strip(),
+                    str(cluster_bin.motif).strip() or "no_motif",
+                )
+                in active_components
+            ]
+        clusters_dir = settings.resolved_clusters_dir
+        if clusters_dir is None:
+            return []
+        return [
+            cluster_bin
+            for cluster_bin in discover_cluster_bins(clusters_dir)
+            if (
+                str(cluster_bin.structure).strip(),
+                str(cluster_bin.motif).strip() or "no_motif",
+            )
+            in active_components
+        ]
+
+    def _extra_cluster_bins_for_geometry_metadata(
+        self,
+        settings: ProjectSettings,
+        component_entries: list[ProjectComponentEntry],
+    ) -> list[ClusterBin]:
+        if not settings.use_predicted_structure_weights:
+            return []
+        predicted_components = {
+            (
+                str(entry.structure).strip(),
+                str(entry.motif).strip() or "no_motif",
+            )
+            for entry in component_entries
+            if str(entry.motif).strip().startswith("predicted_rank")
+        }
+        if not predicted_components:
+            return []
+        return self.predicted_structure_cluster_bins(
+            settings.project_dir,
+            included_components=predicted_components,
+        )
+
+    def ensure_cluster_geometry_metadata(
+        self,
+        settings: ProjectSettings,
+        *,
+        component_entries: list[ProjectComponentEntry],
+        artifact_paths: ProjectArtifactPaths | None = None,
+        progress_callback: ProgressCallback | None = None,
+        force_recompute: bool = False,
+    ) -> bool:
+        from saxshell.saxs._model_templates import load_template_spec
+        from saxshell.saxs.prefit.cluster_geometry import (
+            apply_default_component_mapping,
+            compute_cluster_geometry_metadata,
+            load_cluster_geometry_metadata,
+            save_cluster_geometry_metadata,
+            synchronize_cluster_geometry_table,
+            validate_positive_cluster_geometry_table,
+        )
+
+        template_name = _optional_str(settings.selected_model_template)
+        if not template_name:
+            return False
+        try:
+            template_spec = load_template_spec(template_name)
+        except Exception:
+            return False
+        capability = template_spec.cluster_geometry_support
+        if not capability.supported:
+            return False
+
+        resolved_artifact_paths = artifact_paths or project_artifact_paths(
+            settings,
+            storage_mode="distribution",
+        )
+        metadata_path = self._cluster_geometry_metadata_path_for_settings(
+            settings,
+            artifact_paths=resolved_artifact_paths,
+        )
+        resolved_artifact_paths.prefit_dir.mkdir(parents=True, exist_ok=True)
+        mapping_components = self._prefit_mapping_components_from_entries(
+            component_entries
+        )
+        allowed_sf_approximations = capability.allowed_sf_approximations
+
+        if not force_recompute and metadata_path.is_file():
+            table = load_cluster_geometry_metadata(metadata_path)
+            table.template_name = template_name
+            dirty = synchronize_cluster_geometry_table(
+                table,
+                allowed_sf_approximations=allowed_sf_approximations,
+            )
+            if apply_default_component_mapping(
+                table.rows,
+                mapping_components,
+            ):
+                dirty = True
+            if self._cluster_geometry_metadata_is_ready(
+                table,
+                mapping_components,
+            ):
+                if dirty:
+                    save_cluster_geometry_metadata(metadata_path, table)
+                return True
+
+        clusters_dir = settings.resolved_clusters_dir
+        if clusters_dir is None:
+            raise ValueError(
+                "Select a clusters directory in Project Setup before "
+                "building SAXS components for geometry-aware templates."
+            )
+        cluster_bins = self._cluster_bins_for_geometry_metadata(
+            settings,
+            component_entries,
+            progress_callback=progress_callback,
+        )
+        extra_cluster_bins = self._extra_cluster_bins_for_geometry_metadata(
+            settings,
+            component_entries,
+        )
+        if progress_callback is not None:
+            progress_callback(
+                0,
+                max(len(component_entries), 1),
+                "Computing cluster geometry metadata for "
+                f"{template_spec.display_name}...",
+            )
+        table = compute_cluster_geometry_metadata(
+            clusters_dir,
+            cluster_bins=cluster_bins or None,
+            extra_cluster_bins=extra_cluster_bins or None,
+            template_name=template_name,
+            allowed_sf_approximations=allowed_sf_approximations,
+            progress_callback=progress_callback,
+        )
+        apply_default_component_mapping(table.rows, mapping_components)
+        validate_positive_cluster_geometry_table(table)
+        save_cluster_geometry_metadata(metadata_path, table)
+        if progress_callback is not None:
+            progress_callback(
+                max(len(component_entries), 1),
+                max(len(component_entries), 1),
+                (
+                    "Cluster geometry metadata ready for "
+                    f"{template_spec.display_name}."
+                ),
+            )
+        return True
+
     def build_scattering_project(
         self,
         settings: ProjectSettings,
@@ -3713,6 +3941,12 @@ class SAXSProjectManager:
         )
         model_map_path = artifact_paths.component_map_file
         self._write_component_map(model_map_path, component_entries)
+        self.ensure_cluster_geometry_metadata(
+            settings,
+            component_entries=component_entries,
+            artifact_paths=artifact_paths,
+            progress_callback=progress_callback,
+        )
         self._write_distribution_metadata(
             settings,
             artifact_paths=artifact_paths,
@@ -3816,6 +4050,12 @@ class SAXSProjectManager:
         )
         model_map_path = artifact_paths.component_map_file
         self._write_component_map(model_map_path, component_entries)
+        self.ensure_cluster_geometry_metadata(
+            settings,
+            component_entries=component_entries,
+            artifact_paths=artifact_paths,
+            progress_callback=progress_callback,
+        )
         self._write_distribution_metadata(
             settings,
             artifact_paths=artifact_paths,
@@ -4067,6 +4307,12 @@ class SAXSProjectManager:
             in _EXTERNAL_COMPONENT_BUILD_MODES
         ):
             self._reset_distribution_component_artifacts(artifact_paths)
+        self.ensure_cluster_geometry_metadata(
+            settings,
+            component_entries=component_entries,
+            artifact_paths=artifact_paths,
+            progress_callback=progress_callback,
+        )
         self._write_distribution_metadata(
             settings,
             artifact_paths=artifact_paths,
@@ -6197,6 +6443,10 @@ def load_experimental_data_file(
         guessed_header_rows = _guess_experimental_header_rows(file_path)
         if guessed_header_rows > effective_skiprows:
             effective_skiprows = guessed_header_rows
+            data = _load_experimental_numeric_data(
+                file_path,
+                skiprows=effective_skiprows,
+            )
         column_names = _read_experimental_column_names(
             file_path,
             effective_skiprows,
@@ -6274,6 +6524,34 @@ def read_experimental_column_names(
     )
 
 
+def _valid_column_index(index: int | None, n_columns: int) -> int | None:
+    if index is None:
+        return None
+    if index < 0 or index >= n_columns:
+        return None
+    return index
+
+
+def _apply_experimental_column_settings(
+    settings: ProjectSettings,
+    summary: ExperimentalDataSummary,
+) -> None:
+    settings.experimental_header_rows = int(summary.header_rows)
+    settings.experimental_q_column = int(summary.q_column)
+    settings.experimental_intensity_column = int(summary.intensity_column)
+    settings.experimental_error_column = summary.error_column
+
+
+def _apply_solvent_column_settings(
+    settings: ProjectSettings,
+    summary: ExperimentalDataSummary,
+) -> None:
+    settings.solvent_header_rows = int(summary.header_rows)
+    settings.solvent_q_column = int(summary.q_column)
+    settings.solvent_intensity_column = int(summary.intensity_column)
+    settings.solvent_error_column = summary.error_column
+
+
 def infer_experimental_columns(
     column_names: list[str],
 ) -> tuple[int | None, int | None, int | None]:
@@ -6335,27 +6613,18 @@ def _resolve_experimental_columns(
                 f"The selected {label} column index {index} is out of range."
             )
 
-    if error_column is not None:
-        resolved_error = error_column
-    elif inferred_e is not None:
-        resolved_error = inferred_e
-    elif n_columns >= 3:
-        candidate = 2
-        resolved_error = (
-            candidate if candidate not in {resolved_q, resolved_i} else None
-        )
-    else:
-        resolved_error = None
-
-    if resolved_error is not None:
-        if resolved_error in {resolved_q, resolved_i}:
-            raise ValueError(
-                "The error column must be different from q and intensity."
-            )
-        if resolved_error < 0 or resolved_error >= n_columns:
-            raise ValueError(
-                f"The selected error column index {resolved_error} is out of range."
-            )
+    resolved_error: int | None = None
+    for candidate in (
+        _valid_column_index(error_column, n_columns),
+        _valid_column_index(inferred_e, n_columns),
+        2 if n_columns >= 3 else None,
+    ):
+        if candidate is None:
+            continue
+        if candidate in {resolved_q, resolved_i}:
+            continue
+        resolved_error = candidate
+        break
     return resolved_q, resolved_i, resolved_error
 
 

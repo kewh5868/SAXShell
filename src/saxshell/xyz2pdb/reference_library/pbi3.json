@@ -1,0 +1,8 @@
+{
+  "backbone_pairs": [
+    ["PB1", "I2"],
+    ["PB1", "I1"],
+    ["PB1", "I3"]
+  ],
+  "residue_name": "PBI"
+}

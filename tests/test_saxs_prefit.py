@@ -2870,6 +2870,35 @@ def test_poly_lma_saved_snapshot_preserves_cluster_geometry_state(tmp_path):
     )
 
 
+def test_build_scattering_components_ensures_cluster_geometry_metadata(
+    tmp_path,
+):
+    project_dir, paths, effective_radius = _build_poly_lma_geometry_project(
+        tmp_path,
+        template_name=POLY_LMA_HS_TEMPLATE,
+    )
+    geometry_path = paths.cluster_geometry_metadata_file
+    if geometry_path.is_file():
+        geometry_path.unlink()
+
+    manager = SAXSProjectManager()
+    settings = manager.load_project(project_dir)
+    manager.build_scattering_components(settings)
+
+    assert geometry_path.is_file()
+    workflow = SAXSPrefitWorkflow(project_dir)
+    assert workflow.cluster_geometry_rows()
+    assert workflow.cluster_geometry_rows()[0].mapped_parameter == "w0"
+    assert workflow.cluster_geometry_rows()[
+        0
+    ].effective_radius == pytest.approx(effective_radius)
+    evaluation = workflow.evaluate()
+    assert np.allclose(
+        evaluation.model_intensities,
+        evaluation.experimental_intensities,
+    )
+
+
 def test_poly_lma_prefit_workflow_computes_and_uses_cluster_geometry(
     tmp_path,
 ):
